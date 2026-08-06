@@ -607,11 +607,19 @@ budgets:
 
 Configuration should be split into three ownership classes:
 
-| Class | Examples | Modification authority |
-|---|---|---|
-| User policy | Autonomy, budgets, risk rules, merge mode | Human only |
-| Repository policy | Checks, architecture rules, review rubrics | Human-reviewed repository change |
-| Runtime state | Run ID, lease expiry, session IDs, check results | runmill only |
+| Class | Examples | Location | Modification authority |
+|---|---|---|---|
+| User policy | Autonomy, budgets, risk rules, merge mode | **Outside the repository**, in the user config directory | Human only |
+| Repository policy | Checks, architecture rules, review rubrics | In the repository, always read from the **base commit** | Human-reviewed repository change |
+| Runtime state | Run ID, lease generation, session IDs, check results | State store | runmill only |
+
+Location is a security property, not a convenience. If user policy lived in the repository, the
+agent — or any inbound pull request — could change autonomy mode, budgets, and risk rules. Because
+repository policy legitimately lives in the repository, it is always resolved from the base commit
+and diffed against the working tree; any delta is a merge-blocking manual-approval condition. The
+same treatment applies to context entry files: `AGENTS.md` is read into every prompt, so an
+outside contributor's merged change to it is a persistent injection into all future runs. Those
+files are hash-pinned and changes alert.
 
 A coding agent may propose changes to the first two classes, but cannot activate those changes during the run that produced the proposal.
 
@@ -633,7 +641,7 @@ An issue is eligible only when:
 
 Eligible issues are ordered by:
 
-1. Explicit Linear priority, with urgent before high, high before medium, medium before low, and no-priority last.
+1. Explicit backlog priority, with urgent before high, high before medium, medium before low, and no-priority last. Note that Linear encodes *no priority* as `0` and *urgent* as `1`, so a naive ascending sort places unprioritized issues first. The sort key maps `0` to positive infinity. This is stated in the ordering rule and not only in the filtering rule, because implementing it from the filter alone is the obvious mistake.
 2. Breached or nearest due date or SLA, when configured.
 3. Manual within-priority rank if retrievable.
 4. Oldest creation timestamp.
@@ -1110,7 +1118,13 @@ runmill should write a task packet to `.runmill/run/task.json`:
   },
   "constraints": {
     "allowed_paths": ["src/**", "tests/**", "docs/**"],
-    "forbidden_paths": [".github/workflows/release.yml"],
+    "forbidden_paths": [
+      ".runmill/**",
+      ".github/**",
+      "package.json",
+      "*.lock",
+      ".github/workflows/release.yml"
+    ],
     "network": "restricted"
   },
   "required_checks": [
@@ -1121,6 +1135,7 @@ runmill should write a task packet to `.runmill/run/task.json`:
   ],
   "completion_contract": {
     "require_clean_git_status": false,
+    "_note_clean_git_status": "The agent is not required to commit; the orchestrator creates the candidate commit and verification runs against it in a separate detached worktree. This flag must never be read as permission to verify a dirty tree.",
     "require_summary": true,
     "require_test_evidence": true,
     "require_scope_statement": true
@@ -1277,8 +1292,8 @@ exhaustion testable in milliseconds rather than hours.
 |---|---|
 | Reliability | All external mutations are idempotent or reconciled after ambiguous responses. |
 | Security | Secrets are stored in an OS keychain or external secret provider, never in repository files or task packets. |
-| Portability | macOS and Linux are first-class; Windows through WSL may follow after worktree and process behavior is validated. |
-| Performance | Orchestrator overhead excluding model and test execution should remain below five seconds per state transition. |
+| Portability | macOS and Linux are first-class for *execution*. Their isolation guarantees differ materially (Seatbelt has no network namespace, no cgroups, no process-tree cleanup), so `doctor` prints a per-platform enforcement matrix and a config requesting an unenforceable control is an error. Windows through WSL may follow once worktree and process-group behavior is validated. |
+| Performance | Orchestrator CPU per state transition, excluding all I/O and subprocess time, stays under 50ms. A blanket "five seconds per transition" is simultaneously meaningless for network-bound states like `CI_WAIT` and far too lax for local ones. |
 | Scalability | The data model supports multiple repositories and workers, although the MVP defaults to one active issue. |
 | Auditability | Every merge decision includes policy inputs, required gates, their exact results, and the responsible identity. |
 | Operability | Logs are structured, redacted, correlated by run ID, and available both interactively and as files. |
@@ -1661,6 +1676,27 @@ the PR head — the queue rebases — so the actual merge SHA is read back from 
 
 The policy engine computes risk deterministically from paths, labels, file types, diff properties, repository metadata, and issue characteristics. An agent may provide an advisory risk assessment but cannot reduce the deterministic classification.
 
+**Classification is two-phase.** Deterministic risk needs the diff, which only exists after
+implementation — so a `critical` classification arrives after the money is already spent. runmill
+therefore computes a *predicted* risk before dispatch from issue text, labels, and referenced
+paths, which gates whether the run starts at all, and a *deterministic* reclassification after
+implementation which may only escalate, never reduce.
+
+**Determinism buys auditability, not accuracy.** Path-based tiers are wrong in both directions: a
+one-line change to a shared date utility can break billing, and an additive migration under
+`migrations/**` may be trivially safe. The classification is consistent and explainable, which is
+what merge governance requires; it is not a claim that the rules are correct. Before the risk
+engine is trusted, its rules are validated by classifying 100 historical merged pull requests from
+the target repository and publishing the resulting tier distribution. If most real issues land in
+Medium or High, nearly every run escalates and the autonomy ladder needs recalibrating rather than
+implementing.
+
+Note also that label-add authority becomes code-execution authority: anyone who can apply
+`agent-ready` in the backlog can cause autonomous changes against a production repository. `doctor`
+states this explicitly at setup, the applying actor is recorded in the audit bundle as part of the
+merge decision's responsible identity, and the label may optionally be restricted to an allowlist
+of actors.
+
 | Risk | Typical examples | Default policy |
 |---|---|---|
 | Low | Documentation, isolated tests, internal refactor with unchanged behavior, narrow bug fix with strong regression test | Eligible for guarded auto-merge after calibration |
@@ -1997,7 +2033,7 @@ This gives humans and future coding agents a progressive-disclosure map rather t
 
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
-| Foundation | CLI setup, config, keychain, Linear query, deterministic selection, dry run, SQLite state | User can authenticate, inspect selection, and claim/release an issue without invoking a model |
+| Foundation | CLI setup, config, keychain, backlog query, deterministic selection, dry run, SQLite state with migrations, **git-ref lease with fencing**, **fake backlog + fake GitHub with fault injection**, **`crashpoint()` hooks**, **injected `Clock`** | User can authenticate, inspect selection, and claim/release an issue without invoking a model. Forced-interleaving concurrency tests pass. Kill-at-crashpoint tests pass for every claim-sequence boundary |
 | Agent execution | Worktree isolation, Codex adapter, Claude adapter, task packet, normalized events, budgets | The same fixture issue executes through both providers and survives an orchestrator restart |
 | Verified PR | Check manifest, local review/fix loop, PR creation, CI reconciliation | An issue reliably becomes an evidence-bearing draft PR; no merge capability required |
 | Governed merge | Risk engine, branch-protection discovery, approvals, merge queue, Linear completion | Low-risk fixture may merge; high-risk fixture always requires human approval |
@@ -2492,3 +2528,59 @@ Resolved at the /autoplan approval gate on 2026-08-06.
 - T14 DX — `RunmillError` first-class type + code for all 25 failure modes; no mode may be `USER SEES? Silent`       [DX-12]
 - T15 Persistence — `user_version`, migration under cross-process lock, auto-backup, WAL + busy_timeout        [CM-11/12]
 - T16 Sandbox — **rewrite prd.md:623**; provider bypass permitted only under a verified runmill sandbox              [D-06]
+
+## A.14 Resolution ledger
+
+Status of every review finding after the PRD body was updated (commits `6b99be2`, `2a58338`,
+and this one). RESOLVED means the body now specifies the fix; OPEN means it is tracked for
+implementation but the document does not yet constrain it.
+
+| Finding | Status | Where in the body |
+|---|---|---|
+| CM-01 worktree shares `.git` | RESOLVED | Sandbox baseline policy: git dir relocated per run, `core.hooksPath=/dev/null` |
+| CM-02 claim protocol has no mutual exclusion | RESOLVED | Issue selection and claim protocol: git-ref lease + fencing generation |
+| CM-03 local persist after remote mutation | RESOLVED | Claim protocol crash-safety paragraph; `side_effects` outbox |
+| CM-04 `skipped_tests` unobtainable | RESOLVED | Verification contract: differential skip baseline + machine-readable reports |
+| CM-05 `commit_sha` does not prove freshness | RESOLVED | Verification contract: detached worktree at candidate SHA, tree hash before/after |
+| CM-06 path-filtered checks hang CI_WAIT | RESOLVED | Merge eligibility: static workflow parse at doctor + bounded deadline classification |
+| CM-07 check-name namespace collision | RESOLVED | Merge eligibility: three-namespace mapping with expected app id |
+| CM-08 cancellation before `session.started` | RESOLVED | Adapter contract: `AgentSession` + `AbortSignal` |
+| CM-09 `permission.requested` undeliverable | RESOLVED | Adapter contract: `respondToPermission()` |
+| CM-10 lease has no liveness semantics | RESOLVED | Claim protocol: heartbeat timer, TTL 20m vs 240m budget, takeover procedure |
+| CM-11 no schema migration | RESOLVED | Persistence: `user_version`, cross-process lock, backup, version handshake |
+| CM-12 no WAL / busy_timeout | RESOLVED | Persistence: concurrency protocol |
+| CM-13 missing states | RESOLVED | State machine: PUSHED, PR_DELIVERED, AWAITING_APPROVAL, REBASING, QUEUE_EJECTED + missing edges |
+| CM-14 sandbox profiles unspecified | RESOLVED | Sandbox: per-platform matrix, egress proxy, mandatory + fail-closed |
+| CM-15 no test plan / fakes | RESOLVED | Delivery phases: fakes, crashpoints, Clock moved into Foundation |
+| CL-01 check runner unsandboxed | RESOLVED | Sandbox: check runner sandboxed with allowlisted env |
+| CL-02 agent-proposed checks are RCE | RESOLVED | Verification: agent proposals are identifiers, never shell |
+| CL-03 review channel is a privilege boundary | RESOLVED | Control-plane boundary: untrusted fencing, write-permission gating, verdict cross-check |
+| CL-04 `runmill.yaml` location | RESOLVED | Manifest resolved from base commit; `.runmill/**` and `.github/**` forbidden by default |
+| CL-05 merge credential can disable governance | OPEN | Tracked: GitHub App token without `administration`; doctor asserts it cannot write protection |
+| CL-06 ambient credential channels | RESOLVED | Sandbox: env built from empty, NODE_OPTIONS/LD_PRELOAD scrubbed, keychain denied as Mach service |
+| CL-07 branch name per-issue not per-run | OPEN | Tracked: `attempts` table exists; `branch_template` still needs the discriminator |
+| CL-08 nobody owns commit/push | RESOLVED | Control-plane boundary: orchestrator owns staging, signing, pushing, WIP checkpoints |
+| CL-09 label authority is code authority | RESOLVED | Risk classification: stated at doctor, actor recorded, optional allowlist |
+| CL-10 sandbox nesting contradiction | RESOLVED | Adapter contract: single enforcement layer, bypass coupled to verified sandbox |
+| CL-11 path constraints unenforced | RESOLVED | Control-plane boundary: two-layer enforcement, forbidden wins |
+| H-01 distribution unspecified | RESOLVED | Distribution section |
+| H-08 dead citation tokens | RESOLVED | 100 private-use tokens stripped |
+| DX-01 review skill format unspecified | RESOLVED | Review skill format section |
+| DX-03 no cost answer before first run | RESOLVED | Live run surface shows spend against cap; `--dry-run` on `run` gives a cost band |
+| DX-06 no `approve` command | RESOLVED | CLI table |
+| DX-12 no error presentation contract | RESOLVED | `RunmillError` + FR-23 |
+| DX-19 macOS/Linux differ silently | RESOLVED | Sandbox matrix + `allow_unenforced` + NFR portability row |
+| DX-20 CI impossible | RESOLVED | Distribution: explicitly unsupported, doctor says so |
+| DX-22 no JSON Schema | OPEN | Tracked: `runmill.schema.json` + `yaml-language-server` header |
+| DX-23 no license | OPEN | Requires a product decision |
+| DX-26 TTHW unmeasurable | OPEN | Tracked: onboarding funnel + `doctor --report` |
+| Config: budget math exhausts itself | RESOLVED | Per-role invocation budgets |
+| Config: timeout x invocations > wall budget | RESOLVED | `clamp_invocation_timeout_to_remaining` |
+| Config: `clean_untracked_files` mid-run | RESOLVED | Scoped to teardown |
+| Config: priority-0 ordering | RESOLVED | Ordering rule states the `0 -> +inf` mapping |
+| Config: perf NFR meaningless | RESOLVED | Restated as orchestrator CPU per transition |
+| Config: single `github.repository` vs mapping | OPEN | The mapping structure still does not exist in the config model |
+
+**Six findings remain OPEN.** Two need a product decision (license, repository mapping model);
+four are implementation tasks that the body does not need to constrain further (App-scoped merge
+token, branch discriminator, config schema, onboarding telemetry).
