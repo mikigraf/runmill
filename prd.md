@@ -38,7 +38,7 @@ The user authenticates once from the CLI, chooses a coding-agent provider, maps 
 
 runmill is **not another coding model** and should not attempt to reproduce the internal planning or editing abilities of Codex or Claude Code. It is the workflow, state, policy, observability, and verification layer around those agents.
 
-That distinction follows the emerging harness literature: code-based harnesses convert otherwise transient model behavior into executable, inspectable, stateful, and verifiable processes. The harness controls what enters context, which actions are available, how state persists, how outputs are checked, and how failures are recovered. citeturn11view3turn12view3
+That distinction follows the emerging harness literature: code-based harnesses convert otherwise transient model behavior into executable, inspectable, stateful, and verifiable processes. The harness controls what enters context, which actions are available, how state persists, how outputs are checked, and how failures are recovered.
 
 ### Problem statement
 
@@ -57,9 +57,9 @@ Current coding agents are effective interactive workers, but their default opera
 | Cost is measured separately from engineering outcome | Token usage can rise without improving accepted, maintainable changes. |
 | Harness improvements are driven by anecdote | Prompt, skill, and tool changes can regress behavior without detection. |
 
-The user research reflects these gaps. Practitioners report value from repeated independent verification, fresh contexts, explicit task boundaries, private-repository evaluations, quiet terminal output, progressive context disclosure, and fail-closed check coverage. They also repeatedly warn that tests alone do not measure maintainability and that unconstrained optimization tends to exploit incomplete evaluators. fileciteturn0file0
+The user research reflects these gaps. Practitioners report value from repeated independent verification, fresh contexts, explicit task boundaries, private-repository evaluations, quiet terminal output, progressive context disclosure, and fail-closed check coverage. They also repeatedly warn that tests alone do not measure maintainability and that unconstrained optimization tends to exploit incomplete evaluators.
 
-The OpenAI Codex case study likewise emphasizes repository-local knowledge, per-worktree environments, mechanically enforced architecture, agent-readable observability, iterative agent review, and continuous “garbage collection.” It is useful evidence of an operating model, but it is a first-party case study rather than a controlled demonstration that autonomous merging is safe for arbitrary repositories. fileciteturn0file3
+The OpenAI Codex case study likewise emphasizes repository-local knowledge, per-worktree environments, mechanically enforced architecture, agent-readable observability, iterative agent review, and continuous “garbage collection.” It is useful evidence of an operating model, but it is a first-party case study rather than a controlled demonstration that autonomous merging is safe for arbitrary repositories.
 
 ### Product thesis
 
@@ -88,9 +88,9 @@ This positioning avoids competing directly with Codex or Claude Code. It also di
 
 The initial concept—fetch an issue, run an agent, review it, and merge it—is directionally correct but underspecified. The recent literature implies that the durable product is not the loop itself; it is the **explicit control surface around the loop**.
 
-Lilian Weng characterizes a harness as the deployment system that decides how a model plans, invokes tools, manages context, persists artifacts, evaluates results, and interacts with permissions. She identifies workflow automation, filesystem-backed memory, inspectable subagents, bounded self-improvement, and external evaluators as recurring patterns. Her central warning is directly relevant to runmill: the evaluator and permission layer should sit outside any loop that can modify the harness. fileciteturn0file1
+Lilian Weng characterizes a harness as the deployment system that decides how a model plans, invokes tools, manages context, persists artifacts, evaluates results, and interacts with permissions. She identifies workflow automation, filesystem-backed memory, inspectable subagents, bounded self-improvement, and external evaluators as recurring patterns. Her central warning is directly relevant to runmill: the evaluator and permission layer should sit outside any loop that can modify the harness.
 
-The “Code as Agent Harness” survey adds a useful architectural boundary. Code is valuable as a harness substrate because it makes actions executable, intermediate behavior inspectable, and state persistent. That supports a TypeScript state machine and structured artifacts rather than a long master prompt that asks the agent to manage the entire SDLC implicitly. citeturn11view3turn12view3
+The “Code as Agent Harness” survey adds a useful architectural boundary. Code is valuable as a harness substrate because it makes actions executable, intermediate behavior inspectable, and state persistent. That supports a TypeScript state machine and structured artifacts rather than a long master prompt that asks the agent to manage the entire SDLC implicitly.
 
 Agentic Harness Engineering, or AHE, divides observability into three surfaces:
 
@@ -98,13 +98,13 @@ Agentic Harness Engineering, or AHE, divides observability into three surfaces:
 - **Experience observability:** raw trajectories are distilled into layered evidence with drill-down access.
 - **Decision observability:** every harness edit is paired with a falsifiable prediction.
 
-In its Terminal-Bench 2 experiments, ten evolution iterations raised pass@1 from 69.7% to 77.0%, compared with 71.9% for the tested Codex harness. Its ablations found that tools, middleware, and long-term memory carried gains while the system-prompt-only configuration regressed. The result does not prove safe production merging, but it strongly argues against reducing harness engineering to prompt editing. citeturn10view0turn11view0turn12view0
+In its Terminal-Bench 2 experiments, ten evolution iterations raised pass@1 from 69.7% to 77.0%, compared with 71.9% for the tested Codex harness. Its ablations found that tools, middleware, and long-term memory carried gains while the system-prompt-only configuration regressed. The result does not prove safe production merging, but it strongly argues against reducing harness engineering to prompt editing.
 
-Meta-Harness pushes the optimization target further: the harness itself is a stateful program, and a coding agent searches over its source, scores, and execution traces through filesystem access. For runmill, the immediate implication is not to self-modify production code. It is to make every policy, adapter, skill, and evaluation result inspectable and versioned so that later offline optimization is possible. citeturn10view1turn11view1turn12view1
+Meta-Harness pushes the optimization target further: the harness itself is a stateful program, and a coding agent searches over its source, scores, and execution traces through filesystem access. For runmill, the immediate implication is not to self-modify production code. It is to make every policy, adapter, skill, and evaluation result inspectable and versioned so that later offline optimization is possible.
 
-Harness Handbook addresses a different but important problem: as a harness grows, neither humans nor agents can easily locate the code responsible for a behavior. Its approach combines static analysis, behavior-centric organization, a three-level hierarchy, and behavior-guided progressive disclosure. runmill should adopt a lightweight version of this pattern by generating a behavior catalog that maps workflow stages, policies, adapters, state transitions, and side effects back to source locations. citeturn10view2turn11view2turn12view2
+Harness Handbook addresses a different but important problem: as a harness grows, neither humans nor agents can easily locate the code responsible for a behavior. Its approach combines static analysis, behavior-centric organization, a three-level hierarchy, and behavior-guided progressive disclosure. runmill should adopt a lightweight version of this pattern by generating a behavior catalog that maps workflow stages, policies, adapters, state transitions, and side effects back to source locations.
 
-Practitioner discussions reinforce several compatible patterns: a single explicit lifecycle, strict architectural boundaries, repository-local plans and worklogs, isolated environments, mechanical checks, and review loops. They also surface unresolved concerns around token cost, codebase growth, self-review correlation, and misleading throughput metrics such as lines of code or raw PR count. fileciteturn0file2
+Practitioner discussions reinforce several compatible patterns: a single explicit lifecycle, strict architectural boundaries, repository-local plans and worklogs, isolated environments, mechanical checks, and review loops. They also surface unresolved concerns around token cost, codebase growth, self-review correlation, and misleading throughput metrics such as lines of code or raw PR count.
 
 ### Refined architecture decisions
 
@@ -125,7 +125,7 @@ The research leads to the following material changes from a naïve implementatio
 
 ### Evidence limitations
 
-Most of the 2026 harness work remains preprint research conducted on coding benchmarks or constrained environments. Benchmark gains may not transfer to long-lived repositories with migrations, security boundaries, operational dependencies, unclear product requirements, or delayed post-merge failures. AHE itself reports that interactions between components are non-additive and that its self-attribution is better at predicting fixes than regressions. citeturn10view0turn11view0
+Most of the 2026 harness work remains preprint research conducted on coding benchmarks or constrained environments. Benchmark gains may not transfer to long-lived repositories with migrations, security boundaries, operational dependencies, unclear product requirements, or delayed post-merge failures. AHE itself reports that interactions between components are non-additive and that its self-attribution is better at predicting fixes than regressions.
 
 Therefore, runmill should be built as a **governed autonomy system**, not as an assumption that model output is inherently trustworthy. Its strongest differentiator should be knowing when not to merge.
 
@@ -240,13 +240,13 @@ Credentials stored in OS keychain
 Run `runmill doctor` before starting.
 ```
 
-Linear provides a GraphQL API, a typed TypeScript SDK, API-key authentication, and OAuth. Its API supports priority filters such as urgent and high-priority issues, while warning that unprioritized issues use priority value zero and therefore require explicit exclusion when using numeric filters. runmill should query a bounded eligible set and perform its final deterministic ordering locally. citeturn3search0turn3search3turn3search4turn13search0
+Linear provides a GraphQL API, a typed TypeScript SDK, API-key authentication, and OAuth. Its API supports priority filters such as urgent and high-priority issues, while warning that unprioritized issues use priority value zero and therefore require explicit exclusion when using numeric filters. runmill should query a bounded eligible set and perform its final deterministic ordering locally.
 
-For a local personal tool, an API key stored in the operating-system keychain is the simplest MVP path. OAuth should also be supported for shared or distributed use, with the application actor used where the integration should visibly perform actions as the app rather than impersonating an individual. Linear’s current OAuth integration uses refresh tokens, so the credential manager must handle refresh, revocation, and rotation. citeturn3search5turn3search6
+For a local personal tool, an API key stored in the operating-system keychain is the simplest MVP path. OAuth should also be supported for shared or distributed use, with the application actor used where the integration should visibly perform actions as the app rather than impersonating an individual. Linear’s current OAuth integration uses refresh tokens, so the credential manager must handle refresh, revocation, and rotation.
 
-runmill should reuse an existing authenticated Codex, Claude Code, and `gh` installation wherever possible rather than collecting provider credentials itself. Claude Code exposes noninteractive execution, JSON and streaming JSON output, session resume, turn limits, and tool allow/deny controls suitable for an adapter. citeturn13search1turn13search2
+runmill should reuse an existing authenticated Codex, Claude Code, and `gh` installation wherever possible rather than collecting provider credentials itself. Claude Code exposes noninteractive execution, JSON and streaming JSON output, session resume, turn limits, and tool allow/deny controls suitable for an adapter.
 
-Codex should be integrated behind the same adapter boundary, preferably through its supported SDK where practical and through a version-probed CLI runner where the user wants to reuse local Codex authentication. OpenAI describes the Codex SDK as embedding the same agent used by the CLI, while current Codex surfaces support skills, sandboxing, and long-running work. citeturn4search0turn4search7turn13search8
+Codex should be integrated behind the same adapter boundary, preferably through its supported SDK where practical and through a version-probed CLI runner where the user wants to reuse local Codex authentication. OpenAI describes the Codex SDK as embedding the same agent used by the CLI, while current Codex surfaces support skills, sandboxing, and long-running work.
 
 ### Core CLI
 
@@ -311,9 +311,20 @@ github:
 
 workspace:
   strategy: worktree
-  sandbox: container
-  network: restricted
-  clean_untracked_files: true
+  git_isolation: separate-git-dir # separate-git-dir | clone
+  sandbox: native                 # native | container | none
+  # native -> Seatbelt (macOS) | bubblewrap (Linux). Resolved by `doctor`,
+  # never chosen by the user. `doctor` fails closed if the resolved
+  # mechanism cannot be constructed; there is no silent downgrade.
+  network: proxy                  # proxy | none
+  network_allowlist:
+    - api.anthropic.com
+    - api.openai.com
+    - registry.npmjs.org
+  allow_unenforced: []            # e.g. [network] to knowingly accept a
+                                  # platform that cannot enforce a control
+  clean_untracked_files: true     # applied at worktree teardown ONLY,
+                                  # never mid-run (would delete new source files)
 
 context:
   entry_files:
@@ -368,8 +379,28 @@ risk:
 budgets:
   max_cost_usd_per_issue: 50
   max_wall_minutes_per_issue: 240
-  max_agent_invocations: 8
   daily_cost_usd: 200
+  daily_window: utc # utc | local — explicit day boundary for the daily cap
+  # Per-role invocation budgets. The happy path MUST complete within these.
+  # A single global cap of 8 is exhausted by implementation and local review
+  # alone: implementer(1) + local review(1) + 3x(fix + re-review)(6) = 8,
+  # leaving zero invocations for PR review. Budgets are therefore per-role.
+  max_agent_invocations:
+    total: 14
+    implementer: 1
+    local_review: 4 # initial + one per fix iteration
+    fixer: 3        # must equal review.max_fix_iterations
+    pr_review: 3
+    pr_fixer: 2
+  # Per-invocation timeout is clamped to the run's remaining wall budget.
+  # Without this, provider.timeout_minutes (120) x 14 invocations = 28h
+  # against a 240-minute run budget.
+  clamp_invocation_timeout_to_remaining: true
+  # Which budget dimensions are actually enforceable depends on the provider
+  # auth mode. Subscription plans report no dollar cost, so cost budgets
+  # silently become no-ops. `doctor` reports enforceable dimensions and
+  # refuses `continuous` mode when none are.
+  cost_enforcement: auto # auto | tokens-estimated | wall-and-invocations-only
 ```
 
 Configuration should be split into three ownership classes:
@@ -406,97 +437,191 @@ Eligible issues are ordered by:
 4. Oldest creation timestamp.
 5. Stable issue identifier as the final tie breaker.
 
-Linear recommends avoiding high-frequency polling and provides webhooks for change notifications. For the local MVP, runmill should query at safe task boundaries rather than continuously polling. A later hosted coordinator may accept signed webhooks and use them to wake the scheduler while still re-reading issue state before acting. citeturn3search1turn3search2
+Linear recommends avoiding high-frequency polling and provides webhooks for change notifications. For the local MVP, runmill should query at safe task boundaries rather than continuously polling. A later hosted coordinator may accept signed webhooks and use them to wake the scheduler while still re-reading issue state before acting.
 
-The claim operation must behave like a lease:
+The claim operation must behave like a lease with genuine mutual exclusion.
+
+**The backlog system is not the lock.** Linear's GraphQL API has no compare-and-swap
+primitive. A protocol built from independent mutations (transition state, assign bot, post
+comment) followed by a read cannot exclude a concurrent claimant: both processes pass the
+eligibility re-read, both transition the state, both assign the *same* configured bot identity,
+and both then "verify ownership" successfully — because the assignee is identical for both.
+Any design resting on that sequence fails FR-04 on the first real race.
+
+**Git refs are the lock.** `git push` of a new ref is an atomic server-side create that rejects
+a non-fast-forward update. runmill already holds the credential. This gives true mutual
+exclusion across hosts with no additional infrastructure.
 
 ```text
 Generate run ID
         ↓
-Re-read issue eligibility
+Write local intent row  (state=CLAIMING, target mutations, run_id)   ← BEFORE any remote call
         ↓
-Transition issue to claim state
+git push origin <lease-blob>:refs/runmill/leases/<issue-id>
         ↓
-Assign configured bot/app identity
-        ↓
-Add structured claim marker with run ID and lease expiry
-        ↓
-Re-read issue and verify claim ownership
-        ↓
-Persist local lease
-        ↓
-Begin workspace creation
+   ┌────┴────┐
+rejected   created
+   ↓          ↓
+abandon    ACQUIRED — fencing generation = ref creation ordinal
+(no repo      ↓
+ mutation) Re-read issue eligibility (may have changed since selection)
+              ↓
+           Transition issue to claim state    ┐
+              ↓                               │ display-only side effects,
+           Assign configured bot identity     │ each recorded in the outbox
+              ↓                               │ as intended → in_flight →
+           Post human-readable claim comment  ┘ confirmed
+              ↓
+           Begin workspace creation
 ```
 
-The claim marker should be human-readable and machine-parseable:
+The lease ref's blob content is the authoritative record:
 
 ```text
-runmill claimed this issue.
-
-Run: run_01J...
-Repository: acme/platform
-Provider: codex
-Claimed at: 2026-08-06T10:42:11Z
-Lease expires: 2026-08-06T14:42:11Z
-Host: sha256:...
+run: run_01J...
+issue: ENG-123
+repository: acme/platform
+provider: codex
+generation: 7
+acquired_at: 2026-08-06T10:42:11Z
+expires_at: 2026-08-06T11:02:11Z
+host_id: 9f2c...
+pid: 48213
+boot_id: 1a77...
+heartbeat_at: 2026-08-06T10:57:03Z
+prior_state_id: <restore target>
+prior_assignee_id: <restore target>
 ```
 
-If verification shows that another run owns the claim, runmill must abandon the attempt without editing the repository. Lease renewal occurs only at safe checkpoints. Expired claims are never silently stolen; runmill first verifies that the previous run is absent or explicitly recoverable.
+The Linear comment is **human-visible status only** and is never consulted to determine
+ownership.
+
+**Fencing.** The lease carries a monotonically increasing `generation`. Every external mutation
+— push, PR creation, merge-queue enqueue, merge, backlog completion — revalidates
+`(owner == self && generation == self.generation)` immediately before executing. A worker whose
+lease was taken over cannot act, even if it is still running and unaware.
+
+**Liveness.** `expires_at` is far shorter than the run budget (default 20 minutes against a
+240-minute budget) and is renewed by a heartbeat timer that runs independently of state
+transitions. Renewing only at state-transition checkpoints guarantees expiry during the two
+longest states, `IMPLEMENTING` and `CI_WAIT`, which contain no checkpoints. `heartbeat_at`,
+`host_id`, `pid`, and `boot_id` make staleness decidable without a presence service.
+
+**Takeover.** Expired leases are never silently stolen. Takeover requires heartbeat staleness
+well beyond the TTL, and executes an explicit written procedure: close the prior run's PR,
+rename its branch to `runmill/abandoned/<run-id>/…`, mark the prior run `ABORTED`, restore
+`prior_state_id` and `prior_assignee_id` if the prior run never progressed past `CLAIMED`, then
+force-update the lease ref with an incremented generation.
+
+**Crash safety.** The local intent row is committed *before* the first remote call. A crash at
+any point leaves a durable record naming the run and its target mutations, so startup
+reconciliation can query the lease ref and the backlog for that run ID and either resume or
+compensate. Persisting the lease *after* the remote mutations — as a naive ordering would —
+leaves an externally claimed issue with no local record, permanently ineligible and
+unrecoverable.
 
 ### State machine
 
 ```text
-DISCOVERED
-    ↓
-ELIGIBILITY_CHECKED
-    ↓
-CLAIMED
-    ↓
-WORKSPACE_READY
-    ↓
-TASK_PACKET_READY
-    ↓
-IMPLEMENTING
-    ↓
-LOCAL_VERIFY
-    ↓
-LOCAL_REVIEW
-    ↙          ↘
-FIXING       PR_READY
-  ↑             ↓
-  └──────── LOCAL_VERIFY
-                ↓
-             PR_OPEN
-                ↓
-             CI_WAIT
-                ↓
-             PR_REVIEW
-             ↙       ↘
-        PR_FIXING   MERGE_READY
-             ↑          ↓
-             └────── CI_WAIT
-                        ↓
-                  MERGE_QUEUED
-                        ↓
-                     MERGED
-                        ↓
-                  LINEAR_UPDATED
-                        ↓
-                     CLEANUP
-                        ↓
-                    COMPLETED
+  DISCOVERED ──▶ ELIGIBILITY_CHECKED ──▶ CLAIMED ──▶ WORKSPACE_READY
+                                                            │
+                                                            ▼
+                                                   TASK_PACKET_READY
+                                                            │
+          ┌─────────────────────────────────────────────────┘
+          ▼
+    IMPLEMENTING ──▶ LOCAL_VERIFY ──▶ LOCAL_REVIEW
+          ▲                ▲                │
+          │                │                ├── findings ──▶ FIXING ──┐
+          │                └──────────────── re-verify ── re-review ◀──┘
+          │                                  │
+          │                                  └── clean ──▶ PR_READY
+          │                                                    │
+          │                                                    ▼
+          │                                                 PUSHED
+          │                                                    │
+          │                                                    ▼
+          │                                                 PR_OPEN
+          │                                                    │
+          │                          ┌─────────────────────────┤
+          │                          ▼                         │
+          │                    (draft?) READY_FOR_REVIEW ──────▶│
+          │                                                    ▼
+          │                                                 CI_WAIT ◀──────┐
+          │                                                    │           │
+          │                    ┌───────────────────────────────┤           │
+          │                    ▼                               ▼           │
+          │              red CI ──▶ PR_FIXING              PR_REVIEW       │
+          │                             │                      │           │
+          │                             └──────────────────────┤           │
+          │                                                    │           │
+          │                          ┌─────────────────────────┤           │
+          │                          ▼                         ▼           │
+          │                  base moved ──▶ REBASING      MERGE_READY      │
+          │                                     │              │           │
+          │                                     └──────────────┴───────────┘
+          │                                        (full re-verification)
+          │                                                    │
+          │                    ┌───────────────────────────────┤
+          │                    ▼                               ▼
+          │            AWAITING_APPROVAL ─── approved ──▶ MERGE_QUEUED
+          │                                                    │
+          │                                   ┌────────────────┤
+          │                                   ▼                ▼
+          │                            QUEUE_EJECTED        MERGED
+          │                                   │                │
+          │                                   └──▶ CI_WAIT     ▼
+          │                                              BACKLOG_UPDATED
+          │                                                    │
+          │                                                    ▼
+          │                                                 CLEANUP ──▶ COMPLETED
+          │
+          └── pr-only mode: PR_OPEN ──▶ CI_WAIT ──▶ PR_REVIEW ──▶ PR_DELIVERED (terminal)
 ```
+
+Three edges deserve explicit mention because their absence is a defect:
+
+- **`FIXING → LOCAL_VERIFY → LOCAL_REVIEW`.** A fix must be re-reviewed, not merely re-verified.
+  A fix loop that only re-runs checks lets a fix introduce a critical defect that is never seen.
+- **`CI_WAIT → PR_FIXING`.** Red CI routes directly to a fix; forcing a full PR review pass to
+  rediscover what the orchestrator already knows wastes an invocation and budget.
+- **`QUEUE_EJECTED → CI_WAIT`.** A merge queue can eject a PR (base moved, `merge_group` check
+  failed, queue timeout). Without a dequeue edge the run sits until the wall budget kills it,
+  leaving an enqueued PR that may merge later with no observer and a leaked worktree.
+
+`PR_DELIVERED` is the terminal state for `pr-only`, which is the initial default autonomy mode.
+Its absence would leave the default mode with no successful exit. On entering `PR_DELIVERED` the
+lease is released, the issue is transitioned to a configured `delivered_state`, and the daemon is
+free to select the next issue; a subsequent external merge or close is reconciled by a background
+sweep, not by holding the run open.
 
 Every active state may transition to one of four controlled exception states:
 
 | State | Meaning |
 |---|---|
-| `RETRY_WAIT` | A transient, classified failure is eligible for bounded retry. |
+| `RETRY_WAIT` | A transient, classified failure is eligible for bounded retry. Records the state to return to. |
 | `NEEDS_HUMAN` | Product judgment, credentials, an approval, or ambiguous requirements are required. |
 | `QUARANTINED` | A safety, secret, corruption, evaluator, or unexpected-side-effect condition occurred. |
 | `ABORTED` | A human or circuit breaker terminated the run. |
 
-Each transition must be idempotent. On restart, runmill inspects durable state and external reality before repeating any side effect.
+Exception states are not terminal black holes. Each defines its outgoing edges, its lease policy
+(held or released), its workspace policy (preserved or collected), and whether the issue is
+transitioned to `blocked_state` or restored to `prior_state_id` with `prior_assignee_id`. Without
+that last rule a quarantined issue remains in the claim state assigned to the bot: invisible in
+the human ready queue and permanently ineligible for future runs.
+
+**The transition table is a required deliverable, not the diagram.** "Each transition must be
+idempotent" is an assertion; the implementation contract is a table with one row per edge —
+including all 22 × 4 exception edges — carrying: source, target, guard, durable inputs, side
+effect, idempotency key, reconciliation query, compensation, and retry classification. The
+compensations differ materially per source state: quarantine from `MERGE_QUEUED` must dequeue the
+PR; from `IMPLEMENTING` it need only kill the session; from `CLAIMED` it must decide whether to
+release the lease ref and restore the prior assignee and state. This table is the largest hidden
+implementation cost in the document and the behavior handbook should be generated from it rather
+than written by hand.
+
+On restart, runmill inspects durable state and external reality before repeating any side effect.
+
 
 ## Functional and technical requirements
 
@@ -583,13 +708,44 @@ interface CodingAgentAdapter {
   authStatus(): Promise<AuthStatus>;
   capabilities(): Promise<ProviderCapabilities>;
 
-  start(request: AgentRunRequest): AsyncIterable<AgentEvent>;
-  resume(request: AgentResumeRequest): AsyncIterable<AgentEvent>;
-  cancel(sessionId: string): Promise<void>;
+  // Returns a session handle, not a bare iterator. A bare AsyncIterable
+  // cannot be cancelled before `session.started` arrives (there is no
+  // session id yet), and offers no reverse channel for permission
+  // responses or mid-run steering.
+  start(request: AgentRunRequest): Promise<AgentSession>;
+  resume(request: AgentResumeRequest): Promise<AgentSession>;
+}
 
-  normalizeExit(result: ProviderExit): AgentRunResult;
+interface AgentSession {
+  readonly sessionId: Promise<string>;   // resolves on session.started
+  readonly events: AsyncIterable<AgentEvent>;
+  readonly result: Promise<AgentRunResult>;
+
+  respondToPermission(requestId: string, decision: "allow" | "deny"): Promise<void>;
+  abort(reason: string): Promise<void>;  // process-group kill, SIGTERM→SIGKILL
 }
 ```
+
+`AgentRunRequest` carries an `AbortSignal` so a provider that stalls before emitting
+`session.started` is still cancellable — which is precisely the case FR-09's budget enforcement
+must handle. Cancellation kills the process *group*: an agent spawns `npm test`, which spawns
+workers, and a signal delivered only to the CLI leaves detached grandchildren holding file
+handles in the worktree, which then fails to clean up.
+
+`ProviderCapabilities` is an enumerated contract, not a loose bag. Minimum set: streaming
+structured output, session resume, turn limits, tool allow/deny, sandbox mode, model selection,
+cost reporting, and structured output conformance. Both providers self-update, so the version
+check runs on **every invocation**, not only at `doctor`; a provider that drifts outside the
+supported range mid-daemon pauses the run at the next safe checkpoint and escalates rather than
+failing mid-stream.
+
+**Only the `implementer` role may resume a session.** `local-reviewer`, `pr-reviewer`, and
+`fixer` always start fresh. Provider session resume replays prior context, so resuming a crashed
+reviewer — or resuming an implementer session into a reviewer role — silently breaks the "no
+implementer chain of thought" requirement that reviewer independence rests on. Resume is also
+keyed to the working directory in at least one provider, so a recreated worktree at a different
+path starts a new session instead of attaching; the run records whether resume actually attached
+and fails closed if it did not.
 
 `AgentRunRequest` includes:
 
@@ -607,26 +763,83 @@ interface CodingAgentAdapter {
 Normalized events include:
 
 ```ts
-type AgentEvent =
-  | { type: "session.started"; sessionId: string }
+// Every event carries correlation and ordering fields. Without them, replaying
+// buffered provider output after a crash duplicates usage, commands, and audit
+// entries — which contradicts FR-08's restart-survival requirement.
+interface AgentEventBase {
+  seq: number;          // provider-monotonic, gap-detectable
+  ts: string;           // ISO 8601
+  runId: string;
+  sessionId: string;
+  role: AgentRole;
+  attempt: number;
+}
+
+type AgentEvent = AgentEventBase & (
+  | { type: "session.started" }
   | { type: "assistant.message"; text: string }
-  | { type: "tool.requested"; tool: string; input: unknown }
-  | { type: "tool.completed"; tool: string; outputRef: string }
-  | { type: "command.started"; command: string }
-  | { type: "command.completed"; exitCode: number; outputRef: string }
-  | { type: "file.changed"; path: string }
-  | { type: "permission.requested"; action: string }
-  | { type: "usage.updated"; tokens?: number; costUsd?: number }
-  | { type: "result"; status: "success" | "failure"; outputRef: string };
+  | { type: "tool.requested"; callId: string; tool: string; input: unknown }
+  | { type: "tool.completed"; callId: string; tool: string; outputRef: string }
+  | { type: "command.started"; callId: string; command: string; cwd: string;
+      envPolicyHash: string; pid: number; timeoutMs: number }
+  | { type: "command.completed"; callId: string; outputRef: string;
+      outcome: "exited" | "signaled" | "timeout" | "cancelled" | "sandbox-denied";
+      exitCode?: number; signal?: string }
+  | { type: "file.changed"; path: string; op: "create" | "modify" | "delete" | "rename";
+      beforeHash?: string; afterHash?: string }   // advisory telemetry only
+  | { type: "permission.requested"; requestId: string; action: string;
+      scope: string; expiresAt: string }
+  | { type: "usage.updated"; cumulative: true; inputTokens: number;
+      outputTokens: number; cacheReadTokens?: number; model: string;
+      costUsd?: number }
+  | { type: "error"; class: "rate_limit" | "auth" | "context_overflow"
+      | "transport" | "provider_internal"; retryable: boolean; providerCode?: string }
+  | { type: "result"; status: "success" | "failure"; outputRef: string }
+);
 ```
 
-The Claude adapter can use print mode, streaming JSON, `--max-turns`, resume support, and explicit tool permissions. The adapter must never invoke `--dangerously-skip-permissions` in a non-ephemeral host environment. citeturn13search1turn13search4
+Four rules the union encodes:
+
+- **Exactly one terminal `result` per session.** Iterator completion without a `result` is a
+  failure, not a success. Events arriving after `result` are rejected.
+- **`usage.updated` is cumulative, not delta**, and names the model — cost cannot be computed
+  from token counts without knowing which model produced them.
+- **A distinct `error` event exists** so failure classification has somewhere to live. Crushing
+  rate limits, auth expiry, context overflow, and transport failures into `result: failure`
+  destroys the classification the entire recovery policy at "Failure and recovery policy" depends
+  on.
+- **`file.changed` is advisory telemetry and is never a source of truth.** Agents change files
+  through shell tools — `sed`, code generators, `npm install` — that emit no tool event. The
+  authoritative diff always comes from git. Policy enforcement uses supervisor-observed process
+  and filesystem state, never provider-reported events.
+
+The Claude adapter can use print mode, streaming JSON, `--max-turns`, resume support, and explicit
+tool permissions.
+
+**Sandbox layering.** Codex and Claude Code each ship their own sandbox. These do not nest
+usefully — Seatbelt profiles in particular do not compose, so an inner provider sandbox may be
+denied by the outer profile and the provider either fails to start or quietly degrades. runmill
+resolves this by making **its own sandbox the single enforcement layer**: the provider runs with
+its native sandboxing disabled, inside runmill's Seatbelt (macOS) or bubblewrap (Linux) boundary.
+
+A provider bypass flag (`--dangerously-skip-permissions` and its equivalents) is therefore
+permitted **only when runmill's own sandbox is active and has been positively verified for this
+run**. If the sandbox cannot be constructed, the run does not start and no bypass flag is ever
+passed. The dangerous flag is coupled to the presence of the stronger boundary, never to its
+absence.
+
+The consequence is that runmill owns 100% of the isolation risk, so the guarantee is tested
+rather than asserted. `runmill doctor` performs **positive escape tests** on both platforms:
+attempt a write outside the worktree, attempt to read `~/.ssh` and `~/.config/gh/hosts.yml`,
+attempt an outbound connection to a non-allowlisted host, and attempt to write
+`.git/hooks/pre-commit`. Any success fails the check. The resolved enforcement layer is recorded
+in the run record and the audit bundle.
 
 Provider CLIs evolve independently. Therefore, `runmill doctor` must run a capability probe and adapters must have versioned conformance tests. Unknown or incompatible output formats must fail closed rather than being interpreted heuristically.
 
 ### Task packet
 
-The initial agent prompt should remain small. Current model guidance also recommends lean prompts, exposing only relevant tools and validating prompt reductions on representative evaluations rather than accumulating repeated instructions. citeturn14search6
+The initial agent prompt should remain small. Current model guidance also recommends lean prompts, exposing only relevant tools and validating prompt reductions on representative evaluations rather than accumulating repeated instructions.
 
 runmill should write a task packet to `.runmill/run/task.json`:
 
@@ -762,7 +975,7 @@ The verification engine must answer four separate questions:
 3. **Freshness:** Did they run against the exact candidate commit?
 4. **Outcome:** Did they complete successfully without prohibited skips or flakes?
 
-A green command is insufficient if the expected integration suite was never discovered. This is the fail-closed coverage concern highlighted in the user research: an incomplete evaluator can be more dangerous than an openly weak one because it reports decisive success while omitting the case that would have failed. fileciteturn0file0
+A green command is insufficient if the expected integration suite was never discovered. This is the fail-closed coverage concern highlighted in the user research: an incomplete evaluator can be more dangerous than an openly weak one because it reports decisive success while omitting the case that would have failed.
 
 Required checks may come from:
 
@@ -774,7 +987,55 @@ Required checks may come from:
 - GitHub-required checks.
 - Agent-proposed additional checks.
 
-The agent may add checks, but it cannot remove checks from the resolved manifest.
+The manifest is resolved from the **base commit**, never from the working tree, and
+`.runmill/**` and `.github/**` are in the default `forbidden_paths`. Otherwise the constraint
+below is unenforceable: `.runmill/checks.yaml` is a repository file the agent could edit.
+
+The agent may add checks, but it cannot remove them — and an agent-proposed check is an
+**identifier referencing a manifest-declared command from the base commit**, never a free-form
+shell string. Checks are executed by the orchestrator; permitting the agent to propose a command
+would be a remote-code-execution primitive.
+
+The manifest is **recomputed after every candidate change** and the union is monotonic. A fixer
+that adds a migration or touches CI configuration after the original manifest was resolved must
+not retain stale results; any newly required check blocks progress.
+
+The manifest is partitioned into **local-executable** and **remote-observed** checks with
+separate coverage rules. GitHub-required contexts such as a coverage bot or a deploy-preview
+status have no local command; if they entered the local manifest under
+`fail_on_missing_check: true`, every run would fail closed at `LOCAL_VERIFY`.
+
+**Freshness is proven, not recorded.** Reading `HEAD` and storing the SHA proves nothing: a
+check can run against a dirty worktree whose contents differ from that commit, and the task
+packet explicitly permits an unclean tree. Verification therefore runs in a **separate detached
+worktree created at the exact candidate commit** (`git worktree add --detach <sha>`), never in
+the mutable development worktree, and the provider is locked out of writes for the duration.
+`git rev-parse HEAD`, `git status --porcelain`, and `git write-tree` are captured before *and*
+after every command; any mismatch invalidates the result. The tree hash is recorded alongside
+the commit SHA, because the commit alone does not describe what was on disk.
+
+**Skips are differential, not counted.** A single integer cannot distinguish a platform guard
+from a committed `.skip` from a filter that selected zero tests from a missing shard — and some
+frameworks exit 0 having discovered nothing at all. Worse, *deleting* a failing test lowers a
+skip count and looks like an improvement. Every check therefore declares a machine-readable
+report, and coverage is judged against a baseline test inventory:
+
+- Cache a baseline inventory keyed by `(check_id, base_sha)`: the full set of test identifiers
+  and statuses, from the same report parser. Run it once per base commit.
+- Fail closed if any test that **passed at base** is skipped **or absent** at candidate. Absence
+  is the half that counting can never detect.
+- Every legitimate skip is declared in `.runmill/checks.yaml` with a stable test id, a cause
+  (`platform`, `requires-service`, `flaky-quarantine`), and an expiry, matched against the
+  reporter's skip reason. Any *undeclared* new skip is merge-blocking regardless of total count.
+- Separately diff the check-configuration surface — test globs, ignore patterns, `package.json`
+  scripts, CI config, `.runmill/**` — against base. Any change is merge-blocking. Skips are not
+  the only suppression channel: `--passWithNoTests`, `|| true`, `continue-on-error`,
+  `testPathIgnorePatterns`, `xit`, `@Ignore`, `#[ignore]`, and `t.Skip()` all reach the same
+  outcome.
+
+A check with no parseable report is `coverage: unproven` and cannot satisfy a required gate while
+`fail_on_skipped_check` is true. `runmill doctor` refuses to enable that flag until every
+required check declares a report.
 
 Each result records:
 
@@ -782,17 +1043,43 @@ Each result records:
 {
   "check_id": "unit",
   "required": true,
+  "origin": "local",
   "source": "repository-policy",
   "command": "npm test",
+  "attempt": 1,
+  "superseded_by": null,
   "commit_sha": "def456",
+  "tree_hash_before": "sha1:9c1e...",
+  "tree_hash_after": "sha1:9c1e...",
+  "worktree_dirty": false,
+  "report": { "path": "junit.xml", "format": "junit", "parser_version": "1.4.0" },
+  "tests_discovered": 1284,
+  "tests_executed": 1284,
+  "tests_expected_from_baseline": 1284,
+  "skips_declared": 3,
+  "skips_undeclared": 0,
+  "tests_absent_vs_baseline": [],
+  "focused_execution_detected": false,
+  "matrix_cells_expected": 4,
+  "matrix_cells_reported": 4,
   "started_at": "2026-08-06T12:01:00Z",
   "completed_at": "2026-08-06T12:03:14Z",
+  "outcome": "exited",
   "exit_code": 0,
-  "skipped_tests": 0,
-  "output_hash": "sha256:...",
-  "status": "passed"
+  "exit_signal": null,
+  "runner_env": { "os": "darwin-arm64", "node": "22.11.0", "sandbox": "seatbelt" },
+  "executor": "orchestrator",
+  "output_hash_raw": "sha256:...",
+  "output_hash_redacted": "sha256:...",
+  "status": "passed",
+  "coverage": "proven"
 }
 ```
+
+`executor` is load-bearing. Checks run by the coding agent during implementation are **advisory
+telemetry only and never coverage evidence**. The orchestrator independently re-executes the full
+resolved manifest against the candidate commit; otherwise an agent that stubs a test satisfies
+the coverage contract it was supposed to be held to.
 
 ### Local review protocol
 
@@ -865,7 +1152,7 @@ runmill should support three review configurations:
 | Same provider, different model | Higher | Medium | Sensitive but bounded changes |
 | Different provider family | Highest practical independence | Highest | Security, migrations, or calibration samples |
 
-Repeated review by multiple model families can reduce correlated blind spots, but it can also increase cost and generate low-value speculative findings. The policy should therefore require additional reviewers based on risk rather than blindly repeating every review five to ten times. Practitioner reports support independent repetition but also note that subsequent verification is necessary to filter over-eager findings. fileciteturn0file0
+Repeated review by multiple model families can reduce correlated blind spots, but it can also increase cost and generate low-value speculative findings. The policy should therefore require additional reviewers based on risk rather than blindly repeating every review five to ten times. Practitioner reports support independent repetition but also note that subsequent verification is necessary to filter over-eager findings.
 
 ### Pull request creation
 
@@ -933,7 +1220,7 @@ GitHub does not allow a PR author to approve their own pull request. Therefore, 
 - Internal automated review evidence.
 - GitHub review submitted by a separate bot identity.
 - Required human approval.
-- Repository-owner or code-owner approval. citeturn1search0
+- Repository-owner or code-owner approval.
 
 The initial product should not attempt to simulate human independence by creating several nominal bot identities controlled by one unrestricted credential. Identity separation is useful for audit and least privilege, but it does not transform correlated model judgments into human review.
 
@@ -957,9 +1244,9 @@ A run is `MERGE_READY` only if all conditions hold:
 | Merge protection | Merge uses an allowed GitHub path |
 | Linear state | Issue is still valid and not canceled or reassigned incompatibly |
 
-GitHub branch protection can require status checks, approving reviews, conversation resolution, signed commits, linear history, deployments, and merge queues. runmill must discover and respect these controls rather than mirror a potentially stale subset in its own configuration. citeturn1search5
+GitHub branch protection can require status checks, approving reviews, conversation resolution, signed commits, linear history, deployments, and merge queues. runmill must discover and respect these controls rather than mirror a potentially stale subset in its own configuration.
 
-Where a repository uses GitHub’s merge queue, runmill should enqueue the PR rather than merge directly. The queue validates the PR against the latest base branch; CI workflows must also handle GitHub’s `merge_group` event for required queue checks. citeturn1search1turn1search4
+Where a repository uses GitHub’s merge queue, runmill should enqueue the PR rather than merge directly. The queue validates the PR against the latest base branch; CI workflows must also handle GitHub’s `merge_group` event for required queue checks.
 
 ### Risk classification
 
@@ -999,17 +1286,74 @@ runmill should follow a least-authority design:
 | Package registry credentials | Short-lived scoped helper where required | Command-specific |
 | runmill policy key | Orchestrator | None |
 
-The sandbox defaults to:
+The sandbox is **mandatory**. `runmill doctor` fails, rather than warns, when isolation cannot be
+constructed and verified, and no run starts without it. There is no silent downgrade path.
 
-- Write access only to the run worktree and designated temporary directories.
-- No access to other run directories.
-- Restricted outbound network.
-- Denial of privileged container operations.
-- Redacted environment.
-- Command and path policies.
-- Maximum process count and resource limits.
-- Explicit package-install policy.
-- No direct access to OS keychain sockets.
+| Platform | Mechanism | What it does enforce | What it does NOT enforce |
+|---|---|---|---|
+| macOS | Seatbelt (`sandbox-exec`) with a generated profile | Path-scoped read/write denial, Mach service denial | No namespaces, no cgroups, no resource limits, no process-tree cleanup, **no network namespace** |
+| Linux | bubblewrap (`bwrap`) | Mount + user namespaces, path scoping, `--unshare-net` | No cgroup accounting or CPU/memory limits without a systemd/cgroup-v2 supervisor |
+
+These guarantees are **materially different**, and both platforms are declared first-class. The
+difference is surfaced, never hidden: `runmill doctor` prints a per-platform isolation matrix
+showing which requested controls are actually enforced, and a config requesting a control the
+platform cannot enforce is an **error**, not a silent no-op. `workspace.allow_unenforced` is the
+explicit, knowing opt-in.
+
+Baseline policy:
+
+- **Write access only to the run worktree** and designated temporary directories.
+- **Git metadata isolated per run.** A linked worktree's `.git` is a *file* pointing into the
+  parent repository's shared git directory, so the object store, config, and **hooks** are shared
+  across every worktree and with the orchestrator's own git invocations. Scoping writes to the
+  worktree alone breaks git entirely; granting the shared `.git` is the escape — an agent can
+  write `.git/hooks/pre-commit` or set `core.hooksPath` and obtain code execution in the
+  orchestrator's context, and can read and modify other runs' refs. runmill therefore relocates
+  each run's git directory into the run directory (`--separate-git-dir`) or uses a separate
+  clone, and sets `core.hooksPath=/dev/null`, `receive.denyCurrentBranch`, and
+  `protocol.ext.allow=never`.
+- No access to other run directories. Symlink, hardlink, and bind-mount traversal explicitly
+  handled.
+- **Network denied at the sandbox boundary**, with egress via a runmill-operated HTTPS proxy on
+  loopback carrying a host allowlist, a per-run bearer token, and request logging. `restricted`
+  is not expressible in either mechanism directly — Seatbelt cannot allowlist by host and
+  bubblewrap's `--unshare-net` is all-or-nothing — while the worker genuinely needs the provider
+  API and often a package registry. The proxy is the only construction that satisfies both, and
+  its request log doubles as the exfiltration detector. It binds a unique port and requires the
+  token, so permitting loopback does not expose the user's other local dev servers.
+- **Environment constructed from empty via an explicit allowlist**, never filtered from the
+  parent. Denylisting is insufficient because credentials reach a child through many channels
+  that are not environment variables: `~/.gitconfig` `credential.helper` (which makes `git push`
+  silently use the user's token), `~/.git-credentials`, `~/.netrc`, `~/.config/gh/hosts.yml`,
+  `~/.npmrc`, `~/.aws/credentials`, `~/.kube/config`, `~/.ssh/id_*`. Variables that must be
+  scrubbed even when not obviously credential-bearing include `NODE_OPTIONS` (force-loads a
+  script into every node process, **including the check runner**), `NODE_EXTRA_CA_CERTS`,
+  `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `BASH_ENV`, `PYTHONSTARTUP`, `SSH_AUTH_SOCK`, and `PATH`
+  (an agent-writable directory earlier in `PATH` shadows `npm`). The `gh` and `ssh` binaries are
+  denied outright.
+- **Keychain denied as a service, not as a socket.** On macOS the keychain is reached through a
+  Mach service, so the profile denies `(mach-lookup (global-name "com.apple.SecurityServer"))`
+  and the `security` binary. A socket-oriented rule does not block it.
+- Command and path policies, with `forbidden_paths` taking precedence over `allowed_paths`.
+- Resource limits where the platform supports them: Linux via cgroup v2 delegation. `RLIMIT_NPROC`
+  is per-*user* and is never used, because setting it would break the user's entire login session.
+- Explicit package-install policy; `--ignore-scripts` in the check runner where the ecosystem
+  permits.
+- Timeout kills are **process-group-wide** with SIGTERM→SIGKILL escalation, verified to leave no
+  survivors before cleanup is declared complete.
+
+**The provider's own credentials are inside the boundary.** `~/.claude/.credentials.json` and
+`~/.codex/auth.json` must be readable for the provider to function at all, which means the agent
+can read and exfiltrate its own provider token. This is accepted and bounded: the token is
+scoped to the provider, the proxy logs every request, and no other credential is reachable.
+
+**The check runner is sandboxed too, with the same policy.** This is not the worker; it is easy
+to miss, and missing it is the most likely security bug to actually ship. `npm run typecheck`
+resolves through `package.json` scripts, `node_modules/.bin`, and lifecycle hooks — all of which
+the agent just edited. A check runner spawned from the orchestrator inheriting `process.env`
+hands the backlog credential and GitHub token to the agent's diff on the first run. The check
+runner is a sandboxed subprocess with an allowlisted environment that returns only a structured
+result.
 
 Issue descriptions, PR comments, documentation, dependency output, and repository files must be treated as untrusted data. Instructions found there cannot override the task contract, allowed tools, or policy engine.
 
@@ -1040,7 +1384,7 @@ The primary product metric should be:
 
 > **Accepted, non-reverted Linear issues merged per hour of human attention, within quality and cost constraints.**
 
-This avoids the principal weakness of raw PR count and lines of code. The OpenAI case study reports substantial PR and code throughput, while the accompanying practitioner discussion correctly questions whether volume alone establishes maintainability, user value, or long-term software quality. fileciteturn0file2turn0file3
+This avoids the principal weakness of raw PR count and lines of code. The OpenAI case study reports substantial PR and code throughput, while the accompanying practitioner discussion correctly questions whether volume alone establishes maintainability, user value, or long-term software quality.
 
 ### Product metrics
 
@@ -1122,7 +1466,7 @@ Each task needs a composite evaluator:
 | Human calibration sample | Validate automated judgment |
 | Delayed outcome | Revert, incident, or follow-up defect where historical data exists |
 
-The suite must be separated into development, validation, and held-out sets. The harness optimizer may see development traces and validation scores, but not held-out task details or evaluator implementation. This separation follows the self-improvement literature’s concern that an optimizer will exploit whatever signal it can modify or infer. fileciteturn0file1
+The suite must be separated into development, validation, and held-out sets. The harness optimizer may see development traces and validation scores, but not held-out task details or evaluator implementation. This separation follows the self-improvement literature’s concern that an optimizer will exploit whatever signal it can modify or infer.
 
 Because agent execution is stochastic, representative configurations should be run more than once. Comparisons should report confidence intervals or paired task outcomes rather than relying on one successful demonstration.
 
@@ -1183,7 +1527,7 @@ acceptance:
   maximum_cost_increase_percent: 10
 ```
 
-This adapts AHE’s evidence, root-cause, targeted-fix, and predicted-impact model while preserving a stronger boundary: production policy, verifier code, held-out data, and permission controls remain read-only to the proposing agent. citeturn10view0turn12view0
+This adapts AHE’s evidence, root-cause, targeted-fix, and predicted-impact model while preserving a stronger boundary: production policy, verifier code, held-out data, and permission controls remain read-only to the proposing agent.
 
 ### Behavior handbook
 
@@ -1232,7 +1576,7 @@ Each behavior entry should identify:
 - Failure and recovery paths.
 - Tests covering the behavior.
 
-This gives humans and future coding agents a progressive-disclosure map rather than requiring them to infer the control plane from files and classes. It is the most directly applicable productization of the Harness Handbook work. citeturn10view2turn12view2
+This gives humans and future coding agents a progressive-disclosure map rather than requiring them to infer the control plane from files and classes. It is the most directly applicable productization of the Harness Handbook work.
 
 ### Delivery phases
 
