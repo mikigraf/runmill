@@ -1,0 +1,301 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runmill.dev/runmill.schema.json",
+  "title": "runmill configuration",
+  "description": "Configuration for runmill, a control plane that turns a backlog into governed pull requests. Add `# yaml-language-server: $schema=https://runmill.dev/runmill.schema.json` to the top of runmill.yaml for editor autocomplete and inline validation.",
+  "type": "object",
+  "required": ["version", "autonomy", "provider", "backlog", "github"],
+  "additionalProperties": false,
+
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Config format version. A binary reading a version it does not understand fails with a named error rather than guessing."
+    },
+
+    "autonomy": {
+      "enum": ["observe", "pr-only", "guarded-merge", "continuous"],
+      "default": "pr-only",
+      "description": "observe: plan only, no repository mutation. pr-only: implement, verify, review, open a PR, never merge. guarded-merge: may merge low-risk changes after all gates pass. continuous: repeat guarded execution until no eligible work remains, a budget is reached, or a circuit breaker opens. guarded-merge and continuous require a GitHub App token without `administration`."
+    },
+
+    "provider": {
+      "type": "object",
+      "required": ["implementation"],
+      "additionalProperties": false,
+      "properties": {
+        "implementation": { "enum": ["codex", "claude"] },
+        "execution": { "enum": ["local"], "default": "local" },
+        "max_turns": { "type": "integer", "minimum": 1, "default": 80 },
+        "timeout_minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 120,
+          "description": "Clamped to the run's remaining wall budget when budgets.clamp_invocation_timeout_to_remaining is true."
+        }
+      }
+    },
+
+    "backlog": {
+      "type": "object",
+      "required": ["provider", "team", "eligible_states", "claim_state"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "enum": ["linear", "github-issues"] },
+        "team": { "type": "string" },
+        "eligible_states": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "claim_state": { "type": "string" },
+        "completed_state": { "type": "string" },
+        "blocked_state": { "type": "string" },
+        "delivered_state": {
+          "type": "string",
+          "description": "Terminal state for pr-only mode, entered at PR_DELIVERED. Distinct from completed_state, which means merged."
+        },
+        "include_labels": { "type": "array", "items": { "type": "string" } },
+        "exclude_labels": { "type": "array", "items": { "type": "string" } },
+        "max_estimate": { "type": "number", "minimum": 0 },
+        "allow_unassigned": { "type": "boolean", "default": true },
+        "claim_assignee": { "type": "string" },
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "priority_first": { "type": "boolean", "default": true },
+            "unprioritized_last": {
+              "type": "boolean",
+              "default": true,
+              "description": "Linear encodes no-priority as 0 and urgent as 1, so a naive ascending sort puts unprioritized issues first. When true the sort key maps 0 to positive infinity."
+            },
+            "due_date_tiebreaker": { "type": "boolean", "default": true },
+            "oldest_first": { "type": "boolean", "default": true }
+          }
+        }
+      }
+    },
+
+    "github": {
+      "type": "object",
+      "required": ["repositories"],
+      "additionalProperties": false,
+      "properties": {
+        "repositories": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Ordered match rules. First match wins. No match, or two matches at the same precedence, makes the issue ineligible with a named reason rather than a guess.",
+          "items": {
+            "type": "object",
+            "required": ["match", "repo"],
+            "additionalProperties": false,
+            "properties": {
+              "match": {
+                "type": "object",
+                "minProperties": 1,
+                "additionalProperties": false,
+                "properties": {
+                  "team": { "type": "string" },
+                  "project": { "type": "string" },
+                  "label": { "type": "string" }
+                }
+              },
+              "repo": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
+              "base_branch": { "type": "string", "default": "main" }
+            }
+          }
+        },
+        "branch_template": {
+          "type": "string",
+          "default": "runmill/{issue_identifier}-{slug}-{attempt}",
+          "pattern": "\\{attempt\\}",
+          "description": "Must contain {attempt}. Without it a retry or post-takeover run reuses the previous run's branch; GitHub rejects the duplicate PR with 422 and runmill would silently adopt the prior run's PR, inheriting its reviews and CI history."
+        },
+        "draft_pr": {
+          "type": "boolean",
+          "default": true,
+          "description": "Note that many workflows carry `if: github.event.pull_request.draft == false`, so no checks run while draft, and auto-merge cannot be enabled on a draft. Marking ready for review is an explicit transition before CI_WAIT."
+        },
+        "merge": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "method": { "enum": ["squash", "merge", "rebase"], "default": "squash" },
+            "delete_branch": { "type": "boolean", "default": true }
+          },
+          "description": "Merge queue usage is discovered from the branch ruleset and is deliberately not configurable here; a local flag would be a stale mirror of a remote control."
+        }
+      }
+    },
+
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy": { "enum": ["worktree"], "default": "worktree" },
+        "git_isolation": {
+          "enum": ["separate-git-dir", "clone"],
+          "default": "separate-git-dir",
+          "description": "A linked worktree's .git points into the parent repository's shared git directory, sharing the object store, config, and hooks. Both options relocate or duplicate git metadata per run so the sandbox can deny everything outside the run directory."
+        },
+        "sandbox": {
+          "enum": ["native", "container", "none"],
+          "default": "native",
+          "description": "native resolves to Seatbelt on macOS and bubblewrap on Linux, chosen by doctor rather than by the user. `none` is rejected unless the run is in observe mode."
+        },
+        "network": { "enum": ["proxy", "none"], "default": "proxy" },
+        "network_allowlist": { "type": "array", "items": { "type": "string" } },
+        "allow_unenforced": {
+          "type": "array",
+          "items": { "enum": ["network", "resource_limits", "process_cleanup"] },
+          "default": [],
+          "description": "Knowing opt-in for controls the host platform cannot enforce. Without an entry here, requesting an unenforceable control is an error rather than a silent no-op."
+        },
+        "clean_untracked_files": {
+          "type": "boolean",
+          "default": true,
+          "description": "Applied at worktree teardown only. Applying it mid-run would delete newly created source files."
+        }
+      }
+    },
+
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "entry_files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Read into every prompt, so these are hash-pinned and changes alert: a merged change to AGENTS.md is a persistent injection into all future runs."
+        },
+        "max_initial_bytes": { "type": "integer", "minimum": 0, "default": 50000 },
+        "progressive_disclosure": { "type": "boolean", "default": true }
+      }
+    },
+
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "manifest": { "type": "string", "default": ".runmill/checks.yaml" },
+        "fail_on_missing_check": { "type": "boolean", "default": true },
+        "fail_on_skipped_check": {
+          "type": "boolean",
+          "default": true,
+          "description": "Judged differentially against a baseline test inventory, not by counting. doctor refuses to enable this until every required check declares a machine-readable report."
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "run"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "run": { "type": "string" },
+              "report": {
+                "type": "object",
+                "required": ["path", "format"],
+                "additionalProperties": false,
+                "properties": {
+                  "path": { "type": "string" },
+                  "format": { "enum": ["junit", "tap", "json", "go-json"] }
+                },
+                "description": "Without a parseable report the check is coverage: unproven and cannot satisfy a required gate."
+              }
+            }
+          }
+        },
+        "changed_area_rules": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "additional_checks": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "local_review_skill": { "type": "string", "default": ".runmill/skills/code-review.md" },
+        "pr_review_skill": { "type": "string", "default": ".runmill/skills/pr-review.md" },
+        "fresh_context": { "type": "boolean", "const": true, "default": true },
+        "provider": { "enum": ["inherit", "codex", "claude"], "default": "inherit" },
+        "max_fix_iterations": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3,
+          "description": "Must not exceed budgets.max_agent_invocations.fixer."
+        },
+        "merge_blocking_severities": {
+          "type": "array",
+          "items": { "enum": ["critical", "high", "medium", "low"] },
+          "default": ["critical", "high"]
+        },
+        "require_all_findings_resolved": { "type": "boolean", "default": true }
+      }
+    },
+
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": { "enum": ["low", "medium", "high", "critical"], "default": "medium" },
+        "manual_approval": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "paths": { "type": "array", "items": { "type": "string" } },
+            "labels": { "type": "array", "items": { "type": "string" } },
+            "conditions": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "public_api_change",
+                  "permissions_change",
+                  "secret_related_change",
+                  "missing_acceptance_criteria",
+                  "check_config_changed",
+                  "lockfile_changed"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_cost_usd_per_issue": { "type": "number", "minimum": 0 },
+        "max_wall_minutes_per_issue": { "type": "integer", "minimum": 1 },
+        "daily_cost_usd": { "type": "number", "minimum": 0 },
+        "daily_window": { "enum": ["utc", "local"], "default": "utc" },
+        "max_agent_invocations": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Per-role, not global. A single global cap is exhausted by implementation and local review alone, leaving nothing for PR review.",
+          "properties": {
+            "total": { "type": "integer", "minimum": 1, "default": 14 },
+            "implementer": { "type": "integer", "minimum": 1, "default": 1 },
+            "local_review": { "type": "integer", "minimum": 1, "default": 4 },
+            "fixer": { "type": "integer", "minimum": 0, "default": 3 },
+            "pr_review": { "type": "integer", "minimum": 1, "default": 3 },
+            "pr_fixer": { "type": "integer", "minimum": 0, "default": 2 }
+          }
+        },
+        "clamp_invocation_timeout_to_remaining": { "type": "boolean", "default": true },
+        "cost_enforcement": {
+          "enum": ["auto", "tokens-estimated", "wall-and-invocations-only"],
+          "default": "auto",
+          "description": "Subscription provider plans report no dollar cost, so cost budgets silently become no-ops. doctor reports which dimensions are enforceable and refuses continuous mode when none are."
+        }
+      }
+    }
+  }
+}

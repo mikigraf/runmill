@@ -480,6 +480,7 @@ prerequisites for changing this, and they are tracked rather than assumed.
 A representative configuration is:
 
 ```yaml
+# yaml-language-server: $schema=https://runmill.dev/runmill.schema.json
 version: 1
 
 # Autonomy is a top-level, user-owned setting. It is the single most
@@ -492,12 +493,17 @@ provider:
   max_turns: 80
   timeout_minutes: 120
 
-linear:
+# The backlog is a pluggable source. Linear is implementation #1; the key is
+# `backlog`, not `linear`, so a second implementation does not require a
+# breaking config migration.
+backlog:
+  provider: linear # linear | github-issues
   team: ENG
   eligible_states: [Todo, Ready]
   claim_state: In Progress
   completed_state: Done
   blocked_state: Blocked
+  delivered_state: In Review # terminal state for pr-only mode
   include_labels: [agent-ready]
   exclude_labels: [needs-design, no-agent]
   max_estimate: 5
@@ -638,6 +644,17 @@ Configuration should be split into three ownership classes:
 | User policy | Autonomy, budgets, risk rules, merge mode | **Outside the repository**, in the user config directory | Human only |
 | Repository policy | Checks, architecture rules, review rubrics | In the repository, always read from the **base commit** | Human-reviewed repository change |
 | Runtime state | Run ID, lease generation, session IDs, check results | State store | runmill only |
+
+Configuration is explicit rather than inferred, which places the entire burden of correctness on
+the person writing the file. That is only tolerable if the file is checkable while being written,
+so **a published JSON Schema is part of the product, not tooling around it**:
+`runmill.schema.json` ships in the repository and is served from `runmill.dev`, and `init` emits
+the `# yaml-language-server: $schema=` header so editors give autocomplete, inline validation, and
+hover documentation from the first keystroke. `runmill config validate` runs the same schema in
+CI and at `doctor` time. The schema encodes constraints prose cannot enforce — that
+`branch_template` must contain `{attempt}`, that `repositories` needs at least one rule, that
+`review.max_fix_iterations` cannot exceed `budgets.max_agent_invocations.fixer`. Without it, a
+~70-key file with no defaults is an error surface with no guardrail.
 
 Location is a security property, not a convenience. If user policy lived in the repository, the
 agent — or any inbound pull request — could change autonomy mode, budgets, and risk rules. Because
@@ -1646,6 +1663,28 @@ GitHub does not allow a PR author to approve their own pull request. Therefore, 
 
 The initial product should not attempt to simulate human independence by creating several nominal bot identities controlled by one unrestricted credential. Identity separation is useful for audit and least privilege, but it does not transform correlated model judgments into human review.
 
+**The merge credential must not be able to disable the governance that constrains it.** A `gh`
+OAuth token typically carries broad scopes. If the credential runmill merges with can also edit
+branch protection, or appears in a ruleset's bypass-actor list, then the launch target of zero
+protection-bypassing merges is unverifiable and the entire governance story is one API call from
+irrelevance — not because runmill would make that call, but because nothing proves it cannot.
+
+Therefore, before any merge mode is enabled:
+
+- The merge credential is a **GitHub App installation token** scoped to `contents:write` and
+  `pull_requests:write`, and explicitly **not** `administration`.
+- `runmill doctor` performs a **negative capability test**: it attempts to write branch protection
+  and asserts the attempt fails. A credential that succeeds is rejected, and merge modes stay
+  locked.
+- `doctor` reads the ruleset bypass-actor list and fails if the app's own id appears in it.
+- The `gh` binary and `~/.config/gh` are denied inside the worker sandbox regardless of which
+  credential the orchestrator holds, so the worker cannot reach a broader token even if one exists
+  on the host.
+
+`pr-only` may run on an existing `gh` session, because opening a pull request cannot bypass
+anything. The App token is a precondition for `guarded-merge` and `continuous`, not for the whole
+product.
+
 ### Merge eligibility
 
 A run is `MERGE_READY` only if all conditions hold:
@@ -1897,6 +1936,43 @@ This avoids the principal weakness of raw PR count and lines of code. The OpenAI
 | Merge performance | Time waiting for CI or merge queue versus active implementation time |
 | Calibration | Agreement between automated risk classification and human audit |
 | Harness health | Candidate changes accepted, rejected, regressed, or rolled back in offline evaluation |
+
+### Measuring runmill's own developer experience
+
+The metrics above measure agent outcomes. None of them measure whether runmill itself is usable,
+and the product's central claim is about human attention — so its own onboarding is instrumented
+too, or Time To Hello World stays an aspiration nobody can check.
+
+**Telemetry stance: local-only by default, and stated plainly.** For a local-first tool that holds
+credentials and reads private source, silent phone-home is disqualifying. runmill records an
+onboarding funnel in its own SQLite database and sends nothing. Sharing is an explicit, per-bundle
+act by the user.
+
+The funnel:
+
+| Field | Recorded at |
+|---|---|
+| `installed_at` | first CLI invocation |
+| `init_started_at` / `init_completed_at` | `runmill init` |
+| `first_doctor_run_at` / `first_doctor_pass_at` | `runmill doctor` |
+| `doctor_failures[]` | every failing check's stable code, every run |
+| `first_run_started_at` | first `runmill run` |
+| `first_pr_opened_at` | first PR created |
+| `first_run_abandoned` | process exited before a terminal state |
+
+`first_pr_opened_at − installed_at` is TTHW, measured rather than estimated. The distribution of
+`doctor_failures[]` codes identifies the actual onboarding cliff, which is otherwise guesswork.
+
+`runmill doctor --report` packages the funnel, the resolved configuration, the last run summary,
+and redacted logs into one shareable bundle. That single artifact is simultaneously the support
+channel (a developer pastes one file instead of narrating), the bug-report format, and — when a
+user chooses to send it — the DX dataset. `runmill feedback` is the discoverable front door to it.
+
+Attention accounting is recorded in the same place, because the north-star metric is unmeasurable
+without it: minutes between a run entering `NEEDS_HUMAN` and the human responding, minutes between
+a PR opening and a human acting on it, and a binary flag for whether the human opened the diff at
+all. That last one is the honest, operable proxy: **issues merged without the human opening the
+diff**.
 
 ### Launch targets
 
@@ -2151,8 +2227,8 @@ The MVP should exclude:
 | Lease primitive | Atomic git ref (`refs/runmill/leases/<issue>`) in the mapped repository, with a monotonic fencing generation. The backlog comment is display only |
 | License | MIT |
 | Default provider | User-selected during setup; no automatic model routing initially |
-| Linear auth | Personal API key for solo MVP, OAuth for shared mode |
-| GitHub auth | Existing `gh` session for initial PR-only mode; dedicated GitHub App or bot identity before shared auto-merge |
+| Backlog auth | Personal API key for solo MVP, OAuth for shared mode |
+| GitHub auth | Existing `gh` session for `pr-only`. A GitHub App installation token scoped to `contents:write` + `pull_requests:write` and explicitly **without** `administration` is REQUIRED before any merge mode is enabled |
 | Default autonomy | `pr-only` |
 | Local reviewer | Same provider in a fresh session |
 | Auto-merge eligibility | Low-risk only, after calibration and branch-protection verification |
@@ -2605,7 +2681,7 @@ implementation but the document does not yet constrain it.
 | CL-02 agent-proposed checks are RCE | RESOLVED | Verification: agent proposals are identifiers, never shell |
 | CL-03 review channel is a privilege boundary | RESOLVED | Control-plane boundary: untrusted fencing, write-permission gating, verdict cross-check |
 | CL-04 `runmill.yaml` location | RESOLVED | Manifest resolved from base commit; `.runmill/**` and `.github/**` forbidden by default |
-| CL-05 merge credential can disable governance | OPEN | Tracked: GitHub App token without `administration`; doctor asserts it cannot write protection |
+| CL-05 merge credential can disable governance | RESOLVED | GitHub identities and approval: App token without `administration`, doctor negative capability test, ruleset bypass-actor check |
 | CL-06 ambient credential channels | RESOLVED | Sandbox: env built from empty, NODE_OPTIONS/LD_PRELOAD scrubbed, keychain denied as Mach service |
 | CL-07 branch name per-issue not per-run | RESOLVED | `branch_template` now carries `{attempt}` |
 | CL-08 nobody owns commit/push | RESOLVED | Control-plane boundary: orchestrator owns staging, signing, pushing, WIP checkpoints |
@@ -2620,9 +2696,9 @@ implementation but the document does not yet constrain it.
 | DX-12 no error presentation contract | RESOLVED | `RunmillError` + FR-23 |
 | DX-19 macOS/Linux differ silently | RESOLVED | Sandbox matrix + `allow_unenforced` + NFR portability row |
 | DX-20 CI impossible | RESOLVED | Distribution: explicitly unsupported, doctor says so |
-| DX-22 no JSON Schema | OPEN | Tracked: `runmill.schema.json` + `yaml-language-server` header |
+| DX-22 no JSON Schema | RESOLVED | `runmill.schema.json` shipped; `init` emits the `yaml-language-server` header |
 | DX-23 no license | RESOLVED | MIT, stated in Distribution and the decisions table |
-| DX-26 TTHW unmeasurable | OPEN | Tracked: onboarding funnel + `doctor --report` |
+| DX-26 TTHW unmeasurable | RESOLVED | Measuring runmill's own developer experience: local-only funnel, `doctor --report`, attention accounting |
 | Config: budget math exhausts itself | RESOLVED | Per-role invocation budgets |
 | Config: timeout x invocations > wall budget | RESOLVED | `clamp_invocation_timeout_to_remaining` |
 | Config: `clean_untracked_files` mid-run | RESOLVED | Scoped to teardown |
@@ -2630,8 +2706,14 @@ implementation but the document does not yet constrain it.
 | Config: perf NFR meaningless | RESOLVED | Restated as orchestrator CPU per transition |
 | Config: single `github.repository` vs mapping | RESOLVED | Ordered `github.repositories` match rules + multi-repository semantics section |
 
-**Three findings remain OPEN**, all implementation tasks the body does not need to constrain
-further: CL-05 (App-scoped merge token without `administration`, asserted by `doctor`), DX-22
-(`runmill.schema.json` plus a `yaml-language-server` header emitted by `init`), and DX-26
-(onboarding funnel and `doctor --report`). Both product decisions are closed: **MIT license**
-and **multi-repository mapping via ordered match rules**.
+**No findings remain open.** All 44 are resolved in the body or shipped as artifacts.
+
+Both product decisions are closed: **MIT license** and **multi-repository mapping via ordered
+match rules**. The three findings that were implementation-tracked in the previous revision are
+now specified: the merge credential is an App token that `doctor` proves cannot write branch
+protection, `runmill.schema.json` ships in the repository, and runmill's own onboarding funnel is
+instrumented locally with `doctor --report` as the shareable bundle.
+
+The specification is complete. The remaining work is implementation, sequenced by the delivery
+phases, beginning with the git isolation model — three other Foundation tasks depend on whether
+it resolves to a separate clone or a relocated git directory.
