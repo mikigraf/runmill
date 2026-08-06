@@ -179,7 +179,7 @@ The first release will not:
 - Bypass GitHub branch protections or required reviews.
 - Autonomously merge high-risk changes by default.
 - Allow the coding agent to modify runmill’s evaluator, policy engine, credentials, or production configuration.
-- Execute several issues concurrently in the same working tree.
+- Execute several issues concurrently in the same working tree, or two runs against the same repository.
 - Coordinate multi-repository transactions.
 - Guarantee that every Linear issue is sufficiently specified for autonomous execution.
 - Use lines of code, token consumption, or raw PR count as the primary success metric.
@@ -449,6 +449,15 @@ A CLI nobody can install is not a product. runmill ships as:
 - **npm package** (`npm i -g runmill`) for the Node-native path.
 - **Single binaries** via `bun build --compile` for `darwin-arm64`, `darwin-x64`, `linux-x64`, and
   `linux-arm64`, published by CI on tag, with checksums and npm provenance attestations.
+
+**runmill is MIT licensed.** The code that reads your repository, holds your credentials, and
+merges to your default branch is readable and auditable by the people being asked to trust it,
+which is the point: the security model in this document is a claim, and a permissive license is
+what lets a skeptical engineer verify it rather than take it on faith. MIT carries no patent
+grant and no commercial restriction, so the license protects nothing — which is consistent with
+where this document already locates durable advantage: the repository-specific evaluation corpus,
+risk calibration against a real backlog, and accumulated governance policy. None of those are in
+the binary.
 - **Homebrew tap** wrapping the binaries.
 - Canonical quickstart line: `curl -fsSL runmill.dev/install | sh`.
 
@@ -501,15 +510,32 @@ linear:
     oldest_first: true
 
 github:
-  repository: acme/platform
-  base_branch: main
-  branch_template: runmill/{issue_identifier}-{slug}
+  # Ordered mapping rules. First match wins. No match, or two matches at the
+  # same precedence, makes the issue INELIGIBLE with a named reason rather
+  # than a guess — this is what the "unambiguous repository mapping"
+  # eligibility rule is checked against.
+  repositories:
+    - match: { team: ENG, label: mobile }
+      repo: acme/ios
+      base_branch: main
+    - match: { project: Payments }
+      repo: acme/billing
+      base_branch: main
+    - match: { team: ENG }          # catch-all for the team
+      repo: acme/platform
+      base_branch: main
+  # {attempt} is required, not decorative. Without it a retry or a post-takeover
+  # run reuses the previous run's branch; GitHub rejects a duplicate PR for the
+  # same head/base with 422 and runmill would silently adopt the prior run's PR,
+  # inheriting its reviews, its CI history, and a head it did not produce.
+  branch_template: runmill/{issue_identifier}-{slug}-{attempt}
   draft_pr: true
   merge:
-    mode: guarded
     method: squash
-    use_merge_queue: true
     delete_branch: true
+    # Merge queue usage is DISCOVERED from the branch ruleset, never declared
+    # here. A local flag is exactly the stale mirrored subset that the merge
+    # eligibility section forbids.
 
 workspace:
   strategy: worktree
@@ -627,9 +653,25 @@ A coding agent may propose changes to the first two classes, but cannot activate
 
 “Highest priority” must be defined deterministically rather than left to model interpretation.
 
+**Multi-repository semantics.** runmill maps one backlog across many repositories, which has four
+consequences the rest of this document depends on:
+
+- **The lease ref lives in the mapped repository.** `refs/runmill/leases/<issue-id>` is created in
+  the repo the issue resolved to. An issue whose mapping is ambiguous has no lease target, which
+  is why ambiguity must be an eligibility failure rather than a runtime error.
+- **Concurrency is one active run per repository**, not one globally. Two issues mapping to
+  different repos may execute simultaneously; two mapping to the same repo may not, because they
+  would contend for the same base branch and CI capacity.
+- **Cost and circuit breakers are global.** The daily cap, budget ledger, and breakers span all
+  repositories. A runaway in one repo pauses the worker everywhere.
+- **`doctor` validates every mapped repository** — access, base branch, rulesets, required checks,
+  merge queue, and identity separation are per-repo and can differ. A single repo failing its
+  checks makes only the issues mapping to it ineligible; it does not block the others.
+
 An issue is eligible only when:
 
-- It belongs to a mapped Linear team or project.
+- It belongs to a mapped backlog team or project, **and resolves to exactly one repository under
+  the ordered mapping rules**.
 - Its workflow state is allowed.
 - It is not canceled, completed, or actively leased.
 - Its labels satisfy the configured allow and deny rules.
@@ -1294,7 +1336,7 @@ exhaustion testable in milliseconds rather than hours.
 | Security | Secrets are stored in an OS keychain or external secret provider, never in repository files or task packets. |
 | Portability | macOS and Linux are first-class for *execution*. Their isolation guarantees differ materially (Seatbelt has no network namespace, no cgroups, no process-tree cleanup), so `doctor` prints a per-platform enforcement matrix and a config requesting an unenforceable control is an error. Windows through WSL may follow once worktree and process-group behavior is validated. |
 | Performance | Orchestrator CPU per state transition, excluding all I/O and subprocess time, stays under 50ms. A blanket "five seconds per transition" is simultaneously meaningless for network-bound states like `CI_WAIT` and far too lax for local ones. |
-| Scalability | The data model supports multiple repositories and workers, although the MVP defaults to one active issue. |
+| Scalability | One backlog maps to many repositories via ordered match rules. Concurrency is one active run per repository; cost caps and circuit breakers are global. The data model supports multiple workers across hosts, with mutual exclusion provided by the git-ref lease rather than by local state. |
 | Auditability | Every merge decision includes policy inputs, required gates, their exact results, and the responsible identity. |
 | Operability | Logs are structured, redacted, correlated by run ID, and available both interactively and as files. |
 | Upgrade safety | Provider adapter upgrades run conformance tests before they may become the active version. |
@@ -2066,7 +2108,9 @@ The MVP should exclude:
 
 - Live self-modification.
 - Parallel issue execution.
-- Cross-repository transactions.
+- Cross-repository transactions (a single issue whose change must land atomically in
+  more than one repository). Mapping one backlog onto many repositories IS supported; a run
+  still touches exactly one repository.
 - Hosted webhook infrastructure.
 - Production cloud access.
 - Automatic high-risk merging.
@@ -2079,7 +2123,8 @@ The MVP should exclude:
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Linear issue is underspecified | Incorrect but plausible implementation | Readiness gate, acceptance-criteria extraction, human escalation |
-| Two workers select the same issue | Duplicate code and conflicting PRs | Verified lease, stable run ID, re-read after claim, local uniqueness |
+| Two workers select the same issue | Duplicate code and conflicting PRs | Atomic git-ref lease with fencing generation revalidated before every external mutation; works across hosts |
+| Issue maps to the wrong repository | Branch and PR created in the wrong codebase | Ordered mapping rules, first match wins; no match or ambiguous match is ineligible with a named reason, never a guess |
 | Agent follows malicious repository instruction | Credential or policy compromise | No external credentials in worker, separate data and policy channels, sandbox |
 | Reviewer repeats implementer assumptions | Defects survive review | Fresh context, evidence schema, optional cross-provider review |
 | Tests pass but required coverage is absent | False confidence | Fail-closed manifest discovery and coverage proof |
@@ -2099,8 +2144,12 @@ The MVP should exclude:
 |---|---|
 | Implementation language | TypeScript, because Linear’s typed SDK and the broader CLI ecosystem fit the target user and integration surface |
 | Local state | SQLite plus artifact files |
-| Workspace | Git worktree inside an ephemeral container where available |
-| Concurrency | One active issue globally for MVP; one per repository later |
+| Workspace | Git worktree with per-run git-dir isolation, inside a mandatory native sandbox (Seatbelt on macOS, bubblewrap on Linux) |
+| Sandbox layering | runmill's sandbox is the single enforcement layer; the provider runs with its own sandboxing disabled inside it |
+| Concurrency | One active run per repository. Cost caps and circuit breakers are global across repositories |
+| Repository mapping | Ordered match rules (team / project / label to repo), first match wins; no match or ambiguous match is ineligible |
+| Lease primitive | Atomic git ref (`refs/runmill/leases/<issue>`) in the mapped repository, with a monotonic fencing generation. The backlog comment is display only |
+| License | MIT |
 | Default provider | User-selected during setup; no automatic model routing initially |
 | Linear auth | Personal API key for solo MVP, OAuth for shared mode |
 | GitHub auth | Existing `gh` session for initial PR-only mode; dedicated GitHub App or bot identity before shared auto-merge |
@@ -2558,7 +2607,7 @@ implementation but the document does not yet constrain it.
 | CL-04 `runmill.yaml` location | RESOLVED | Manifest resolved from base commit; `.runmill/**` and `.github/**` forbidden by default |
 | CL-05 merge credential can disable governance | OPEN | Tracked: GitHub App token without `administration`; doctor asserts it cannot write protection |
 | CL-06 ambient credential channels | RESOLVED | Sandbox: env built from empty, NODE_OPTIONS/LD_PRELOAD scrubbed, keychain denied as Mach service |
-| CL-07 branch name per-issue not per-run | OPEN | Tracked: `attempts` table exists; `branch_template` still needs the discriminator |
+| CL-07 branch name per-issue not per-run | RESOLVED | `branch_template` now carries `{attempt}` |
 | CL-08 nobody owns commit/push | RESOLVED | Control-plane boundary: orchestrator owns staging, signing, pushing, WIP checkpoints |
 | CL-09 label authority is code authority | RESOLVED | Risk classification: stated at doctor, actor recorded, optional allowlist |
 | CL-10 sandbox nesting contradiction | RESOLVED | Adapter contract: single enforcement layer, bypass coupled to verified sandbox |
@@ -2572,15 +2621,17 @@ implementation but the document does not yet constrain it.
 | DX-19 macOS/Linux differ silently | RESOLVED | Sandbox matrix + `allow_unenforced` + NFR portability row |
 | DX-20 CI impossible | RESOLVED | Distribution: explicitly unsupported, doctor says so |
 | DX-22 no JSON Schema | OPEN | Tracked: `runmill.schema.json` + `yaml-language-server` header |
-| DX-23 no license | OPEN | Requires a product decision |
+| DX-23 no license | RESOLVED | MIT, stated in Distribution and the decisions table |
 | DX-26 TTHW unmeasurable | OPEN | Tracked: onboarding funnel + `doctor --report` |
 | Config: budget math exhausts itself | RESOLVED | Per-role invocation budgets |
 | Config: timeout x invocations > wall budget | RESOLVED | `clamp_invocation_timeout_to_remaining` |
 | Config: `clean_untracked_files` mid-run | RESOLVED | Scoped to teardown |
 | Config: priority-0 ordering | RESOLVED | Ordering rule states the `0 -> +inf` mapping |
 | Config: perf NFR meaningless | RESOLVED | Restated as orchestrator CPU per transition |
-| Config: single `github.repository` vs mapping | OPEN | The mapping structure still does not exist in the config model |
+| Config: single `github.repository` vs mapping | RESOLVED | Ordered `github.repositories` match rules + multi-repository semantics section |
 
-**Six findings remain OPEN.** Two need a product decision (license, repository mapping model);
-four are implementation tasks that the body does not need to constrain further (App-scoped merge
-token, branch discriminator, config schema, onboarding telemetry).
+**Three findings remain OPEN**, all implementation tasks the body does not need to constrain
+further: CL-05 (App-scoped merge token without `administration`, asserted by `doctor`), DX-22
+(`runmill.schema.json` plus a `yaml-language-server` header emitted by `init`), and DX-26
+(onboarding funnel and `doctor --report`). Both product decisions are closed: **MIT license**
+and **multi-repository mapping via ordered match rules**.
