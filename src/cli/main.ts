@@ -12,6 +12,7 @@ import { buildAdapters, type AdapterSet } from "../factory.js";
 import { Orchestrator } from "../orchestrator/orchestrator.js";
 import { GitRefLease } from "../queue/git-lease.js";
 import { SystemClock } from "../platform/clock.js";
+import { Daemon, CircuitBreakers, DEFAULT_BREAKERS } from "../orchestrator/daemon.js";
 import type { CheckSpec } from "../verification/engine.js";
 import type { RunmillConfig } from "../config/types.js";
 
@@ -265,6 +266,123 @@ export function buildProgram(): Command {
             outcome.finalState === "QUARANTINED" ||
             outcome.finalState === "AWAITING_APPROVAL";
           process.exit(blocked ? EXIT.blocked : EXIT.ok);
+        } finally {
+          store.close();
+        }
+      } catch (err) {
+        fail(err, opts);
+      }
+    });
+
+  program
+    .command("daemon")
+    .description("Continuously process eligible issues until the work or the budget runs out")
+    .option("--max-runs <n>", "stop after this many runs", (v: string) => Number(v))
+    .action(async (cmdOpts: { maxRuns?: number }) => {
+      const opts = program.opts<GlobalOpts>();
+      try {
+        const { config: cfg } = loadOrExit(opts, process.cwd());
+        if (cfg.autonomy === "observe") {
+          emit(opts, "autonomy is `observe`; the daemon has nothing to do.", { ran: false });
+          process.exit(EXIT.ok);
+        }
+
+        const adapters = await buildAdapters(cfg);
+        const store = StateStore.open(join(dataDir(), "runmill.db"));
+        const clock = new SystemClock();
+        const breakers = new CircuitBreakers({
+          ...DEFAULT_BREAKERS,
+          ...(cfg.budgets.dailyCostUsd === undefined
+            ? {}
+            : { dailyCostUsd: cfg.budgets.dailyCostUsd }),
+        });
+
+        const daemon = new Daemon({
+          clock,
+          store,
+          breakers,
+          ...(cmdOpts.maxRuns === undefined ? {} : { maxRuns: cmdOpts.maxRuns }),
+          onEvent: (m) => {
+            if (opts.quiet !== true && opts.json !== true) process.stdout.write(`${m}\n`);
+          },
+          onIdle: () => {
+            if (opts.quiet !== true && opts.json !== true) {
+              process.stdout.write("no eligible work remaining\n");
+            }
+          },
+        });
+
+        // A signal stops at the next boundary rather than mid-run, so a lease
+        // is never abandoned with a workspace half-written.
+        process.on("SIGINT", () => daemon.requestStop());
+        process.on("SIGTERM", () => daemon.requestStop());
+
+        try {
+          const result = await daemon.loop(async () => {
+            const selection = await selectNext({
+              backlog: adapters.backlog,
+              config: cfg,
+              leasedIssueIds: store.activeLeaseIssueIds(),
+            });
+            if (selection.selected === undefined) return undefined;
+
+            const { orchestrator, lease } = await buildOrchestrator(cfg, adapters, store, opts);
+            const runId = `run_${Date.now().toString(36)}`;
+            return orchestrator.run({
+              runId,
+              issue: selection.selected.issue,
+              target: selection.selected.target,
+              lease: lease(runId),
+            });
+          });
+
+          emit(
+            opts,
+            [
+              "",
+              `stopped: ${result.stoppedBecause}`,
+              result.breaker === undefined ? "" : `  breaker: ${result.breaker.name} — ${result.breaker.reason ?? ""}`,
+              `  runs:    ${result.outcomes.length}`,
+              `  spend:   $${breakers.spendUsd.toFixed(2)}`,
+            ]
+              .filter((l) => l !== "")
+              .join("\n"),
+            { ...result, spendUsd: breakers.spendUsd },
+          );
+          process.exit(result.stoppedBecause === "breaker" ? EXIT.blocked : EXIT.ok);
+        } finally {
+          store.close();
+        }
+      } catch (err) {
+        fail(err, opts);
+      }
+    });
+
+  program
+    .command("list")
+    .description("Show runs, or only those waiting on a human")
+    .option("--needs-attention", "only runs blocked on a human decision")
+    .action((cmdOpts: { needsAttention?: boolean }) => {
+      const opts = program.opts<GlobalOpts>();
+      try {
+        const store = StateStore.open(join(dataDir(), "runmill.db"));
+        try {
+          const blocked = new Set(["NEEDS_HUMAN", "AWAITING_APPROVAL", "QUARANTINED"]);
+          const rows = store
+            .listRuns()
+            .filter((r) => cmdOpts.needsAttention !== true || blocked.has(r.state));
+
+          emit(
+            opts,
+            rows.length === 0
+              ? cmdOpts.needsAttention === true
+                ? "Nothing is waiting on you."
+                : "No runs yet."
+              : rows
+                  .map((r) => `  ${r.runId}  ${r.issueId.padEnd(10)} ${r.state}`)
+                  .join("\n"),
+            rows,
+          );
         } finally {
           store.close();
         }

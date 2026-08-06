@@ -250,6 +250,18 @@ export class StateStore {
     tx();
   }
 
+  /** Newest first. Backs `runmill list` and `list --needs-attention`. */
+  listRuns(limit = 50): RunRow[] {
+    return this.#db
+      .prepare(
+        `SELECT run_id AS runId, issue_id AS issueId, repo, provider, state,
+                state_version AS stateVersion, attempt, base_commit AS baseCommit,
+                candidate_sha AS candidateSha, branch
+         FROM runs ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(limit) as RunRow[];
+  }
+
   transitionHistory(runId: string): { from: string; to: string; at: string }[] {
     return this.#db
       .prepare(

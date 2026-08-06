@@ -142,13 +142,24 @@ export class Orchestrator {
     let workspace: Workspace | undefined;
     let costUsd = 0;
 
-    const finish = (state: RunState, extra: Partial<RunOutcome> = {}): RunOutcome => ({
-      runId,
-      issueId: issue.identifier,
-      finalState: state,
-      costUsd,
-      ...extra,
-    });
+    /**
+     * Record the terminal state before returning it.
+     *
+     * The returned outcome and the persisted state must agree: recovery reads
+     * the store, and `runmill list` shows it. A run that ends NEEDS_HUMAN but
+     * is stored as LOCAL_REVIEW is invisible to both.
+     */
+    const finish = (state: RunState, extra: Partial<RunOutcome> = {}): RunOutcome => {
+      if (state !== this.#state) {
+        try {
+          this.#advance(runId, state, extra.reason);
+        } catch {
+          // The run row may not exist yet (failure during createRun). The
+          // outcome is still returned truthfully.
+        }
+      }
+      return { runId, issueId: issue.identifier, finalState: state, costUsd, ...extra };
+    };
 
     try {
       this.#d.store.createRun({

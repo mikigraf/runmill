@@ -5,13 +5,12 @@ A control plane for autonomous software engineering.
 runmill continuously takes work from your backlog, dispatches it to coding agents, verifies and
 reviews what they produce, gets the change through CI and merge, and moves on to the next issue.
 
-> **Status: the loop closes.** An issue goes from the backlog through claim, isolated workspace,
-> agent execution, sandboxed verification, independent review, and out as a governed pull request —
-> with merge governance behind it. 190 tests. The remaining gap is live adapters: Linear, Codex /
-> Claude Code, and GitHub are behind interfaces with deterministic in-memory implementations, so
-> the loop runs today with `RUNMILL_DEMO=1` and needs those three adapters to run against your real
-> systems. See [Implementation status](#implementation-status).
-> [`prd.md`](./prd.md) is the source of truth for everything.
+> **Status: working, with live adapters.** An issue goes from the backlog through claim, isolated
+> workspace, agent execution, sandboxed verification, independent review, and out as a governed
+> pull request — then the daemon moves to the next one. Linear, GitHub, Codex, and Claude Code all
+> have real implementations. 205 tests plus a live suite that runs against real systems.
+> Still specified-only: the evaluation harness and the generated behavior handbook.
+> [`prd.md`](./prd.md) is the source of truth.
 
 ## Try it in 30 seconds
 
@@ -62,13 +61,31 @@ it, and fails if that succeeds.
 | **Agent execution** — clone isolation, Seatbelt/bubblewrap sandbox, task packet, adapter contract | **Working** |
 | **Verified PR** — manifest resolution, freshness proof, skip detection, schema-validated review | **Working** |
 | **Governed merge** — CI reconciliation, negative credential test, approval gate, protected merge | **Working** |
-| Live adapters — Linear, Codex / Claude Code, GitHub | **Interfaces only** |
-| Continuous operation — daemon, circuit breakers, cleanup sweep | Specified |
+| **Live adapters** — Linear, Codex / Claude Code, GitHub | **Working** |
+| **Continuous operation** — daemon, circuit breakers | **Working** |
 | Evaluation — historical replay, held-out suites | Specified |
 | Behavior handbook | Specified |
 
-Commands: `run`, `next --dry-run`, `doctor`, `config validate`, `config show`, `state` — all with
-`--json`, `--quiet`, and documented exit codes.
+Commands: `run`, `daemon`, `next --dry-run`, `list [--needs-attention]`, `doctor`,
+`config validate`, `config show`, `state` — all with `--json`, `--quiet`, and documented exit codes.
+
+### Running against your real systems
+
+```bash
+gh auth login                        # GitHub credential
+export LINEAR_API_KEY=lin_api_...    # or store it in the OS keychain
+runmill doctor                       # verifies the host, including sandbox escape probes
+runmill run ENG-123
+```
+
+Each boundary resolves independently, and `run` prints which are live:
+
+```text
+  adapters: backlog=live provider=live forge=live
+```
+
+In-memory substitutes require an explicit `RUNMILL_DEMO=1`. A fake never stands in for production
+silently — that is the difference between a governance system and a theatre of one.
 
 ### Run the whole loop
 
@@ -99,6 +116,28 @@ ENG-101  →  PR_DELIVERED
 
 `unproven` there is the system being honest: that check declares no
 machine-readable report, so runmill ran it but cannot prove what it covered.
+
+### Continuous operation
+
+```bash
+runmill daemon
+```
+
+```text
+ENG-102 → PR_DELIVERED ($0.02)
+ENG-101 → PR_DELIVERED ($0.02)
+ENG-103 → PR_DELIVERED ($0.02)
+ENG-106 → PR_DELIVERED ($0.02)
+no eligible work remaining
+stopped: no-work
+  runs:    4
+  spend:   $0.08
+```
+
+Serial by construction: selection happens only after the previous run released its lease. Circuit
+breakers stop the worker on a quarantine, consecutive failures, the daily cost cap, or a high
+escalation rate — that last one reports the likely cause as an underspecified backlog rather than
+a broken worker, because that is usually what it is.
 
 ## What it is
 

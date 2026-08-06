@@ -39,6 +39,40 @@ export interface FakeProviderScript {
 }
 
 /**
+ * Out-of-the-box behavior, so demo mode is usable without a script.
+ *
+ * The implementer writes a marker file (a real tree change, so verification
+ * and the checkpoint have something to act on) and the reviewer returns a
+ * schema-valid approval. Anything more opinionated would hide real defects
+ * behind a fake that always agrees.
+ */
+const DEFAULT_ACTIONS: Readonly<Record<string, readonly ScriptedAction[]>> = {
+  implementer: [
+    { kind: "say", text: "implementing the task packet" },
+    {
+      kind: "write",
+      path: "RUNMILL_DEMO.md",
+      content: "Written by the in-memory demo agent.\n",
+    },
+  ],
+  fixer: [{ kind: "say", text: "addressing review findings" }],
+  "local-reviewer": [{ kind: "say", text: "reviewing against acceptance criteria" }],
+  "pr-reviewer": [{ kind: "say", text: "reviewing the pull request diff" }],
+};
+
+const APPROVAL = {
+  verdict: "approved",
+  scope_assessment: "within_scope",
+  acceptance_criteria_met: [],
+  findings: [],
+};
+
+const DEFAULT_OUTPUT: Readonly<Record<string, unknown>> = {
+  "local-reviewer": APPROVAL,
+  "pr-reviewer": APPROVAL,
+};
+
+/**
  * A deterministic coding agent.
  *
  * Real enough to close the loop: it edits files in the workspace, emits a
@@ -92,7 +126,10 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
     this.#sessionSeq += 1;
     const sessionId = `fake-session-${this.#sessionSeq}`;
     const actions =
-      this.#script.byRole?.[request.role] ?? this.#script.defaultActions ?? [];
+      this.#script.byRole?.[request.role] ??
+      this.#script.defaultActions ??
+      DEFAULT_ACTIONS[request.role] ??
+      [];
 
     const events: AgentEvent[] = [];
     let seq = 0;
@@ -186,7 +223,7 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
         costUsd: this.#script.costUsdPerCall ?? 0.01,
       });
 
-      const output = this.#script.outputByRole?.[request.role];
+      const output = this.#script.outputByRole?.[request.role] ?? DEFAULT_OUTPUT[request.role];
       let outputRef = "";
       if (output !== undefined) {
         outputRef = join(request.workingDirectory, ".runmill", "run", `${request.role}-output.json`);
