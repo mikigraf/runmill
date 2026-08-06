@@ -7,15 +7,11 @@ import { RunmillError, renderError } from "../errors/runmill-error.js";
 import { runAllChecks, worstStatus } from "../doctor/checks.js";
 import { renderDoctor, renderSelection } from "./render.js";
 import { selectNext } from "../queue/selector.js";
-import { FakeBacklogAdapter } from "../testing/fake-backlog.js";
 import { StateStore, CURRENT_SCHEMA_VERSION } from "../state/store.js";
-import type { BacklogAdapter } from "../backlog/adapter.js";
+import { buildAdapters, type AdapterSet } from "../factory.js";
 import { Orchestrator } from "../orchestrator/orchestrator.js";
 import { GitRefLease } from "../queue/git-lease.js";
-import { FakeProviderAdapter } from "../testing/fake-provider.js";
-import { FakeForgeAdapter } from "../testing/fake-forge.js";
 import { SystemClock } from "../platform/clock.js";
-import type { SelectedCandidate } from "../queue/selector.js";
 import type { CheckSpec } from "../verification/engine.js";
 import type { RunmillConfig } from "../config/types.js";
 
@@ -46,30 +42,6 @@ function loadOrExit(opts: GlobalOpts, repoRoot: string): { config: RunmillConfig
   return loadConfig(path, { repoRoot });
 }
 
-/**
- * Build the backlog adapter.
- *
- * `RUNMILL_FAKE_BACKLOG` points at a JSON array of issues and selects the
- * in-memory adapter. This is how the end-to-end walkthrough runs without
- * credentials, and how the CLI is tested without a live backlog.
- */
-function buildBacklog(config: RunmillConfig): BacklogAdapter {
-  const fixture = process.env["RUNMILL_FAKE_BACKLOG"];
-  if (fixture !== undefined && existsSync(fixture)) {
-    return new FakeBacklogAdapter(JSON.parse(readFileSync(fixture, "utf8")));
-  }
-  if (config.backlog.provider === "linear") {
-    throw RunmillError.fromCatalog("RM-AUTH-003", {
-      whatHappened:
-        "The Linear adapter needs a credential and none is configured.\n" +
-        "Set RUNMILL_FAKE_BACKLOG=<fixture.json> to explore runmill without one.",
-    });
-  }
-  throw RunmillError.fromCatalog("RM-CONFIG-001", {
-    whatHappened: `No adapter for backlog.provider "${config.backlog.provider}"`,
-  });
-}
-
 function emit(opts: GlobalOpts, human: string, data: unknown): void {
   if (opts.json === true) {
     process.stdout.write(`${JSON.stringify(data, null, 2)}\n`);
@@ -93,55 +65,20 @@ function fail(err: unknown, opts: GlobalOpts): never {
 
 
 /**
- * Assemble the orchestrator.
+ * Assemble the orchestrator around whichever adapters resolved.
  *
- * Provider and forge adapters resolve from the environment so the loop can be
- * exercised without credentials. `RUNMILL_DEMO=1` substitutes deterministic
- * in-memory implementations for both; without it, the real adapters are
- * required and their absence is a named error rather than a silent fake.
+ * Live adapters are used whenever their credentials exist; the in-memory
+ * substitutes only appear under an explicit RUNMILL_DEMO=1, and which ones are
+ * live is reported to the operator rather than inferred.
  */
 async function buildOrchestrator(
   cfg: RunmillConfig,
-  backlog: BacklogAdapter,
+  adapters: AdapterSet,
   store: StateStore,
-  candidate: SelectedCandidate,
-  _opts: GlobalOpts,
+  opts: GlobalOpts,
 ): Promise<{ orchestrator: Orchestrator; lease: (runId: string) => GitRefLease }> {
-  const demo = process.env["RUNMILL_DEMO"] === "1";
-  if (!demo) {
-    throw RunmillError.fromCatalog("RM-AUTH-003", {
-      whatHappened:
-        "Live provider and forge adapters are not configured.\n" +
-        "Set RUNMILL_DEMO=1 to run the full loop with deterministic in-memory\n" +
-        "provider and forge implementations.",
-    });
-  }
-
   const sourceRepo = process.env["RUNMILL_SOURCE_REPO"] ?? process.cwd();
   const clock = new SystemClock();
-
-  const provider = new FakeProviderAdapter({
-    byRole: {
-      implementer: [
-        { kind: "say", text: `implementing ${candidate.issue.identifier}` },
-        {
-          kind: "write",
-          path: `runmill-demo-${candidate.issue.identifier}.md`,
-          content: `# ${candidate.issue.title}\n\nImplemented by the demo agent.\n`,
-        },
-      ],
-      "local-reviewer": [{ kind: "say", text: "reviewing" }],
-    },
-    outputByRole: {
-      "local-reviewer": {
-        verdict: "approved",
-        scope_assessment: "within_scope",
-        acceptance_criteria_met: [],
-        findings: [],
-      },
-    },
-    costUsdPerCall: 0.12,
-  });
 
   const checks: CheckSpec[] = cfg.verification.commands.map((c) => ({
     id: c.id,
@@ -153,20 +90,17 @@ async function buildOrchestrator(
 
   return {
     orchestrator: new Orchestrator({
-      backlog,
-      provider,
-      forge: new FakeForgeAdapter(),
+      backlog: adapters.backlog,
+      provider: adapters.provider,
+      forge: adapters.forge,
       store,
       clock,
       config: cfg,
       sourceRepoPath: sourceRepo,
-      workspaceRoot: join(
-        process.env["RUNMILL_DATA_DIR"] ?? resolve(process.cwd(), ".runmill", "state"),
-        "runs",
-      ),
+      workspaceRoot: join(dataDir(), "runs"),
       checks,
       onEvent: (m) => {
-        if (_opts.quiet !== true && _opts.json !== true) process.stdout.write(`  ${m}\n`);
+        if (opts.quiet !== true && opts.json !== true) process.stdout.write(`  ${m}\n`);
       },
     }),
     lease: (runId: string) =>
@@ -179,6 +113,10 @@ async function buildOrchestrator(
         pid: process.pid,
       }),
   };
+}
+
+function dataDir(): string {
+  return process.env["RUNMILL_DATA_DIR"] ?? resolve(process.cwd(), ".runmill", "state");
 }
 
 export function buildProgram(): Command {
@@ -230,7 +168,7 @@ export function buildProgram(): Command {
       const opts = program.opts<GlobalOpts>();
       try {
         const { config } = loadOrExit(opts, process.cwd());
-        const backlog = buildBacklog(config);
+        const { backlog } = await buildAdapters(config);
         const result = await selectNext({ backlog, config, leasedIssueIds: new Set() });
         emit(opts, renderSelection(result), {
           selected: result.selected === undefined
@@ -259,13 +197,17 @@ export function buildProgram(): Command {
       const opts = program.opts<GlobalOpts>();
       try {
         const { config: cfg } = loadOrExit(opts, process.cwd());
-        const backlog = buildBacklog(cfg);
-        const store = StateStore.open(
-          resolve(
-            process.env["RUNMILL_DATA_DIR"] ?? resolve(process.cwd(), ".runmill", "state"),
-            "runmill.db",
-          ),
-        );
+        const adapters = await buildAdapters(cfg);
+        const backlog = adapters.backlog;
+        const store = StateStore.open(join(dataDir(), "runmill.db"));
+
+        if (opts.quiet !== true && opts.json !== true) {
+          const mark = (live: boolean): string => (live ? "live" : "in-memory");
+          process.stdout.write(
+            `  adapters: backlog=${mark(adapters.live.backlog)} ` +
+              `provider=${mark(adapters.live.provider)} forge=${mark(adapters.live.forge)}\n`,
+          );
+        }
 
         try {
           const selection = await selectNext({
@@ -294,7 +236,7 @@ export function buildProgram(): Command {
             process.exit(EXIT.ok);
           }
 
-          const { orchestrator, lease } = await buildOrchestrator(cfg, backlog, store, candidate, opts);
+          const { orchestrator, lease } = await buildOrchestrator(cfg, adapters, store, opts);
           const runId = `run_${Date.now().toString(36)}`;
           const outcome = await orchestrator.run({
             runId,
@@ -377,10 +319,7 @@ export function buildProgram(): Command {
     .description("Show state store health")
     .action(() => {
       const opts = program.opts<GlobalOpts>();
-      const path = resolve(
-        process.env["RUNMILL_DATA_DIR"] ?? resolve(process.cwd(), ".runmill", "state"),
-        "runmill.db",
-      );
+      const path = join(dataDir(), "runmill.db");
       try {
         const store = StateStore.open(path);
         const info = {
