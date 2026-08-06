@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://runmill.dev/runmill.schema.json
+version: 1
+autonomy: pr-only
+
+provider:
+  implementation: codex
+
+backlog:
+  provider: linear
+  team: ENG
+  eligible_states: [Todo, Ready]
+  claim_state: In Progress
+  completed_state: Done
+  blocked_state: Blocked
+  delivered_state: In Review
+  include_labels: [agent-ready]
+  exclude_labels: [needs-design, no-agent]
+  max_estimate: 5
+
+github:
+  repositories:
+    - match: { team: ENG, label: mobile }
+      repo: acme/ios
+      base_branch: main
+    - match: { team: ENG }
+      repo: acme/platform
+      base_branch: main

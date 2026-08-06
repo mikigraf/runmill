@@ -1,0 +1,68 @@
+[
+  {
+    "identifier": "ENG-101",
+    "title": "Prevent duplicate webhook delivery processing",
+    "description": "Repeated delivery ids are processed more than once.\n\nAcceptance criteria:\n- repeated delivery ids are processed exactly once\n- deduplication records expire after the retention period\n- existing webhook behavior stays backward compatible",
+    "priority": 2,
+    "labels": ["agent-ready", "backend"],
+    "state": "Todo",
+    "teamKey": "ENG",
+    "createdAt": "2026-07-01T09:00:00Z",
+    "canceled": false, "completed": false, "blockedBy": []
+  },
+  {
+    "identifier": "ENG-102",
+    "title": "Crash on cold start in the iOS app",
+    "description": "The app crashes on first launch after install.\n\nAcceptance criteria:\n- cold start completes without crashing on a clean device\n- a regression test covers the first-launch path",
+    "priority": 1,
+    "labels": ["agent-ready", "mobile"],
+    "state": "Todo",
+    "teamKey": "ENG",
+    "createdAt": "2026-07-02T09:00:00Z",
+    "canceled": false, "completed": false, "blockedBy": []
+  },
+  {
+    "identifier": "ENG-103",
+    "title": "Tidy up the dashboard",
+    "description": "make it nicer",
+    "priority": 3,
+    "labels": ["agent-ready"],
+    "state": "Todo",
+    "teamKey": "ENG",
+    "createdAt": "2026-07-03T09:00:00Z",
+    "canceled": false, "completed": false, "blockedBy": []
+  },
+  {
+    "identifier": "ENG-104",
+    "title": "Migrate billing to the new provider",
+    "description": "We need to move billing across.\n\nAcceptance criteria:\n- all existing subscriptions continue to bill correctly\n- a rollback path exists",
+    "priority": 1,
+    "labels": ["agent-ready", "billing"],
+    "state": "Todo",
+    "teamKey": "ENG",
+    "createdAt": "2026-07-04T09:00:00Z",
+    "canceled": false, "completed": false, "blockedBy": ["ENG-99"]
+  },
+  {
+    "identifier": "ENG-105",
+    "title": "Redesign onboarding",
+    "description": "Onboarding needs a rethink before anything is built.\n\nAcceptance criteria:\n- design review completed\n- flows agreed",
+    "priority": 2,
+    "labels": ["agent-ready", "needs-design"],
+    "state": "Todo",
+    "teamKey": "ENG",
+    "createdAt": "2026-07-05T09:00:00Z",
+    "canceled": false, "completed": false, "blockedBy": []
+  },
+  {
+    "identifier": "ENG-106",
+    "title": "Unprioritized cleanup task",
+    "description": "Some tidying that has been sitting around for a very long time indeed and has plenty of description text.",
+    "priority": 0,
+    "labels": ["agent-ready"],
+    "state": "Todo",
+    "teamKey": "ENG",
+    "createdAt": "2019-01-01T09:00:00Z",
+    "canceled": false, "completed": false, "blockedBy": []
+  }
+]

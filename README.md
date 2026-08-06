@@ -5,8 +5,66 @@ A control plane for autonomous software engineering.
 runmill continuously takes work from your backlog, dispatches it to coding agents, verifies and
 reviews what they produce, gets the change through CI and merge, and moves on to the next issue.
 
-> **Status: pre-implementation.** The specification is complete and reviewed; the code is not
-> written yet. [`prd.md`](./prd.md) is the source of truth. Start there.
+> **Status: Foundation phase, working.** Selection, configuration, state, the distributed lease,
+> and the CLI are implemented and tested (135 tests). Agent execution, verification, pull requests,
+> and merge governance are specified but not yet built — see [Implementation status](#implementation-status).
+> [`prd.md`](./prd.md) is the source of truth for everything.
+
+## Try it in 30 seconds
+
+No credentials needed — the quickstart runs against an in-memory backlog fixture.
+
+```bash
+git clone <this repo> && cd runmill && npm install
+cd examples/quickstart
+RUNMILL_FAKE_BACKLOG=issues.json npx tsx ../../src/cli/main.ts next --dry-run
+```
+
+```text
+Would select  ENG-102  Crash on cold start in the iOS app
+  repository  acme/ios (base main)
+  priority    1
+
+Next in queue (3):
+  ENG-101  Prevent duplicate webhook delivery processing
+  ENG-103  Tidy up the dashboard
+  ENG-106  Unprioritized cleanup task
+
+Rejected (2):
+  ENG-104  Migrate billing to the new provider
+      ✗ dependencies: blocked by ENG-99
+  ENG-105  Redesign onboarding
+      ✗ labels: carries excluded label(s): needs-design
+```
+
+Two things worth noticing. `ENG-102` routed to `acme/ios` because it carries the `mobile` label and
+the first matching rule wins. And `ENG-106` sorted last despite being the oldest issue by seven
+years, because it has no priority — backlogs encode "no priority" as zero, which a naive sort puts
+first.
+
+Then check the host is safe to run on:
+
+```bash
+npx tsx ../../src/cli/main.ts doctor
+```
+
+`doctor` does not ask whether a sandbox exists. It builds one, tries to read `~/.ssh` from inside
+it, and fails if that succeeds.
+
+## Implementation status
+
+| Phase | State |
+|---|---|
+| **Foundation** — CLI, config, state store, deterministic selection, git-ref lease | **Working** |
+| Agent execution — worktrees, sandbox, provider adapters, task packet | Specified |
+| Verified PR — check manifest, coverage proof, fresh-context review | Specified |
+| Governed merge — risk engine, CI reconciliation, protected merge | Specified |
+| Continuous operation — daemon, cleanup, circuit breakers | Specified |
+| Evaluation — historical replay, held-out suites | Specified |
+| Behavior handbook | Specified |
+
+What works today: `runmill next --dry-run`, `doctor`, `config validate`, `config show`, `state`,
+with `--json`, `--quiet`, and documented exit codes throughout.
 
 ## What it is
 
