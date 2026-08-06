@@ -5,9 +5,12 @@ A control plane for autonomous software engineering.
 runmill continuously takes work from your backlog, dispatches it to coding agents, verifies and
 reviews what they produce, gets the change through CI and merge, and moves on to the next issue.
 
-> **Status: Foundation phase, working.** Selection, configuration, state, the distributed lease,
-> and the CLI are implemented and tested (135 tests). Agent execution, verification, pull requests,
-> and merge governance are specified but not yet built — see [Implementation status](#implementation-status).
+> **Status: the loop closes.** An issue goes from the backlog through claim, isolated workspace,
+> agent execution, sandboxed verification, independent review, and out as a governed pull request —
+> with merge governance behind it. 190 tests. The remaining gap is live adapters: Linear, Codex /
+> Claude Code, and GitHub are behind interfaces with deterministic in-memory implementations, so
+> the loop runs today with `RUNMILL_DEMO=1` and needs those three adapters to run against your real
+> systems. See [Implementation status](#implementation-status).
 > [`prd.md`](./prd.md) is the source of truth for everything.
 
 ## Try it in 30 seconds
@@ -56,15 +59,46 @@ it, and fails if that succeeds.
 | Phase | State |
 |---|---|
 | **Foundation** — CLI, config, state store, deterministic selection, git-ref lease | **Working** |
-| Agent execution — worktrees, sandbox, provider adapters, task packet | Specified |
-| Verified PR — check manifest, coverage proof, fresh-context review | Specified |
-| Governed merge — risk engine, CI reconciliation, protected merge | Specified |
-| Continuous operation — daemon, cleanup, circuit breakers | Specified |
+| **Agent execution** — clone isolation, Seatbelt/bubblewrap sandbox, task packet, adapter contract | **Working** |
+| **Verified PR** — manifest resolution, freshness proof, skip detection, schema-validated review | **Working** |
+| **Governed merge** — CI reconciliation, negative credential test, approval gate, protected merge | **Working** |
+| Live adapters — Linear, Codex / Claude Code, GitHub | **Interfaces only** |
+| Continuous operation — daemon, circuit breakers, cleanup sweep | Specified |
 | Evaluation — historical replay, held-out suites | Specified |
 | Behavior handbook | Specified |
 
-What works today: `runmill next --dry-run`, `doctor`, `config validate`, `config show`, `state`,
-with `--json`, `--quiet`, and documented exit codes throughout.
+Commands: `run`, `next --dry-run`, `doctor`, `config validate`, `config show`, `state` — all with
+`--json`, `--quiet`, and documented exit codes.
+
+### Run the whole loop
+
+```bash
+export RUNMILL_DEMO=1 RUNMILL_FAKE_BACKLOG=issues.json
+npx tsx src/cli/main.ts run ENG-101
+```
+
+```text
+  → ELIGIBILITY_CHECKED
+  → CLAIMED
+  → WORKSPACE_READY
+  → TASK_PACKET_READY
+  → IMPLEMENTING
+  → LOCAL_VERIFY
+    check readme-exists: passed (unproven)
+  → LOCAL_REVIEW
+  → PR_READY
+  → PUSHED
+  → PR_OPEN
+  → CI_WAIT
+  → PR_DELIVERED
+
+ENG-101  →  PR_DELIVERED
+  pull request  https://fake/acme/platform/pull/1/...
+  cost          $0.24
+```
+
+`unproven` there is the system being honest: that check declares no
+machine-readable report, so runmill ran it but cannot prove what it covered.
 
 ## What it is
 

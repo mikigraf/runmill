@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
 import { loadConfig, parseConfig, validateConfig } from "../config/load.js";
 import { RunmillError, renderError } from "../errors/runmill-error.js";
 import { runAllChecks, worstStatus } from "../doctor/checks.js";
@@ -10,6 +10,13 @@ import { selectNext } from "../queue/selector.js";
 import { FakeBacklogAdapter } from "../testing/fake-backlog.js";
 import { StateStore, CURRENT_SCHEMA_VERSION } from "../state/store.js";
 import type { BacklogAdapter } from "../backlog/adapter.js";
+import { Orchestrator } from "../orchestrator/orchestrator.js";
+import { GitRefLease } from "../queue/git-lease.js";
+import { FakeProviderAdapter } from "../testing/fake-provider.js";
+import { FakeForgeAdapter } from "../testing/fake-forge.js";
+import { SystemClock } from "../platform/clock.js";
+import type { SelectedCandidate } from "../queue/selector.js";
+import type { CheckSpec } from "../verification/engine.js";
 import type { RunmillConfig } from "../config/types.js";
 
 const VERSION = "0.1.0";
@@ -84,6 +91,96 @@ function fail(err: unknown, opts: GlobalOpts): never {
   process.exit(EXIT.failed);
 }
 
+
+/**
+ * Assemble the orchestrator.
+ *
+ * Provider and forge adapters resolve from the environment so the loop can be
+ * exercised without credentials. `RUNMILL_DEMO=1` substitutes deterministic
+ * in-memory implementations for both; without it, the real adapters are
+ * required and their absence is a named error rather than a silent fake.
+ */
+async function buildOrchestrator(
+  cfg: RunmillConfig,
+  backlog: BacklogAdapter,
+  store: StateStore,
+  candidate: SelectedCandidate,
+  _opts: GlobalOpts,
+): Promise<{ orchestrator: Orchestrator; lease: (runId: string) => GitRefLease }> {
+  const demo = process.env["RUNMILL_DEMO"] === "1";
+  if (!demo) {
+    throw RunmillError.fromCatalog("RM-AUTH-003", {
+      whatHappened:
+        "Live provider and forge adapters are not configured.\n" +
+        "Set RUNMILL_DEMO=1 to run the full loop with deterministic in-memory\n" +
+        "provider and forge implementations.",
+    });
+  }
+
+  const sourceRepo = process.env["RUNMILL_SOURCE_REPO"] ?? process.cwd();
+  const clock = new SystemClock();
+
+  const provider = new FakeProviderAdapter({
+    byRole: {
+      implementer: [
+        { kind: "say", text: `implementing ${candidate.issue.identifier}` },
+        {
+          kind: "write",
+          path: `runmill-demo-${candidate.issue.identifier}.md`,
+          content: `# ${candidate.issue.title}\n\nImplemented by the demo agent.\n`,
+        },
+      ],
+      "local-reviewer": [{ kind: "say", text: "reviewing" }],
+    },
+    outputByRole: {
+      "local-reviewer": {
+        verdict: "approved",
+        scope_assessment: "within_scope",
+        acceptance_criteria_met: [],
+        findings: [],
+      },
+    },
+    costUsdPerCall: 0.12,
+  });
+
+  const checks: CheckSpec[] = cfg.verification.commands.map((c) => ({
+    id: c.id,
+    run: c.run,
+    required: true,
+    source: "repository-policy" as const,
+    report: c.report,
+  }));
+
+  return {
+    orchestrator: new Orchestrator({
+      backlog,
+      provider,
+      forge: new FakeForgeAdapter(),
+      store,
+      clock,
+      config: cfg,
+      sourceRepoPath: sourceRepo,
+      workspaceRoot: join(
+        process.env["RUNMILL_DATA_DIR"] ?? resolve(process.cwd(), ".runmill", "state"),
+        "runs",
+      ),
+      checks,
+      onEvent: (m) => {
+        if (_opts.quiet !== true && _opts.json !== true) process.stdout.write(`  ${m}\n`);
+      },
+    }),
+    lease: (runId: string) =>
+      new GitRefLease({
+        cwd: sourceRepo,
+        runId,
+        clock,
+        ttlMinutes: 20,
+        hostId: process.env["HOSTNAME"] ?? "local",
+        pid: process.pid,
+      }),
+  };
+}
+
 export function buildProgram(): Command {
   const program = new Command();
 
@@ -149,6 +246,86 @@ export function buildProgram(): Command {
           })),
         });
         process.exit(result.selected === undefined ? EXIT.ok : EXIT.ok);
+      } catch (err) {
+        fail(err, opts);
+      }
+    });
+
+  program
+    .command("run")
+    .argument("[issue]", "issue identifier; omitted selects the next eligible issue")
+    .description("Process one issue end to end")
+    .action(async (issueId: string | undefined) => {
+      const opts = program.opts<GlobalOpts>();
+      try {
+        const { config: cfg } = loadOrExit(opts, process.cwd());
+        const backlog = buildBacklog(cfg);
+        const store = StateStore.open(
+          resolve(
+            process.env["RUNMILL_DATA_DIR"] ?? resolve(process.cwd(), ".runmill", "state"),
+            "runmill.db",
+          ),
+        );
+
+        try {
+          const selection = await selectNext({
+            backlog,
+            config: cfg,
+            leasedIssueIds: store.activeLeaseIssueIds(),
+          });
+
+          const candidate =
+            issueId === undefined
+              ? selection.selected
+              : [selection.selected, ...selection.runnersUp].find(
+                  (c) => c?.issue.identifier === issueId,
+                );
+
+          if (candidate === undefined) {
+            const rejected = selection.rejected.find((r) => r.issue.identifier === issueId);
+            const detail =
+              rejected === undefined
+                ? "no eligible issue"
+                : rejected.decision.rules
+                    .filter((r) => !r.passed)
+                    .map((r) => `  ✗ ${r.rule}: ${r.reason}`)
+                    .join("\n");
+            emit(opts, `Nothing to run.\n${detail}`, { ran: false, reason: detail });
+            process.exit(EXIT.ok);
+          }
+
+          const { orchestrator, lease } = await buildOrchestrator(cfg, backlog, store, candidate, opts);
+          const runId = `run_${Date.now().toString(36)}`;
+          const outcome = await orchestrator.run({
+            runId,
+            issue: candidate.issue,
+            target: candidate.target,
+            lease: lease(runId),
+          });
+
+          emit(
+            opts,
+            [
+              "",
+              `${outcome.issueId}  →  ${outcome.finalState}`,
+              outcome.prUrl === undefined ? "" : `  pull request  ${outcome.prUrl}`,
+              outcome.mergeSha === undefined ? "" : `  merged        ${outcome.mergeSha}`,
+              `  cost          $${outcome.costUsd.toFixed(2)}`,
+              outcome.reason === undefined ? "" : `  reason        ${outcome.reason}`,
+            ]
+              .filter((l) => l !== "")
+              .join("\n"),
+            outcome,
+          );
+
+          const blocked =
+            outcome.finalState === "NEEDS_HUMAN" ||
+            outcome.finalState === "QUARANTINED" ||
+            outcome.finalState === "AWAITING_APPROVAL";
+          process.exit(blocked ? EXIT.blocked : EXIT.ok);
+        } finally {
+          store.close();
+        }
       } catch (err) {
         fail(err, opts);
       }
