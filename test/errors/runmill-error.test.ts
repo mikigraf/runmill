@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { RunmillError, ERROR_CATALOG, renderError } from "../../src/errors/runmill-error.js";
+import { RunmillError, ERROR_CATALOG, renderError, DOCS_BASE } from "../../src/errors/runmill-error.js";
 import type { ErrorCatalogEntry } from "../../src/errors/runmill-error.js";
 
 describe("RunmillError", () => {
@@ -13,7 +13,7 @@ describe("RunmillError", () => {
       recoverable: false,
     });
     expect(err.code).toBe("RM-SANDBOX-001");
-    expect(err.docsUrl).toBe("https://runmill.dev/errors/RM-SANDBOX-001");
+    expect(err.docsUrl).toBe(`${DOCS_BASE}#rm-sandbox-001`);
     expect(err).toBeInstanceOf(Error);
   });
 
@@ -29,7 +29,7 @@ describe("RunmillError", () => {
     expect(json).toMatchObject({
       code: "RM-SELECT-002",
       recoverable: expect.any(Boolean),
-      docsUrl: "https://runmill.dev/errors/RM-SELECT-002",
+      docsUrl: `${DOCS_BASE}#rm-select-002`,
     });
     expect(() => JSON.stringify(json)).not.toThrow();
   });
@@ -93,7 +93,7 @@ describe("renderError", () => {
     expect(out).toContain("What happened");
     expect(out).toContain("Why");
     expect(out).toContain("Fix");
-    expect(out).toContain("https://runmill.dev/errors/RM-SANDBOX-001");
+    expect(out).toContain(`${DOCS_BASE}#rm-sandbox-001`);
   });
 
   it("renders every fix as its own actionable line", () => {

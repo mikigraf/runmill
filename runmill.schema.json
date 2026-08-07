@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://runmill.dev/runmill.schema.json",
+  "$id": "https://raw.githubusercontent.com/mikigraf/runmill/main/runmill.schema.json",
   "title": "runmill configuration",
-  "description": "Configuration for runmill, a control plane that turns a backlog into governed pull requests. Add `# yaml-language-server: $schema=https://runmill.dev/runmill.schema.json` to the top of runmill.yaml for editor autocomplete and inline validation.",
+  "description": "Configuration for runmill, a control plane that turns a backlog into governed pull requests. Add `# yaml-language-server: $schema=https://raw.githubusercontent.com/mikigraf/runmill/main/runmill.schema.json` to the top of runmill.yaml for editor autocomplete and inline validation.",
   "type": "object",
   "required": ["version", "autonomy", "provider", "backlog", "github"],
   "additionalProperties": false,

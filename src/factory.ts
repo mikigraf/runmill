@@ -11,6 +11,23 @@ import { FakeForgeAdapter } from "./testing/fake-forge.js";
 import { FakeProviderAdapter } from "./testing/fake-provider.js";
 import { RunmillError } from "./errors/runmill-error.js";
 import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/**
+ * The issue fixture demo mode falls back to.
+ *
+ * Demo mode used to hand back an empty backlog, so the advertised
+ * zero-credential quickstart printed "No eligible issue." — a demonstration of
+ * nothing, indistinguishable from a real backlog with no work in it. A demo
+ * with no data is not a demo. Shipped in `files` so this works from an
+ * installed package, not just a clone.
+ */
+export function demoFixturePath(): string {
+  // dist/factory.js and src/factory.ts are both one level below the root.
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  return join(root, "examples", "quickstart", "issues.json");
+}
 
 export interface AdapterSet {
   readonly backlog: BacklogAdapter;
@@ -20,10 +37,18 @@ export interface AdapterSet {
   readonly live: { backlog: boolean; provider: boolean; forge: boolean };
 }
 
+export type Boundary = "backlog" | "provider" | "forge";
+
 export interface BuildAdaptersOptions {
   readonly credentials?: CredentialStore | undefined;
   /** Force in-memory implementations for every boundary. */
   readonly demo?: boolean | undefined;
+  /**
+   * Which boundaries to resolve. Read-only commands need only the backlog,
+   * and resolving a provider costs a subprocess — for one dialect, a real
+   * billable inference — that `next` and `prepare` never use.
+   */
+  readonly need?: readonly Boundary[] | undefined;
 }
 
 /**
@@ -42,6 +67,8 @@ export async function buildAdapters(
 ): Promise<AdapterSet> {
   const credentials = options.credentials ?? new CredentialStore();
   const demo = options.demo === true || process.env["RUNMILL_DEMO"] === "1";
+  const need = options.need ?? (["backlog", "provider", "forge"] as const);
+  const wants = (b: Boundary): boolean => need.includes(b);
 
   // -- backlog -----------------------------------------------------------
   let backlog: BacklogAdapter;
@@ -55,7 +82,12 @@ export async function buildAdapters(
       backlog = new LinearBacklogAdapter({ apiKey });
       backlogLive = true;
     } else if (demo) {
-      backlog = new FakeBacklogAdapter([]);
+      // Prefer the caller's fixture; fall back to the bundled one so
+      // RUNMILL_DEMO=1 always has something to demonstrate.
+      const bundled = demoFixturePath();
+      backlog = new FakeBacklogAdapter(
+        existsSync(bundled) ? (JSON.parse(readFileSync(bundled, "utf8")) as never) : [],
+      );
     } else {
       throw RunmillError.fromCatalog("RM-AUTH-003", {
         whatHappened:
@@ -75,9 +107,11 @@ export async function buildAdapters(
   let providerLive = false;
   const dialect = config.provider.implementation === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
   const cli = new CliProviderAdapter({ dialect });
-  const installation = await cli.detect();
+  const installation = wants("provider") ? await cli.detect() : { installed: false };
 
-  if (installation.installed && !demo) {
+  if (!wants("provider")) {
+    provider = new FakeProviderAdapter();
+  } else if (installation.installed && !demo) {
     const auth = await cli.authStatus();
     if (!auth.authenticated) {
       throw RunmillError.fromCatalog("RM-AUTH-003", {
@@ -101,8 +135,10 @@ export async function buildAdapters(
   // -- forge -------------------------------------------------------------
   let forge: ForgeAdapter;
   let forgeLive = false;
-  const token = await credentials.get("github");
-  if (token !== undefined && !demo) {
+  const token = wants("forge") ? await credentials.get("github") : undefined;
+  if (!wants("forge")) {
+    forge = new FakeForgeAdapter();
+  } else if (token !== undefined && !demo) {
     forge = new GitHubForgeAdapter({ token });
     forgeLive = true;
   } else if (demo) {

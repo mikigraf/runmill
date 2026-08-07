@@ -1,0 +1,30 @@
+name: Bug report
+description: Something did not work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Run `runmill doctor --report` and paste the bundle below. It contains no
+        credentials, no source, and no absolute paths.
+  - type: textarea
+    id: bundle
+    attributes:
+      label: Support bundle
+      description: Output of `runmill doctor --report`
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command you ran
+      placeholder: runmill run ENG-123
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true

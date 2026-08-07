@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Error code reference
+    url: https://github.com/mikigraf/runmill/blob/main/docs/errors.md
+    about: Every error code, its cause, and its fix. Check here first.

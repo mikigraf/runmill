@@ -25,7 +25,13 @@ export interface ErrorCatalogEntry {
   readonly recoverable: boolean;
 }
 
-export const DOCS_BASE = "https://runmill.dev/errors";
+/**
+ * Where the Docs line points.
+ *
+ * Was `runmill.dev`, which does not resolve — so every error in the catalog
+ * printed a dead link. Points at the repository, which exists.
+ */
+export const DOCS_BASE = "https://github.com/mikigraf/runmill/blob/main/docs/errors.md";
 
 /**
  * Every failure mode runmill can present. Adding a throw site without adding
@@ -234,8 +240,22 @@ export const ERROR_CATALOG = {
       "A path in runmill.yaml points at a file that is not present. This is " +
       "checked before any agent is dispatched so it cannot fail after spend.",
     fixes: [
-      { description: "Write the built-in defaults", command: "runmill skills eject" },
-      { description: "Remove the key to use the built-in" },
+      { description: "Write the built-in review skills", command: "runmill skills eject" },
+      { description: "Check which paths are unresolvable", command: "runmill config validate" },
+    ],
+    recoverable: false,
+  },
+  "RM-CONFIG-003": {
+    title: "No configuration file",
+    why:
+      "runmill needs a runmill.yaml to know which backlog to read, which " +
+      "repositories issues map to, and how much autonomy it has.",
+    fixes: [
+      { description: "Create one, with the repository inferred from git", command: "runmill init" },
+      {
+        description: "Or point at one that lives somewhere else",
+        command: "runmill --config <path> next",
+      },
     ],
     recoverable: false,
   },
@@ -290,7 +310,9 @@ export class RunmillError extends Error {
   }
 
   get docsUrl(): string {
-    return `${DOCS_BASE}/${this.code}`;
+    // Anchor into the generated reference rather than a per-code page: one
+    // file that CI keeps in sync beats twenty that drift.
+    return `${DOCS_BASE}#${this.code.toLowerCase()}`;
   }
 
   static fromCatalog(

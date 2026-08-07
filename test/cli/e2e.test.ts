@@ -149,7 +149,7 @@ describe("runmill errors", () => {
     expect(r.stderr).toContain("What happened");
     expect(r.stderr).toContain("Why");
     expect(r.stderr).toContain("Fix");
-    expect(r.stderr).toContain("https://runmill.dev/errors/");
+    expect(r.stderr).toMatch(/https:\/\/github\.com\/.*\/errors/);
   });
 
   it("emits structured errors under --json", async () => {
@@ -157,7 +157,7 @@ describe("runmill errors", () => {
     const r = await cli(["--json", "next"]);
     const err = JSON.parse(r.stdout) as { code: string; docsUrl: string };
     expect(err.code).toMatch(/^RM-/);
-    expect(err.docsUrl).toContain("runmill.dev/errors");
+    expect(err.docsUrl).toMatch(/github\.com/);
   });
 });
 

@@ -24,11 +24,23 @@ export function renderDoctor(results: readonly CheckResult[]): string {
  * a developer actually has. Rejected candidates show every rule, with the
  * failing ones marked, so the reason is never inferred.
  */
-export function renderSelection(result: SelectionResult): string {
+export function renderSelection(result: SelectionResult, team?: string): string {
   const out: string[] = [];
 
   if (result.selected === undefined) {
-    out.push("No eligible issue.");
+    // An empty backlog and a backlog that rejected everything are different
+    // problems with different fixes, and "No eligible issue." named neither.
+    if (result.runnersUp.length === 0 && result.rejected.length === 0) {
+      out.push("No issues came back from the backlog.");
+      out.push("");
+      out.push("  Either the query matched nothing, or the credential reads a different team.");
+      out.push(`  Configured team: ${team ?? "(unset)"}`);
+      out.push("");
+      out.push("  runmill config show          confirm the team and filters in effect");
+      out.push("  runmill auth status          confirm which credential is resolving");
+    } else {
+      out.push("No eligible issue — every candidate was rejected. Reasons below.");
+    }
   } else {
     const { issue, target } = result.selected;
     out.push(`Would select  ${issue.identifier}  ${issue.title}`);

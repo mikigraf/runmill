@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://runmill.dev/runmill.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/mikigraf/runmill/main/runmill.schema.json
 version: 1
 autonomy: pr-only
 

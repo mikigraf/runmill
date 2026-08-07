@@ -273,8 +273,14 @@ export function loadConfig(
   options: LoadOptions,
 ): { config: RunmillConfig; path: string } {
   if (!existsSync(path)) {
-    throw RunmillError.fromCatalog("RM-CONFIG-002", {
-      whatHappened: `No configuration file at ${path}`,
+    // Distinct from RM-CONFIG-002 (a path INSIDE the config is unresolvable).
+    // Conflating them meant the first error a new developer ever saw offered
+    // fixes that could not possibly apply.
+    throw RunmillError.fromCatalog("RM-CONFIG-003", {
+      whatHappened:
+        `No runmill.yaml at ${path}\n\n` +
+        `  runmill init creates one, inferring the repository and base branch\n` +
+        `  from git. Everything it cannot infer is left as an editable placeholder.`,
     });
   }
 

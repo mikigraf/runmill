@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # Both are first-class execution targets and their sandbox mechanisms
+    # differ, so a green macOS run says nothing about Linux.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - run: npm run typecheck
+      - run: npm test
+
+      - name: Error reference is current
+        run: npm run docs:check
+
+      - name: Package contains the binary it declares
+        run: |
+          npm pack --pack-destination /tmp >/dev/null
+          tar tzf /tmp/runmill-*.tgz | grep -q 'package/dist/cli/main.js' \
+            || { echo "::error::bin target missing from the published package"; exit 1; }

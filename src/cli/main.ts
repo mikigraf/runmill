@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { resolve, join } from "node:path";
 import { loadConfig, parseConfig, validateConfig } from "../config/load.js";
 import { RunmillError, renderError , errorMessage } from "../errors/runmill-error.js";
@@ -13,6 +14,9 @@ import { Orchestrator } from "../orchestrator/orchestrator.js";
 import { GitRefLease } from "../queue/git-lease.js";
 import { SystemClock } from "../platform/clock.js";
 import { Daemon, CircuitBreakers, DEFAULT_BREAKERS } from "../orchestrator/daemon.js";
+import { registerExtraCommands } from "./extra-commands.js";
+import { EXPLANATIONS, buildSupportBundle } from "./explain.js";
+import { recordMilestone, recordDoctorFailure, readFunnel } from "../state/funnel.js";
 import type { CheckSpec } from "../verification/engine.js";
 import type { RunmillConfig } from "../config/types.js";
 
@@ -122,6 +126,11 @@ function dataDir(): string {
 export function buildProgram(): Command {
   const program = new Command();
 
+  // First invocation of anything starts the clock. Local only.
+  program.hook("preAction", () => {
+    recordMilestone(dataDir(), "installed_at", new Date());
+  });
+
   program
     .name("runmill")
     .description("A control plane for autonomous software engineering.")
@@ -135,7 +144,9 @@ export function buildProgram(): Command {
     .command("doctor")
     .description("Verify this host can run runmill safely")
     .option("--check <id>", "run only checks whose id starts with this prefix")
-    .action(async (cmdOpts: { check?: string }) => {
+    .option("--explain <topic>", "explain what a check requires and why")
+    .option("--report", "print a support bundle to attach to an issue")
+    .action(async (cmdOpts: { check?: string; explain?: string; report?: boolean }) => {
       const opts = program.opts<GlobalOpts>();
       const repoRoot = process.cwd();
 
@@ -147,9 +158,50 @@ export function buildProgram(): Command {
         // itself is what reports that.
       }
 
+      if (cmdOpts.explain !== undefined) {
+        const topic = EXPLANATIONS[cmdOpts.explain];
+        if (topic === undefined) {
+          emit(
+            opts,
+            `No explanation for "${cmdOpts.explain}".\n  Available: ${Object.keys(EXPLANATIONS).join(", ")}`,
+            { topics: Object.keys(EXPLANATIONS) },
+          );
+          process.exit(EXIT.ok);
+        }
+        emit(opts, topic, { topic: cmdOpts.explain, explanation: topic });
+        process.exit(EXIT.ok);
+      }
+
       let results = await runAllChecks({ repoRoot }, providerImpl);
       if (cmdOpts.check !== undefined) {
-        results = results.filter((r) => r.id.startsWith(cmdOpts.check as string));
+        const prefix = cmdOpts.check;
+        const matched = results.filter((r) => r.id.startsWith(prefix));
+        if (matched.length === 0) {
+          // A filter that matches nothing used to report `overall: PASS`,
+          // which told a developer their setup was fine when nothing had
+          // been checked at all.
+          emit(
+            opts,
+            `No check matches "${prefix}".\n  Available: ${results.map((r) => r.id).join(", ")}`,
+            { overall: "fail", checks: [], reason: `no check matches "${prefix}"` },
+          );
+          process.exit(EXIT.configInvalid);
+        }
+        results = matched;
+      }
+
+      recordMilestone(dataDir(), "first_doctor_run_at", new Date());
+      for (const r of results) {
+        if (r.status === "fail" && r.code !== undefined) recordDoctorFailure(dataDir(), r.code);
+      }
+      if (worstStatus(results) !== "fail") {
+        recordMilestone(dataDir(), "first_doctor_pass_at", new Date());
+      }
+
+      if (cmdOpts.report === true) {
+        const bundle = buildSupportBundle(results, repoRoot, readFunnel(dataDir()));
+        emit(opts, bundle.human, bundle.data);
+        process.exit(EXIT.ok);
       }
 
       const overall = worstStatus(results);
@@ -168,9 +220,9 @@ export function buildProgram(): Command {
       const opts = program.opts<GlobalOpts>();
       try {
         const { config } = loadOrExit(opts, process.cwd());
-        const { backlog } = await buildAdapters(config);
+        const { backlog } = await buildAdapters(config, { need: ["backlog"] });
         const result = await selectNext({ backlog, config, leasedIssueIds: new Set() });
-        emit(opts, renderSelection(result), {
+        emit(opts, renderSelection(result, config.backlog.team), {
           selected: result.selected === undefined
             ? null
             : {
@@ -237,6 +289,7 @@ export function buildProgram(): Command {
           }
 
           const { orchestrator, lease } = buildOrchestrator(cfg, adapters, store, opts);
+          recordMilestone(dataDir(), "first_run_started_at", new Date());
           const runId = `run_${Date.now().toString(36)}`;
           const outcome = await orchestrator.run({
             runId,
@@ -244,6 +297,9 @@ export function buildProgram(): Command {
             target: candidate.target,
             lease: lease(runId),
           });
+          if (outcome.prNumber !== undefined) {
+            recordMilestone(dataDir(), "first_pr_opened_at", new Date());
+          }
 
           emit(
             opts,
@@ -464,13 +520,38 @@ export function buildProgram(): Command {
       }
     });
 
+  registerExtraCommands(program, {
+    emit: (human, data) => emit(program.opts<GlobalOpts>(), human, data),
+    fail: (err) => fail(err, program.opts<GlobalOpts>()),
+    dataDir,
+    configPath: () => findConfigPath(program.opts<GlobalOpts>().config, process.cwd()),
+    repoRoot: () => process.cwd(),
+    exitCodes: EXIT,
+  });
+
   return program;
 }
 
-const isDirectRun =
-  process.argv[1] !== undefined && import.meta.url === `file://${process.argv[1]}`;
+/**
+ * Are we the entrypoint?
+ *
+ * Comparing `import.meta.url` to `process.argv[1]` directly is wrong once the
+ * package is installed: npm links `node_modules/.bin/runmill` to the real file,
+ * so argv[1] is the SYMLINK and the two never match. The CLI then parsed
+ * nothing and exited 0 — installed, on PATH, and silently inert. Resolving the
+ * real path of argv[1] first is what makes the shipped binary work.
+ */
+function isEntrypoint(): boolean {
+  const invoked = process.argv[1];
+  if (invoked === undefined) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(invoked)).href;
+  } catch {
+    return false;
+  }
+}
 
-if (isDirectRun) {
+if (isEntrypoint()) {
   buildProgram().parseAsync(process.argv).catch((err: unknown) => {
     fail(err, {});
   });

@@ -55,7 +55,7 @@ describe("parseConfig", () => {
 
   it("tolerates a yaml-language-server schema header", () => {
     const cfg = parseConfig(
-      `# yaml-language-server: $schema=https://runmill.dev/runmill.schema.json\n${MINIMAL}`,
+      `# yaml-language-server: $schema=https://raw.githubusercontent.com/mikigraf/runmill/main/runmill.schema.json\n${MINIMAL}`,
     );
     expect(cfg.version).toBe(1);
   });
@@ -161,6 +161,23 @@ describe("loadConfig", () => {
       expect(err).toBeInstanceOf(RunmillError);
       expect((err as RunmillError).code).toBe("RM-CONFIG-002");
       expect((err as RunmillError).whatHappened).toMatch(/code-review\.md/);
+    }
+  });
+
+  it("distinguishes no-config-at-all from a bad reference inside one", () => {
+    // The very first error a new developer can hit. It was reported as
+    // RM-CONFIG-002 ("referenced file does not exist"), whose remedies —
+    // `runmill skills eject`, `runmill config validate` — cannot possibly
+    // help when there is no config yet. Wrong advice on first contact is
+    // more expensive than any later error.
+    try {
+      loadConfig(join(dir, "absent.yaml"), { repoRoot: dir });
+      expect.unreachable("should reject a missing config file");
+    } catch (err) {
+      expect(err).toBeInstanceOf(RunmillError);
+      const e = err as RunmillError;
+      expect(e.code).toBe("RM-CONFIG-003");
+      expect(e.fixes.some((f) => f.command === "runmill init")).toBe(true);
     }
   });
 

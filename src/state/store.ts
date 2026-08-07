@@ -456,6 +456,31 @@ export class StateStore {
       .run(this.#clock.now().toISOString(), issueId, runId);
   }
 
+  // -- onboarding funnel (local only, never transmitted) -----------------
+
+  /** First write wins: a milestone records when something first happened. */
+  recordFunnelOnce(key: string, value: string): void {
+    this.#db
+      .prepare("INSERT INTO onboarding_funnel(key, value) VALUES (?,?) ON CONFLICT(key) DO NOTHING")
+      .run(key, value);
+  }
+
+  incrementFunnelCounter(key: string): void {
+    this.#db
+      .prepare(
+        `INSERT INTO onboarding_funnel(key, value) VALUES (?, '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)`,
+      )
+      .run(key);
+  }
+
+  readFunnel(): Record<string, string> {
+    const rows = this.#db
+      .prepare("SELECT key, value FROM onboarding_funnel")
+      .all() as { key: string; value: string }[];
+    return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+  }
+
   activeLeaseIssueIds(): Set<string> {
     const rows = this.#db
       .prepare("SELECT issue_id AS issueId FROM leases WHERE released_at IS NULL")

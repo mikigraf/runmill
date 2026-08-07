@@ -13,7 +13,8 @@
   "files": [
     "dist",
     "runmill.schema.json",
-    "assets"
+    "assets",
+    "examples/quickstart"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -22,7 +23,11 @@
     "test:watch": "vitest",
     "coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src test --max-warnings 0"
+    "lint": "eslint src test --max-warnings 0",
+    "prepare": "npm run build",
+    "prepack": "npm run build",
+    "docs:errors": "tsx scripts/gen-error-docs.ts",
+    "docs:check": "tsx scripts/gen-error-docs.ts --check"
   },
   "dependencies": {
     "@linear/sdk": "^39.0.0",
@@ -39,5 +44,19 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^3.0.5"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikigraf/runmill.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mikigraf/runmill/issues"
+  },
+  "homepage": "https://github.com/mikigraf/runmill#readme",
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "automation",
+    "cli"
+  ]
 }
