@@ -60,12 +60,21 @@ stopped: no-work
 Not published to npm yet. Install from the clone:
 
 ```bash
-cd runmill && npm install && npm link
+cd runmill && npm install && npm run build && npm link
 runmill --version
 ```
 
 `npm link` puts `runmill` on your PATH pointing at your working copy; `npm unlink -g runmill`
-removes it. It builds first, so `dist/` is present.
+removes it.
+
+**Run `npm run build` after every change.** The linked binary runs `dist/`, not your sources.
+`npm link` only builds when it actually installs, so re-linking an already-linked package does
+*not* rebuild — and a stale `dist/` looks exactly like a change that did not work. During
+development, skip the build and run the sources directly:
+
+```bash
+npx tsx src/cli/main.ts <command>
+```
 
 If that fails with `EACCES ... /usr/local/lib/node_modules` — the default npm prefix is root-owned
 on many macOS installs — point npm at a directory you own rather than reaching for `sudo`:

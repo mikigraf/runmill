@@ -12,6 +12,7 @@
   },
   "files": [
     "dist",
+    "docs",
     "runmill.schema.json",
     "assets",
     "examples/quickstart"
