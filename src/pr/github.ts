@@ -1,6 +1,4 @@
 import { Octokit } from "@octokit/rest";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import type {
   BranchProtection,
   ForgeAdapter,
@@ -10,8 +8,8 @@ import type {
   CheckConclusion,
 } from "./adapter.js";
 import { ForgeError } from "./adapter.js";
-
-const run = promisify(execFile);
+import { errorMessage } from "../errors/runmill-error.js";
+import { run } from "../platform/process.js";
 
 function splitRepo(repo: string): { owner: string; name: string } {
   const [owner, name] = repo.split("/");
@@ -76,22 +74,23 @@ export class GitHubForgeAdapter implements ForgeAdapter {
     // Push happens through git with a credential the worker never sees. The
     // token is passed via an askpass-free header rather than embedded in the
     // remote URL, so it never lands in .git/config or the reflog.
-    try {
-      await run(
-        "git",
-        [
-          "-c",
-          `http.extraheader=AUTHORIZATION: basic ${Buffer.from(`x-access-token:${this.#token}`).toString("base64")}`,
-          "push",
-          "--set-upstream",
-          `https://github.com/${input.repo}.git`,
-          `HEAD:refs/heads/${input.branch}`,
-        ],
-        { cwd: input.workspacePath },
+    const result = await run(
+      "git",
+      [
+        "-c",
+        `http.extraheader=AUTHORIZATION: basic ${Buffer.from(`x-access-token:${this.#token}`).toString("base64")}`,
+        "push",
+        "--set-upstream",
+        `https://github.com/${input.repo}.git`,
+        `HEAD:refs/heads/${input.branch}`,
+      ],
+      { cwd: input.workspacePath },
+    );
+    if (!result.ok) {
+      throw new ForgeError(
+        `push failed: ${result.stderr.trim()}`,
+        /timed out|network|503|502/i.test(result.stderr),
       );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new ForgeError(`push failed: ${message}`, /timed out|network|503|502/i.test(message));
     }
   }
 
@@ -123,7 +122,7 @@ export class GitHubForgeAdapter implements ForgeAdapter {
         state: "open",
       };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       // A 422 here usually means a PR already exists for this head/base.
       // Adopting it blindly would inherit another run's reviews and CI
       // history, so it is surfaced rather than swallowed.
@@ -170,12 +169,17 @@ export class GitHubForgeAdapter implements ForgeAdapter {
     const { owner, name } = splitRepo(input.repo);
     const checks: RemoteCheck[] = [];
 
-    const runs = await this.#octokit.checks.listForRef({
-      owner,
-      repo: name,
-      ref: input.ref,
-      per_page: 100,
-    });
+    // check-runs and commit statuses are separate APIs and independent calls.
+    const [runs, statuses] = await Promise.all([
+      this.#octokit.checks.listForRef({ owner, repo: name, ref: input.ref, per_page: 100 }),
+      this.#octokit.repos.listCommitStatusesForRef({
+        owner,
+        repo: name,
+        ref: input.ref,
+        per_page: 100,
+      }),
+    ]);
+
     for (const r of runs.data.check_runs) {
       checks.push({
         name: r.name,
@@ -186,12 +190,6 @@ export class GitHubForgeAdapter implements ForgeAdapter {
       });
     }
 
-    const statuses = await this.#octokit.repos.listCommitStatusesForRef({
-      owner,
-      repo: name,
-      ref: input.ref,
-      per_page: 100,
-    });
     for (const s of statuses.data) {
       checks.push({
         name: s.context,
@@ -299,7 +297,7 @@ export class GitHubForgeAdapter implements ForgeAdapter {
         return { mergeSha: after.mergeSha };
       }
       throw new ForgeError(
-        `merge failed: ${err instanceof Error ? err.message : String(err)}`,
+        `merge failed: ${errorMessage(err)}`,
         true,
       );
     }

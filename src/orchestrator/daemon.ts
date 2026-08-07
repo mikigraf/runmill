@@ -119,14 +119,6 @@ export class CircuitBreakers {
   get spendUsd(): number {
     return this.#spendUsd;
   }
-
-  get stats(): { completed: number; escalations: number; quarantines: number } {
-    return {
-      completed: this.#completed,
-      escalations: this.#escalations,
-      quarantines: this.#quarantines,
-    };
-  }
 }
 
 export interface DaemonOptions {

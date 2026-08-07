@@ -1,5 +1,6 @@
 import type { CheckResult, CheckStatus } from "../doctor/checks.js";
 import type { SelectionResult } from "../queue/selector.js";
+import { PRIORITY_LABELS } from "../domain/types.js";
 
 const SYMBOL: Record<CheckStatus, string> = { pass: "✓", warn: "!", fail: "✗" };
 
@@ -32,7 +33,7 @@ export function renderSelection(result: SelectionResult): string {
     const { issue, target } = result.selected;
     out.push(`Would select  ${issue.identifier}  ${issue.title}`);
     out.push(`  repository  ${target.repo} (base ${target.baseBranch})`);
-    out.push(`  priority    ${issue.priority === 0 ? "none" : String(issue.priority)}`);
+    out.push(`  priority    ${PRIORITY_LABELS[issue.priority] ?? String(issue.priority)}`);
   }
 
   if (result.runnersUp.length > 0) {

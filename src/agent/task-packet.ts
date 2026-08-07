@@ -1,4 +1,5 @@
 import type { BacklogIssue, RepositoryTarget } from "../domain/types.js";
+import { PRIORITY_LABELS } from "../domain/types.js";
 
 /**
  * Paths the agent may never touch, regardless of configuration.
@@ -48,14 +49,6 @@ export interface TaskPacket {
     readonly require_scope_statement: boolean;
   };
 }
-
-const PRIORITY_NAMES: Record<number, string> = {
-  0: "none",
-  1: "urgent",
-  2: "high",
-  3: "medium",
-  4: "low",
-};
 
 const CRITERIA_HEADING = /^\s*#{0,4}\s*(acceptance criteria|success criteria|done when)\s*:?\s*$/i;
 const BULLET = /^\s*[-*+]\s+(.*\S)\s*$/;
@@ -114,7 +107,7 @@ export function buildTaskPacket(input: BuildTaskPacketInput): TaskPacket {
       identifier: input.issue.identifier,
       title: input.issue.title,
       description_file: "issue.md",
-      priority: PRIORITY_NAMES[input.issue.priority] ?? "unknown",
+      priority: PRIORITY_LABELS[input.issue.priority] ?? "unknown",
       labels: input.issue.labels,
       snapshot_hash: input.snapshotHash,
     },

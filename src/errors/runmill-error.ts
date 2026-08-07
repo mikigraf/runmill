@@ -7,6 +7,11 @@
  * fixes, and a docs URL. FR-23 forbids any failure mode presenting as silent.
  */
 
+/** Narrow an unknown thrown value to a message. Written 7 times before this. */
+export function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export interface Fix {
   readonly description: string;
   /** An exact command the developer can run, when one exists. */

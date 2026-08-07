@@ -9,6 +9,12 @@ const run = promisify(execFile);
 const CLI = resolve(process.cwd(), "src/cli/main.ts");
 const QUICKSTART = resolve(process.cwd(), "examples/quickstart");
 
+// Resolve the local tsx binary by absolute path rather than going through
+// `npx`. The CLI is spawned with its cwd inside a temp directory, where npx
+// cannot see this project's node_modules and would try to DOWNLOAD tsx —
+// making the suite depend on the network and on a shared mutable npm cache.
+const TSX = resolve(process.cwd(), "node_modules/.bin/tsx");
+
 let dir: string;
 
 beforeEach(() => {
@@ -25,7 +31,7 @@ async function cli(
   env: Record<string, string> = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    const { stdout, stderr } = await run("npx", ["tsx", CLI, ...args], {
+    const { stdout, stderr } = await run(TSX, [CLI, ...args], {
       cwd: dir,
       env: { ...process.env, ...env },
     });

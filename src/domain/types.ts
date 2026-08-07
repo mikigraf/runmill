@@ -19,11 +19,14 @@
  */
 export type BacklogPriority = 0 | 1 | 2 | 3 | 4;
 
-export const PRIORITY_NONE = 0 as const;
-export const PRIORITY_URGENT = 1 as const;
-export const PRIORITY_HIGH = 2 as const;
-export const PRIORITY_MEDIUM = 3 as const;
-export const PRIORITY_LOW = 4 as const;
+/** Human labels for the priority encoding above. One table, three readers. */
+export const PRIORITY_LABELS: Readonly<Record<number, string>> = {
+  0: "none",
+  1: "urgent",
+  2: "high",
+  3: "medium",
+  4: "low",
+};
 
 export interface BacklogIssue {
   /** Human-facing stable identifier, e.g. "ENG-123". Final tie-breaker. */

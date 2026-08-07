@@ -1,9 +1,6 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { platform } from "node:os";
 import { RunmillError } from "../errors/runmill-error.js";
-
-const run = promisify(execFile);
+import { run } from "../platform/process.js";
 
 export type CredentialName = "linear" | "github" | "runmill-policy";
 
@@ -39,29 +36,19 @@ export class CredentialStore {
     if (fromEnv !== undefined && fromEnv !== "") return fromEnv;
 
     if (platform() === "darwin") {
-      try {
-        const { stdout } = await run("security", [
-          "find-generic-password",
-          "-s",
-          `${SERVICE}:${name}`,
-          "-w",
-        ]);
-        const value = stdout.trim();
-        if (value !== "") return value;
-      } catch {
-        // Not present in the keychain; fall through.
-      }
+      const keychain = await run("security", [
+        "find-generic-password",
+        "-s",
+        `${SERVICE}:${name}`,
+        "-w",
+      ]);
+      if (keychain.ok && keychain.stdout.trim() !== "") return keychain.stdout.trim();
     }
 
     // GitHub has a well-known local source that is already authenticated.
     if (name === "github") {
-      try {
-        const { stdout } = await run("gh", ["auth", "token"]);
-        const value = stdout.trim();
-        if (value !== "") return value;
-      } catch {
-        // gh absent or unauthenticated.
-      }
+      const gh = await run("gh", ["auth", "token"]);
+      if (gh.ok && gh.stdout.trim() !== "") return gh.stdout.trim();
     }
 
     return undefined;
@@ -101,10 +88,7 @@ export class CredentialStore {
 
   async remove(name: CredentialName): Promise<void> {
     if (platform() !== "darwin") return;
-    try {
-      await run("security", ["delete-generic-password", "-s", `${SERVICE}:${name}`]);
-    } catch {
-      // Nothing stored; deleting is idempotent.
-    }
+    // Deleting is idempotent: nothing stored is not an error.
+    await run("security", ["delete-generic-password", "-s", `${SERVICE}:${name}`]);
   }
 }

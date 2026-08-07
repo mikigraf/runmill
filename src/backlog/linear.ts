@@ -3,6 +3,8 @@ import { LinearClient } from "@linear/sdk";
 import type { BacklogAdapter } from "./adapter.js";
 import { AmbiguousMutationError, BacklogRateLimitError } from "./adapter.js";
 import type { BacklogIssue, BacklogPriority } from "../domain/types.js";
+import { errorMessage } from "../errors/runmill-error.js";
+import { snapshotHash } from "../domain/snapshot.js";
 
 export interface LinearAdapterOptions {
   readonly apiKey: string;
@@ -29,7 +31,7 @@ function toIsoString(value: Date | string | null | undefined): string | undefine
 }
 
 function isRateLimit(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err);
+  const message = errorMessage(err);
   return /rate limit|429|too many requests/i.test(message);
 }
 
@@ -46,13 +48,15 @@ export class LinearBacklogAdapter implements BacklogAdapter {
   readonly name = "linear";
   readonly #client: LinearClient;
   readonly #pageSize: number;
+  /** Workflow states are stable for a run; re-querying them per transition is waste. */
+  readonly #stateIds = new Map<string, string>();
 
   constructor(options: LinearAdapterOptions) {
     this.#client = new LinearClient({ apiKey: options.apiKey });
     this.#pageSize = options.pageSize ?? 100;
   }
 
-  async #wrap<T>(operation: string, fn: () => Promise<T>): Promise<T> {
+  async #wrap<T>(fn: () => Promise<T>): Promise<T> {
     try {
       return await fn();
     } catch (err) {
@@ -65,7 +69,7 @@ export class LinearBacklogAdapter implements BacklogAdapter {
     team: string;
     states: readonly string[];
   }): Promise<BacklogIssue[]> {
-    return this.#wrap("listCandidates", async () => {
+    return this.#wrap(async () => {
       const connection = await this.#client.issues({
         first: this.#pageSize,
         filter: {
@@ -74,16 +78,16 @@ export class LinearBacklogAdapter implements BacklogAdapter {
         },
       });
 
-      const issues: BacklogIssue[] = [];
-      for (const node of connection.nodes) {
-        issues.push(await this.#hydrate(node as unknown as RawIssueShape, node));
-      }
-      return issues;
+      // Hydrating serially made this ~100 sequential round-trip chains
+      // against a rate-limited API; the request count is the same either way.
+      return Promise.all(
+        connection.nodes.map((node) => this.#hydrate(node as unknown as RawIssueShape, node)),
+      );
     });
   }
 
   async getIssue(identifier: string): Promise<BacklogIssue | undefined> {
-    return this.#wrap("getIssue", async () => {
+    return this.#wrap(async () => {
       const connection = await this.#client.issues({
         first: 1,
         filter: { number: { eq: Number(identifier.split("-")[1] ?? "0") } },
@@ -118,10 +122,10 @@ export class LinearBacklogAdapter implements BacklogAdapter {
     const blockedBy: string[] = [];
     try {
       const relations = await issueNode.inverseRelations?.();
-      for (const relation of relations?.nodes ?? []) {
-        if (relation.type !== "blocks") continue;
-        const related = await relation.issue;
-        if (related?.identifier !== undefined) blockedBy.push(related.identifier);
+      const blocking = (relations?.nodes ?? []).filter((r) => r.type === "blocks");
+      const related = await Promise.all(blocking.map((r) => r.issue));
+      for (const issue of related) {
+        if (issue?.identifier !== undefined) blockedBy.push(issue.identifier);
       }
     } catch {
       // Relations are paginated and rate-limited; an unavailable relation set
@@ -151,6 +155,10 @@ export class LinearBacklogAdapter implements BacklogAdapter {
   }
 
   async #findStateId(teamKey: string, stateName: string): Promise<string> {
+    const cacheKey = `${teamKey}:${stateName}`;
+    const cached = this.#stateIds.get(cacheKey);
+    if (cached !== undefined) return cached;
+
     const states = await this.#client.workflowStates({
       first: 100,
       filter: { team: { key: { eq: teamKey } }, name: { eq: stateName } },
@@ -159,6 +167,7 @@ export class LinearBacklogAdapter implements BacklogAdapter {
     if (id === undefined) {
       throw new Error(`workflow state "${stateName}" not found for team ${teamKey}`);
     }
+    this.#stateIds.set(cacheKey, id);
     return id;
   }
 
@@ -215,17 +224,6 @@ export class LinearBacklogAdapter implements BacklogAdapter {
    * currently holds.
    */
   snapshotHash(issue: BacklogIssue): string {
-    return createHash("sha256")
-      .update(
-        JSON.stringify({
-          title: issue.title,
-          description: issue.description,
-          labels: [...issue.labels].sort(),
-          state: issue.state,
-          priority: issue.priority,
-        }),
-      )
-      .digest("hex")
-      .slice(0, 16);
+    return snapshotHash(issue);
   }
 }

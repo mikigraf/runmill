@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
 import { RunmillError } from "../errors/runmill-error.js";
+import { armKillTimer } from "../platform/process.js";
 
 export type SandboxMechanism = "seatbelt" | "bubblewrap" | "none";
 
@@ -73,6 +74,14 @@ const ENV_DENYLIST = [
   "GIT_ASKPASS",
   "SSH_ASKPASS",
 ];
+
+/**
+ * Output retained per stream.
+ *
+ * The detectors (zero-tests, focused execution, skip counts) all read summary
+ * lines at the tail, so the tail is what is kept.
+ */
+const MAX_CAPTURED_OUTPUT = 512 * 1024;
 
 /** Paths denied inside the sandbox regardless of policy. */
 const CREDENTIAL_PATHS = [
@@ -205,6 +214,62 @@ export class Sandbox {
     return this.#mechanism;
   }
 
+  /**
+   * Wrap a command in this platform's sandbox.
+   *
+   * The single primitive every child process goes through. Returns the
+   * rewritten command plus a cleanup handle for the generated profile.
+   */
+  wrap(input: {
+    command: string;
+    args: readonly string[];
+    cwd: string;
+    policy: SandboxPolicy;
+    env?: Readonly<Record<string, string>> | undefined;
+  }): {
+    command: string;
+    args: string[];
+    cwd: string;
+    env: Record<string, string>;
+    cleanup: () => void;
+  } {
+    if (this.#mechanism === "none") {
+      throw RunmillError.fromCatalog("RM-SANDBOX-001", {
+        whatHappened: `No sandbox mechanism available on ${platform()}.`,
+      });
+    }
+
+    const home = process.env["HOME"] ?? tmpdir();
+    const env = buildEnvironment(input.env);
+    const policy: SandboxPolicy = {
+      ...input.policy,
+      writablePaths: input.policy.writablePaths.map(realPath),
+      readablePaths: (input.policy.readablePaths ?? []).map(realPath),
+    };
+    const cwd = realPath(input.cwd);
+
+    if (this.#mechanism === "seatbelt") {
+      const profileDir = mkdtempSync(join(tmpdir(), "runmill-sb-"));
+      const profile = join(profileDir, "policy.sb");
+      writeFileSync(profile, buildSeatbeltProfile(policy, home));
+      return {
+        command: "/usr/bin/sandbox-exec",
+        args: ["-f", profile, input.command, ...input.args],
+        cwd,
+        env,
+        cleanup: () => rmSync(profileDir, { recursive: true, force: true }),
+      };
+    }
+
+    return {
+      command: "bwrap",
+      args: [...buildBubblewrapArgs(policy, home), input.command, ...input.args],
+      cwd,
+      env,
+      cleanup: () => undefined,
+    };
+  }
+
   async run(input: SandboxRunInput): Promise<SandboxResult> {
     if (this.#mechanism === "none") {
       throw RunmillError.fromCatalog("RM-SANDBOX-001", {
@@ -269,34 +334,28 @@ export class Sandbox {
         stdio: ["ignore", "pipe", "pipe"],
       });
 
+      // Bounded: a check emitting hundreds of megabytes would otherwise be
+      // retained in full, to run three regexes over its tail.
       let stdout = "";
       let stderr = "";
       let timedOut = false;
 
-      child.stdout?.on("data", (c: Buffer) => (stdout += c.toString()));
-      child.stderr?.on("data", (c: Buffer) => (stderr += c.toString()));
-
-      const killTree = (signal: NodeJS.Signals): void => {
-        if (child.pid === undefined) return;
-        try {
-          process.kill(-child.pid, signal);
-        } catch {
-          try {
-            child.kill(signal);
-          } catch {
-            /* already gone */
-          }
-        }
+      const append = (buffer: string, chunk: Buffer): string => {
+        const next = buffer + chunk.toString();
+        return next.length <= MAX_CAPTURED_OUTPUT
+          ? next
+          : `[...truncated...]\n${next.slice(next.length - MAX_CAPTURED_OUTPUT)}`;
       };
 
-      const timer = setTimeout(() => {
+      child.stdout?.on("data", (c: Buffer) => (stdout = append(stdout, c)));
+      child.stderr?.on("data", (c: Buffer) => (stderr = append(stderr, c)));
+
+      const cancelTimer = armKillTimer(child, input.timeoutMs, () => {
         timedOut = true;
-        killTree("SIGTERM");
-        setTimeout(() => killTree("SIGKILL"), 2_000).unref();
-      }, input.timeoutMs);
+      });
 
       child.on("error", (err) => {
-        clearTimeout(timer);
+        cancelTimer();
         resolve({
           outcome: "sandbox-denied",
           exitCode: null,
@@ -308,7 +367,7 @@ export class Sandbox {
       });
 
       child.on("close", (code, signal) => {
-        clearTimeout(timer);
+        cancelTimer();
         resolve({
           outcome: timedOut ? "timeout" : signal !== null ? "signaled" : "exited",
           exitCode: code,

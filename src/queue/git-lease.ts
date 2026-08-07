@@ -1,8 +1,5 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import type { Clock } from "../platform/clock.js";
-
-const run = promisify(execFile);
+import { git } from "../platform/git.js";
 
 /**
  * Distributed lease built on an atomic git ref.
@@ -84,21 +81,7 @@ export class GitRefLease {
   }
 
   async #git(...args: string[]): Promise<string> {
-    const { stdout } = await run("git", args, {
-      cwd: this.#opts.cwd,
-      env: {
-        ...process.env,
-        GIT_AUTHOR_NAME: "runmill",
-        GIT_AUTHOR_EMAIL: "runmill@localhost",
-        GIT_COMMITTER_NAME: "runmill",
-        GIT_COMMITTER_EMAIL: "runmill@localhost",
-        // Deterministic object ids for a given record + clock, which keeps
-        // tests reproducible and makes the ref content auditable.
-        GIT_AUTHOR_DATE: "1970-01-01T00:00:00Z",
-        GIT_COMMITTER_DATE: "1970-01-01T00:00:00Z",
-      },
-    });
-    return stdout.trim();
+    return git(this.#opts.cwd, args, { runmillIdentity: true });
   }
 
   /** Build the orphan commit whose message carries the lease record. */

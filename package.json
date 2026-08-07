@@ -27,10 +27,8 @@
   "dependencies": {
     "@linear/sdk": "^39.0.0",
     "@octokit/rest": "^21.1.1",
-    "ajv": "^8.17.1",
     "better-sqlite3": "^11.8.1",
     "commander": "^13.1.0",
-    "execa": "^9.5.2",
     "yaml": "^2.7.0",
     "zod": "^4.4.3"
   },

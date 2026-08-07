@@ -40,26 +40,26 @@ function createdAtSortKey(issue: BacklogIssue): number {
  *   4. oldest creation timestamp
  *   5. stable identifier
  */
+/**
+ * Comparison by ordering, not subtraction.
+ *
+ * Subtraction is what forced the Infinity special-casing this replaces:
+ * `Infinity - Infinity` is NaN, so every key that uses Infinity as its
+ * "absent" sentinel needed a guard. Comparing directly handles it by
+ * construction, and adding a tiebreaker becomes one line.
+ */
+function cmp(x: number | string, y: number | string): number {
+  return x === y ? 0 : x < y ? -1 : 1;
+}
+
 export function compareIssues(a: BacklogIssue, b: BacklogIssue): number {
-  const byPriority = prioritySortKey(a.priority) - prioritySortKey(b.priority);
-  if (byPriority !== 0) return byPriority;
-
-  const byDueDate = dueDateSortKey(a) - dueDateSortKey(b);
-  if (byDueDate !== 0 && Number.isFinite(byDueDate)) return byDueDate;
-  if (dueDateSortKey(a) !== dueDateSortKey(b)) {
-    return dueDateSortKey(a) === Number.POSITIVE_INFINITY ? 1 : -1;
-  }
-
-  const byRank = manualRankSortKey(a) - manualRankSortKey(b);
-  if (byRank !== 0 && Number.isFinite(byRank)) return byRank;
-  if (manualRankSortKey(a) !== manualRankSortKey(b)) {
-    return manualRankSortKey(a) === Number.POSITIVE_INFINITY ? 1 : -1;
-  }
-
-  const byCreatedAt = createdAtSortKey(a) - createdAtSortKey(b);
-  if (byCreatedAt !== 0 && Number.isFinite(byCreatedAt)) return byCreatedAt;
-
-  return a.identifier < b.identifier ? -1 : a.identifier > b.identifier ? 1 : 0;
+  return (
+    cmp(prioritySortKey(a.priority), prioritySortKey(b.priority)) ||
+    cmp(dueDateSortKey(a), dueDateSortKey(b)) ||
+    cmp(manualRankSortKey(a), manualRankSortKey(b)) ||
+    cmp(createdAtSortKey(a), createdAtSortKey(b)) ||
+    cmp(a.identifier, b.identifier)
+  );
 }
 
 /** Returns a new ordered array. Never mutates the input. */

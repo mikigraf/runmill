@@ -1,10 +1,9 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { git as runGit } from "../platform/git.js";
+import { run } from "../platform/process.js";
 
-const run = promisify(execFile);
 
 export type GitIsolation = "clone" | "separate-git-dir";
 
@@ -28,8 +27,7 @@ export interface CreateWorkspaceInput {
 }
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
-  const { stdout } = await run("git", args, { cwd });
-  return stdout.trim();
+  return runGit(cwd, args);
 }
 
 /**

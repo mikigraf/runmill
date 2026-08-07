@@ -1,8 +1,6 @@
 import { spawn } from "node:child_process";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type {
   AgentRunRequest,
   AgentRunResult,
@@ -17,15 +15,17 @@ import type { AgentEvent, AgentEventBody } from "./events.js";
 import { UnknownEventError } from "./events.js";
 import type { Clock } from "../platform/clock.js";
 import { SystemClock } from "../platform/clock.js";
-import { buildEnvironment } from "../workspace/sandbox.js";
-
-const runFile = promisify(execFile);
+import { Sandbox } from "../workspace/sandbox.js";
+import { run, killTree, armKillTimer } from "../platform/process.js";
+import { outputPathFor, outputContractFor } from "./output-contract.js";
 
 /** Maps one provider's native JSON line onto the normalized union. */
 export interface ProviderDialect {
   readonly name: string;
   readonly binary: string;
   readonly versionArgs: readonly string[];
+  /** Per-dialect facts. Keeps the adapter from switching on a provider name. */
+  readonly capabilities: ProviderCapabilities;
   authArgs(): readonly string[];
   isAuthenticated(stdout: string, stderr: string, code: number | null): boolean;
   buildArgs(request: AgentRunRequest, prompt: string): readonly string[];
@@ -33,10 +33,22 @@ export interface ProviderDialect {
   mapLine(line: unknown): AgentEventBody | undefined;
 }
 
+const BASE_CAPABILITIES: ProviderCapabilities = {
+  streamingOutput: true,
+  sessionResume: false,
+  turnLimits: true,
+  toolAllowDeny: true,
+  sandboxMode: true,
+  modelSelection: true,
+  costReporting: false,
+  structuredOutput: true,
+};
+
 export const CODEX_DIALECT: ProviderDialect = {
   name: "codex",
   binary: "codex",
   versionArgs: ["--version"],
+  capabilities: BASE_CAPABILITIES,
   authArgs: () => ["login", "status"],
   isAuthenticated: (stdout, stderr, code) =>
     code === 0 && !/not logged in|unauthenticated/i.test(`${stdout}${stderr}`),
@@ -73,6 +85,7 @@ export const CLAUDE_DIALECT: ProviderDialect = {
   name: "claude",
   binary: "claude",
   versionArgs: ["--version"],
+  capabilities: { ...BASE_CAPABILITIES, sessionResume: true, costReporting: true },
   authArgs: () => ["-p", "ping", "--max-turns", "1"],
   isAuthenticated: (stdout, stderr, code) =>
     code === 0 || !/not logged in|authentication|api key/i.test(`${stdout}${stderr}`),
@@ -114,6 +127,15 @@ export const CLAUDE_DIALECT: ProviderDialect = {
           status: l.is_error === true ? "failure" : "success",
           outputRef: "",
         };
+      case "usage":
+        return {
+          type: "usage.updated",
+          cumulative: true,
+          inputTokens: l.usage?.input_tokens ?? 0,
+          outputTokens: l.usage?.output_tokens ?? 0,
+          model: "claude",
+          costUsd: l.total_cost_usd,
+        };
       default:
         return undefined;
     }
@@ -124,6 +146,7 @@ export interface CliProviderOptions {
   readonly dialect: ProviderDialect;
   readonly clock?: Clock | undefined;
   readonly promptBuilder?: ((request: AgentRunRequest) => string) | undefined;
+  readonly sandbox?: Sandbox | undefined;
 }
 
 /**
@@ -138,11 +161,24 @@ export class CliProviderAdapter implements CodingAgentAdapter {
   readonly #dialect: ProviderDialect;
   readonly #clock: Clock;
   readonly #promptBuilder: (request: AgentRunRequest) => string;
+  readonly #sandbox: Sandbox;
 
   constructor(options: CliProviderOptions) {
     this.#dialect = options.dialect;
     this.#clock = options.clock ?? new SystemClock();
     this.#promptBuilder = options.promptBuilder ?? defaultPrompt;
+    this.#sandbox = options.sandbox ?? new Sandbox();
+  }
+
+  /**
+   * The provider's own credential and config directory.
+   *
+   * Readable by necessity: the CLI cannot authenticate without it. This is
+   * the one credential inside the boundary, and it is scoped to the provider.
+   */
+  #providerHome(): string[] {
+    const home = process.env["HOME"];
+    return home === undefined ? [] : [join(home, `.${this.#dialect.name}`)];
   }
 
   get name(): string {
@@ -150,41 +186,20 @@ export class CliProviderAdapter implements CodingAgentAdapter {
   }
 
   async detect(): Promise<ProviderInstallation> {
-    try {
-      const { stdout } = await runFile(this.#dialect.binary, [...this.#dialect.versionArgs]);
-      return { installed: true, version: stdout.trim().split("\n")[0] ?? stdout.trim() };
-    } catch {
-      return { installed: false };
-    }
+    const result = await run(this.#dialect.binary, this.#dialect.versionArgs);
+    if (!result.ok) return { installed: false };
+    const version = result.stdout.trim();
+    return { installed: true, version: version.split("\n")[0] ?? version };
   }
 
   async authStatus(): Promise<AuthStatus> {
-    try {
-      const { stdout, stderr } = await runFile(this.#dialect.binary, [
-        ...this.#dialect.authArgs(),
-      ]);
-      const ok = this.#dialect.isAuthenticated(stdout, stderr, 0);
-      return ok ? { authenticated: true } : { authenticated: false, detail: stderr.trim() };
-    } catch (err) {
-      const e = err as { stdout?: string; stderr?: string; code?: number };
-      const ok = this.#dialect.isAuthenticated(e.stdout ?? "", e.stderr ?? "", e.code ?? 1);
-      return ok
-        ? { authenticated: true }
-        : { authenticated: false, detail: (e.stderr ?? "").trim() };
-    }
+    const result = await run(this.#dialect.binary, this.#dialect.authArgs());
+    const ok = this.#dialect.isAuthenticated(result.stdout, result.stderr, result.code);
+    return ok ? { authenticated: true } : { authenticated: false, detail: result.stderr.trim() };
   }
 
   async capabilities(): Promise<ProviderCapabilities> {
-    return {
-      streamingOutput: true,
-      sessionResume: this.#dialect.name === "claude",
-      turnLimits: true,
-      toolAllowDeny: true,
-      sandboxMode: true,
-      modelSelection: true,
-      costReporting: this.#dialect.name === "claude",
-      structuredOutput: true,
-    };
+    return this.#dialect.capabilities;
   }
 
   async resume(request: AgentRunRequest & { sessionId: string }): Promise<AgentSession> {
@@ -218,40 +233,45 @@ export class CliProviderAdapter implements CodingAgentAdapter {
       if (body.type === "session.started") sessionIdResolve(sessionId);
     };
 
-    const child = spawn(this.#dialect.binary, [...args], {
+    // The agent is the untrusted party, so it runs under the same sandbox
+    // primitive as the check runner. Previously only checks were isolated
+    // while the agent itself ran unconfined — the inverse of the intent.
+    const wrapped = this.#sandbox.wrap({
+      command: this.#dialect.binary,
+      args,
       cwd: request.workingDirectory,
-      env: buildEnvironment({}, process.env),
+      policy: {
+        writablePaths: [request.workingDirectory],
+        // The provider needs its own credential file and its API endpoint;
+        // everything else stays denied.
+        readablePaths: this.#providerHome(),
+        allowNetwork: request.network !== "none",
+      },
+    });
+
+    const child = spawn(wrapped.command, wrapped.args, {
+      cwd: wrapped.cwd,
+      env: wrapped.env,
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    const killTree = (signal: NodeJS.Signals): void => {
-      if (child.pid === undefined) return;
-      try {
-        process.kill(-child.pid, signal);
-      } catch {
-        try {
-          child.kill(signal);
-        } catch {
-          /* already gone */
-        }
-      }
-    };
-
     // Cancellation works even before session.started arrives, because the
     // process handle is captured here rather than derived from a session id.
-    request.signal?.addEventListener("abort", () => killTree("SIGTERM"), { once: true });
+    request.signal?.addEventListener("abort", () => killTree(child, "SIGTERM"), { once: true });
 
-    const timer = setTimeout(() => {
-      killTree("SIGTERM");
-      setTimeout(() => killTree("SIGKILL"), 2_000).unref();
-    }, request.timeoutMs);
+    const cancelTimer = armKillTimer(child, request.timeoutMs);
 
+    // Only ever read by two regexes; a two-hour chatty session should not
+    // retain every byte to answer them.
+    const MAX_STDERR = 64 * 1024;
     let stderr = "";
     let buffer = "";
     let parseError: Error | undefined;
 
-    child.stderr?.on("data", (c: Buffer) => (stderr += c.toString()));
+    child.stderr?.on("data", (c: Buffer) => {
+      stderr = (stderr + c.toString()).slice(-MAX_STDERR);
+    });
     child.stdout?.on("data", (chunk: Buffer) => {
       buffer += chunk.toString();
       const lines = buffer.split("\n");
@@ -277,7 +297,8 @@ export class CliProviderAdapter implements CodingAgentAdapter {
 
     const result = new Promise<AgentRunResult>((resolve) => {
       child.on("error", (err) => {
-        clearTimeout(timer);
+        cancelTimer();
+        wrapped.cleanup();
         sessionIdResolve(sessionId);
         resolve({
           status: "failure",
@@ -290,7 +311,8 @@ export class CliProviderAdapter implements CodingAgentAdapter {
       });
 
       child.on("close", (code, signal) => {
-        clearTimeout(timer);
+        cancelTimer();
+        wrapped.cleanup();
         sessionIdResolve(sessionId);
 
         if (parseError !== undefined) {
@@ -303,16 +325,12 @@ export class CliProviderAdapter implements CodingAgentAdapter {
           return;
         }
 
-        // Structured output, when the role requires it, is written by the
-        // agent to a path the orchestrator names. Its absence is a failure.
+        // Structured output is resolved from the shared role contract, not
+        // from a per-request flag: the contract is the single definition of
+        // which roles produce output and where it lands.
         let outputRef: string | undefined;
-        if (request.outputSchema !== undefined) {
-          const expected = join(
-            request.workingDirectory,
-            ".runmill",
-            "run",
-            `${request.role}-output.json`,
-          );
+        const expected = outputPathFor(request.workingDirectory, request.role);
+        if (expected !== undefined) {
           try {
             readFileSync(expected, "utf8");
             outputRef = expected;
@@ -351,7 +369,7 @@ export class CliProviderAdapter implements CodingAgentAdapter {
         // mid-run request is not expected. Nothing to answer.
       },
       abort: async () => {
-        killTree("SIGTERM");
+        killTree(child, "SIGTERM");
       },
     };
   }
@@ -377,6 +395,7 @@ function isRetryable(stderr: string): boolean {
  * copy that drifts.
  */
 export function defaultPrompt(request: AgentRunRequest): string {
+  const contract = outputContractFor(request.role);
   const roleInstruction: Record<string, string> = {
     implementer:
       "Implement the task described in the task packet. Stay strictly within its scope.",
@@ -402,18 +421,12 @@ export function defaultPrompt(request: AgentRunRequest): string {
     `You may edit: ${request.allowedPaths.join(", ")}`,
     `You may NOT edit: ${request.forbiddenPaths.join(", ")}`,
     "Do not commit. Do not push. The orchestrator owns git history.",
+    ...(contract === undefined
+      ? []
+      : [
+          "",
+          `Write your structured output as JSON to .runmill/run/${contract.fileName}`,
+          `It must satisfy the ${contract.schema} schema. Malformed output is not a pass.`,
+        ]),
   ].join("\n");
-}
-
-/** Write structured output where the orchestrator expects to find it. */
-export function outputPathFor(workingDirectory: string, role: string): string {
-  const path = join(workingDirectory, ".runmill", "run", `${role}-output.json`);
-  mkdirSync(dirname(path), { recursive: true });
-  return path;
-}
-
-export function writeStructuredOutput(workingDirectory: string, role: string, data: unknown): string {
-  const path = outputPathFor(workingDirectory, role);
-  writeFileSync(path, JSON.stringify(data, null, 2));
-  return path;
 }

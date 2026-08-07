@@ -3,7 +3,7 @@ import { Command } from "commander";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { loadConfig, parseConfig, validateConfig } from "../config/load.js";
-import { RunmillError, renderError } from "../errors/runmill-error.js";
+import { RunmillError, renderError , errorMessage } from "../errors/runmill-error.js";
 import { runAllChecks, worstStatus } from "../doctor/checks.js";
 import { renderDoctor, renderSelection } from "./render.js";
 import { selectNext } from "../queue/selector.js";
@@ -34,8 +34,7 @@ interface GlobalOpts {
 
 function findConfigPath(explicit: string | undefined, repoRoot: string): string {
   if (explicit !== undefined) return resolve(explicit);
-  const local = resolve(repoRoot, "runmill.yaml");
-  return local;
+  return resolve(repoRoot, "runmill.yaml");
 }
 
 function loadOrExit(opts: GlobalOpts, repoRoot: string): { config: RunmillConfig; path: string } {
@@ -60,7 +59,7 @@ function fail(err: unknown, opts: GlobalOpts): never {
     }
     process.exit(err.code.startsWith("RM-CONFIG") ? EXIT.configInvalid : EXIT.failed);
   }
-  process.stderr.write(`${String(err instanceof Error ? err.message : err)}\n`);
+  process.stderr.write(`${errorMessage(err)}\n`);
   process.exit(EXIT.failed);
 }
 
@@ -72,12 +71,12 @@ function fail(err: unknown, opts: GlobalOpts): never {
  * substitutes only appear under an explicit RUNMILL_DEMO=1, and which ones are
  * live is reported to the operator rather than inferred.
  */
-async function buildOrchestrator(
+function buildOrchestrator(
   cfg: RunmillConfig,
   adapters: AdapterSet,
   store: StateStore,
   opts: GlobalOpts,
-): Promise<{ orchestrator: Orchestrator; lease: (runId: string) => GitRefLease }> {
+): { orchestrator: Orchestrator; lease: (runId: string) => GitRefLease } {
   const sourceRepo = process.env["RUNMILL_SOURCE_REPO"] ?? process.cwd();
   const clock = new SystemClock();
 
@@ -237,7 +236,7 @@ export function buildProgram(): Command {
             process.exit(EXIT.ok);
           }
 
-          const { orchestrator, lease } = await buildOrchestrator(cfg, adapters, store, opts);
+          const { orchestrator, lease } = buildOrchestrator(cfg, adapters, store, opts);
           const runId = `run_${Date.now().toString(36)}`;
           const outcome = await orchestrator.run({
             runId,
@@ -326,7 +325,7 @@ export function buildProgram(): Command {
             });
             if (selection.selected === undefined) return undefined;
 
-            const { orchestrator, lease } = await buildOrchestrator(cfg, adapters, store, opts);
+            const { orchestrator, lease } = buildOrchestrator(cfg, adapters, store, opts);
             const runId = `run_${Date.now().toString(36)}`;
             return orchestrator.run({
               runId,

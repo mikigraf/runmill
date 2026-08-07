@@ -1,10 +1,7 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir, homedir, platform } from "node:os";
 import { join } from "node:path";
-
-const run = promisify(execFile);
+import { run } from "../platform/process.js";
 
 export type CheckStatus = "pass" | "warn" | "fail";
 
@@ -23,13 +20,11 @@ export interface DoctorContext {
 }
 
 async function tryRun(cmd: string, args: string[], cwd?: string): Promise<{ ok: boolean; out: string }> {
-  try {
-    const { stdout } = await run(cmd, args, cwd === undefined ? {} : { cwd });
-    return { ok: true, out: stdout.trim() };
-  } catch (err) {
-    const e = err as { stdout?: string; stderr?: string; message?: string };
-    return { ok: false, out: (e.stderr ?? e.stdout ?? e.message ?? "").trim() };
-  }
+  const result = await run(cmd, args, cwd === undefined ? {} : { cwd });
+  return {
+    ok: result.ok,
+    out: (result.ok ? result.stdout : result.stderr || result.stdout).trim(),
+  };
 }
 
 export async function checkGit(): Promise<CheckResult> {
@@ -55,17 +50,8 @@ export async function checkRepository(ctx: DoctorContext): Promise<CheckResult> 
 }
 
 export async function checkGitHubCli(): Promise<CheckResult> {
-  const present = await tryRun("gh", ["--version"]);
-  if (!present.ok) {
-    return {
-      id: "github-auth",
-      status: "fail",
-      code: "RM-AUTH-003",
-      observed: "gh not installed",
-      expected: "authenticated gh, or a GitHub App token",
-      remediation: "Install the GitHub CLI, then run: gh auth login",
-    };
-  }
+  // `gh auth status` already fails informatively when gh is absent, so a
+  // separate presence probe would just be one more spawn.
   const auth = await tryRun("gh", ["auth", "status"]);
   return {
     id: "github-auth",
@@ -222,14 +208,16 @@ export async function runAllChecks(
   ctx: DoctorContext,
   providerImplementation = "codex",
 ): Promise<CheckResult[]> {
-  const results: CheckResult[] = [];
-  results.push(checkCiEnvironment());
-  results.push(await checkGit());
-  results.push(await checkRepository(ctx));
-  results.push(await checkGitHubCli());
-  results.push(await checkProvider(providerImplementation));
-  results.push(...(await checkSandbox()));
-  return results;
+  // Every probe is independent, so wall time is the slowest one rather than
+  // the sum. Promise.all preserves order, so the rendered output is identical.
+  const [git, repository, github, provider, sandbox] = await Promise.all([
+    checkGit(),
+    checkRepository(ctx),
+    checkGitHubCli(),
+    checkProvider(providerImplementation),
+    checkSandbox(),
+  ]);
+  return [checkCiEnvironment(), git, repository, github, provider, ...sandbox];
 }
 
 export function worstStatus(results: readonly CheckResult[]): CheckStatus {

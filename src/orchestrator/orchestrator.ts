@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import type { BacklogAdapter } from "../backlog/adapter.js";
 import type { CodingAgentAdapter } from "../agent/adapter.js";
 import type { ForgeAdapter } from "../pr/adapter.js";
@@ -14,8 +14,9 @@ import { parseReviewJson, blockingFindings, crossCheckVerdict, type Review } fro
 import { reconcileChecks, summarize, type CheckMapping } from "../pr/reconcile.js";
 import { GitRefLease, type HeldLease } from "../queue/git-lease.js";
 import { accumulateUsage } from "../agent/events.js";
-import { RunmillError } from "../errors/runmill-error.js";
+import { RunmillError , errorMessage } from "../errors/runmill-error.js";
 import { renderPullRequestBody } from "./pr-body.js";
+import { outputContractFor } from "../agent/output-contract.js";
 
 export type RunState =
   | "DISCOVERED"
@@ -125,7 +126,7 @@ export class Orchestrator {
     } catch (err) {
       // Failure does not prove the effect did not land; the row stays pending
       // so the recovery sweep reconciles it against the remote.
-      this.#d.store.failSideEffect(key, String(err instanceof Error ? err.message : err));
+      this.#d.store.failSideEffect(key, errorMessage(err));
       throw err;
     }
   }
@@ -171,6 +172,13 @@ export class Orchestrator {
       this.#advance(runId, "ELIGIBILITY_CHECKED");
 
       // -- claim ---------------------------------------------------------
+      // observe performs no remote mutation at all, and acquiring the lease is
+      // a `git push` of a new ref. Bail before it rather than after.
+      if (cfg.autonomy === "observe") {
+        this.#log("observe mode: selection only, no lease and no repository mutation");
+        return finish("COMPLETED", { reason: "observe mode" });
+      }
+
       held = await input.lease.acquire(issue.identifier, {
         priorStateId: issue.state,
         ...(issue.assigneeId === undefined ? {} : { priorAssigneeId: issue.assigneeId }),
@@ -185,14 +193,12 @@ export class Orchestrator {
       });
       this.#advance(runId, "CLAIMED");
 
-      if (cfg.autonomy !== "observe") {
-        await this.#withOutbox(runId, "backlog", "transition-claim", issue.identifier, () =>
-          this.#d.backlog.transitionState({
-            identifier: issue.identifier,
-            toState: cfg.backlog.claimState,
-          }),
-        );
-      }
+      await this.#withOutbox(runId, "backlog", "transition-claim", issue.identifier, () =>
+        this.#d.backlog.transitionState({
+          identifier: issue.identifier,
+          toState: cfg.backlog.claimState,
+        }),
+      );
 
       // -- workspace -----------------------------------------------------
       const branch = cfg.github.branchTemplate
@@ -238,14 +244,10 @@ export class Orchestrator {
       writeFileSync(join(workspace.path, ".runmill", "run", "issue.md"), renderIssueDocument(issue));
       this.#advance(runId, "TASK_PACKET_READY");
 
-      if (cfg.autonomy === "observe") {
-        this.#log("observe mode: planning only, no repository mutation");
-        return finish("COMPLETED", { reason: "observe mode" });
-      }
-
       // -- implement / verify / review loop -------------------------------
       let review: Review | undefined;
       let candidateSha = workspace.baseCommit;
+      let verificationResults: readonly { checkId: string; status: string }[] = [];
 
       for (let iteration = 0; iteration <= cfg.review.maxFixIterations; iteration += 1) {
         const role = iteration === 0 ? "implementer" : "fixer";
@@ -284,17 +286,17 @@ export class Orchestrator {
         // -- verify ------------------------------------------------------
         this.#advance(runId, "LOCAL_VERIFY");
         const changed = await this.#workspaces.changedFiles(workspace);
-        const iterationManifest = resolveManifest({
-          configured: this.#d.checks,
-          changedPaths: changed,
-        });
         const verification = await this.#verification.run({
           workspace,
           workspaces: this.#workspaces,
-          manifest: iterationManifest,
+          manifest: resolveManifest({ configured: this.#d.checks, changedPaths: changed }),
           candidateSha,
         });
 
+        verificationResults = verification.results.map((r) => ({
+          checkId: r.checkId,
+          status: `${r.status} (${r.coverage})`,
+        }));
         for (const result of verification.results) {
           this.#log(`  check ${result.checkId}: ${result.status} (${result.coverage})`);
         }
@@ -333,9 +335,7 @@ export class Orchestrator {
             runId,
           });
         }
-        review = parseReviewJson(
-          await import("node:fs").then((fs) => fs.readFileSync(reviewResult.outputRef as string, "utf8")),
-        );
+        review = parseReviewJson(readFileSync(reviewResult.outputRef, "utf8"));
 
         const cross = crossCheckVerdict(review, changed, cfg.risk.manualApproval.paths);
         if (!cross.accepted) {
@@ -374,7 +374,7 @@ export class Orchestrator {
             review: review as Review,
             runId,
             provider: cfg.provider.implementation,
-            checks: [],
+            checks: verificationResults.map((r) => ({ id: r.checkId, status: r.status })),
           }),
           draft: cfg.github.draftPr,
         }),
@@ -387,18 +387,34 @@ export class Orchestrator {
 
       // -- CI --------------------------------------------------------------
       this.#advance(runId, "CI_WAIT");
+      const ciWaitStartedMs = this.#d.clock.now().getTime();
       const protection = await this.#d.forge.getBranchProtection({
         repo: target.repo,
         branch: target.baseBranch,
       });
+
+      // Unreadable rules are not absent rules. A 403 on the protection
+      // endpoint is common (it needs admin), and treating the empty result as
+      // "nothing is required" would let a run sail through the merge gate on
+      // the strength of a permission error.
+      if (protection.unreadable) {
+        return finish("NEEDS_HUMAN", {
+          prNumber: pr.number,
+          prUrl: pr.url,
+          reason:
+            "branch protection could not be read, so required checks and approvals are " +
+            "unknown; refusing to treat unreadable rules as absent rules",
+        });
+      }
       const observed = await this.#d.forge.listChecks({ repo: target.repo, ref: pr.headSha });
       const verdicts = reconcileChecks({
         requiredContexts: protection.requiredChecks,
-        mappings: this.#d.checkMappings ?? [],
+        mappings: this.#d.checkMappings ?? defaultCheckMappings(protection.requiredChecks),
         observed,
         headSha: pr.headSha,
-        waitedMs: 0,
-        scheduleDeadlineMs: 0,
+        waitedMs: this.#d.clock.now().getTime() - ciWaitStartedMs,
+        scheduleDeadlineMs: CI_SCHEDULE_DEADLINE_MS,
+        ...(protection.usesMergeQueue ? { event: "merge_group" as const } : {}),
       });
       const ci = summarize(verdicts);
 
@@ -489,7 +505,7 @@ export class Orchestrator {
         mergeSha: merged.mergeSha,
       });
     } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
+      const reason = errorMessage(err);
       this.#log(`run failed: ${reason}`);
       return finish("QUARANTINED", { reason });
     } finally {
@@ -507,6 +523,20 @@ export class Orchestrator {
       }
     }
   }
+}
+
+/** Bound on how long a required check may go unscheduled before escalating. */
+const CI_SCHEDULE_DEADLINE_MS = 10 * 60_000;
+
+/**
+ * Identity mapping for required contexts with no explicit configuration.
+ *
+ * Without this every context is `unmapped` and fails closed, which makes any
+ * protected repository escalate on every run. An identity mapping is the
+ * honest default: the context name IS the check name until told otherwise.
+ */
+function defaultCheckMappings(contexts: readonly string[]): CheckMapping[] {
+  return contexts.map((context) => ({ localId: context, contextName: context }));
 }
 
 function slugify(text: string): string {

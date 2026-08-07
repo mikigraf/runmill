@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Sandbox } from "../workspace/sandbox.js";
 import type { WorkspaceManager, Workspace } from "../workspace/manager.js";
 import { RunmillError } from "../errors/runmill-error.js";
@@ -6,7 +7,7 @@ export interface CheckSpec {
   readonly id: string;
   readonly run: string;
   readonly required: boolean;
-  readonly source: "repository-policy" | "changed-path" | "label" | "risk" | "github" | "agent";
+  readonly source: "repository-policy" | "changed-path" | "github" | "agent";
   readonly report?: { readonly path: string; readonly format: string } | undefined;
   /** Test ids permitted to skip, with a stated cause. */
   readonly declaredSkips?: readonly { readonly testId: string; readonly cause: string }[] | undefined;
@@ -43,7 +44,6 @@ export interface ResolveManifestInput {
   readonly configured: readonly CheckSpec[];
   readonly changedPaths: readonly string[];
   readonly changedAreaRules?: Readonly<Record<string, { additionalChecks: readonly string[] }>> | undefined;
-  readonly labels?: readonly string[] | undefined;
   readonly githubRequired?: readonly string[] | undefined;
   readonly agentProposed?: readonly string[] | undefined;
 }
@@ -93,18 +93,11 @@ export interface RunChecksInput {
   readonly manifest: readonly CheckSpec[];
   readonly candidateSha: string;
   readonly timeoutMs?: number | undefined;
-  readonly sandbox?: Sandbox | undefined;
   readonly failOnMissingCheck?: boolean | undefined;
 }
 
 function hash(text: string): string {
-  // Small, dependency-free content hash for artifact identity.
-  let h = 0x811c9dc5;
-  for (let i = 0; i < text.length; i += 1) {
-    h ^= text.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(16).padStart(8, "0");
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
 
 const SKIP_PATTERNS = [

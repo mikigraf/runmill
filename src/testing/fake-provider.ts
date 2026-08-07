@@ -14,6 +14,7 @@ import type { AgentEvent, AgentEventBody } from "../agent/events.js";
 import { assertKnownEvent } from "../agent/events.js";
 import type { Clock } from "../platform/clock.js";
 import { SystemClock } from "../platform/clock.js";
+import { outputPathFor } from "../agent/output-contract.js";
 
 /** A scripted action the fake agent performs inside its workspace. */
 export type ScriptedAction =
@@ -223,10 +224,13 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
         costUsd: this.#script.costUsdPerCall ?? 0.01,
       });
 
+      // Same contract the real adapter uses, so a role that produces output
+      // in tests produces it in production and vice versa.
       const output = this.#script.outputByRole?.[request.role] ?? DEFAULT_OUTPUT[request.role];
+      const contractPath = outputPathFor(request.workingDirectory, request.role);
       let outputRef = "";
-      if (output !== undefined) {
-        outputRef = join(request.workingDirectory, ".runmill", "run", `${request.role}-output.json`);
+      if (output !== undefined && contractPath !== undefined) {
+        outputRef = contractPath;
         mkdirSync(dirname(outputRef), { recursive: true });
         writeFileSync(outputRef, JSON.stringify(output, null, 2));
       }
