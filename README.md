@@ -55,9 +55,31 @@ stopped: no-work
   spend:   $0.08
 ```
 
+## Install
+
+Not published to npm yet. Install from the clone:
+
+```bash
+cd runmill && npm install && npm link
+runmill --version
+```
+
+`npm link` puts `runmill` on your PATH pointing at your working copy; `npm unlink -g runmill`
+removes it. It builds first, so `dist/` is present.
+
+If that fails with `EACCES ... /usr/local/lib/node_modules` — the default npm prefix is root-owned
+on many macOS installs — point npm at a directory you own rather than reaching for `sudo`:
+
+```bash
+npm config set prefix ~/.npm-global
+export PATH="$HOME/.npm-global/bin:$PATH"   # add to your shell profile
+npm link
+```
+
 ## Use it on your own repository
 
 ```bash
+cd ~/your-repo
 runmill init      # writes runmill.yaml, the check manifest, and review skills
 runmill doctor    # verifies this host can run safely
 runmill next      # see what would be selected, and why everything else was not
