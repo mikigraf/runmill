@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, validateConfig, parseConfig } from "../../src/config/load.js";
@@ -49,8 +49,23 @@ describe("parseConfig", () => {
     const cfg = parseConfig(MINIMAL);
     expect(cfg.github.branchTemplate).toContain("{attempt}");
     expect(cfg.workspace.sandbox).toBe("native");
-    expect(cfg.workspace.gitIsolation).toBe("separate-git-dir");
+    expect(cfg.workspace.gitIsolation).toBe("clone");
     expect(cfg.budgets.maxAgentInvocations.total).toBeGreaterThan(0);
+  });
+
+  it("defaults git isolation to the mode WorkspaceManager considers safe", () => {
+    // These two defaults drifted apart: WorkspaceManager documents `clone` as
+    // the default and explains why (a linked worktree shares `.git` with the
+    // parent, so granting write access hands the agent `.git/hooks/pre-commit`
+    // and code execution in the orchestrator's context). parseConfig defaulted
+    // to `separate-git-dir` and the orchestrator passed it through, so the safe
+    // default never applied to a single real run.
+    const fromConfig = parseConfig(MINIMAL).workspace.gitIsolation;
+    expect(fromConfig).toBe("clone");
+
+    const manager = readFileSync("src/workspace/manager.ts", "utf8");
+    const managerDefault = manager.match(/input\.isolation \?\? "([a-z-]+)"/)?.[1];
+    expect(fromConfig, "config default must match WorkspaceManager's").toBe(managerDefault);
   });
 
   it("tolerates a yaml-language-server schema header", () => {

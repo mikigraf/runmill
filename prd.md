@@ -545,7 +545,7 @@ github:
 
 workspace:
   strategy: worktree
-  git_isolation: separate-git-dir # separate-git-dir | clone
+  git_isolation: clone            # clone | separate-git-dir
   sandbox: native                 # native | container | none
   # native -> Seatbelt (macOS) | bubblewrap (Linux). Resolved by `doctor`,
   # never chosen by the user. `doctor` fails closed if the resolved

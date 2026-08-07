@@ -109,7 +109,7 @@ describe("runmill config show", () => {
     const r = await cli(["--json", "config", "show"]);
     const cfg = JSON.parse(r.stdout) as Record<string, Record<string, unknown>>;
     expect(cfg["workspace"]?.["sandbox"]).toBe("native");
-    expect(cfg["workspace"]?.["gitIsolation"]).toBe("separate-git-dir");
+    expect(cfg["workspace"]?.["gitIsolation"]).toBe("clone");
     expect(String(cfg["github"]?.["branchTemplate"])).toContain("{attempt}");
   });
 });

@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { resolve, join } from "node:path";
+import { resolve, join, dirname } from "node:path";
 import { loadConfig, parseConfig, validateConfig } from "../config/load.js";
 import { RunmillError, renderError , errorMessage } from "../errors/runmill-error.js";
 import { runAllChecks, worstStatus } from "../doctor/checks.js";
@@ -18,6 +18,7 @@ import { registerExtraCommands } from "./extra-commands.js";
 import { EXPLANATIONS, buildSupportBundle } from "./explain.js";
 import { recordMilestone, recordDoctorFailure, readFunnel } from "../state/funnel.js";
 import type { CheckSpec } from "../verification/engine.js";
+import { loadChecksManifest, mergeCheckSources } from "../verification/manifest.js";
 import type { RunmillConfig } from "../config/types.js";
 
 const VERSION = "0.1.0";
@@ -84,13 +85,24 @@ function buildOrchestrator(
   const sourceRepo = process.env["RUNMILL_SOURCE_REPO"] ?? process.cwd();
   const clock = new SystemClock();
 
-  const checks: CheckSpec[] = cfg.verification.commands.map((c) => ({
+  const configured: CheckSpec[] = cfg.verification.commands.map((c) => ({
     id: c.id,
     run: c.run,
     required: true,
     source: "repository-policy" as const,
     report: c.report,
   }));
+
+  // The repository's own manifest is the primary source of checks; runmill.yaml
+  // adds any the repository has not adopted. Read from the base branch so a
+  // pull request cannot relax the checks that govern its own merge.
+  const baseRef = cfg.github.repositories[0]?.baseBranch;
+  const manifest = loadChecksManifest({
+    repoRoot: sourceRepo,
+    manifestPath: cfg.verification.manifest,
+    baseRef,
+  });
+  const checks = mergeCheckSources(manifest?.checks ?? [], configured);
 
   return {
     orchestrator: new Orchestrator({
@@ -456,20 +468,53 @@ export function buildProgram(): Command {
       const path = findConfigPath(opts.config, process.cwd());
       if (!existsSync(path)) {
         fail(
-          RunmillError.fromCatalog("RM-CONFIG-002", { whatHappened: `No config at ${path}` }),
+          RunmillError.fromCatalog("RM-CONFIG-003", { whatHappened: `No runmill.yaml at ${path}` }),
           opts,
         );
       }
       const parsed = parseConfig(readFileSync(path, "utf8"));
       const result = validateConfig(parsed);
-      if (result.valid) {
-        emit(opts, `✓ ${path} is valid`, { valid: true, path, errors: [] });
+
+      // The check manifest is configuration too, and it is the file the
+      // verification errors tell people to come back and fix. Validating one
+      // and not the other means `config validate` can say "valid" about a
+      // repository whose checks will not load.
+      const manifestErrors: string[] = [];
+      let manifestPath: string | undefined;
+      try {
+        const loaded = loadChecksManifest({
+          repoRoot: dirname(path),
+          manifestPath: parsed.verification.manifest,
+        });
+        if (loaded !== undefined) {
+          manifestPath = loaded.path;
+          if (loaded.checks.length === 0) {
+            manifestErrors.push(`${loaded.path}: declares no checks`);
+          }
+        }
+      } catch (err) {
+        // The detail IS the fix — "the manifest is invalid" without naming the
+        // offending check leaves the developer to bisect the file by hand.
+        manifestErrors.push(
+          err instanceof RunmillError
+            ? `${err.code}: ${err.whatHappened}`.split("\n").join("\n      ")
+            : errorMessage(err),
+        );
+      }
+
+      const errors = [...result.errors, ...manifestErrors];
+      if (errors.length === 0) {
+        emit(
+          opts,
+          `✓ ${path} is valid` + (manifestPath === undefined ? "" : `\n✓ ${manifestPath} is valid`),
+          { valid: true, path, manifest: manifestPath ?? null, errors: [] },
+        );
         process.exit(EXIT.ok);
       }
       emit(
         opts,
-        `✗ ${path}\n${result.errors.map((e) => `    - ${e}`).join("\n")}`,
-        { valid: false, path, errors: result.errors },
+        `✗ ${path}\n${errors.map((e) => `    - ${e}`).join("\n")}`,
+        { valid: false, path, manifest: manifestPath ?? null, errors },
       );
       process.exit(EXIT.configInvalid);
     });

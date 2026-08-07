@@ -98,9 +98,14 @@ export function parseConfig(source: string): RunmillConfig {
     },
     workspace: {
       strategy: "worktree",
-      gitIsolation: (workspace["git_isolation"] ?? "separate-git-dir") as
-        | "separate-git-dir"
-        | "clone",
+      // `clone`, matching WorkspaceManager's default and for its reasons: a
+      // linked worktree's `.git` is a file into the PARENT repository, so the
+      // object store, config, and hooks are shared. Granting the sandbox write
+      // access to that shared `.git` hands an agent `.git/hooks/pre-commit` and
+      // code execution in the orchestrator's context; denying it breaks git.
+      // Only `clone` makes "writable: the run worktree, and nothing else" both
+      // true and workable.
+      gitIsolation: (workspace["git_isolation"] ?? "clone") as "separate-git-dir" | "clone",
       sandbox: (workspace["sandbox"] ?? "native") as "native" | "container" | "none",
       network: (workspace["network"] ?? "proxy") as "proxy" | "none",
       networkAllowlist: asArray<string>(workspace["network_allowlist"]),

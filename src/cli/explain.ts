@@ -43,7 +43,9 @@ kernel has unprivileged user namespaces disabled:
     sudo sysctl -w kernel.unprivileged_userns_clone=1
 
 There is no silent downgrade. If isolation cannot be constructed and verified,
-no run starts.`,
+no run starts.
+
+Full reference: docs/sandbox.md`,
 
   github: `GitHub access
 
@@ -69,7 +71,9 @@ write branch protection, and keeps merging locked if it could.
 Branch protection is often unreadable — the classic endpoint needs admin and
 org-level rulesets are invisible to repo-scoped calls. runmill treats unreadable
 rules as unknown, not as absent, and refuses rather than assuming there is
-nothing to satisfy.`,
+nothing to satisfy.
+
+Full reference: docs/autonomy.md`,
 
   provider: `Coding agent provider
 
@@ -87,7 +91,9 @@ or a terminal result is worse than stopping.
 
 The provider's own credential file is readable inside the sandbox, because the
 CLI cannot authenticate without it. That is the one credential inside the
-boundary and it is scoped to the provider. Every other credential is denied.`,
+boundary and it is scoped to the provider. Every other credential is denied.
+
+Full reference: docs/lifecycle.md`,
 
   linear: `Backlog access
 
@@ -105,7 +111,9 @@ Or explore with no credential at all:
 
 Priority is read raw, including the encoding where 0 means "no priority" rather
 than "most urgent". Sorting on the raw value would point the agent at the least
-specified work in the backlog first.`,
+specified work in the backlog first.
+
+Full reference: docs/configuration.md`,
 };
 
 export interface SupportBundle {

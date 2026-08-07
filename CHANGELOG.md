@@ -10,6 +10,14 @@ Upgrades should be boring. Anything that requires action on your part appears un
 
 ### Added
 
+- `docs/` — conceptual documentation for the mechanisms the CLI cannot explain on its own:
+  the coverage contract, the lease model, the seven merge gates, the sandbox, the run lifecycle,
+  and a full configuration reference. `test/docs/contract.test.ts` fails if a doc cites a command,
+  flag, error code, source file, or link that does not exist.
+- The check manifest is now actually loaded. `.runmill/checks.yaml` was written by `runmill init`
+  and pointed at by `verification.manifest`, but nothing read it: checks came only from
+  `runmill.yaml`. `declared_skips` therefore never parsed, so declaring a skip was impossible.
+- `runmill config validate` validates the check manifest too, naming the offending check.
 - `runmill init` — writes `runmill.yaml`, `.runmill/checks.yaml`, and the review skills, inferring
   the repository and base branch from git.
 - `runmill prepare <issue>` — scores how ready an issue is to run and names what is missing, so an
@@ -24,6 +32,16 @@ Upgrades should be boring. Anything that requires action on your part appears un
 
 ### Fixed
 
+- **The safe git-isolation default never applied to a single real run.** `WorkspaceManager`
+  documents `clone` as its default, because a linked worktree's `.git` is a file into the parent
+  repository — so the object store, config, and hooks are shared, and granting the sandbox write
+  access hands an agent `.git/hooks/pre-commit` and code execution in the orchestrator's context.
+  `parseConfig` defaulted to `separate-git-dir` and the orchestrator passed it through, so the
+  documented default was dead code. Now `clone` in both, with a test that fails if they drift.
+- **A failed clone was ignored.** Workspace creation used the non-throwing `run` for the clone
+  while every other call used `runGit`, so a failure surfaced three steps later as a confusing
+  `git config` error. It also cloned from the invocation directory rather than the repository
+  root, which fails whenever runmill is run from a subdirectory.
 - **The published package contained no code.** `bin` pointed at `dist/cli/main.js` with no build
   step at pack time, so `npm i -g runmill` installed a package whose only executable was absent.
 - **The installed binary silently did nothing.** The entrypoint guard compared `import.meta.url`

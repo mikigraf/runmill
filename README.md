@@ -219,8 +219,16 @@ read from the base commit and diffed; **runtime state** belongs to runmill alone
 
 ## Documentation
 
+Start at [`docs/`](./docs/README.md).
+
 | Document | Contents |
 |---|---|
+| [`docs/verification.md`](./docs/verification.md) | The coverage contract — why a green test run is not proof |
+| [`docs/leases.md`](./docs/leases.md) | The lease model — how two workers never take the same issue |
+| [`docs/autonomy.md`](./docs/autonomy.md) | The seven merge gates, and what `guarded-merge` actually requires |
+| [`docs/sandbox.md`](./docs/sandbox.md) | What the agent can and cannot reach, per platform |
+| [`docs/lifecycle.md`](./docs/lifecycle.md) | Run states, the side-effect outbox, crash recovery |
+| [`docs/configuration.md`](./docs/configuration.md) | Every configuration key, with defaults |
 | [`docs/errors.md`](./docs/errors.md) | Every error code, what causes it, and how to fix it |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Development setup, tests, and how the layers fit |
 | [`CHANGELOG.md`](./CHANGELOG.md) | What changed, and what upgrading requires |

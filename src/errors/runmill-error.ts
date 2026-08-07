@@ -154,6 +154,19 @@ export const ERROR_CATALOG = {
     recoverable: true,
   },
 
+  "RM-VERIFY-004": {
+    title: "Check manifest is invalid",
+    why:
+      "The repository declares its required checks in this file. An unreadable " +
+      "manifest must never be treated as 'no checks required', so it fails the " +
+      "run instead of being skipped.",
+    fixes: [
+      { description: "Check the manifest and report every problem at once", command: "runmill config validate" },
+      { description: "Write a fresh manifest alongside the existing one", command: "runmill init" },
+    ],
+    recoverable: false,
+  },
+
   // -- CI ----------------------------------------------------------------
   "RM-CI-002": {
     title: "Required check never reported",

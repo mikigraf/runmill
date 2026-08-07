@@ -132,7 +132,7 @@
         "strategy": { "enum": ["worktree"], "default": "worktree" },
         "git_isolation": {
           "enum": ["separate-git-dir", "clone"],
-          "default": "separate-git-dir",
+          "default": "clone",
           "description": "A linked worktree's .git points into the parent repository's shared git directory, sharing the object store, config, and hooks. Both options relocate or duplicate git metadata per run so the sandbox can deny everything outside the run directory."
         },
         "sandbox": {

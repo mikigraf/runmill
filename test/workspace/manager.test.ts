@@ -60,6 +60,40 @@ describe("WorkspaceManager.create (clone isolation)", () => {
     expect(statSync(dotGit).isDirectory()).toBe(true);
   });
 
+  it("clones from the repository root when invoked from a subdirectory", async () => {
+    // runmill is routinely run from a subdirectory, and `git clone <repo>/sub`
+    // is not a repository. This failed silently — create() used the
+    // non-throwing `run` for the clone while everything else used `runGit` — so
+    // the run died three steps later in #harden and blamed `git config`.
+    const sub = join(source, "examples", "quickstart");
+    execFileSync("mkdir", ["-p", sub]);
+    const ws = await mgr.create({
+      runId: "run_sub",
+      sourceRepo: sub,
+      branch: "runmill/ENG-2-slug-1",
+      baseBranch: "main",
+      root: runs,
+      isolation: "clone",
+    });
+    expect(existsSync(join(ws.path, "README.md"))).toBe(true);
+    expect(git(ws.path, "rev-parse", "HEAD")).toBe(git(source, "rev-parse", "HEAD"));
+  });
+
+  it("fails loudly when the clone cannot happen", async () => {
+    // A silently ignored clone leaves an empty directory that every later step
+    // misattributes.
+    await expect(
+      mgr.create({
+        runId: "run_bad",
+        sourceRepo: source,
+        branch: "runmill/ENG-3-slug-1",
+        baseBranch: "no-such-branch",
+        root: runs,
+        isolation: "clone",
+      }),
+    ).rejects.toThrow();
+  });
+
   it("does not share the parent object store", async () => {
     const ws = await create();
     // A new commit in the workspace must not appear in the source repository.

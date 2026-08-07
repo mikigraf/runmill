@@ -2,7 +2,6 @@ import { mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { git as runGit, tryGit } from "../platform/git.js";
-import { run } from "../platform/process.js";
 
 
 export type GitIsolation = "clone" | "separate-git-dir";
@@ -28,6 +27,17 @@ export interface CreateWorkspaceInput {
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   return runGit(cwd, args);
+}
+
+/**
+ * The repository root containing `dir`.
+ *
+ * runmill is routinely invoked from a subdirectory, and a subdirectory is not
+ * something you can clone.
+ */
+async function repoRoot(dir: string): Promise<string> {
+  const found = await tryGit(dir, ["rev-parse", "--show-toplevel"]);
+  return found.ok ? found.stdout.trim() : dir;
 }
 
 /**
@@ -66,13 +76,19 @@ export class WorkspaceManager {
     mkdirSync(input.root, { recursive: true, mode: 0o700 });
 
     if (isolation === "clone") {
-      await run("git", [
+      // Clone from the repository ROOT, not from whatever directory runmill was
+      // invoked in. `git clone <repo>/subdir` is not a repository and fails —
+      // and it failed silently here, because this used the non-throwing `run`
+      // while every other call used `runGit`. The run then died three steps
+      // later in #harden, pointing at `git config` instead of the clone.
+      const root = await repoRoot(input.sourceRepo);
+      await runGit(root, [
         "clone",
         "--no-hardlinks",
         "--quiet",
         "--branch",
         input.baseBranch,
-        input.sourceRepo,
+        root,
         path,
       ]);
     } else {
