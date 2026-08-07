@@ -14,6 +14,7 @@ import { CliProviderAdapter, CODEX_DIALECT, CLAUDE_DIALECT } from "../../src/age
 import { CredentialStore } from "../../src/credentials/store.js";
 import { GitHubForgeAdapter } from "../../src/pr/github.js";
 import { LinearBacklogAdapter } from "../../src/backlog/linear.js";
+import { snapshotHash } from "../../src/domain/snapshot.js";
 
 const creds = new CredentialStore();
 const githubToken = await creds.get("github");
@@ -128,12 +129,14 @@ describe.runIf(linearKey !== undefined)("live: Linear backlog", () => {
     }
   }, 60_000);
 
-  it("produces a stable snapshot hash", async () => {
+  it("produces a stable snapshot hash for a real issue", async () => {
+    // snapshotHash is a domain function now, not an adapter method: it must
+    // give the same answer whatever produced the issue.
     const team = process.env["RUNMILL_LIVE_TEAM"] ?? "ENG";
     const issues = await backlog().listCandidates({ team, states: ["Todo", "Backlog"] });
     const first = issues[0];
     if (first === undefined) return;
-    expect(backlog().snapshotHash(first)).toBe(backlog().snapshotHash(first));
+    expect(snapshotHash(first)).toBe(snapshotHash(first));
   }, 60_000);
 });
 

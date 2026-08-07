@@ -21,9 +21,19 @@ export interface GitOptions {
   readonly env?: NodeJS.ProcessEnv | undefined;
 }
 
+/**
+ * Inherited `GIT_*` variables that would change what a command sees.
+ *
+ * `treeHash` is the freshness proof the verification contract rests on; an
+ * ambient GIT_DIR or GIT_INDEX_FILE could quietly change its answer.
+ */
+const STRIPPED = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"];
+
 function envFor(options: GitOptions): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of STRIPPED) delete env[key];
   return {
-    ...process.env,
+    ...env,
     ...(options.runmillIdentity === true ? RUNMILL_GIT_ENV : {}),
     ...(options.env ?? {}),
   };

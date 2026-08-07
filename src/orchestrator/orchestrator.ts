@@ -11,12 +11,13 @@ import { WorkspaceManager, type Workspace } from "../workspace/manager.js";
 import { VerificationEngine, resolveManifest, type CheckSpec } from "../verification/engine.js";
 import { buildTaskPacket, renderIssueDocument } from "../agent/task-packet.js";
 import { parseReviewJson, blockingFindings, crossCheckVerdict, type Review } from "../review/schema.js";
-import { reconcileChecks, summarize, type CheckMapping } from "../pr/reconcile.js";
+import { reconcileChecks, type CheckMapping } from "../pr/reconcile.js";
 import { GitRefLease, type HeldLease } from "../queue/git-lease.js";
 import { accumulateUsage } from "../agent/events.js";
 import { RunmillError , errorMessage } from "../errors/runmill-error.js";
 import { renderPullRequestBody } from "./pr-body.js";
 import { outputContractFor } from "../agent/output-contract.js";
+import { snapshotHash } from "../domain/snapshot.js";
 
 export type RunState =
   | "DISCOVERED"
@@ -217,12 +218,12 @@ export class Orchestrator {
       this.#advance(runId, "WORKSPACE_READY");
 
       // -- task packet ---------------------------------------------------
-      const snapshotHash = this.#d.backlog.snapshotHash(issue);
+      const snapshot = snapshotHash(issue);
       this.#d.store.appendEvent({
         runId,
         seq: 1,
         type: "issue.snapshot",
-        payload: { identifier: issue.identifier, snapshotHash },
+        payload: { identifier: issue.identifier, snapshotHash: snapshot },
       });
 
       const manifest = resolveManifest({
@@ -235,7 +236,7 @@ export class Orchestrator {
         target,
         baseCommit: workspace.baseCommit,
         branch,
-        snapshotHash,
+        snapshotHash: snapshot,
         requiredChecks: manifest.map((c) => c.id),
         network: cfg.workspace.network,
       });
@@ -247,7 +248,7 @@ export class Orchestrator {
       // -- implement / verify / review loop -------------------------------
       let review: Review | undefined;
       let candidateSha = workspace.baseCommit;
-      let verificationResults: readonly { checkId: string; status: string }[] = [];
+      let prChecks: readonly { id: string; status: string }[] = [];
 
       for (let iteration = 0; iteration <= cfg.review.maxFixIterations; iteration += 1) {
         const role = iteration === 0 ? "implementer" : "fixer";
@@ -293,8 +294,8 @@ export class Orchestrator {
           candidateSha,
         });
 
-        verificationResults = verification.results.map((r) => ({
-          checkId: r.checkId,
+        prChecks = verification.results.map((r) => ({
+          id: r.checkId,
           status: `${r.status} (${r.coverage})`,
         }));
         for (const result of verification.results) {
@@ -374,7 +375,7 @@ export class Orchestrator {
             review: review as Review,
             runId,
             provider: cfg.provider.implementation,
-            checks: verificationResults.map((r) => ({ id: r.checkId, status: r.status })),
+            checks: prChecks,
           }),
           draft: cfg.github.draftPr,
         }),
@@ -409,24 +410,24 @@ export class Orchestrator {
       const observed = await this.#d.forge.listChecks({ repo: target.repo, ref: pr.headSha });
       const verdicts = reconcileChecks({
         requiredContexts: protection.requiredChecks,
-        mappings: this.#d.checkMappings ?? defaultCheckMappings(protection.requiredChecks),
+        // Identity by default: the context name IS the check name until an
+        // explicit mapping says otherwise. Without this every context is
+        // `unmapped` and any protected repository escalates on every run.
+        mappings:
+          this.#d.checkMappings ??
+          protection.requiredChecks.map((c) => ({ localId: c, contextName: c })),
         observed,
         headSha: pr.headSha,
         waitedMs: this.#d.clock.now().getTime() - ciWaitStartedMs,
         scheduleDeadlineMs: CI_SCHEDULE_DEADLINE_MS,
         ...(protection.usesMergeQueue ? { event: "merge_group" as const } : {}),
       });
-      const ci = summarize(verdicts);
-
-      if (!ci.allSatisfied) {
-        const detail = [...verdicts.entries()]
-          .filter(([, v]) => v.state !== "satisfied")
-          .map(([name, v]) => `${name}: ${v.detail}`)
-          .join("; ");
+      const unsatisfied = [...verdicts].filter(([, v]) => v.state !== "satisfied");
+      if (unsatisfied.length > 0) {
         return finish("NEEDS_HUMAN", {
           prNumber: pr.number,
           prUrl: pr.url,
-          reason: `CI not satisfied — ${detail}`,
+          reason: `CI not satisfied — ${unsatisfied.map(([n, v]) => `${n}: ${v.detail}`).join("; ")}`,
         });
       }
 
@@ -446,7 +447,6 @@ export class Orchestrator {
             body: `runmill opened ${pr.url} for this issue.\n\nRun: ${runId}`,
           }),
         );
-        this.#advance(runId, "PR_DELIVERED");
         await input.lease.release(held);
         held = undefined;
         return finish("PR_DELIVERED", { prNumber: pr.number, prUrl: pr.url });
@@ -465,7 +465,6 @@ export class Orchestrator {
       }
 
       if (protection.requiresApproval) {
-        this.#advance(runId, "AWAITING_APPROVAL");
         return finish("AWAITING_APPROVAL", { prNumber: pr.number, prUrl: pr.url });
       }
 
@@ -498,7 +497,6 @@ export class Orchestrator {
       await input.lease.release(held);
       held = undefined;
       this.#advance(runId, "CLEANUP");
-      this.#advance(runId, "COMPLETED");
       return finish("COMPLETED", {
         prNumber: pr.number,
         prUrl: pr.url,
@@ -527,17 +525,6 @@ export class Orchestrator {
 
 /** Bound on how long a required check may go unscheduled before escalating. */
 const CI_SCHEDULE_DEADLINE_MS = 10 * 60_000;
-
-/**
- * Identity mapping for required contexts with no explicit configuration.
- *
- * Without this every context is `unmapped` and fails closed, which makes any
- * protected repository escalate on every run. An identity mapping is the
- * honest default: the context name IS the check name until told otherwise.
- */
-function defaultCheckMappings(contexts: readonly string[]): CheckMapping[] {
-  return contexts.map((context) => ({ localId: context, contextName: context }));
-}
 
 function slugify(text: string): string {
   return text

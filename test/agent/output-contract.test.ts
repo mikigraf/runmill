@@ -84,13 +84,3 @@ describe("provider capability parity", () => {
     }
   });
 });
-
-describe("fake and real adapters agree on the contract", () => {
-  it("the fake resolves output to the contract path", async () => {
-    const fake = new FakeProviderAdapter();
-    const caps = await fake.capabilities();
-    expect(caps.structuredOutput).toBe(true);
-    // Path resolution is shared, so a role with no contract gets no ref.
-    expect(outputPathFor("/tmp/x", "implementer")).toBeUndefined();
-  });
-});

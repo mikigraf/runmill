@@ -1,8 +1,6 @@
-import { createHash } from "node:crypto";
 import type { BacklogAdapter } from "../backlog/adapter.js";
 import { AmbiguousMutationError, BacklogRateLimitError } from "../backlog/adapter.js";
 import type { BacklogIssue } from "../domain/types.js";
-import { snapshotHash } from "../domain/snapshot.js";
 
 export interface FaultInjection {
   /**
@@ -108,9 +106,6 @@ export class FakeBacklogAdapter implements BacklogAdapter {
     return { commentId };
   }
 
-  snapshotHash(issue: BacklogIssue): string {
-    return snapshotHash(issue);
-  }
 
   // -- test affordances ---------------------------------------------------
 

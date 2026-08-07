@@ -134,7 +134,10 @@ export class FakeForgeAdapter implements ForgeAdapter {
   }
 
   async canWriteBranchProtection(): Promise<boolean> {
-    return this.#opts.credentialCanWriteProtection ?? false;
+    // Mirrors the real adapter's unknown-default. GitHubForgeAdapter returns
+    // true when it cannot determine the answer, so a fake that defaults to
+    // false would exercise a branch the production default cannot reach.
+    return this.#opts.credentialCanWriteProtection ?? true;
   }
 
   // -- test affordances ---------------------------------------------------

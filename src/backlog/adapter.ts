@@ -25,9 +25,6 @@ export interface BacklogAdapter {
 
   /** Human-visible status only. Never authoritative for ownership. */
   comment(input: { identifier: string; body: string }): Promise<{ commentId: string }>;
-
-  /** Content hash over the fields a task packet derives from. */
-  snapshotHash(issue: BacklogIssue): string;
 }
 
 /** Thrown when the remote applied a mutation but the response was lost. */

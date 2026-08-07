@@ -124,7 +124,10 @@ describe("unreadable branch protection", () => {
     // The protection endpoint needs admin and commonly 403s. Returning an
     // empty required-check list made CI vacuously satisfied and approval
     // vacuously unnecessary — a fail-open in the middle of the merge gate.
-    const forge = new FakeForgeAdapter({ protectionUnreadable: true });
+    const forge = new FakeForgeAdapter({
+      protectionUnreadable: true,
+      credentialCanWriteProtection: false,
+    });
     const { orchestrator } = build("guarded-merge", forge);
     const outcome = await orchestrator.run({
       runId: "run_u",
@@ -138,7 +141,10 @@ describe("unreadable branch protection", () => {
   }, 90_000);
 
   it("does not merge on unreadable protection even when everything else passes", async () => {
-    const forge = new FakeForgeAdapter({ protectionUnreadable: true });
+    const forge = new FakeForgeAdapter({
+      protectionUnreadable: true,
+      credentialCanWriteProtection: false,
+    });
     const { orchestrator } = build("guarded-merge", forge);
     await orchestrator.run({ runId: "run_u2", issue: ISSUE, target: TARGET, lease: lease("run_u2") });
     expect(forge.calls.some((c) => c.op === "merge")).toBe(false);

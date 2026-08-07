@@ -9,7 +9,7 @@ import type {
 } from "./adapter.js";
 import { ForgeError } from "./adapter.js";
 import { errorMessage } from "../errors/runmill-error.js";
-import { run } from "../platform/process.js";
+import { tryGit } from "../platform/git.js";
 
 function splitRepo(repo: string): { owner: string; name: string } {
   const [owner, name] = repo.split("/");
@@ -74,8 +74,8 @@ export class GitHubForgeAdapter implements ForgeAdapter {
     // Push happens through git with a credential the worker never sees. The
     // token is passed via an askpass-free header rather than embedded in the
     // remote URL, so it never lands in .git/config or the reflog.
-    const result = await run(
-      "git",
+    const result = await tryGit(
+      input.workspacePath,
       [
         "-c",
         `http.extraheader=AUTHORIZATION: basic ${Buffer.from(`x-access-token:${this.#token}`).toString("base64")}`,
@@ -84,7 +84,6 @@ export class GitHubForgeAdapter implements ForgeAdapter {
         `https://github.com/${input.repo}.git`,
         `HEAD:refs/heads/${input.branch}`,
       ],
-      { cwd: input.workspacePath },
     );
     if (!result.ok) {
       throw new ForgeError(

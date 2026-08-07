@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
-import { RunmillError } from "../errors/runmill-error.js";
-import { armKillTimer } from "../platform/process.js";
+import { RunmillError, errorMessage } from "../errors/runmill-error.js";
+import { armKillTimer, BoundedCapture } from "../platform/process.js";
 
 export type SandboxMechanism = "seatbelt" | "bubblewrap" | "none";
 
@@ -271,47 +271,18 @@ export class Sandbox {
   }
 
   async run(input: SandboxRunInput): Promise<SandboxResult> {
-    if (this.#mechanism === "none") {
-      throw RunmillError.fromCatalog("RM-SANDBOX-001", {
-        whatHappened: `No sandbox mechanism available on ${platform()}.`,
-      });
-    }
-
-    const home = process.env["HOME"] ?? tmpdir();
-    const env = buildEnvironment(input.env);
-
-    // Resolve symlinks before building the policy. On macOS `tmpdir()` is
-    // `/var/folders/...`, a symlink to `/private/var/folders/...`, and Seatbelt
-    // `subpath` rules match the real path. A rule written against the symlink
-    // silently grants nothing, which looks like a broken sandbox rather than a
-    // restrictive one.
-    const policy: SandboxPolicy = {
-      ...input.policy,
-      writablePaths: input.policy.writablePaths.map(realPath),
-      readablePaths: (input.policy.readablePaths ?? []).map(realPath),
-    };
-    const cwd = realPath(input.cwd);
-
-    let command = input.command;
-    let args = [...input.args];
-    let profileDir: string | undefined;
-
-    if (this.#mechanism === "seatbelt") {
-      profileDir = mkdtempSync(join(tmpdir(), "runmill-sb-"));
-      const profile = join(profileDir, "policy.sb");
-      writeFileSync(profile, buildSeatbeltProfile(policy, home));
-      args = ["-f", profile, input.command, ...input.args];
-      command = "/usr/bin/sandbox-exec";
-    } else {
-      args = [...buildBubblewrapArgs(policy, home), input.command, ...input.args];
-      command = "bwrap";
-    }
-
+    const wrapped = this.wrap(input);
     const started = Date.now();
     try {
-      return await this.#spawn(command, args, { ...input, cwd }, env, started);
+      return await this.#spawn(
+        wrapped.command,
+        wrapped.args,
+        { ...input, cwd: wrapped.cwd },
+        wrapped.env,
+        started,
+      );
     } finally {
-      if (profileDir !== undefined) rmSync(profileDir, { recursive: true, force: true });
+      wrapped.cleanup();
     }
   }
 
@@ -334,34 +305,25 @@ export class Sandbox {
         stdio: ["ignore", "pipe", "pipe"],
       });
 
-      // Bounded: a check emitting hundreds of megabytes would otherwise be
-      // retained in full, to run three regexes over its tail.
-      let stdout = "";
-      let stderr = "";
+      const out = new BoundedCapture(MAX_CAPTURED_OUTPUT);
+      const err = new BoundedCapture(MAX_CAPTURED_OUTPUT);
       let timedOut = false;
 
-      const append = (buffer: string, chunk: Buffer): string => {
-        const next = buffer + chunk.toString();
-        return next.length <= MAX_CAPTURED_OUTPUT
-          ? next
-          : `[...truncated...]\n${next.slice(next.length - MAX_CAPTURED_OUTPUT)}`;
-      };
-
-      child.stdout?.on("data", (c: Buffer) => (stdout = append(stdout, c)));
-      child.stderr?.on("data", (c: Buffer) => (stderr = append(stderr, c)));
+      child.stdout?.on("data", (c: Buffer) => out.push(c));
+      child.stderr?.on("data", (c: Buffer) => err.push(c));
 
       const cancelTimer = armKillTimer(child, input.timeoutMs, () => {
         timedOut = true;
       });
 
-      child.on("error", (err) => {
+      child.on("error", (spawnError) => {
         cancelTimer();
         resolve({
           outcome: "sandbox-denied",
           exitCode: null,
           signal: null,
-          stdout,
-          stderr: `${stderr}${String(err)}`,
+          stdout: out.text(),
+          stderr: `${err.text()}${errorMessage(spawnError)}`,
           durationMs: Date.now() - started,
         });
       });
@@ -372,8 +334,8 @@ export class Sandbox {
           outcome: timedOut ? "timeout" : signal !== null ? "signaled" : "exited",
           exitCode: code,
           signal,
-          stdout,
-          stderr,
+          stdout: out.text(),
+          stderr: err.text(),
           durationMs: Date.now() - started,
         });
       });

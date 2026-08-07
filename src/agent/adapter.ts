@@ -42,7 +42,6 @@ export interface AgentRunRequest {
   readonly network: "proxy" | "none";
   readonly maxTurns: number;
   readonly timeoutMs: number;
-  readonly outputSchema?: string | undefined;
   /** Cancels the session even before `session.started` arrives. */
   readonly signal?: AbortSignal | undefined;
 }

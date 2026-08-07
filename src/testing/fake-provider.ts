@@ -15,6 +15,7 @@ import { assertKnownEvent } from "../agent/events.js";
 import type { Clock } from "../platform/clock.js";
 import { SystemClock } from "../platform/clock.js";
 import { outputPathFor } from "../agent/output-contract.js";
+import { BASE_CAPABILITIES } from "../agent/cli-provider.js";
 
 /** A scripted action the fake agent performs inside its workspace. */
 export type ScriptedAction =
@@ -105,16 +106,9 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
   }
 
   async capabilities(): Promise<ProviderCapabilities> {
-    return {
-      streamingOutput: true,
-      sessionResume: true,
-      turnLimits: true,
-      toolAllowDeny: true,
-      sandboxMode: true,
-      modelSelection: false,
-      costReporting: true,
-      structuredOutput: true,
-    };
+    // Derived from the same base every real dialect uses, so a test gating on
+    // a capability cannot pass against the fake and fail against a provider.
+    return { ...BASE_CAPABILITIES, sessionResume: true, costReporting: true };
   }
 
   async resume(request: AgentRunRequest & { sessionId: string }): Promise<AgentSession> {

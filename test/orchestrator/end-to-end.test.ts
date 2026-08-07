@@ -214,7 +214,10 @@ describe("end-to-end: issue to governed pull request", () => {
 
   it("leaves a failed external mutation PENDING for the recovery sweep", async () => {
     // Failure does not prove the effect did not land.
-    const forge = new FakeForgeAdapter({ applyThenTimeout: new Set(["merge"]) });
+    const forge = new FakeForgeAdapter({
+      applyThenTimeout: new Set(["merge"]),
+      credentialCanWriteProtection: false,
+    });
     const { orchestrator } = makeOrchestrator({
       forge,
       cfg: config("  merge:\n    method: squash\n"),
@@ -405,7 +408,10 @@ describe("end-to-end: the loop refuses to proceed when it should", () => {
 
 describe("guarded merge", () => {
   it("merges when every gate passes and records the merge sha", async () => {
-    const forge = new FakeForgeAdapter();
+    // credentialCanWriteProtection: false is the properly-scoped App token.
+    // The fake defaults to true, mirroring the real adapter's fail-closed
+    // answer when it cannot determine the credential's power.
+    const forge = new FakeForgeAdapter({ credentialCanWriteProtection: false });
     const cfg = { ...config(), autonomy: "guarded-merge" as const };
     const { orchestrator, backlog } = makeOrchestrator({ forge, cfg });
 
@@ -422,7 +428,10 @@ describe("guarded merge", () => {
   }, 90_000);
 
   it("waits for approval when branch protection requires it", async () => {
-    const forge = new FakeForgeAdapter({ requiresApproval: true });
+    const forge = new FakeForgeAdapter({
+      requiresApproval: true,
+      credentialCanWriteProtection: false,
+    });
     const cfg = { ...config(), autonomy: "guarded-merge" as const };
     const { orchestrator } = makeOrchestrator({ forge, cfg });
     const outcome = await orchestrator.run({
@@ -436,7 +445,7 @@ describe("guarded merge", () => {
   }, 90_000);
 
   it("cleans up the workspace only after a fully completed run", async () => {
-    const forge = new FakeForgeAdapter();
+    const forge = new FakeForgeAdapter({ credentialCanWriteProtection: false });
     const cfg = { ...config(), autonomy: "guarded-merge" as const };
     const { orchestrator } = makeOrchestrator({ forge, cfg });
     await orchestrator.run({ runId: "run_c", issue: ISSUE, target: TARGET, lease: lease("run_c") });

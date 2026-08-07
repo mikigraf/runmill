@@ -1,11 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { run } from "../../src/platform/process.js";
 import { mkdtempSync, rmSync, writeFileSync, cpSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-const run = promisify(execFile);
 const CLI = resolve(process.cwd(), "src/cli/main.ts");
 const QUICKSTART = resolve(process.cwd(), "examples/quickstart");
 
@@ -30,16 +28,11 @@ async function cli(
   args: string[],
   env: Record<string, string> = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  try {
-    const { stdout, stderr } = await run(TSX, [CLI, ...args], {
-      cwd: dir,
-      env: { ...process.env, ...env },
-    });
-    return { code: 0, stdout, stderr };
-  } catch (err) {
-    const e = err as { code?: number; stdout?: string; stderr?: string };
-    return { code: e.code ?? 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
-  }
+  const result = await run(TSX, [CLI, ...args], {
+    cwd: dir,
+    env: { ...process.env, ...env },
+  });
+  return { code: result.code ?? 1, stdout: result.stdout, stderr: result.stderr };
 }
 
 describe("runmill next --dry-run", () => {

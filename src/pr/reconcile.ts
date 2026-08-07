@@ -128,16 +128,3 @@ export function reconcileChecks(input: ReconcileInput): Map<string, ReconcileVer
   return verdicts;
 }
 
-export function summarize(verdicts: ReadonlyMap<string, ReconcileVerdict>): {
-  allSatisfied: boolean;
-  waiting: string[];
-  blocked: string[];
-} {
-  const waiting: string[] = [];
-  const blocked: string[] = [];
-  for (const [context, verdict] of verdicts) {
-    if (verdict.state === "waiting") waiting.push(context);
-    else if (verdict.state !== "satisfied") blocked.push(context);
-  }
-  return { allSatisfied: waiting.length === 0 && blocked.length === 0, waiting, blocked };
-}

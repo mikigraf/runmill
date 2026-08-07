@@ -4,8 +4,8 @@ import type { AgentRole } from "../domain/types.js";
 /**
  * Which roles produce structured output, and where it lands.
  *
- * One table, read by the orchestrator (to populate `outputSchema`), by every
- * provider adapter (to resolve the path), and by the fakes. Spreading this
+ * One table, read by every provider adapter to resolve the path and by the
+ * orchestrator to know whether output is owed at all. Spreading this
  * across three files is what let the fake and the real adapter disagree about
  * when `outputRef` is present — tests passed while the real reviewer path
  * could never produce output at all.

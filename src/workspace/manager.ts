@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { git as runGit } from "../platform/git.js";
+import { git as runGit, tryGit } from "../platform/git.js";
 import { run } from "../platform/process.js";
 
 
@@ -80,9 +80,7 @@ export class WorkspaceManager {
       // repositories, but it shares the parent object store, so the sandbox
       // profile must additionally grant read access to the parent `.git` and
       // the isolation guarantee is correspondingly weaker.
-      await run("git", ["worktree", "add", "--quiet", "--detach", path, input.baseBranch], {
-        cwd: input.sourceRepo,
-      });
+      await runGit(input.sourceRepo, ["worktree", "add", "--quiet", "--detach", path, input.baseBranch]);
     }
 
     await this.#harden(path);
@@ -135,12 +133,11 @@ export class WorkspaceManager {
       tmpdir(),
       `runmill-index-${process.pid}-${workspace.runId}-${this.#indexSeq}`,
     );
-    const env = { ...process.env, GIT_INDEX_FILE: scratchIndex };
+    const env = { GIT_INDEX_FILE: scratchIndex };
     try {
-      await run("git", ["read-tree", "HEAD"], { cwd: workspace.path, env });
-      await run("git", ["add", "-A"], { cwd: workspace.path, env });
-      const { stdout } = await run("git", ["write-tree"], { cwd: workspace.path, env });
-      return stdout.trim();
+      await runGit(workspace.path, ["read-tree", "HEAD"], { env });
+      await runGit(workspace.path, ["add", "-A"], { env });
+      return await runGit(workspace.path, ["write-tree"], { env });
     } finally {
       rmSync(scratchIndex, { force: true });
     }
@@ -208,18 +205,14 @@ export class WorkspaceManager {
 
   async destroy(workspace: Workspace, sourceRepo?: string): Promise<void> {
     if (workspace.isolation === "separate-git-dir" && sourceRepo !== undefined) {
-      try {
-        await run("git", ["worktree", "remove", "--force", workspace.path], { cwd: sourceRepo });
-        return;
-      } catch {
-        // fall through to a plain removal
-      }
+      const removed = await tryGit(sourceRepo, ["worktree", "remove", "--force", workspace.path]);
+      if (removed.ok) return;
     }
     rmSync(workspace.path, { recursive: true, force: true });
   }
 
   /** Reconcile worktrees and stale run directories after a crash. */
   async prune(sourceRepo: string): Promise<void> {
-    await run("git", ["worktree", "prune"], { cwd: sourceRepo });
+    await runGit(sourceRepo, ["worktree", "prune"]);
   }
 }

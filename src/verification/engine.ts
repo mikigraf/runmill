@@ -150,6 +150,11 @@ export class VerificationEngine {
     const verifyPath = await workspaces.createVerificationCheckout(workspace, candidateSha);
     const verifyWorkspace: Workspace = { ...workspace, path: verifyPath };
 
+    // Carried across checks: nothing runs between the `after` of one check and
+    // the `before` of the next, so re-hashing the whole tree there is waste.
+    // 2N full-tree hashes become N+1.
+    let treeBefore: string | undefined;
+
     try {
       for (const spec of manifest) {
         if (spec.source === "github") {
@@ -166,7 +171,7 @@ export class VerificationEngine {
           continue;
         }
 
-        const before = await workspaces.treeHash(verifyWorkspace);
+        const before = treeBefore ?? (await workspaces.treeHash(verifyWorkspace));
         const parts = spec.run.split(/\s+/).filter((p) => p !== "");
         const [command, ...args] = parts;
 
@@ -179,6 +184,7 @@ export class VerificationEngine {
         });
 
         const after = await workspaces.treeHash(verifyWorkspace);
+        treeBefore = after;
         const notes: string[] = [];
         let status: CheckResult["status"] = outcome.exitCode === 0 ? "passed" : "failed";
         let coverage: Coverage = "proven";

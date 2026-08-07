@@ -16,7 +16,7 @@ import { UnknownEventError } from "./events.js";
 import type { Clock } from "../platform/clock.js";
 import { SystemClock } from "../platform/clock.js";
 import { Sandbox } from "../workspace/sandbox.js";
-import { run, killTree, armKillTimer } from "../platform/process.js";
+import { run, killTree, armKillTimer, BoundedCapture } from "../platform/process.js";
 import { outputPathFor, outputContractFor } from "./output-contract.js";
 
 /** Maps one provider's native JSON line onto the normalized union. */
@@ -31,9 +31,18 @@ export interface ProviderDialect {
   buildArgs(request: AgentRunRequest, prompt: string): readonly string[];
   /** Returns undefined for lines that carry no normalized meaning. */
   mapLine(line: unknown): AgentEventBody | undefined;
+  /**
+   * Directories the provider needs to read to authenticate.
+   *
+   * Readable inside the sandbox by necessity: the CLI cannot start without
+   * them. Declared per dialect rather than guessed from the name, because a
+   * wrong guess is an auth failure inside a sandbox with nothing pointing at
+   * the profile as the cause.
+   */
+  configPaths(home: string): readonly string[];
 }
 
-const BASE_CAPABILITIES: ProviderCapabilities = {
+export const BASE_CAPABILITIES: ProviderCapabilities = {
   streamingOutput: true,
   sessionResume: false,
   turnLimits: true,
@@ -49,6 +58,7 @@ export const CODEX_DIALECT: ProviderDialect = {
   binary: "codex",
   versionArgs: ["--version"],
   capabilities: BASE_CAPABILITIES,
+  configPaths: (home) => [join(home, ".codex")],
   authArgs: () => ["login", "status"],
   isAuthenticated: (stdout, stderr, code) =>
     code === 0 && !/not logged in|unauthenticated/i.test(`${stdout}${stderr}`),
@@ -86,6 +96,7 @@ export const CLAUDE_DIALECT: ProviderDialect = {
   binary: "claude",
   versionArgs: ["--version"],
   capabilities: { ...BASE_CAPABILITIES, sessionResume: true, costReporting: true },
+  configPaths: (home) => [join(home, ".claude"), join(home, ".config", "claude")],
   authArgs: () => ["-p", "ping", "--max-turns", "1"],
   isAuthenticated: (stdout, stderr, code) =>
     code === 0 || !/not logged in|authentication|api key/i.test(`${stdout}${stderr}`),
@@ -170,15 +181,9 @@ export class CliProviderAdapter implements CodingAgentAdapter {
     this.#sandbox = options.sandbox ?? new Sandbox();
   }
 
-  /**
-   * The provider's own credential and config directory.
-   *
-   * Readable by necessity: the CLI cannot authenticate without it. This is
-   * the one credential inside the boundary, and it is scoped to the provider.
-   */
-  #providerHome(): string[] {
+  #providerHome(): readonly string[] {
     const home = process.env["HOME"];
-    return home === undefined ? [] : [join(home, `.${this.#dialect.name}`)];
+    return home === undefined ? [] : this.#dialect.configPaths(home);
   }
 
   get name(): string {
@@ -264,14 +269,11 @@ export class CliProviderAdapter implements CodingAgentAdapter {
 
     // Only ever read by two regexes; a two-hour chatty session should not
     // retain every byte to answer them.
-    const MAX_STDERR = 64 * 1024;
-    let stderr = "";
+    const stderrCapture = new BoundedCapture(64 * 1024);
     let buffer = "";
     let parseError: Error | undefined;
 
-    child.stderr?.on("data", (c: Buffer) => {
-      stderr = (stderr + c.toString()).slice(-MAX_STDERR);
-    });
+    child.stderr?.on("data", (c: Buffer) => stderrCapture.push(c));
     child.stdout?.on("data", (chunk: Buffer) => {
       buffer += chunk.toString();
       const lines = buffer.split("\n");
@@ -352,7 +354,10 @@ export class CliProviderAdapter implements CodingAgentAdapter {
           error:
             code === 0
               ? undefined
-              : { class: classifyStderr(stderr), retryable: isRetryable(stderr) },
+              : (() => {
+                  const stderr = stderrCapture.text();
+                  return { class: classifyStderr(stderr), retryable: isRetryable(stderr) };
+                })(),
         });
       });
     });

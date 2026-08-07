@@ -1,10 +1,39 @@
-import { createHash } from "node:crypto";
 import { LinearClient } from "@linear/sdk";
 import type { BacklogAdapter } from "./adapter.js";
 import { AmbiguousMutationError, BacklogRateLimitError } from "./adapter.js";
 import type { BacklogIssue, BacklogPriority } from "../domain/types.js";
 import { errorMessage } from "../errors/runmill-error.js";
-import { snapshotHash } from "../domain/snapshot.js";
+
+/** Issues hydrated at once. Each fans out to ~6 relation queries. */
+const HYDRATE_CONCURRENCY = 6;
+
+/**
+ * Map with a ceiling on in-flight work.
+ *
+ * Preserves input order, and stops the first rejection from stranding the
+ * requests that were already in flight behind it.
+ */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      const item = items[index];
+      if (item === undefined) return;
+      results[index] = await fn(item);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
 
 export interface LinearAdapterOptions {
   readonly apiKey: string;
@@ -78,10 +107,13 @@ export class LinearBacklogAdapter implements BacklogAdapter {
         },
       });
 
-      // Hydrating serially made this ~100 sequential round-trip chains
-      // against a rate-limited API; the request count is the same either way.
-      return Promise.all(
-        connection.nodes.map((node) => this.#hydrate(node as unknown as RawIssueShape, node)),
+      // Bounded concurrency, not unbounded. Each issue fans out to ~6 lazy
+      // relation queries, so an unbounded Promise.all over a full page fires
+      // ~500 simultaneous requests against a budget of ~1500/hour — one call
+      // burning a third of the hour, and a 429 on any one of them discarding
+      // every other in-flight response.
+      return mapWithConcurrency(connection.nodes, HYDRATE_CONCURRENCY, (node) =>
+        this.#hydrate(node as unknown as RawIssueShape, node),
       );
     });
   }
@@ -119,18 +151,17 @@ export class LinearBacklogAdapter implements BacklogAdapter {
       issueNode.labels?.(),
     ]);
 
+
+    // Deliberately NOT wrapped in a catch. An unavailable relation set must
+    // not read as "nothing blocks this issue" — that would let a blocked issue
+    // pass eligibility and be worked on. A failure here propagates, and the
+    // rate-limit mapping on the enclosing call turns it into a retryable error.
     const blockedBy: string[] = [];
-    try {
-      const relations = await issueNode.inverseRelations?.();
-      const blocking = (relations?.nodes ?? []).filter((r) => r.type === "blocks");
-      const related = await Promise.all(blocking.map((r) => r.issue));
-      for (const issue of related) {
-        if (issue?.identifier !== undefined) blockedBy.push(issue.identifier);
-      }
-    } catch {
-      // Relations are paginated and rate-limited; an unavailable relation set
-      // must not silently read as "nothing blocks this issue", so the caller
-      // sees an empty list only when the query genuinely returned none.
+    const relations = await issueNode.inverseRelations?.();
+    const blocking = (relations?.nodes ?? []).filter((r) => r.type === "blocks");
+    const related = await Promise.all(blocking.map((r) => r.issue));
+    for (const issue of related) {
+      if (issue?.identifier !== undefined) blockedBy.push(issue.identifier);
     }
 
     return {
@@ -214,16 +245,5 @@ export class LinearBacklogAdapter implements BacklogAdapter {
     const node = connection.nodes[0];
     if (node === undefined) throw new Error(`issue ${identifier} not found`);
     return node as unknown as { id: string; team: Promise<{ key: string } | undefined> };
-  }
-
-  /**
-   * Hash the fields a task packet derives from.
-   *
-   * Compared at every safe checkpoint: if a human edits the issue mid-run the
-   * packet is stale, and continuing would implement a specification nobody
-   * currently holds.
-   */
-  snapshotHash(issue: BacklogIssue): string {
-    return snapshotHash(issue);
   }
 }
