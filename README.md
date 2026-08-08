@@ -205,8 +205,10 @@ Concretely, before anything reaches a pull request:
 - Every required check is discovered, run against the exact candidate commit in a clean detached
   worktree, and checked for undeclared skips. A suite that exits 0 having discovered no tests
   fails.
-- Review runs in a fresh context, and its verdict is cross-checked. A clean report on a diff
-  touching risky paths escalates rather than being believed.
+- Review runs in a fresh context, optionally on a different model, and its verdict is
+  cross-checked. A clean report on a diff touching risky paths escalates rather than being believed.
+- Every acceptance criterion in the task packet needs positive evidence from the review. An
+  omitted criterion counts the same as a failed one, because silence is not consent.
 - Merging stays locked until the credential provably cannot edit branch protection.
 
 None of that is novel. It's mutual exclusion, least privilege, provenance, and separation of
@@ -229,8 +231,18 @@ against the exact candidate commit in a clean detached worktree, and finish with
 skip. A command that exits 0 having run nothing has failed.
 
 Review happens in a fresh context with no implementer narrative, and returns findings tied to a
-file and a line. Its verdict is then cross-checked: a clean report on a diff touching risky paths
-escalates instead of being believed.
+file and a line. It can run on a different model from the one that wrote the code, which is the
+part context clearing cannot do: a model reviewing its own work agrees with itself for the same
+reasons it was wrong.
+
+Its verdict is then cross-checked. A clean report on a diff touching risky paths escalates instead
+of being believed, and an approval that lacks positive evidence for any acceptance criterion is
+rejected. That closes the gap no amount of deterministic checking can: a change can pass every
+check, stay in scope, and still not be the thing that was asked for.
+
+Every one of those rules is one-directional. Each can withhold delivery; none can grant it. That
+asymmetry is what makes it safe to let a model's judgment participate at all, because a model that
+can only subtract permission cannot be prompted into releasing something.
 
 Autonomy is tiered by risk. `pr-only` is the default. Auto-merge unlocks for low-risk changes only,
 and only with a credential that provably cannot edit branch protection.
@@ -298,7 +310,19 @@ so you're never authoring it from nothing. The schema ships in the repository:
 # yaml-language-server: $schema=./runmill.schema.json
 version: 1
 autonomy: pr-only
+
+providers:
+  implementer:
+    implementation: codex
+    model: <fast-model>
+  reviewer:
+    implementation: inherit    # same CLI
+    model: <stronger-model>    # different model
 ```
+
+Which agent runs which role is one block, because picking the implementer and picking the reviewer
+is the same decision made twice. Either the CLI or the model differing is enough to make review
+independent, and a different model on the same CLI needs no second subscription.
 
 Validate with `runmill config validate`; see everything including defaults with
 `runmill config show`.
