@@ -2,12 +2,10 @@
 
 A control plane for autonomous software engineering.
 
-runmill continuously takes work from your backlog, dispatches it to coding agents, verifies and
-reviews what they produce, gets the change through CI and merge, and moves on to the next issue.
-
-The loop is the easy part, and your harness probably already has one. What makes it safe to leave
-running is everything around it: atomic claims, a bounded sandbox, proof the right tests ran, and a
-merge gate that fails closed.
+Your harness already has a loop. runmill is the exit condition: it takes work from your backlog,
+dispatches it to coding agents, and refuses to deliver anything it cannot prove. Atomic claims, a
+bounded sandbox, evidence that the tests you cared about actually ran, and a merge gate that fails
+closed.
 
 ## Try it in 60 seconds
 
