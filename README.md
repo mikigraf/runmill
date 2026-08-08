@@ -1,11 +1,13 @@
 # runmill
 
-A control plane for autonomous software engineering.
+The control plane and exit condition for autonomous software engineering.
 
-Your harness already has a loop. runmill is the exit condition: it takes work from your backlog,
-dispatches it to coding agents, and refuses to deliver anything it cannot prove. Atomic claims, a
-bounded sandbox, evidence that the tests you cared about actually ran, and a merge gate that fails
-closed.
+Your coding-agent harness already has a loop. runmill is what makes that loop safe to leave
+running: deterministic selection and an atomic claim from the backlog, proven isolation, evidence
+that the tests you actually cared about ran against the exact candidate, fresh-context review, and
+a merge gate that fails closed. It refuses to deliver anything it cannot prove.
+
+[**Landing page**](./site/index.html) · [Documentation](./docs/README.md)
 
 ## Try it in 60 seconds
 
@@ -181,7 +183,12 @@ It stops working when nothing outside the model can tell you the work is finishe
 condition becomes the model's own opinion, and "the agent said it was done" is a different claim
 from "it is done" in exactly the cases you care about.
 
-runmill is the exit condition. Concretely, before anything reaches a pull request:
+Harnesses get agents running. Claude Code and Codex are very good at that, and runmill does not
+compete with them: it treats both as opaque. A control plane sits above and across harnesses and
+owns what they were never given authority over, which is the claim, the budget, the audit trail,
+and every side effect.
+
+runmill is that layer, and the exit condition. Concretely, before anything reaches a pull request:
 
 - Two workers cannot claim the same issue, because the claim is a compare-and-swap on a git ref
   and every later mutation is fenced on a generation number.
