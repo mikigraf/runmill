@@ -80,3 +80,29 @@ only place some of these decisions are recorded.
 
 `runmill doctor --report` produces a bundle with no credentials, no source, and no absolute paths.
 Paste it into the issue.
+
+## Verifying the Linux sandbox
+
+Half the supported platforms are Linux, where the sandbox is bubblewrap — a
+different mechanism from macOS Seatbelt, with different flags, failure modes,
+and enforcement limits. Developing on a Mac leaves that half unexercised.
+
+```bash
+npm run verify:linux            # full suite on Linux, in Docker
+npm run verify:linux sandbox    # just the sandbox enforcement tests
+```
+
+Requires Docker. It runs `--privileged`, because bubblewrap needs to create user
+namespaces and nested containers do not get that by default — the sandbox needs
+the same kernel feature inside the container that it needs on a real host.
+
+Do not gate a sandbox test to one platform. Enforcement tests were once written
+`it.runIf(onMac)`, so bubblewrap's containment was verified by nothing,
+anywhere. Gate on whether a mechanism exists (`detectMechanism() !== "none"`)
+instead.
+
+And make a negative test prove something. `DENIES reading a credential path`
+originally read the developer's real `~/.ssh/id_rsa`, so on a machine without
+that file it passed because `cat` found nothing — proving nothing about the
+sandbox. Plant the secret, confirm it is readable outside, then assert the
+denial inside.

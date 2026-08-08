@@ -1,7 +1,8 @@
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
-import { tmpdir, homedir, platform } from "node:os";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
 import { run } from "../platform/process.js";
+import { Sandbox, detectMechanism } from "../workspace/sandbox.js";
 
 export type CheckStatus = "pass" | "warn" | "fail";
 
@@ -84,10 +85,11 @@ export async function checkProvider(implementation: string): Promise<CheckResult
  */
 export async function checkSandbox(): Promise<CheckResult[]> {
   const os = platform();
+  const results: CheckResult[] = [];
 
+  // -- is a mechanism there at all ---------------------------------------
   if (os === "darwin") {
-    const present = existsSync("/usr/bin/sandbox-exec");
-    if (!present) {
+    if (!existsSync("/usr/bin/sandbox-exec")) {
       return [
         {
           id: "sandbox:mechanism",
@@ -99,49 +101,59 @@ export async function checkSandbox(): Promise<CheckResult[]> {
         },
       ];
     }
-
-    const dir = mkdtempSync(join(tmpdir(), "runmill-probe-"));
-    const profile = join(dir, "probe.sb");
-    // Deny everything, then allow only what a probe needs to run at all.
-    writeFileSync(
-      profile,
-      [
-        "(version 1)",
-        "(deny default)",
-        "(allow process-exec)",
-        "(allow process-fork)",
-        "(allow sysctl-read)",
-        `(allow file-read* (subpath "/usr/bin") (subpath "/bin") (subpath "/System") (subpath "/usr/lib"))`,
-      ].join("\n"),
-    );
-
-    const results: CheckResult[] = [
-      {
-        id: "sandbox:mechanism",
-        status: "pass",
-        observed: "sandbox-exec (Seatbelt)",
-        expected: "Seatbelt available",
-      },
-    ];
-
-    // Negative probe: reading a credential path must be denied.
-    const denied = await tryRun("/usr/bin/sandbox-exec", [
-      "-f",
-      profile,
-      "/bin/cat",
-      join(homedir(), ".ssh", "id_rsa"),
-    ]);
     results.push({
-      id: "sandbox:deny-credential-read",
-      status: denied.ok ? "fail" : "pass",
-      code: denied.ok ? "RM-SANDBOX-002" : undefined,
-      observed: denied.ok ? "read was PERMITTED" : "read denied",
-      expected: "reading ~/.ssh is denied inside the sandbox",
-      remediation: denied.ok ? "Do not run runmill on this host until the probe fails" : undefined,
+      id: "sandbox:mechanism",
+      status: "pass",
+      observed: "sandbox-exec (Seatbelt)",
+      expected: "Seatbelt available",
+    });
+  } else if (os === "linux") {
+    const bwrap = await tryRun("bwrap", ["--version"]);
+    if (!bwrap.ok) {
+      return [
+        {
+          id: "sandbox:mechanism",
+          status: "fail",
+          code: "RM-SANDBOX-001",
+          observed: "bwrap not found",
+          expected: "bubblewrap installed",
+          remediation: "Install bubblewrap (apt install bubblewrap)",
+        },
+      ];
+    }
+    results.push({
+      id: "sandbox:mechanism",
+      status: "pass",
+      observed: bwrap.out,
+      expected: "bubblewrap available",
     });
 
-    rmSync(dir, { recursive: true, force: true });
+    const userns = await tryRun("bwrap", ["--dev-bind", "/", "/", "true"]);
+    results.push({
+      id: "sandbox:userns",
+      status: userns.ok ? "pass" : "fail",
+      code: userns.ok ? undefined : "RM-SANDBOX-001",
+      observed: userns.ok ? "user namespaces usable" : userns.out.split("\n")[0] ?? "unavailable",
+      expected: "unprivileged user namespaces enabled",
+      remediation: userns.ok ? undefined : "sudo sysctl -w kernel.unprivileged_userns_clone=1",
+    });
+    if (!userns.ok) return results;
+  } else {
+    return [
+      {
+        id: "sandbox:mechanism",
+        status: "fail",
+        code: "RM-SANDBOX-001",
+        observed: `unsupported platform: ${os}`,
+        expected: "macOS or Linux",
+        remediation: "runmill supports macOS (Seatbelt) and Linux (bubblewrap) only",
+      },
+    ];
+  }
 
+  results.push(await probeCredentialDenial());
+
+  if (os === "darwin") {
     // Seatbelt has no network namespace, so `network: proxy` is the only
     // enforceable option on macOS. Surface it rather than hiding it.
     results.push({
@@ -151,44 +163,86 @@ export async function checkSandbox(): Promise<CheckResult[]> {
       expected: "network egress via the runmill proxy",
       remediation: "workspace.network must be `proxy` on macOS; `none` is all-or-nothing",
     });
-
-    return results;
   }
 
-  // Linux
-  const bwrap = await tryRun("bwrap", ["--version"]);
-  if (!bwrap.ok) {
-    return [
-      {
-        id: "sandbox:mechanism",
-        status: "fail",
-        code: "RM-SANDBOX-001",
-        observed: "bwrap not found",
-        expected: "bubblewrap installed",
-        remediation: "Install bubblewrap (apt install bubblewrap)",
-      },
-    ];
-  }
+  return results;
+}
 
-  const userns = await tryRun("bwrap", ["--dev-bind", "/", "/", "true"]);
-  return [
-    {
-      id: "sandbox:mechanism",
-      status: "pass",
-      observed: bwrap.out,
-      expected: "bubblewrap available",
-    },
-    {
-      id: "sandbox:userns",
-      status: userns.ok ? "pass" : "fail",
-      code: userns.ok ? undefined : "RM-SANDBOX-001",
-      observed: userns.ok ? "user namespaces usable" : userns.out.split("\n")[0] ?? "unavailable",
-      expected: "unprivileged user namespaces enabled",
-      remediation: userns.ok
-        ? undefined
-        : "sudo sysctl -w kernel.unprivileged_userns_clone=1",
-    },
-  ];
+/**
+ * Try to read a credential from inside a real sandbox, and fail if it works.
+ *
+ * Two things this deliberately does not do.
+ *
+ * It does not hand-roll a probe profile. It builds the sandbox through the same
+ * `Sandbox` the orchestrator uses, so what is proven here is the configuration
+ * that will actually confine the agent — a bespoke probe profile can pass while
+ * the real one leaks, which is the only outcome that would matter.
+ *
+ * It does not read the developer's real `~/.ssh/id_rsa`. That file is often
+ * absent, and then `cat` fails because there is nothing to read: the probe
+ * reports "denied" having proven nothing at all. Instead it plants a secret in
+ * a temporary HOME, confirms the secret IS readable outside the sandbox, and
+ * only then treats a failed read inside as evidence of denial.
+ */
+async function probeCredentialDenial(): Promise<CheckResult> {
+  const dir = mkdtempSync(join(tmpdir(), "runmill-probe-"));
+  const fakeHome = mkdtempSync(join(tmpdir(), "runmill-probe-home-"));
+  const realHome = process.env["HOME"];
+  const secret = join(fakeHome, ".ssh", "id_rsa");
+  const marker = "RUNMILL-PROBE-SECRET";
+
+  try {
+    mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
+    writeFileSync(secret, `${marker}\n`, { mode: 0o600 });
+    process.env["HOME"] = fakeHome;
+
+    // Control: if this is not readable unsandboxed, the probe cannot conclude
+    // anything from a failure inside.
+    if (!readFileSync(secret, "utf8").includes(marker)) {
+      return {
+        id: "sandbox:deny-credential-read",
+        status: "warn",
+        observed: "probe could not plant a readable secret, so denial is unproven",
+        expected: "a readable secret outside the sandbox, denied inside",
+        remediation: "Check that the temp directory is writable",
+      };
+    }
+
+    const sandbox = new Sandbox(detectMechanism());
+    const attempt = await sandbox.run({
+      command: "/bin/cat",
+      args: [secret],
+      cwd: dir,
+      policy: { writablePaths: [dir], allowNetwork: false },
+      timeoutMs: 15_000,
+    });
+
+    const leaked = attempt.exitCode === 0 || attempt.stdout.includes(marker);
+    return {
+      id: "sandbox:deny-credential-read",
+      status: leaked ? "fail" : "pass",
+      code: leaked ? "RM-SANDBOX-002" : undefined,
+      observed: leaked ? "read was PERMITTED" : "read denied",
+      expected: "reading a credential path is denied inside the sandbox",
+      remediation: leaked ? "Do not run runmill on this host until the probe fails" : undefined,
+    };
+  } catch (err) {
+    // Constructing the sandbox at all failed. That is a sandbox failure, not a
+    // reason to report the isolation guarantee as satisfied.
+    return {
+      id: "sandbox:deny-credential-read",
+      status: "fail",
+      code: "RM-SANDBOX-001",
+      observed: `probe could not run: ${err instanceof Error ? err.message : String(err)}`,
+      expected: "a sandbox that can be constructed and denies credential reads",
+      remediation: "runmill doctor --explain sandbox",
+    };
+  } finally {
+    if (realHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = realHome;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
 }
 
 export function checkCiEnvironment(): CheckResult {
