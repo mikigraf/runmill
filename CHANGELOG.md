@@ -10,6 +10,13 @@ Upgrades should be boring. Anything that requires action on your part appears un
 
 ### Added
 
+- `runmill eval validate` and `runmill eval replay` — the evaluation harness. Replays a suite of
+  tasks derived from your own history through the real selection and orchestration path, and
+  reports pass rates with 95% confidence intervals. Refusal accuracy is reported separately and
+  decides the exit code on its own: a harness that stops escalating has regressed no matter what
+  the aggregate says. `eval validate` rejects a suite in which every task expects success.
+- `runmill gc` — reconcile workspaces left behind by crashed runs.
+- The `PR_REVIEW` stage, which previously shipped as scaffolding and never ran.
 - `docs/` — conceptual documentation for the mechanisms the CLI cannot explain on its own:
   the coverage contract, the lease model, the seven merge gates, the sandbox, the run lifecycle,
   and a full configuration reference. `test/docs/contract.test.ts` fails if a doc cites a command,

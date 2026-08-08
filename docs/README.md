@@ -17,6 +17,7 @@ does. If you want to *use* runmill, start with the [README](../README.md).
 | [Autonomy and merge gates](./autonomy.md) | What `guarded-merge` actually requires, and the seven gates in order |
 | [The sandbox](./sandbox.md) | What the agent can and cannot reach, and what each platform can enforce |
 | [Run lifecycle](./lifecycle.md) | States, the side-effect outbox, crash recovery, budgets |
+| [Evaluation](./evaluation.md) | Measuring the harness against your own history — including the work it should refuse |
 
 ## Reference
 
@@ -58,6 +59,7 @@ knowing when not to merge.
 - **Security review?** [The sandbox](./sandbox.md), then the outbox in
   [run lifecycle](./lifecycle.md).
 - **Running more than one worker?** [The lease model](./leases.md).
+- **Deciding whether to trust auto-merge?** [Evaluation](./evaluation.md).
 - **Something failed?** [Errors](./errors.md), then `runmill inspect <run-id>`.
 
 ## Getting help

@@ -124,6 +124,8 @@ inside it, and fails if that succeeds.
 | `runmill auth login` | Store a credential in the OS keychain |
 | `runmill auth logout` | Remove a stored credential |
 | `runmill gc` | Reconcile workspaces left behind by crashed runs. `--dry-run` to preview |
+| `runmill eval validate` | Check an evaluation suite's structure and composition |
+| `runmill eval replay` | Replay a suite and report pass rates with confidence intervals |
 | `runmill state` | State store health |
 | `runmill feedback` | File an issue, with a support bundle |
 
@@ -224,7 +226,7 @@ read from the base commit and diffed; **runtime state** belongs to runmill alone
 | **Governed merge** — CI reconciliation, negative credential test, protected merge | **Working** |
 | **Live adapters** — Linear, Codex / Claude Code, GitHub | **Working** |
 | **Continuous operation** — daemon, circuit breakers | **Working** |
-| Evaluation — historical replay, held-out suites | Specified |
+| **Evaluation** — historical replay, held-out suites | **Working** |
 | Behavior handbook | Specified |
 
 ## Documentation
@@ -238,6 +240,7 @@ Start at [`docs/`](./docs/README.md).
 | [`docs/autonomy.md`](./docs/autonomy.md) | The seven merge gates, and what `guarded-merge` actually requires |
 | [`docs/sandbox.md`](./docs/sandbox.md) | What the agent can and cannot reach, per platform |
 | [`docs/lifecycle.md`](./docs/lifecycle.md) | Run states, the side-effect outbox, crash recovery |
+| [`docs/evaluation.md`](./docs/evaluation.md) | Measuring the harness against your own history |
 | [`docs/configuration.md`](./docs/configuration.md) | Every configuration key, with defaults |
 | [`docs/errors.md`](./docs/errors.md) | Every error code, what causes it, and how to fix it |
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Development setup, tests, and how the layers fit |

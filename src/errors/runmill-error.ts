@@ -167,6 +167,19 @@ export const ERROR_CATALOG = {
     recoverable: false,
   },
 
+  "RM-EVAL-001": {
+    title: "Evaluation suite is invalid",
+    why:
+      "The suite defines what 'working' means for this repository. An unreadable " +
+      "or malformed suite must not be treated as an empty one, because a suite " +
+      "with no tasks trivially passes.",
+    fixes: [
+      { description: "Check the suite structure and every task", command: "runmill eval validate <suite>" },
+      { description: "Start from the example suite in examples/eval/" },
+    ],
+    recoverable: false,
+  },
+
   // -- CI ----------------------------------------------------------------
   "RM-CI-002": {
     title: "Required check never reported",

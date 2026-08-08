@@ -15,7 +15,8 @@
     "docs",
     "runmill.schema.json",
     "assets",
-    "examples/quickstart"
+    "examples/quickstart",
+    "examples/eval"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

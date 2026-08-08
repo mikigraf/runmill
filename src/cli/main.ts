@@ -14,7 +14,8 @@ import { Orchestrator } from "../orchestrator/orchestrator.js";
 import { GitRefLease } from "../queue/git-lease.js";
 import { SystemClock } from "../platform/clock.js";
 import { Daemon, CircuitBreakers, DEFAULT_BREAKERS } from "../orchestrator/daemon.js";
-import { registerExtraCommands } from "./extra-commands.js";
+import { registerExtraCommands, type CommandContext } from "./extra-commands.js";
+import { registerEvalCommands } from "./eval-commands.js";
 import { EXPLANATIONS, buildSupportBundle } from "./explain.js";
 import { recordMilestone, recordDoctorFailure, readFunnel } from "../state/funnel.js";
 import type { CheckSpec } from "../verification/engine.js";
@@ -565,14 +566,16 @@ export function buildProgram(): Command {
       }
     });
 
-  registerExtraCommands(program, {
+  const commandContext: CommandContext = {
     emit: (human, data) => emit(program.opts<GlobalOpts>(), human, data),
     fail: (err) => fail(err, program.opts<GlobalOpts>()),
     dataDir,
     configPath: () => findConfigPath(program.opts<GlobalOpts>().config, process.cwd()),
     repoRoot: () => process.cwd(),
     exitCodes: EXIT,
-  });
+  };
+  registerExtraCommands(program, commandContext);
+  registerEvalCommands(program, commandContext);
 
   return program;
 }
