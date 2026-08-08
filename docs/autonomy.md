@@ -11,7 +11,7 @@ above it by a specific gate, not by a vague sense of caution.
 | `observe` | Selects and plans | Takes a lease, clones, or mutates anything |
 | `pr-only` | Implements, verifies, reviews, fixes, opens a PR — **the default** | Merges |
 | `guarded-merge` | Merges low-risk changes after every gate passes | Merges when any gate is unprovable |
-| `continuous` | Repeats guarded execution until work, budget, or a breaker stops it | — |
+| `continuous` | Applies guarded merge policy to every run in the daemon loop | — |
 
 `pr-only` is the default because opening a pull request cannot bypass anything. It is the mode
 where a mistake costs a review comment.
@@ -172,8 +172,9 @@ Start at `pr-only`. It is the default, it needs no special credential, and every
 evidence about whether you would have wanted it merged.
 
 Move to `guarded-merge` once you have a body of runs you would have approved, and once you can
-issue a scoped App token. Then `continuous`, which is `guarded-merge` in a loop with circuit
-breakers and budgets.
+issue a scoped App token. Use `continuous` when every repeated daemon run should apply that merge
+policy. The daemon loop itself works with `pr-only` too; autonomy controls each run, while
+`runmill daemon` controls repetition, polling, circuit breakers, and session budgets.
 
 Autonomy should be earned with evidence you actually collected, and the PRs from `pr-only` are
 that evidence.

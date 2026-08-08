@@ -1,11 +1,18 @@
 # Run lifecycle
 
+Successful deliveries and merges are also recorded in `.runmill/log.md`. This is a concise,
+human-readable journal rather than recovery state; the SQLite store remains authoritative. Log
+timestamps use local `DD/MM/YYYY HH:mm` format and 24-hour time.
+
 > Implemented in [`src/orchestrator/orchestrator.ts`](../src/orchestrator/orchestrator.ts) and
 > [`src/state/store.ts`](../src/state/store.ts).
 
 A run is one issue moving from the backlog to a pull request, and possibly to a merge. It is a
 state machine with durable transitions, so a crash is a resumable event rather than an
 investigation.
+
+The daemon is the outer loop around this state machine. It performs one run at a time and polls
+again while idle; see [daemon operation](./daemon.md).
 
 ## States
 
@@ -146,9 +153,10 @@ budgets:
 Per-role invocation caps matter more than the total: a fix loop that oscillates burns its budget
 in the `fixer` role specifically, and a per-role cap stops it without also starving review.
 
-`runmill daemon` adds circuit breakers across runs — consecutive failures, error-rate thresholds —
-so a systemic problem (a broken base branch, an expired credential) stops the loop rather than
-being retried against every issue in the backlog.
+`runmill daemon` adds circuit breakers across runs — consecutive failures, quarantines,
+escalation rate, and daily spend — so a systemic problem stops the loop instead of being retried
+against every issue. An empty queue does not stop the normal daemon; it polls until a signal,
+budget, or breaker stops it. `runmill daemon --once` keeps the batch-style drain-and-exit behavior.
 
 ## Observability
 

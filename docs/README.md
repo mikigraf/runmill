@@ -1,17 +1,21 @@
 # runmill documentation
 
-runmill is not another coding model. It is the workflow, state, policy, and verification layer
-around Codex and Claude Code — it owns everything those agents should not: which issue to work on,
-how it is claimed, what context it gets, whether the tests that mattered actually ran, whether the
-change is in scope, and whether it may merge.
+Runmill is a loop orchestrator daemon for autonomous software engineering. It watches a backlog
+and turns eligible issues into verified, independently reviewed pull requests using Codex or
+Claude Code. Runmill owns selection, state, policy, and side effects; the agents write and review
+code.
 
 These pages explain the mechanisms that make those decisions, and why each one works the way it
 does. If you want to *use* runmill, start with the [README](../README.md).
+
+Runtime and development dependencies are pinned to exact versions, and the lockfile pins the full
+transitive graph. Use `npm ci` for a reproducible local or CI installation.
 
 ## Concepts
 
 | Page | Answers |
 |---|---|
+| [Daemon operation](./daemon.md) | OpenTUI, background operation, idle polling, sleep prevention, and stopping |
 | [The coverage contract](./verification.md) | Why a green test run is not proof, and what runmill requires instead |
 | [The lease model](./leases.md) | How two workers are prevented from taking the same issue, and why the issue tracker cannot do it |
 | [Autonomy and merge gates](./autonomy.md) | What `guarded-merge` actually requires, and the seven gates in order |
@@ -61,6 +65,7 @@ knowing when not to merge.
 - **Running more than one worker?** [The lease model](./leases.md).
 - **Deciding whether to trust auto-merge?** [Evaluation](./evaluation.md).
 - **Something failed?** [Errors](./errors.md), then `runmill inspect <run-id>`.
+- **Leaving it running?** [Daemon operation](./daemon.md).
 
 ## Getting help
 

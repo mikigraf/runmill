@@ -1,5 +1,14 @@
 # Configuration
 
+Create a configuration interactively with `runmill config create`. The wizard uses authenticated
+GitHub and Linear access to preload repository, team, and workflow choices; detects installed Codex
+and Claude CLIs; and lets you choose CLI subscription auth or API-key auth. Secrets are passed to
+the relevant credential store or CLI and are never written to `runmill.yaml`.
+
+For automation or a quick starting point, `runmill config create --defaults` accepts discovered
+values and conservative defaults without prompting. Existing files are preserved unless `--force`
+is provided.
+
 Two files, split by **ownership** — and the split is a security property, not an organizational
 preference.
 
@@ -68,7 +77,7 @@ providers:
 
 | Key | Default | Notes |
 |---|---|---|
-| `provider` | `linear` | |
+| `provider` | `linear` | Linear is the current live adapter. `github-issues` is reserved but not implemented yet. |
 | `team` | — | Required |
 | `eligible_states` | `[]` | States an issue may be picked up from |
 | `claim_state` | — | Moved here on claim. Display only — [the lease](./leases.md) owns ownership |
@@ -239,6 +248,10 @@ the deterministic gates still have to pass.
 
 Per-role caps matter more than the total: an oscillating fix loop burns budget specifically in the
 `fixer` role, and a per-role cap stops it without starving review.
+
+Daemon polling is an operational CLI setting rather than repository policy. Use
+`runmill daemon --poll-seconds <seconds>` to change the 30-second default, or `--once` to drain the
+currently eligible queue and exit. See [daemon operation](./daemon.md).
 
 ---
 
