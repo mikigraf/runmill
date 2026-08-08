@@ -1,328 +1,179 @@
-<title>runmill — the control plane and exit condition for autonomous software engineering</title>
+<title>runmill — the exit condition for coding agents</title>
 
 <style>
   :root {
-    --ground: #0A0C0E;
-    --surface: #14181B;
-    --surface-2: #1B2024;
-    --line: #262D31;
-    --ink: #EAEEF0;
-    --muted: #8A9699;
-    --amber: #E9A23B;
-    --violet: #7C5CFF;
-    --pass: #46D39A;
-    --fail: #FF6B6B;
-    --glow-a: rgba(233, 162, 59, 0.20);
-    --glow-b: rgba(124, 92, 255, 0.22);
-    --card: rgba(255, 255, 255, 0.028);
-    --shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+    --ground: #0A0C0E; --surface: #101417; --surface-2: #171C20;
+    --line: #232A2E; --line-soft: #1A2023;
+    --ink: #EDF1F2; --muted: #8B979B; --faint: #5D686C;
+    --amber: #E9A23B; --violet: #7C5CFF;
+    --pass: #45D39A; --fail: #FF6F6F;
+    --glow-a: rgba(233, 162, 59, 0.20); --glow-b: rgba(124, 92, 255, 0.20);
+    --card: rgba(255, 255, 255, 0.03);
+    --shadow: 0 40px 90px -20px rgba(0, 0, 0, 0.75);
+    color-scheme: dark;
 
     --display: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 
-    --max: 1080px;
-    --step--1: clamp(0.82rem, 0.79rem + 0.13vw, 0.89rem);
-    --step-0: clamp(1rem, 0.96rem + 0.2vw, 1.11rem);
-    --step-1: clamp(1.2rem, 1.1rem + 0.5vw, 1.5rem);
-    --step-2: clamp(1.6rem, 1.35rem + 1.2vw, 2.4rem);
-    --step-3: clamp(2.2rem, 1.6rem + 2.9vw, 4.4rem);
+    --max: 1140px;
+    --s--1: clamp(0.79rem, 0.765rem + 0.11vw, 0.85rem);
+    --s-0: clamp(0.97rem, 0.94rem + 0.16vw, 1.05rem);
+    --s-1: clamp(1.1rem, 1.02rem + 0.4vw, 1.32rem);
+    --s-3: clamp(2.25rem, 1.5rem + 3.2vw, 4.5rem);
   }
 
   @media (prefers-color-scheme: light) {
     :root {
-      --ground: #F6F4F1;
-      --surface: #FFFFFF;
-      --surface-2: #F0EDE8;
-      --line: #DFDAD2;
-      --ink: #16191C;
-      --muted: #5F6A6E;
-      --amber: #A96A00;
-      --violet: #5637D6;
-      --pass: #12805C;
-      --fail: #C0362C;
-      --glow-a: rgba(233, 162, 59, 0.24);
-      --glow-b: rgba(124, 92, 255, 0.16);
-      --card: rgba(20, 24, 27, 0.028);
-      --shadow: 0 18px 44px rgba(40, 34, 24, 0.14);
+      --ground: #F7F5F2; --surface: #FFFFFF; --surface-2: #F2EFEA;
+      --line: #E0DBD3; --line-soft: #EBE7E0;
+      --ink: #14181A; --muted: #5C666A; --faint: #8B9296;
+      --amber: #9C6100; --violet: #5233CE; --pass: #0F7A57; --fail: #BC3128;
+      --glow-a: rgba(233, 162, 59, 0.26); --glow-b: rgba(124, 92, 255, 0.14);
+      --card: rgba(20, 24, 26, 0.03);
+      --shadow: 0 30px 60px -22px rgba(60, 48, 30, 0.28);
       color-scheme: light;
     }
   }
-
   :root[data-theme="light"] {
-    --ground: #F6F4F1;
-    --surface: #FFFFFF;
-    --surface-2: #F0EDE8;
-    --line: #DFDAD2;
-    --ink: #16191C;
-    --muted: #5F6A6E;
-    --amber: #A96A00;
-    --violet: #5637D6;
-    --pass: #12805C;
-    --fail: #C0362C;
-    --glow-a: rgba(233, 162, 59, 0.24);
-    --glow-b: rgba(124, 92, 255, 0.16);
-    --card: rgba(20, 24, 27, 0.028);
-    --shadow: 0 18px 44px rgba(40, 34, 24, 0.14);
+    --ground: #F7F5F2; --surface: #FFFFFF; --surface-2: #F2EFEA;
+    --line: #E0DBD3; --line-soft: #EBE7E0;
+    --ink: #14181A; --muted: #5C666A; --faint: #8B9296;
+    --amber: #9C6100; --violet: #5233CE; --pass: #0F7A57; --fail: #BC3128;
+    --glow-a: rgba(233, 162, 59, 0.26); --glow-b: rgba(124, 92, 255, 0.14);
+    --card: rgba(20, 24, 26, 0.03);
+    --shadow: 0 30px 60px -22px rgba(60, 48, 30, 0.28);
     color-scheme: light;
   }
-
   :root[data-theme="dark"] {
-    --ground: #0A0C0E;
-    --surface: #14181B;
-    --surface-2: #1B2024;
-    --line: #262D31;
-    --ink: #EAEEF0;
-    --muted: #8A9699;
-    --amber: #E9A23B;
-    --violet: #7C5CFF;
-    --pass: #46D39A;
-    --fail: #FF6B6B;
-    --glow-a: rgba(233, 162, 59, 0.20);
-    --glow-b: rgba(124, 92, 255, 0.22);
-    --card: rgba(255, 255, 255, 0.028);
-    --shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+    --ground: #0A0C0E; --surface: #101417; --surface-2: #171C20;
+    --line: #232A2E; --line-soft: #1A2023;
+    --ink: #EDF1F2; --muted: #8B979B; --faint: #5D686C;
+    --amber: #E9A23B; --violet: #7C5CFF; --pass: #45D39A; --fail: #FF6F6F;
+    --glow-a: rgba(233, 162, 59, 0.20); --glow-b: rgba(124, 92, 255, 0.20);
+    --card: rgba(255, 255, 255, 0.03);
+    --shadow: 0 40px 90px -20px rgba(0, 0, 0, 0.75);
     color-scheme: dark;
   }
 
+  * { box-sizing: border-box; }
   body {
-    margin: 0;
-    background: var(--ground);
-    color: var(--ink);
-    font-family: var(--display);
-    font-size: var(--step-0);
-    line-height: 1.6;
-    -webkit-font-smoothing: antialiased;
-    overflow-x: hidden;
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: var(--display); font-size: var(--s-0); line-height: 1.6;
+    -webkit-font-smoothing: antialiased; overflow-x: hidden;
+    min-height: 100vh; display: flex; flex-direction: column;
   }
 
-  .glow { position: fixed; inset: 0; pointer-events: none; z-index: 0; }
-  .glow::before, .glow::after {
-    content: ""; position: absolute; border-radius: 50%;
-    filter: blur(110px);
-  }
-  .glow::before {
-    width: 60vw; height: 46vw; top: -18vw; left: -12vw; background: var(--glow-a);
-  }
-  .glow::after {
-    width: 52vw; height: 40vw; top: -10vw; right: -14vw; background: var(--glow-b);
-  }
+  .glow { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
+  .glow i { position: absolute; border-radius: 50%; filter: blur(120px); display: block; }
+  .glow i:nth-child(1) { width: 64vw; height: 44vw; top: -22vw; left: -16vw; background: var(--glow-a); }
+  .glow i:nth-child(2) { width: 54vw; height: 40vw; top: -16vw; right: -16vw; background: var(--glow-b); }
 
-  .wrap { position: relative; z-index: 1; max-width: var(--max); margin: 0 auto; padding: 0 24px; }
+  .wrap { position: relative; z-index: 1; width: 100%; max-width: var(--max); margin: 0 auto; padding: 0 24px; }
 
-  /* ---- nav ---- */
-  nav {
-    display: flex; align-items: center; justify-content: space-between;
-    gap: 16px; padding: 22px 0 0;
-  }
-  .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: -0.01em; }
-  .mark {
-    width: 26px; height: 26px; border-radius: 7px; flex: none;
-    background: linear-gradient(150deg, var(--amber), var(--violet));
-    box-shadow: 0 0 0 1px var(--line);
-  }
-  .nav-links { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  nav { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 0; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 640; letter-spacing: -0.012em; }
+  .mark { width: 24px; height: 24px; border-radius: 7px; flex: none; background: linear-gradient(145deg, var(--amber), var(--violet)); }
+  .nav-links { display: flex; align-items: center; gap: 8px; }
 
   .pill {
-    display: inline-flex; align-items: center; gap: 8px;
+    display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
     padding: 9px 16px; border-radius: 999px;
     border: 1px solid var(--line); background: var(--card);
     color: var(--ink); text-decoration: none;
-    font-size: var(--step--1); font-weight: 550;
-    transition: border-color .18s ease, background .18s ease, transform .18s ease;
+    font-size: var(--s--1); font-weight: 550; font-family: inherit;
+    transition: border-color .18s ease, background .18s ease, transform .18s ease, color .18s ease;
   }
-  .pill:hover { border-color: color-mix(in oklab, var(--amber) 55%, var(--line)); transform: translateY(-1px); }
-  .pill--solid { background: var(--ink); color: var(--ground); border-color: transparent; font-weight: 650; }
-  .pill--solid:hover { background: var(--amber); color: #0A0C0E; }
-  a:focus-visible, button:focus-visible {
-    outline: 2px solid var(--amber); outline-offset: 3px; border-radius: 999px;
+  .pill:hover { border-color: color-mix(in oklab, var(--amber) 60%, var(--line)); transform: translateY(-1px); }
+  .pill--solid { background: var(--ink); color: var(--ground); border-color: transparent; font-weight: 640; }
+  .pill--solid:hover { background: var(--amber); color: #080A0B; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; }
+
+  main { flex: 1; }
+  .hero { padding: clamp(36px, 6vw, 76px) 0 0; display: grid; gap: clamp(34px, 5vw, 56px); }
+  @media (min-width: 1020px) {
+    .hero { grid-template-columns: minmax(0, 0.88fr) minmax(0, 1.12fr); align-items: center; gap: 54px; }
   }
 
-  /* ---- hero ---- */
-  header { padding: clamp(56px, 9vw, 116px) 0 0; }
   .eyebrow {
-    font-family: var(--mono); font-size: var(--step--1);
-    letter-spacing: 0.14em; text-transform: uppercase; color: var(--amber);
-    margin: 0 0 20px;
+    display: inline-flex; align-items: center; gap: 9px; margin: 0 0 20px;
+    font-family: var(--mono); font-size: 0.73rem; letter-spacing: 0.15em;
+    text-transform: uppercase; color: var(--amber);
   }
-  h1 {
-    font-size: var(--step-3); line-height: 0.98; letter-spacing: -0.035em;
-    font-weight: 800; margin: 0; text-wrap: balance; max-width: 15ch;
-  }
-  h1 .dim { color: var(--muted); }
-  .positioning {
-    margin: 24px 0 0; max-width: 54ch; font-size: var(--step-1);
-    font-weight: 620; letter-spacing: -0.018em; line-height: 1.32; color: var(--ink);
-    text-wrap: balance;
-  }
-  .lede {
-    margin: 14px 0 0; max-width: 60ch; color: var(--muted);
-    font-size: var(--step-1); line-height: 1.5; text-wrap: pretty;
-  }
-  .cta { display: flex; gap: 10px; flex-wrap: wrap; margin: 34px 0 0; }
+  .eyebrow::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 12px var(--amber); }
 
-  /* ---- terminal ---- */
-  .term {
-    margin: clamp(44px, 6vw, 76px) 0 0;
-    border: 1px solid var(--line); border-radius: 14px;
-    background: var(--surface); box-shadow: var(--shadow);
-    overflow: hidden;
+  h1 { font-size: var(--s-3); line-height: 0.96; letter-spacing: -0.04em; font-weight: 800; margin: 0; text-wrap: balance; }
+  h1 .dim { color: var(--faint); }
+  .positioning { margin: 22px 0 0; max-width: 44ch; font-size: var(--s-1); font-weight: 600; letter-spacing: -0.017em; line-height: 1.34; text-wrap: balance; }
+  .lede { margin: 13px 0 0; max-width: 52ch; color: var(--muted); line-height: 1.62; text-wrap: pretty; }
+  .cta { display: flex; gap: 10px; flex-wrap: wrap; margin: 28px 0 0; }
+
+  .stat {
+    margin: 30px 0 0; padding-left: 15px; max-width: 50ch;
+    border-left: 2px solid color-mix(in oklab, var(--amber) 55%, transparent);
   }
-  .term-bar {
-    display: flex; align-items: center; gap: 8px;
-    padding: 11px 14px; border-bottom: 1px solid var(--line);
-    background: var(--surface-2);
-  }
+  .stat b { font-size: var(--s-1); font-weight: 720; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .stat span { display: block; color: var(--faint); font-size: var(--s--1); margin-top: 3px; }
+
+  .term { border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow); overflow: hidden; min-width: 0; }
+  .term-bar { display: flex; align-items: center; gap: 7px; padding: 11px 14px; border-bottom: 1px solid var(--line-soft); background: var(--surface-2); }
   .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); flex: none; }
-  .term-title {
-    font-family: var(--mono); font-size: var(--step--1); color: var(--muted); margin-left: 6px;
+  .term-path { font-family: var(--mono); font-size: 0.73rem; color: var(--faint); margin-left: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .replay {
+    margin-left: auto; border: 1px solid var(--line); background: transparent; color: var(--muted);
+    border-radius: 999px; padding: 4px 11px; cursor: pointer;
+    font-family: var(--mono); font-size: 0.69rem; letter-spacing: 0.05em;
+    transition: color .18s ease, border-color .18s ease;
   }
+  .replay:hover { color: var(--amber); border-color: var(--amber); }
+
+  .steps { display: flex; border-bottom: 1px solid var(--line-soft); background: var(--surface-2); overflow-x: auto; scrollbar-width: none; }
+  .steps::-webkit-scrollbar { display: none; }
+  .step {
+    appearance: none; border: 0; background: transparent; cursor: pointer;
+    font-family: var(--mono); font-size: 0.73rem; color: var(--faint);
+    padding: 10px 14px; white-space: nowrap; border-bottom: 2px solid transparent;
+    transition: color .18s ease, border-color .18s ease;
+  }
+  .step:hover { color: var(--muted); }
+  .step[aria-selected="true"] { color: var(--amber); border-bottom-color: var(--amber); }
+  .step-i { color: var(--line); margin-right: 7px; }
+  .step[aria-selected="true"] .step-i { color: color-mix(in oklab, var(--amber) 55%, transparent); }
+
   .term-body {
-    font-family: var(--mono); font-size: var(--step--1); line-height: 1.85;
-    padding: 20px 18px; margin: 0; overflow-x: auto;
-    white-space: pre; tab-size: 2;
+    font-family: var(--mono); font-size: var(--s--1); line-height: 1.78;
+    padding: 18px 18px 22px; margin: 0; overflow-x: auto; white-space: pre; min-height: 330px;
   }
-  .term-body .ln { display: block; opacity: 0; transform: translateY(2px); }
-  .term-body .ln.on { opacity: 1; transform: none; transition: opacity .22s ease, transform .22s ease; }
-  .c-mute { color: var(--muted); }
+  @media (min-width: 1020px) { .term-body { min-height: 386px; } }
+  .c-mute { color: var(--faint); }
+  .c-dim { color: var(--muted); }
   .c-pass { color: var(--pass); }
   .c-fail { color: var(--fail); }
   .c-amber { color: var(--amber); }
-  .cursor {
-    display: inline-block; width: 8px; height: 1em; vertical-align: -2px;
-    background: var(--amber); animation: blink 1.1s step-end infinite;
-  }
+  .c-ink { color: var(--ink); }
+  .c-prompt { color: var(--violet); }
+  .cursor { display: inline-block; width: 7px; height: 1.05em; vertical-align: -0.18em; background: var(--amber); animation: blink 1.05s step-end infinite; }
   @keyframes blink { 50% { opacity: 0; } }
 
-  .caption {
-    margin: 16px 0 0; color: var(--muted); font-size: var(--step--1);
-    max-width: 62ch;
+  .term-note {
+    padding: 13px 18px; border-top: 1px solid var(--line-soft); background: var(--surface-2);
+    color: var(--muted); font-size: var(--s--1); line-height: 1.55; min-height: 66px; margin: 0;
   }
-
-  /* ---- sections ---- */
-  section { padding: clamp(64px, 9vw, 128px) 0 0; }
-  h2 {
-    font-size: var(--step-2); line-height: 1.08; letter-spacing: -0.028em;
-    font-weight: 750; margin: 0 0 18px; text-wrap: balance; max-width: 20ch;
-  }
-  .section-lede { color: var(--muted); max-width: 62ch; margin: 0; text-wrap: pretty; }
-
-  .split { display: grid; gap: 28px; grid-template-columns: 1fr; align-items: start; }
-  @media (min-width: 820px) { .split { grid-template-columns: 1fr 1fr; gap: 44px; } }
-
-  .card {
-    border: 1px solid var(--line); border-radius: 14px;
-    background: var(--card); padding: 24px;
-  }
-  .card h3 {
-    font-size: var(--step-0); font-weight: 650; margin: 0 0 8px; letter-spacing: -0.012em;
-  }
-  .card p { margin: 0; color: var(--muted); font-size: var(--step--1); line-height: 1.65; }
-  .card code, .term-body code { font-family: var(--mono); }
-
-  .code-block {
-    font-family: var(--mono); font-size: var(--step--1);
-    background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
-    padding: 16px 18px; margin: 20px 0 0; overflow-x: auto; white-space: pre; color: var(--muted);
-  }
-
-  /* ---- gates: the vertical rail ---- */
-  .gates { list-style: none; margin: 32px 0 0; padding: 0; counter-reset: gate; }
-  .gate {
-    display: grid; grid-template-columns: auto 1fr; gap: 16px;
-    padding: 16px 0; border-top: 1px solid var(--line); align-items: start;
-  }
-  .gate:last-child { border-bottom: 1px solid var(--line); }
-  .gate-n {
-    font-family: var(--mono); font-size: var(--step--1); color: var(--amber);
-    font-variant-numeric: tabular-nums; padding-top: 2px; min-width: 2.5ch;
-  }
-  .gate strong { font-weight: 620; letter-spacing: -0.01em; }
-  .gate span { display: block; color: var(--muted); font-size: var(--step--1); margin-top: 3px; }
-
-  /* ---- layers ---- */
-  .layers { list-style: none; margin: 30px 0 0; padding: 0; display: grid; gap: 0; }
-  .layer {
-    display: grid; grid-template-columns: auto 1fr; gap: 20px;
-    padding: 20px 0; border-top: 1px solid var(--line); align-items: start;
-  }
-  .layer:last-child { border-bottom: 1px solid var(--line); }
-  .layer-k {
-    font-family: var(--mono); font-size: var(--step--1); color: var(--amber);
-    text-transform: uppercase; letter-spacing: 0.1em; padding-top: 3px;
-    min-width: 11ch;
-  }
-  .layer strong { display: block; font-weight: 620; letter-spacing: -0.012em; }
-  .layer span { display: block; color: var(--muted); font-size: var(--step--1); margin-top: 5px; max-width: 62ch; }
-
-  .stat {
-    margin: 34px 0 0; padding: 26px 28px; border-radius: 14px;
-    border: 1px solid color-mix(in oklab, var(--amber) 32%, var(--line));
-    background: color-mix(in oklab, var(--amber) 7%, transparent);
-  }
-  .stat-fig {
-    margin: 0; font-size: var(--step-2); font-weight: 780; letter-spacing: -0.03em;
-    line-height: 1.1; color: var(--ink); font-variant-numeric: tabular-nums; text-wrap: balance;
-  }
-  .stat-op { color: var(--muted); font-weight: 500; letter-spacing: -0.01em; }
-  .stat-src { margin: 12px 0 0; color: var(--muted); font-size: var(--step--1); max-width: 64ch; }
-
-  /* ---- ladder ---- */
-  .ladder { display: grid; gap: 10px; margin: 30px 0 0; }
-  .rung {
-    display: grid; grid-template-columns: auto 1fr; gap: 16px; align-items: baseline;
-    border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px;
-    background: var(--card);
-  }
-  .rung-name {
-    font-family: var(--mono); font-size: var(--step--1); color: var(--ink); font-weight: 600;
-  }
-  .rung-name.is-default { color: var(--amber); }
-  .rung p { margin: 0; color: var(--muted); font-size: var(--step--1); }
-  .tag {
-    font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--amber); border: 1px solid color-mix(in oklab, var(--amber) 40%, transparent);
-    border-radius: 999px; padding: 2px 8px; margin-left: 8px; white-space: nowrap;
-  }
-
-  /* ---- built on ---- */
-  .deps { width: 100%; border-collapse: collapse; margin: 24px 0 0; font-size: var(--step--1); }
-  .deps th, .deps td { text-align: left; padding: 11px 12px 11px 0; border-bottom: 1px solid var(--line); }
-  .deps th { font-family: var(--mono); font-weight: 500; color: var(--muted); font-size: 0.76rem; letter-spacing: 0.1em; text-transform: uppercase; }
-  .deps td:first-child { font-family: var(--mono); color: var(--ink); }
-  .deps td:last-child { color: var(--muted); font-family: var(--mono); text-align: right; }
-  .table-scroll { overflow-x: auto; }
-
-  /* ---- closing ---- */
-  .closing {
-    margin: clamp(64px, 9vw, 120px) 0 0; padding: clamp(34px, 5vw, 56px);
-    border: 1px solid var(--line); border-radius: 18px;
-    background: linear-gradient(150deg, color-mix(in oklab, var(--amber) 9%, transparent), color-mix(in oklab, var(--violet) 10%, transparent));
-  }
-  .closing h2 { margin-bottom: 14px; }
+  .term-note b { color: var(--ink); font-weight: 620; }
 
   footer {
-    margin: clamp(56px, 8vw, 96px) 0 0; padding: 26px 0 40px;
-    border-top: 1px solid var(--line);
-    display: flex; gap: 14px; justify-content: space-between; flex-wrap: wrap;
-    color: var(--muted); font-size: var(--step--1);
+    margin-top: clamp(44px, 6vw, 72px); padding: 20px 0 34px; border-top: 1px solid var(--line-soft);
+    display: flex; gap: 12px 22px; justify-content: space-between; flex-wrap: wrap;
+    color: var(--faint); font-size: var(--s--1);
   }
-  footer a { color: var(--muted); }
+  footer a { color: var(--muted); text-decoration: none; }
+  footer a:hover { color: var(--amber); }
 
-  .reveal { opacity: 0; transform: translateY(14px); }
-  .reveal.on { opacity: 1; transform: none; transition: opacity .55s ease, transform .55s ease; }
-
-  @media (prefers-reduced-motion: reduce) {
-    .reveal, .reveal.on, .term-body .ln, .term-body .ln.on {
-      opacity: 1 !important; transform: none !important; transition: none !important;
-    }
-    .cursor { animation: none; }
-  }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 </style>
 
-<div class="glow"></div>
+<div class="glow"><i></i><i></i></div>
 
 <div class="wrap">
-
   <nav>
     <div class="brand"><span class="mark"></span> runmill</div>
     <div class="nav-links">
@@ -330,233 +181,259 @@
       <a class="pill pill--solid" href="https://github.com/mikigraf/runmill">GitHub</a>
     </div>
   </nav>
+</div>
 
-  <header>
-    <p class="eyebrow">Control plane · exit condition</p>
-    <h1>Refuses to deliver <span class="dim">anything it cannot prove.</span></h1>
-    <p class="positioning">
-      runmill is the control plane and exit condition for autonomous software engineering.
-    </p>
-    <p class="lede">
-      Your coding-agent harness already has a loop. runmill is what makes that loop safe to leave
-      running: deterministic selection and an atomic claim from the backlog, proven isolation,
-      evidence that the tests you actually cared about ran against the exact candidate, fresh-context
-      review, and a merge gate that fails closed.
-    </p>
-    <div class="cta">
-      <a class="pill pill--solid" href="https://github.com/mikigraf/runmill#try-it-in-60-seconds">Try it in 60 seconds</a>
-      <a class="pill" href="https://github.com/mikigraf/runmill/blob/main/docs/verification.md">Read the coverage contract</a>
+<main class="wrap">
+  <div class="hero">
+    <div>
+      <p class="eyebrow">Proof of done</p>
+      <h1>The agent says it's done. <span class="dim">runmill checks.</span></h1>
+      <p class="positioning">The exit condition for coding agents.</p>
+      <p class="lede">
+        Your harness already has a loop. runmill decides when that loop is actually finished:
+        deterministic selection and an atomic claim from the backlog, proven isolation, evidence
+        that the checks you said mattered ran against the exact candidate commit, fresh-context
+        review, and a merge gate that fails closed.
+      </p>
+      <div class="cta">
+        <a class="pill pill--solid" href="https://github.com/mikigraf/runmill#try-it-in-60-seconds">Try it in 60 seconds</a>
+        <a class="pill" href="https://github.com/mikigraf/runmill/blob/main/docs/verification.md">What counts as evidence</a>
+      </div>
+      <p class="stat">
+        <b>85% say the bottleneck moved from writing code to reviewing it.</b>
+        <span>GitLab, June 2026, surveying 1,528 developers and technology buyers.</span>
+      </p>
     </div>
 
-    <div class="term" id="term">
+    <div class="term">
       <div class="term-bar">
         <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-        <span class="term-title">runmill daemon</span>
+        <span class="term-path">~/acme/platform</span>
+        <button class="replay" id="replay" type="button">replay</button>
       </div>
-      <pre class="term-body" id="termBody"><span class="ln"><span class="c-amber">$</span> runmill daemon</span><span class="ln"> </span><span class="ln">  ENG-102  →  <span class="c-pass">PR_DELIVERED</span>   $0.02</span><span class="ln">  ENG-101  →  <span class="c-pass">PR_DELIVERED</span>   $0.02</span><span class="ln">  ENG-118  →  <span class="c-fail">NEEDS_HUMAN</span>    $0.03</span><span class="ln">              <span class="c-mute">check "unit" exited 0 having discovered no tests</span></span><span class="ln"> </span><span class="ln">  <span class="c-fail">stopped: breaker</span>  <span class="c-mute">1 run could not be verified</span><span class="cursor"></span></span></pre>
-    </div>
-    <p class="caption">
-      The third run exited 0. It still failed. A suite that discovers no tests is the most
-      convincing false green there is, because it looks identical to a full pass.
-    </p>
-  </header>
-
-  <section class="reveal">
-    <h2>Isn't this just a loop?</h2>
-    <div class="split">
-      <div>
-        <p class="section-lede">
-          The loop is three lines, and it genuinely works when an oracle already exists. A flaky
-          test is its own judge. A nightly end-to-end suite is its own judge. If that describes your
-          problem, use the three lines. You don't need this.
-        </p>
-        <pre class="code-block">while :; do cat PROMPT.md | claude-code; done</pre>
+      <div class="steps" role="tablist" aria-label="A runmill session">
+        <button class="step" role="tab" aria-selected="true" data-i="0"><span class="step-i">01</span>init</button>
+        <button class="step" role="tab" aria-selected="false" data-i="1"><span class="step-i">02</span>doctor</button>
+        <button class="step" role="tab" aria-selected="false" data-i="2"><span class="step-i">03</span>next</button>
+        <button class="step" role="tab" aria-selected="false" data-i="3"><span class="step-i">04</span>daemon</button>
       </div>
-      <div>
-        <p class="section-lede">
-          It stops working when nothing outside the model can tell you the work is finished. Then
-          the exit condition quietly becomes the model's own opinion, and "the agent said it was
-          done" is a different claim from "it is done" in exactly the cases you care about.
-        </p>
-        <p class="section-lede" style="margin-top:16px">
-          Harnesses get agents running. runmill is the layer that decides whether what came out is
-          allowed to land.
-        </p>
-      </div>
-    </div>
-  </section>
-
-  <section class="reveal">
-    <h2>Why this layer, and why now</h2>
-    <p class="section-lede">
-      The conversation moved in three steps, and each one settled before the next began.
-    </p>
-
-    <ol class="layers">
-      <li class="layer">
-        <span class="layer-k">Harness</span>
-        <div>
-          <strong>Settled: 2025 to early 2026</strong>
-          <span>Everything around the model. Sandbox, tools, permissions, context, tests, review gates,
-          and the inner execution loop. Claude Code and Codex are the canonical examples. The model
-          became the commodity and the harness became the engineering surface, because a harness buys
-          observability, constraint, and checkability rather than correctness.</span>
-        </div>
-      </li>
-      <li class="layer">
-        <span class="layer-k">Loop</span>
-        <div>
-          <strong>The current frontier</strong>
-          <span>Once the harness is reliable, the outer loop has to decide when to stop. Triggers,
-          goals, durable state, and a verifier. The first four are the easy ones. The verifier is the
-          whole problem, and without it the exit condition collapses into the model's own opinion.</span>
-        </div>
-      </li>
-      <li class="layer">
-        <span class="layer-k">Control plane</span>
-        <div>
-          <strong>The governance layer, being defined now</strong>
-          <span>Sits above and across harnesses: identity, policy enforcement, budgets and circuit
-          breakers, kill switches, audit trails, and deterministic governance of side effects. Every
-          team that has run agents continuously has ended up building one, because the harness alone
-          never had the authority to say no.</span>
-        </div>
-      </li>
-    </ol>
-
-    <div class="stat">
-      <p class="stat-fig">180% <span class="stat-op">more code generated,</span> 30% <span class="stat-op">more shipped</span></p>
-      <p class="stat-src">MIT research on agent-assisted development. The gap between those two
-      numbers is the verification bottleneck, and it is the only thing runmill is built to close.
-      Merge gates that were tolerable compromises at human volume become liabilities at agent volume.</p>
-    </div>
-
-    <div class="split" style="margin-top:32px">
-      <div class="card">
-        <h3>What a harness does</h3>
-        <p>Gets an agent running. Gives it tools, a sandbox, context, and an inner loop. Claude Code and Codex are very good at this, and runmill does not compete with them.</p>
-      </div>
-      <div class="card">
-        <h3>What a control plane does</h3>
-        <p>Keeps agents under control across harnesses. Owns the claim, the budget, the audit trail, and every side effect. Decides whether the work is allowed to land.</p>
-      </div>
-    </div>
-  </section>
-
-  <section class="reveal">
-    <h2>Seven gates, evaluated in order</h2>
-    <p class="section-lede">
-      Any failure ends the run in a terminal state that names which gate and why.
-      <code>runmill policy explain &lt;run-id&gt;</code> prints this for any run.
-    </p>
-    <ol class="gates">
-      <li class="gate"><span class="gate-n">01</span><div><strong>The lease is still held</strong><span>A compare-and-swap on a git ref, checked against a fencing generation before every external mutation.</span></div></li>
-      <li class="gate"><span class="gate-n">02</span><div><strong>Checks discovered, executed, fresh, unskipped</strong><span>Run against the exact candidate commit in a clean detached worktree, with the tree hashed either side.</span></div></li>
-      <li class="gate"><span class="gate-n">03</span><div><strong>Review verdict, cross-checked</strong><span>A clean report on a diff touching risk-escalating paths escalates rather than being believed.</span></div></li>
-      <li class="gate"><span class="gate-n">04</span><div><strong>Branch protection is readable</strong><span>Unreadable rules are unknown, not absent. A permissions error is not permission.</span></div></li>
-      <li class="gate"><span class="gate-n">05</span><div><strong>Every required context reported</strong><span>Neutral and skipped are not coverage. A context that never gets scheduled fails rather than waits.</span></div></li>
-      <li class="gate"><span class="gate-n">06</span><div><strong>The credential provably cannot edit protection</strong><span>If it could rewrite the rules, "no merge bypassed protection" is not a verifiable claim.</span></div></li>
-      <li class="gate"><span class="gate-n">07</span><div><strong>Autonomy mode permits the classified risk</strong><span>Changes touching declared risk paths escalate instead of auto-merging.</span></div></li>
-    </ol>
-  </section>
-
-  <section class="reveal">
-    <h2>Autonomy you turn up on evidence</h2>
-    <p class="section-lede">
-      Start where a mistake costs a review comment. The built-in evaluation harness replays a suite
-      built from your own history, reporting pass rates with confidence intervals and refusal
-      accuracy on its own line, so moving up a rung is a decision you can defend.
-    </p>
-    <div class="ladder">
-      <div class="rung"><span class="rung-name">observe</span><p>Selects and plans. No lease, no clone, no repository mutation.</p></div>
-      <div class="rung"><span class="rung-name is-default">pr-only<span class="tag">Default</span></span><p>Implements, verifies, reviews, fixes, opens a pull request. Never merges.</p></div>
-      <div class="rung"><span class="rung-name">guarded-merge</span><p>May merge low-risk changes once every automated and repository gate passes.</p></div>
-      <div class="rung"><span class="rung-name">continuous</span><p>Repeats guarded execution until work runs out, a budget is reached, or a breaker opens.</p></div>
-    </div>
-  </section>
-
-  <section class="reveal">
-    <h2>Thin enough to audit</h2>
-    <p class="section-lede">
-      runmill reads your entire repository, holds a backlog credential and a forge token, and can
-      merge to your default branch. A security model is a claim, so the surface is kept small enough
-      that you can check it rather than take it on faith.
-    </p>
-    <div class="split" style="margin-top:28px">
-      <div class="card">
-        <h3>Isolation is the OS, not a library</h3>
-        <p>bubblewrap on Linux, Seatbelt on macOS. <code>doctor</code> does not ask whether a sandbox exists: it plants a secret, tries to read it from inside, and fails if that succeeds.</p>
-      </div>
-      <div class="card">
-        <h3>Coordination is git</h3>
-        <p>The lease is a ref pushed to <code>origin</code>, so mutual exclusion comes from a server-side atomic create. No lock service to operate.</p>
-      </div>
-    </div>
-    <div class="table-scroll">
-      <table class="deps">
-        <thead><tr><th>Runtime dependency</th><th>Does</th><th>License</th></tr></thead>
-        <tbody>
-          <tr><td>better-sqlite3</td><td>Run state, events, side-effect outbox</td><td>MIT</td></tr>
-          <tr><td>commander</td><td>CLI parsing</td><td>MIT</td></tr>
-          <tr><td>yaml</td><td>Config and the check manifest</td><td>ISC</td></tr>
-          <tr><td>zod</td><td>Validates review output before it is trusted</td><td>MIT</td></tr>
-          <tr><td>@linear/sdk</td><td>Backlog adapter</td><td>MIT</td></tr>
-          <tr><td>@octokit/rest</td><td>Forge adapter</td><td>MIT</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p class="caption">
-      Six runtime dependencies, all MIT or ISC. runmill itself is MIT, which is what lets you check
-      the security model instead of trusting it.
-    </p>
-  </section>
-
-  <div class="closing reveal">
-    <h2>None of this is novel, and that is the point</h2>
-    <p class="section-lede">
-      Mutual exclusion, least privilege, provenance, separation of duties. Once the worker is
-      nondeterministic, the old answers stop being optional.
-    </p>
-    <div class="cta">
-      <a class="pill pill--solid" href="https://github.com/mikigraf/runmill">Read the source</a>
-      <a class="pill" href="https://github.com/mikigraf/runmill/blob/main/docs/evaluation.md">How to measure it on your own history</a>
+      <pre class="term-body" id="body" aria-live="polite"></pre>
+      <p class="term-note" id="note"></p>
     </div>
   </div>
+</main>
 
+<div class="wrap">
   <footer>
-    <span>runmill · MIT · macOS and Linux</span>
+    <span>Wraps Codex and Claude Code. Swap the agent without rewriting your trust model.</span>
     <span><a href="https://github.com/mikigraf/runmill/blob/main/docs/README.md">Documentation</a></span>
   </footer>
-
 </div>
 
 <script>
-  (function () {
-    var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+(function () {
+  "use strict";
 
-    // The terminal is the hero, so it plays once: runs land, then one refuses
-    // and the daemon stops. The pause before the failing line is the product.
-    var lines = Array.prototype.slice.call(document.querySelectorAll("#termBody .ln"));
-    if (reduce) {
-      lines.forEach(function (l) { l.classList.add("on"); });
+  // Output copied from real runs, not composed for the page. Inline colour uses
+  // a {class|text} marker, parsed into text nodes below. Nothing is ever
+  // assigned as HTML.
+  var STEPS = [
+    {
+      cmd: "runmill init",
+      lead: "Infers what it can, guesses nothing it shouldn't.",
+      note: " Repository and base branch come from git. Team, workflow states, and merge policy stay editable placeholders, because a guessed merge policy is not a guess worth making.",
+      out: [
+        "Created:",
+        "  runmill.yaml",
+        "  .runmill/checks.yaml",
+        "  .runmill/skills/code-review.md",
+        "  .runmill/skills/pr-review.md",
+        "",
+        "  {dim|repository}  acme/platform",
+        "  {dim|base branch} main",
+        "",
+        "Next:",
+        "  {mute|1.} Edit runmill.yaml   {mute|team, states, repository mapping}",
+        "  {mute|2.} runmill doctor      {mute|verify this host can run safely}"
+      ]
+    },
+    {
+      cmd: "runmill doctor",
+      lead: "It does not ask whether a sandbox exists.",
+      note: " It builds one, plants a secret in a credential path, tries to read it from inside, and fails if that succeeds. The network line is a warning rather than a pass: Seatbelt has no network namespace, and the report says so instead of implying parity.",
+      out: [
+        "  {pass|✓} environment                   interactive host",
+        "  {pass|✓} git                           git version 2.50.1",
+        "  {pass|✓} repository                    ~/acme/platform",
+        "  {pass|✓} github-auth                   authenticated",
+        "  {pass|✓} provider:codex                codex-cli 0.146.0",
+        "  {pass|✓} sandbox:mechanism             sandbox-exec (Seatbelt)",
+        "  {pass|✓} sandbox:deny-credential-read  {ink|read denied}",
+        "  {amber|!} sandbox:network               Seatbelt cannot scope network by host",
+        "      {mute|expected: egress via the runmill proxy}",
+        "      {mute|fix:      workspace.network must be `proxy` on macOS}",
+        "",
+        "  overall: {amber|WARN}"
+      ]
+    },
+    {
+      cmd: "runmill next --dry-run",
+      lead: "Selection is deterministic, and it shows its work.",
+      note: " Every rejection names the rule that failed. ENG-106 sorts last despite being the oldest issue by years, because backlogs encode \"no priority\" as zero and a naive sort puts it first.",
+      out: [
+        "Would select  {ink|ENG-102}  Crash on cold start in the iOS app",
+        "  {dim|repository}  acme/ios (base main)",
+        "  {dim|priority}    urgent",
+        "",
+        "Next in queue (3):",
+        "  {dim|ENG-101}  Prevent duplicate webhook delivery",
+        "  {dim|ENG-103}  Tidy up the dashboard",
+        "  {dim|ENG-106}  Unprioritized cleanup task",
+        "",
+        "Rejected (2):",
+        "  {dim|ENG-104}  Migrate billing to the new provider",
+        "      {fail|✗} {mute|dependencies: blocked by ENG-99}",
+        "  {dim|ENG-105}  Redesign onboarding",
+        "      {fail|✗} {mute|labels: carries excluded label(s): needs-design}"
+      ]
+    },
+    {
+      cmd: "runmill daemon",
+      lead: "The third run exited 0 and still failed.",
+      note: " A suite that discovers no tests is the most convincing false green there is, because it is character-for-character identical to a full pass. The breaker stops the loop rather than working through the rest of the backlog.",
+      out: [
+        "  ENG-102  {mute|→}  {pass|PR_DELIVERED}   {mute|$0.02}",
+        "  ENG-101  {mute|→}  {pass|PR_DELIVERED}   {mute|$0.02}",
+        "  ENG-118  {mute|→}  {fail|NEEDS_HUMAN}    {mute|$0.03}",
+        "           {mute|check \"unit\" exited 0 having discovered no tests}",
+        "",
+        "  {fail|stopped: breaker}  {mute|1 run could not be verified}",
+        "  {mute|runs:   3   spend: $0.07}",
+        "",
+        "  {mute|runmill inspect eng-118}  {dim|candidate SHA, tree hashes, executor}"
+      ]
+    }
+  ];
+
+  var body = document.getElementById("body");
+  var note = document.getElementById("note");
+  var tabs = Array.prototype.slice.call(document.querySelectorAll(".step"));
+  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var timers = [];
+
+  function clearTimers() { timers.forEach(clearTimeout); timers = []; }
+  function later(fn, ms) { timers.push(setTimeout(fn, ms)); }
+
+  /** Turn "{class|text}" markers into real nodes. Never assigns HTML. */
+  function parse(line, frag) {
+    var parts = line.split(/(\{\w+\|[^}]*\})/);
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      if (p === "") continue;
+      if (p.charAt(0) === "{" && p.charAt(p.length - 1) === "}") {
+        var bar = p.indexOf("|");
+        var el = document.createElement("span");
+        el.className = "c-" + p.slice(1, bar);
+        el.textContent = p.slice(bar + 1, -1);
+        frag.appendChild(el);
+      } else {
+        frag.appendChild(document.createTextNode(p));
+      }
+    }
+    return frag;
+  }
+
+  function prompt(frag) {
+    var el = document.createElement("span");
+    el.className = "c-prompt";
+    el.textContent = "$";
+    frag.appendChild(el);
+    frag.appendChild(document.createTextNode(" "));
+  }
+
+  function caret(frag) {
+    var el = document.createElement("span");
+    el.className = "cursor";
+    frag.appendChild(el);
+  }
+
+  /** Draw the command plus the first `shown` output lines. */
+  function draw(step, typed, shown, done) {
+    var frag = document.createDocumentFragment();
+    prompt(frag);
+    frag.appendChild(document.createTextNode(step.cmd.slice(0, typed)));
+    if (shown < 0) {
+      caret(frag);
     } else {
-      lines.forEach(function (l, i) {
-        var delay = 260 + i * 190;
-        if (i >= 5) delay += 420;
-        setTimeout(function () { l.classList.add("on"); }, delay);
-      });
+      frag.appendChild(document.createTextNode("\n\n"));
+      for (var i = 0; i <= shown && i < step.out.length; i++) {
+        parse(step.out[i], frag);
+        if (i < shown) frag.appendChild(document.createTextNode("\n"));
+      }
+      if (done) {
+        frag.appendChild(document.createTextNode("\n\n"));
+        prompt(frag);
+        caret(frag);
+      }
+    }
+    body.textContent = "";
+    body.appendChild(frag);
+  }
+
+  function setNote(step) {
+    note.textContent = "";
+    var b = document.createElement("b");
+    b.textContent = step.lead;
+    note.appendChild(b);
+    note.appendChild(document.createTextNode(step.note));
+  }
+
+  function select(i) {
+    for (var n = 0; n < tabs.length; n++) {
+      tabs[n].setAttribute("aria-selected", n === i ? "true" : "false");
+    }
+  }
+
+  function play(i, chain) {
+    clearTimers();
+    select(i);
+    var step = STEPS[i];
+    setNote(step);
+
+    if (reduce) { draw(step, step.cmd.length, step.out.length - 1, true); return; }
+
+    var typed = 0;
+    draw(step, 0, -1, false);
+
+    function type() {
+      typed++;
+      draw(step, typed, -1, false);
+      if (typed < step.cmd.length) later(type, 26);
+      else later(function () { line(0); }, 360);
     }
 
-    var targets = document.querySelectorAll(".reveal");
-    if (reduce || !("IntersectionObserver" in window)) {
-      Array.prototype.forEach.call(targets, function (t) { t.classList.add("on"); });
-      return;
+    function line(n) {
+      var last = n + 1 >= step.out.length;
+      draw(step, step.cmd.length, n, last);
+      if (!last) {
+        // A beat before the line that refuses, so it reads as a decision.
+        var pause = /NEEDS_HUMAN|stopped:|sandbox:network/.test(step.out[n + 1]) ? 520 : 60;
+        later(function () { line(n + 1); }, pause);
+      } else if (chain && i + 1 < STEPS.length) {
+        later(function () { play(i + 1, true); }, 2700);
+      }
     }
-    var io = new IntersectionObserver(function (entries) {
-      entries.forEach(function (e) {
-        if (e.isIntersecting) { e.target.classList.add("on"); io.unobserve(e.target); }
-      });
-    }, { rootMargin: "0px 0px -12% 0px" });
-    Array.prototype.forEach.call(targets, function (t) { io.observe(t); });
-  })();
+
+    later(type, 240);
+  }
+
+  for (var t = 0; t < tabs.length; t++) {
+    tabs[t].addEventListener("click", function () {
+      play(Number(this.getAttribute("data-i")), false);
+    });
+  }
+  document.getElementById("replay").addEventListener("click", function () { play(0, true); });
+
+  if (reduce) { select(3); play(3, false); } else { play(0, true); }
+})();
 </script>

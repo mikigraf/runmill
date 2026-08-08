@@ -1,11 +1,14 @@
 # runmill
 
-The control plane and exit condition for autonomous software engineering.
+**The exit condition for coding agents.**
 
-Your coding-agent harness already has a loop. runmill is what makes that loop safe to leave
-running: deterministic selection and an atomic claim from the backlog, proven isolation, evidence
-that the tests you actually cared about ran against the exact candidate, fresh-context review, and
-a merge gate that fails closed. It refuses to deliver anything it cannot prove.
+Your harness already has a loop. runmill decides when that loop is actually finished: deterministic
+selection and an atomic claim from the backlog, proven isolation, evidence that the checks you said
+mattered ran against the exact candidate commit, fresh-context review, and a merge gate that fails
+closed.
+
+Claude Code says it's done. Codex says it's done. runmill asks a different question: did the exact
+candidate commit pass the checks you said mattered?
 
 [**Landing page**](./site/index.html) · [Documentation](./docs/README.md)
 
@@ -150,9 +153,15 @@ Every command takes `--json`, `--quiet`, and `--config <path>`.
 
 ## What it is
 
-runmill wraps Codex and Claude Code. It handles the parts they don't: picking which issue to work
+Generation got cheap and asynchronous. Proving the work is ready did not get cheap at the same
+rate. In GitLab's June 2026 survey of 1,528 developers and technology buyers, 85% said AI had moved
+the bottleneck from writing code to reviewing and validating it, and 84% said the hardest part was
+governing what happens after AI writes the code.
+
+runmill wraps Codex and Claude Code and handles the parts they don't: picking which issue to work
 on, claiming it so two workers can't take the same one, deciding what context the agent gets,
 checking that the tests you cared about actually ran, and deciding whether the result can merge.
+You delegate more work without delegating the definition of done.
 
 ```
 backlog issue ──▶ deterministic selection ──▶ atomic claim (git-ref lease)
@@ -183,12 +192,11 @@ It stops working when nothing outside the model can tell you the work is finishe
 condition becomes the model's own opinion, and "the agent said it was done" is a different claim
 from "it is done" in exactly the cases you care about.
 
-Harnesses get agents running. Claude Code and Codex are very good at that, and runmill does not
-compete with them: it treats both as opaque. A control plane sits above and across harnesses and
-owns what they were never given authority over, which is the claim, the budget, the audit trail,
-and every side effect.
+Harnesses get agents running, and Claude Code and Codex are very good at it. runmill does not
+compete with them, and treats both as opaque. Swap the coding agent without rewriting your trust
+model: the worker can change, the evidence contract stays the same.
 
-runmill is that layer, and the exit condition. Concretely, before anything reaches a pull request:
+Concretely, before anything reaches a pull request:
 
 - Two workers cannot claim the same issue, because the claim is a compare-and-swap on a git ref
   and every later mutation is fenced on a generation number.
@@ -204,6 +212,11 @@ runmill is that layer, and the exit condition. Concretely, before anything reach
 None of that is novel. It's mutual exclusion, least privilege, provenance, and separation of
 duties, which is the point: once the worker is nondeterministic, the old answers stop being
 optional.
+
+What runmill does not claim is that your code is correct. It states exactly which checks were
+required, that they were discovered rather than assumed, that they ran against a named candidate,
+what they observed, whether anything was skipped, and which policy allowed the next transition.
+Everything else is your tests' job.
 
 ## Design commitments
 
