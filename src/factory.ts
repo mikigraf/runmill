@@ -32,9 +32,11 @@ export function demoFixturePath(): string {
 export interface AdapterSet {
   readonly backlog: BacklogAdapter;
   readonly provider: CodingAgentAdapter;
+  /** Runs the review roles. The same adapter as `provider` unless configured otherwise. */
+  readonly reviewProvider: CodingAgentAdapter;
   readonly forge: ForgeAdapter;
-  /** Which of the three resolved to a live implementation. */
-  readonly live: { backlog: boolean; provider: boolean; forge: boolean };
+  /** Which boundary resolved to a live implementation. */
+  readonly live: { backlog: boolean; provider: boolean; reviewProvider: boolean; forge: boolean };
 }
 
 export type Boundary = "backlog" | "provider" | "forge";
@@ -144,6 +146,50 @@ export async function buildAdapters(
     });
   }
 
+  // -- reviewer ----------------------------------------------------------
+  //
+  // A reviewer that is a different model from a different vendor is more
+  // independent than the same model reviewing itself in a fresh context. Fresh
+  // context removes the implementer's narrative; a different model also removes
+  // its blind spots, and a review sharing the author's blind spots agrees with
+  // the author for the same reasons it was wrong.
+  //
+  // Defaults to `inherit`, because one authenticated CLI is the common case and
+  // requiring two would be a setup cliff for a property most teams want later.
+  let reviewProvider = provider;
+  let reviewProviderLive = providerLive;
+  const reviewChoice = config.review.provider;
+
+  if (wants("provider") && reviewChoice !== "inherit") {
+    if (demo) {
+      reviewProvider = new FakeProviderAdapter();
+      reviewProviderLive = false;
+    } else {
+      const reviewDialect = reviewChoice === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
+      const reviewCli = new CliProviderAdapter({ dialect: reviewDialect });
+      const found = await reviewCli.detect();
+      if (!found.installed) {
+        throw RunmillError.fromCatalog("RM-AUTH-003", {
+          whatHappened:
+            `review.provider is "${reviewChoice}" but ${reviewDialect.binary} is not installed.\n` +
+            `  Install it, or set review.provider: inherit to review with ${dialect.binary}.`,
+        });
+      }
+      const reviewAuth = await reviewCli.authStatus();
+      if (!reviewAuth.authenticated) {
+        throw RunmillError.fromCatalog("RM-AUTH-003", {
+          whatHappened:
+            `review.provider is "${reviewChoice}" but ${reviewDialect.binary} is not authenticated.` +
+            (reviewAuth.detail === undefined || reviewAuth.detail === ""
+              ? ""
+              : `\n  ${reviewAuth.detail}`),
+        });
+      }
+      reviewProvider = reviewCli;
+      reviewProviderLive = true;
+    }
+  }
+
   // -- forge -------------------------------------------------------------
   let forge: ForgeAdapter;
   let forgeLive = false;
@@ -166,7 +212,13 @@ export async function buildAdapters(
   return {
     backlog,
     provider,
+    reviewProvider,
     forge,
-    live: { backlog: backlogLive, provider: providerLive, forge: forgeLive },
+    live: {
+      backlog: backlogLive,
+      provider: providerLive,
+      reviewProvider: reviewProviderLive,
+      forge: forgeLive,
+    },
   };
 }

@@ -1,14 +1,14 @@
 # runmill
 
-**The exit condition for coding agents.**
+The exit condition for coding agents.
 
-Your harness already has a loop. runmill decides when that loop is actually finished: deterministic
-selection and an atomic claim from the backlog, proven isolation, evidence that the checks you said
-mattered ran against the exact candidate commit, fresh-context review, and a merge gate that fails
-closed.
+Claude Code says it's done. Codex says it's done. runmill asks a narrower question: did the exact
+commit you are about to merge pass the checks you said mattered?
 
-Claude Code says it's done. Codex says it's done. runmill asks a different question: did the exact
-candidate commit pass the checks you said mattered?
+Your harness already has a loop. runmill decides when it is finished. It claims work atomically so
+two workers cannot collide, runs the agent under an OS sandbox with your credentials denied, proves
+the required checks ran against the candidate commit, reviews the diff in a fresh context, and
+refuses to merge anything it cannot account for.
 
 [**Landing page**](./site/index.html) · [Documentation](./docs/README.md)
 
@@ -252,7 +252,7 @@ protection rule, or an unparseable review all stop the run. Knowing when not to 
 runmill is deliberately thin. The parts that do the dangerous work are existing tools with real
 track records, not something invented here.
 
-**Isolation** is the OS, not a library. On Linux that's
+Isolation is the OS, not a library. Prompts steer agents; boundaries constrain them. On Linux that's
 [bubblewrap](https://github.com/containers/bubblewrap) (LGPL-2.1), the unprivileged sandbox
 Flatpak uses, driven with `--unshare-net` and explicit bind mounts. On macOS it's Seatbelt via
 `sandbox-exec`, which is Apple system software rather than an open source project. Its own man
@@ -260,10 +260,10 @@ page has said `DEPRECATED` for years while every sandboxed app on the platform c
 the framework underneath. That is a real risk worth knowing about, and it is why `doctor` reports
 what each mechanism can and cannot enforce instead of implying they are equivalent.
 
-**Coordination** is git. The lease is a ref pushed to `origin`, so mutual exclusion comes from a
+Coordination is git. The lease is a ref pushed to `origin`, so mutual exclusion comes from a
 server-side atomic ref create and `--force-with-lease`, not from a lock service you have to run.
 
-**The coding agents** are [Codex](https://github.com/openai/codex) and
+The coding agents are [Codex](https://github.com/openai/codex) and
 [Claude Code](https://github.com/anthropics/claude-code). runmill treats both as opaque and does
 not tune their prompts or manage their context. Adding a third is a new dialect, not a rewrite.
 

@@ -82,6 +82,11 @@ export function blockingFindings(
  * verdict on a diff that touches risk-escalating paths is rejected outright
  * rather than trusted, because that is exactly the shape a prompt-injected or
  * simply over-agreeable review takes.
+ *
+ * Every rule here is one-directional: each can withhold delivery, none can
+ * grant it. That is what makes it safe to let a model's judgment participate at
+ * all. A model that can only ever subtract permission cannot be prompted into
+ * releasing something.
  */
 export function crossCheckVerdict(
   review: Review,
@@ -102,5 +107,26 @@ export function crossCheckVerdict(
   if (review.verdict === "approved" && review.scope_assessment === "out_of_scope") {
     return { accepted: false, reason: "reviewer approved a change it also called out of scope" };
   }
+
+  // The semantic gate, and the only one no amount of deterministic checking can
+  // replace: a change can pass every check, stay in scope, and still not be the
+  // thing the issue asked for. The acceptance criteria come from the issue and
+  // are pinned in the task packet at claim time, so the run is judged against
+  // what was asked when it was claimed.
+  //
+  // Note the asymmetry. This can only ever turn a pass into a failure. A
+  // reviewer reporting every criterion met grants nothing on its own: the
+  // deterministic gates still have to pass, and "the model says it's done"
+  // remains the claim runmill exists not to accept.
+  const unmet = review.acceptance_criteria_met.filter((c) => !c.met);
+  if (unmet.length > 0 && (review.verdict === "approved" || review.verdict === "no_findings")) {
+    return {
+      accepted: false,
+      reason:
+        `reviewer approved a change that does not meet ${unmet.length} of its stated ` +
+        `acceptance criteria: ${unmet.map((c) => `"${c.criterion}"`).join(", ")}`,
+    };
+  }
+
   return { accepted: true };
 }

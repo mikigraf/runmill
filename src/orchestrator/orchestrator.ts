@@ -48,6 +48,15 @@ export type RunState =
 export interface OrchestratorDeps {
   readonly backlog: BacklogAdapter;
   readonly provider: CodingAgentAdapter;
+  /**
+   * Runs `local-reviewer` and `pr-reviewer`.
+   *
+   * Optional, and equal to `provider` when unset. Pointing it at a different
+   * vendor is what makes review independent rather than merely fresh: a model
+   * reviewing its own work agrees with itself for the same reasons it was
+   * wrong, and no amount of context clearing fixes that.
+   */
+  readonly reviewProvider?: CodingAgentAdapter | undefined;
   readonly forge: ForgeAdapter;
   readonly store: StateStore;
   readonly clock: Clock;
@@ -92,6 +101,11 @@ export class Orchestrator {
     this.#d = deps;
     this.#workspaces = deps.workspaces ?? new WorkspaceManager();
     this.#verification = deps.verification ?? new VerificationEngine();
+  }
+
+  /** The adapter that runs review roles. Falls back to the implementer's. */
+  get #reviewer(): CodingAgentAdapter {
+    return this.#d.reviewProvider ?? this.#d.provider;
   }
 
   #log(message: string): void {
@@ -313,7 +327,7 @@ export class Orchestrator {
 
         // -- review ------------------------------------------------------
         this.#advance(runId, "LOCAL_REVIEW");
-        const reviewSession = await this.#d.provider.start({
+        const reviewSession = await this.#reviewer.start({
           runId,
           issueId: issue.identifier,
           role: "local-reviewer",
@@ -583,7 +597,7 @@ export class Orchestrator {
     for (let attempt = 0; attempt < maxReviews; attempt += 1) {
       this.#advance(runId, "PR_REVIEW");
 
-      const session = await this.#d.provider.start({
+      const session = await this.#reviewer.start({
         runId,
         issueId: issue.identifier,
         role: "pr-reviewer",

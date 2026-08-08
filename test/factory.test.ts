@@ -170,7 +170,7 @@ describe("scoping which boundaries resolve", () => {
       demo: true,
       credentials: NO_CREDENTIALS,
     });
-    expect(live).toEqual({ backlog: false, provider: false, forge: false });
+    expect(live).toEqual({ backlog: false, provider: false, reviewProvider: false, forge: false });
   });
 
   it("returns all three boundaries by default", async () => {
@@ -197,5 +197,29 @@ describe("RUNMILL_DEMO as an explicit signal", () => {
     await expect(
       buildAdapters(CONFIG, { need: ["backlog"], credentials: NO_CREDENTIALS }),
     ).rejects.toBeInstanceOf(RunmillError);
+  });
+});
+
+describe("choosing a reviewer model", () => {
+  // `review.provider` shipped in the config schema and was read nowhere, so
+  // choosing a reviewer silently did nothing.
+  it("inherits the implementer's adapter by default", async () => {
+    const adapters = await buildAdapters(CONFIG, { demo: true, credentials: NO_CREDENTIALS });
+    expect(adapters.reviewProvider).toBe(adapters.provider);
+  });
+
+  it("uses a separate adapter when a different reviewer is configured", async () => {
+    // Independence is the point. A model reviewing its own work agrees with
+    // itself for the same reasons it was wrong, and clearing context does not
+    // change that.
+    const cfg = { ...CONFIG, review: { ...CONFIG.review, provider: "claude" as const } };
+    const adapters = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
+    expect(adapters.reviewProvider).not.toBe(adapters.provider);
+    expect(adapters.live.reviewProvider).toBe(false);
+  });
+
+  it("reports reviewer liveness separately from the implementer", async () => {
+    const adapters = await buildAdapters(CONFIG, { demo: true, credentials: NO_CREDENTIALS });
+    expect(adapters.live).toHaveProperty("reviewProvider");
   });
 });

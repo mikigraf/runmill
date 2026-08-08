@@ -109,6 +109,7 @@ function buildOrchestrator(
     orchestrator: new Orchestrator({
       backlog: adapters.backlog,
       provider: adapters.provider,
+      reviewProvider: adapters.reviewProvider,
       forge: adapters.forge,
       store,
       clock,

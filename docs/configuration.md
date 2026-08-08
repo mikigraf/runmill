@@ -125,13 +125,31 @@ Checks from both sources are unioned by id, and the repository's manifest wins a
 |---|---|---|
 | `local_review_skill` | built-in | `runmill skills eject` to customize |
 | `pr_review_skill` | built-in | Used by the [`PR_REVIEW` stage](./lifecycle.md#two-reviews-not-one), after CI and before the merge gate |
-| `provider` | `inherit` | |
+| `provider` | `inherit` | `inherit` · `codex` · `claude`. Run review on a different vendor than the implementer |
 | `max_fix_iterations` | `3` | Must not exceed the `fixer` invocation budget |
 | `merge_blocking_severities` | `[critical, high]` | |
 | `require_all_findings_resolved` | `true` | |
 
-Review always runs in a fresh context with no implementer narrative. That is not configurable — a
+Review always runs in a fresh context with no implementer narrative. That is not configurable: a
 reviewer that has read the implementer's reasoning is reviewing the reasoning, not the diff.
+
+`review.provider` goes one step further. Fresh context removes the implementer's narrative; a
+different vendor also removes its blind spots. A model reviewing its own work agrees with itself
+for the same reasons it was wrong, and no amount of context clearing fixes that. The cost is a
+second authenticated CLI, which is why the default is `inherit`.
+
+```yaml
+provider:
+  implementation: codex     # writes the code
+review:
+  provider: claude          # judges it
+```
+
+Acceptance criteria are enforced, not just recorded. The reviewer receives the criteria extracted
+from the issue and returns which ones it judges met; an approval that leaves any of them unmet is
+rejected. That rule is one-directional, like every other cross-check: it can withhold delivery, and
+it can never grant it. A reviewer reporting every criterion met earns nothing on its own, because
+the deterministic gates still have to pass.
 
 ### `risk`
 
