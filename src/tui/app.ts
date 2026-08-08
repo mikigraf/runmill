@@ -29,6 +29,26 @@ function runName(run: RunRow): string {
   return `${run.issueId}  ${run.state}`;
 }
 
+const PIPELINE_STAGES = ["claim", "implement", "verify", "review", "PR", "policy"] as const;
+
+function pipelineIndex(state: string): number {
+  if (["DISCOVERED", "ELIGIBILITY_CHECKED", "CLAIMED", "WORKSPACE_READY", "TASK_PACKET_READY"].includes(state)) return 0;
+  if (state === "IMPLEMENTING") return 1;
+  if (state === "LOCAL_VERIFY") return 2;
+  if (["LOCAL_REVIEW", "FIXING"].includes(state)) return 3;
+  if (["PR_READY", "PUSHED", "PR_OPEN", "CI_WAIT", "PR_REVIEW"].includes(state)) return 4;
+  if (["MERGE_READY", "MERGED", "BACKLOG_UPDATED", "CLEANUP", "PR_DELIVERED", "COMPLETED"].includes(state)) return 5;
+  return 0;
+}
+
+export function formatPipeline(state: string): string {
+  const current = pipelineIndex(state);
+  return PIPELINE_STAGES.map((stage, index) => {
+    const marker = index < current ? "✓" : index === current ? "●" : "·";
+    return `${marker} ${stage}`;
+  }).join("  ");
+}
+
 export function formatRunDetail(detail: RunDetail | undefined): string {
   if (detail === undefined) return "Select a run to inspect its history and events.";
   const { run } = detail;
@@ -42,11 +62,12 @@ export function formatRunDetail(detail: RunDetail | undefined): string {
   });
   return [
     `${run.issueId} · ${run.state}`,
-    `run       ${run.runId}`,
-    `repo      ${run.repo}`,
-    `provider  ${run.provider}`,
+    `run       ${run.runId} · provider ${run.provider}`,
+    `repo      ${run.repo} · commit ${run.candidateSha ?? "—"}`,
     `branch    ${run.branch ?? "—"}`,
-    `commit    ${run.candidateSha ?? "—"}`,
+    "",
+    "Pipeline",
+    formatPipeline(run.state),
     "",
     "Transitions",
     ...(transitions.length === 0 ? ["  none yet"] : transitions),

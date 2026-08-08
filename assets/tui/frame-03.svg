@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1110" height="732" viewBox="0 0 1110 732">
 <rect width="100%" height="100%" rx="12" fill="#070a0f"/>
 <g font-family="Menlo, Monaco, 'DejaVu Sans Mono', monospace" font-size="14" xml:space="preserve">
-<rect x="24" y="24" width="117" height="18" fill="rgba(11,15,20,1.000)"/>
-<rect x="141" y="24" width="945" height="18" fill="rgba(11,15,20,1.000)"/>
+<rect x="24" y="24" width="234" height="18" fill="rgba(11,15,20,1.000)"/>
+<rect x="258" y="24" width="828" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="42" width="756" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="780" y="42" width="306" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="60" width="1062" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -46,8 +46,8 @@
 <rect x="384" y="132" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="132" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="402" y="132" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="132" width="180" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="591" y="132" width="477" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="132" width="333" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="744" y="132" width="324" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="132" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="132" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="150" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -59,8 +59,8 @@
 <rect x="384" y="150" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="150" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="402" y="150" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="150" width="207" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="618" y="150" width="450" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="150" width="360" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="771" y="150" width="297" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="150" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="150" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="168" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -74,8 +74,8 @@
 <rect x="384" y="168" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="168" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="402" y="168" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="168" width="135" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="546" y="168" width="522" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="168" width="369" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="780" y="168" width="288" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="168" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="168" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="186" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -86,9 +86,7 @@
 <rect x="375" y="186" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="384" y="186" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="186" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="402" y="186" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="186" width="369" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="780" y="186" width="288" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="402" y="186" width="666" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="186" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="186" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="204" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -102,8 +100,8 @@
 <rect x="384" y="204" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="204" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="402" y="204" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="204" width="153" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="564" y="204" width="504" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="204" width="72" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="483" y="204" width="585" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="204" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="204" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="222" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -114,7 +112,9 @@
 <rect x="375" y="222" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="384" y="222" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="222" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="402" y="222" width="666" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="402" y="222" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="222" width="504" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="915" y="222" width="153" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="222" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="222" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="240" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -125,9 +125,7 @@
 <rect x="375" y="240" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="384" y="240" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="240" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="402" y="240" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="240" width="99" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="510" y="240" width="558" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="402" y="240" width="666" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="240" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="240" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="258" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -139,8 +137,8 @@
 <rect x="384" y="258" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="258" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="402" y="258" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="258" width="432" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="843" y="258" width="225" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="258" width="99" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="510" y="258" width="558" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="258" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="258" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="276" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -152,8 +150,8 @@
 <rect x="384" y="276" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="276" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="402" y="276" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="276" width="432" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="843" y="276" width="225" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="276" width="414" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="825" y="276" width="243" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="276" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="276" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="294" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -164,7 +162,9 @@
 <rect x="375" y="294" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="384" y="294" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="294" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="402" y="294" width="666" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="402" y="294" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="294" width="504" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="915" y="294" width="153" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="294" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="294" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="312" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -176,8 +176,8 @@
 <rect x="384" y="312" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="312" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="402" y="312" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="312" width="54" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="465" y="312" width="603" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="312" width="477" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="888" y="312" width="180" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="312" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="312" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="330" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -188,9 +188,7 @@
 <rect x="375" y="330" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="384" y="330" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="330" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="402" y="330" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="330" width="549" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="960" y="330" width="108" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="402" y="330" width="666" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="330" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="330" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="348" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -202,8 +200,8 @@
 <rect x="384" y="348" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="348" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="402" y="348" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="348" width="504" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="915" y="348" width="153" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="348" width="54" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="465" y="348" width="603" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="348" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="348" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="366" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -215,8 +213,8 @@
 <rect x="384" y="366" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="366" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="402" y="366" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="411" y="366" width="378" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="789" y="366" width="279" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="366" width="612" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="1023" y="366" width="45" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="366" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="366" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="384" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -227,7 +225,9 @@
 <rect x="375" y="384" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="384" y="384" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="384" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="402" y="384" width="666" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="402" y="384" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="384" width="504" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="915" y="384" width="153" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="384" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="384" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="402" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -238,7 +238,9 @@
 <rect x="375" y="402" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="384" y="402" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="393" y="402" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="402" y="402" width="666" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="402" y="402" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="411" y="402" width="486" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="897" y="402" width="171" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="402" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="402" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="420" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -267,50 +269,46 @@
 <rect x="24" y="510" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="33" y="510" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="42" y="510" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="51" y="510" width="396" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="447" y="510" width="621" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="51" y="510" width="486" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="537" y="510" width="531" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="510" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="510" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="528" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="33" y="528" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="42" y="528" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="51" y="528" width="504" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="555" y="528" width="513" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="51" y="528" width="477" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="528" y="528" width="540" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="528" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="528" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="546" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="33" y="546" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="42" y="546" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="51" y="546" width="342" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="393" y="546" width="675" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="51" y="546" width="441" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="492" y="546" width="576" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="546" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="546" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="564" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="33" y="564" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="42" y="564" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="51" y="564" width="594" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="645" y="564" width="423" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="51" y="564" width="477" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="528" y="564" width="540" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="564" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="564" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="582" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="33" y="582" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="42" y="582" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="51" y="582" width="477" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="528" y="582" width="540" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="51" y="582" width="522" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="573" y="582" width="495" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="582" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="582" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="600" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="33" y="600" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="42" y="600" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="51" y="600" width="441" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="492" y="600" width="576" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="42" y="600" width="1026" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="600" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="600" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="618" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="33" y="618" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="42" y="618" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="51" y="618" width="450" height="18" fill="rgba(17,24,33,1.000)"/>
-<rect x="501" y="618" width="567" height="18" fill="rgba(17,24,33,1.000)"/>
+<rect x="42" y="618" width="1026" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1068" y="618" width="9" height="18" fill="rgba(17,24,33,1.000)"/>
 <rect x="1077" y="618" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="636" width="9" height="18" fill="rgba(11,15,20,1.000)"/>
@@ -324,8 +322,8 @@
 <rect x="24" y="672" width="423" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="447" y="672" width="639" height="18" fill="rgba(11,15,20,1.000)"/>
 <rect x="24" y="690" width="1062" height="18" fill="rgba(11,15,20,1.000)"/>
-<text x="24" y="38" fill="rgba(219,231,243,1.000)">RUNMILL  IDLE</text>
-<text x="24" y="56" fill="rgba(219,231,243,1.000)">/Users/dev/acme-platform · pid 48217 · caffeinate · 0 lease(s) · 0 pending effect(s)</text>
+<text x="24" y="38" fill="rgba(219,231,243,1.000)">RUNMILL  RUNNING · ENG-142</text>
+<text x="24" y="56" fill="rgba(219,231,243,1.000)">/Users/dev/acme-platform · pid 48217 · caffeinate · 1 lease(s) · 0 pending effect(s)</text>
 <text x="33" y="92" fill="rgba(45,59,79,1.000)">╭─ Runs ──────────────────────────────╮</text>
 <text x="393" y="92" fill="rgba(45,59,79,1.000)">╭─ Run detail ─────────────────────────────────────────────────────────────╮</text>
 <text x="33" y="110" fill="rgba(45,59,79,1.000)">│</text>
@@ -333,91 +331,92 @@
 <text x="393" y="110" fill="rgba(45,59,79,1.000)">│</text>
 <text x="1068" y="110" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="128" fill="rgba(45,59,79,1.000)">│</text>
-<text x="60" y="128" fill="rgba(84,210,210,1.000)">▶ ENG-142  PR_DELIVERED</text>
+<text x="60" y="128" fill="rgba(84,210,210,1.000)">▶ ENG-142  IMPLEMENTING</text>
 <text x="375" y="128" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="128" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="128" fill="rgba(219,231,243,1.000)">ENG-142 · LOCAL_REVIEW</text>
+<text x="411" y="128" fill="rgba(219,231,243,1.000)">ENG-142 · IMPLEMENTING</text>
 <text x="1068" y="128" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="146" fill="rgba(45,59,79,1.000)">│</text>
 <text x="78" y="146" fill="rgba(204,204,204,1.000)">acme/platform · codex</text>
 <text x="375" y="146" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="146" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="146" fill="rgba(219,231,243,1.000)">run       run_m2k9p3</text>
+<text x="411" y="146" fill="rgba(219,231,243,1.000)">run       run_m2k9p3 · provider codex</text>
 <text x="1068" y="146" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="164" fill="rgba(45,59,79,1.000)">│</text>
 <text x="51" y="164" fill="rgba(255,255,255,1.000)">   ENG-139  PR_DELIVERED           </text>
 <text x="375" y="164" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="164" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="164" fill="rgba(219,231,243,1.000)">repo      acme/platform</text>
+<text x="411" y="164" fill="rgba(219,231,243,1.000)">repo      acme/platform · commit 7f4c9a1</text>
 <text x="1068" y="164" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="182" fill="rgba(45,59,79,1.000)">│</text>
 <text x="78" y="182" fill="rgba(127,145,166,1.000)">acme/platform · claude</text>
 <text x="375" y="182" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="182" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="182" fill="rgba(219,231,243,1.000)">provider  codex</text>
+<text x="411" y="182" fill="rgba(219,231,243,1.000)">branch    runmill/eng-142-session-cache-1</text>
 <text x="1068" y="182" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="200" fill="rgba(45,59,79,1.000)">│</text>
 <text x="51" y="200" fill="rgba(255,255,255,1.000)">   ENG-133  COMPLETED              </text>
 <text x="375" y="200" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="200" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="200" fill="rgba(219,231,243,1.000)">branch    runmill/eng-142-session-cache-1</text>
 <text x="1068" y="200" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="218" fill="rgba(45,59,79,1.000)">│</text>
 <text x="78" y="218" fill="rgba(127,145,166,1.000)">acme/web · codex</text>
 <text x="375" y="218" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="218" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="218" fill="rgba(219,231,243,1.000)">commit    7f4c9a1</text>
+<text x="411" y="218" fill="rgba(219,231,243,1.000)">Pipeline</text>
 <text x="1068" y="218" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="236" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="236" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="236" fill="rgba(45,59,79,1.000)">│</text>
+<text x="411" y="236" fill="rgba(219,231,243,1.000)">✓ claim  ● implement  · verify  · review  · PR  · policy</text>
 <text x="1068" y="236" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="254" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="254" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="254" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="254" fill="rgba(219,231,243,1.000)">Transitions</text>
 <text x="1068" y="254" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="272" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="272" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="272" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="272" fill="rgba(219,231,243,1.000)">2026-08-09 19:41:12  IMPLEMENTING → LOCAL_VERIFY</text>
+<text x="411" y="272" fill="rgba(219,231,243,1.000)">Transitions</text>
 <text x="1068" y="272" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="290" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="290" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="290" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="290" fill="rgba(219,231,243,1.000)">2026-08-09 19:42:07  LOCAL_VERIFY → LOCAL_REVIEW</text>
+<text x="411" y="290" fill="rgba(219,231,243,1.000)">2026-08-09 19:40:08  CLAIMED → WORKSPACE_READY</text>
 <text x="1068" y="290" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="308" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="308" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="308" fill="rgba(45,59,79,1.000)">│</text>
+<text x="411" y="308" fill="rgba(219,231,243,1.000)">2026-08-09 19:40:10  WORKSPACE_READY → TASK_PACKET_READY</text>
 <text x="1068" y="308" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="326" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="326" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="326" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="326" fill="rgba(219,231,243,1.000)">Events</text>
+<text x="411" y="326" fill="rgba(219,231,243,1.000)">2026-08-09 19:40:12  TASK_PACKET_READY → IMPLEMENTING</text>
 <text x="1068" y="326" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="344" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="344" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="344" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="344" fill="rgba(219,231,243,1.000)"> 18  check.completed  {&quot;check&quot;:&quot;typecheck&quot;,&quot;status&quot;:&quot;passed&quot;}</text>
 <text x="1068" y="344" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="362" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="362" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="362" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="362" fill="rgba(219,231,243,1.000)"> 19  check.completed  {&quot;check&quot;:&quot;test&quot;,&quot;status&quot;:&quot;passed&quot;}</text>
+<text x="411" y="362" fill="rgba(219,231,243,1.000)">Events</text>
 <text x="1068" y="362" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="380" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="380" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="380" fill="rgba(45,59,79,1.000)">│</text>
-<text x="411" y="380" fill="rgba(219,231,243,1.000)"> 20  review.started  {&quot;provider&quot;:&quot;claude&quot;}</text>
+<text x="411" y="380" fill="rgba(219,231,243,1.000)">  3  workspace.created  {&quot;branch&quot;:&quot;runmill/eng-142-session-cache-1&quot;}</text>
 <text x="1068" y="380" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="398" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="398" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="398" fill="rgba(45,59,79,1.000)">│</text>
+<text x="411" y="398" fill="rgba(219,231,243,1.000)">  4  agent.started  {&quot;provider&quot;:&quot;codex&quot;,&quot;context&quot;:&quot;new&quot;}</text>
 <text x="1068" y="398" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="416" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="416" fill="rgba(45,59,79,1.000)">│</text>
 <text x="393" y="416" fill="rgba(45,59,79,1.000)">│</text>
+<text x="411" y="416" fill="rgba(219,231,243,1.000)">  8  agent.progress  {&quot;filesChanged&quot;:3,&quot;testsAdded&quot;:4}</text>
 <text x="1068" y="416" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="434" fill="rgba(45,59,79,1.000)">│</text>
 <text x="375" y="434" fill="rgba(45,59,79,1.000)">│</text>
@@ -429,25 +428,23 @@
 <text x="33" y="506" fill="rgba(45,59,79,1.000)">│</text>
 <text x="1068" y="506" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="524" fill="rgba(45,59,79,1.000)">│</text>
-<text x="51" y="524" fill="rgba(127,145,166,1.000)">19:40:00  sleep inhibitor active: caffeinate</text>
+<text x="51" y="524" fill="rgba(127,145,166,1.000)">19:40:04  selected ENG-142 · Add bounded session cache</text>
 <text x="1068" y="524" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="542" fill="rgba(45,59,79,1.000)">│</text>
-<text x="51" y="542" fill="rgba(127,145,166,1.000)">19:40:01  control socket ready; connect with runmill tui</text>
+<text x="51" y="542" fill="rgba(127,145,166,1.000)">19:40:05  lease acquired · issue moved to In Progress</text>
 <text x="1068" y="542" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="560" fill="rgba(45,59,79,1.000)">│</text>
-<text x="51" y="560" fill="rgba(127,145,166,1.000)">19:40:04  selected ENG-142 from Linear</text>
+<text x="51" y="560" fill="rgba(127,145,166,1.000)">19:40:08  workspace ready · isolated git worktree</text>
 <text x="1068" y="560" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="578" fill="rgba(45,59,79,1.000)">│</text>
-<text x="51" y="578" fill="rgba(127,145,166,1.000)">19:40:05  workspace ready · branch runmill/eng-142-session-cache-1</text>
+<text x="51" y="578" fill="rgba(127,145,166,1.000)">19:40:12  Codex implementing from a clean task packet</text>
 <text x="1068" y="578" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="596" fill="rgba(45,59,79,1.000)">│</text>
-<text x="51" y="596" fill="rgba(127,145,166,1.000)">19:41:12  implementation complete · candidate 7f4c9a1</text>
+<text x="51" y="596" fill="rgba(127,145,166,1.000)">19:40:47  agent progress · 3 files changed · 4 tests added</text>
 <text x="1068" y="596" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="614" fill="rgba(45,59,79,1.000)">│</text>
-<text x="51" y="614" fill="rgba(127,145,166,1.000)">19:42:07  verification passed · 6 required checks</text>
 <text x="1068" y="614" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="632" fill="rgba(45,59,79,1.000)">│</text>
-<text x="51" y="632" fill="rgba(127,145,166,1.000)">19:42:08  fresh-context review started with Claude</text>
 <text x="1068" y="632" fill="rgba(45,59,79,1.000)">│</text>
 <text x="33" y="650" fill="rgba(45,59,79,1.000)">│</text>
 <text x="1068" y="650" fill="rgba(45,59,79,1.000)">│</text>

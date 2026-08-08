@@ -7,6 +7,9 @@ reviewed pull requests. It runs Codex or Claude Code; Runmill owns the loop arou
 
 ![Runmill OpenTUI showing a live agent review, verification events, and daemon logs](./assets/runmill-tui.gif)
 
+The dashboard follows an issue from backlog claim through implementation, checks, an independent
+fresh-context review, and PR delivery—then shows the daemon returning to watch for more work.
+
 [Documentation](./docs/README.md) · [Configuration](./docs/configuration.md) ·
 [Daemon operations](./docs/daemon.md)
 
@@ -87,10 +90,10 @@ session.
 
 `runmill tui` is an OpenTUI dashboard for the running daemon. It discovers a user-private local
 socket, so it works from any directory and does not need `runmill.yaml`. The dashboard shows live
-daemon status and logs, recent runs, transitions, agent events, and pending external effects. It
-can also request a safe stop at the next run boundary. Runmill automatically launches this one
-command with Bun because OpenTUI's native renderer needs it on the Node versions Runmill otherwise
-supports.
+daemon status and logs, recent runs, the active orchestration pipeline, transitions, agent events,
+and pending external effects. It can also request a safe stop at the next run boundary. Runmill
+automatically launches this one command with Bun because OpenTUI's native renderer needs it on the
+Node versions Runmill otherwise supports.
 
 ## Try it without credentials
 
