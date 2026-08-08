@@ -8,6 +8,8 @@ import { RunmillError, renderError , errorMessage } from "../errors/runmill-erro
 import { runAllChecks, worstStatus } from "../doctor/checks.js";
 import { renderDoctor, renderSelection } from "./render.js";
 import { selectNext } from "../queue/selector.js";
+import { planStack } from "../queue/stack.js";
+import type { BacklogIssue, RepositoryTarget } from "../domain/types.js";
 import { StateStore, CURRENT_SCHEMA_VERSION } from "../state/store.js";
 import { buildAdapters, type AdapterSet } from "../factory.js";
 import { Orchestrator } from "../orchestrator/orchestrator.js";
@@ -21,6 +23,9 @@ import { recordMilestone, recordDoctorFailure, readFunnel } from "../state/funne
 import type { CheckSpec } from "../verification/engine.js";
 import { loadChecksManifest, mergeCheckSources } from "../verification/manifest.js";
 import type { RunmillConfig } from "../config/types.js";
+
+/** Terminal states in which a branch exists for a later layer to build on. */
+const DELIVERED: ReadonlySet<string> = new Set(["PR_DELIVERED", "COMPLETED"]);
 
 const VERSION = "0.1.0";
 
@@ -391,23 +396,99 @@ export function buildProgram(): Command {
         process.on("SIGINT", () => daemon.requestStop());
         process.on("SIGTERM", () => daemon.requestStop());
 
+        // Layers of a dependency chain still owed a run. Each is built on the
+        // branch the previous one pushed, so the pull requests form a stack.
+        let pending: { issue: BacklogIssue; target: RepositoryTarget; depth: number }[] = [];
+
         try {
           const result = await daemon.loop(async () => {
-            const selection = await selectNext({
-              backlog: adapters.backlog,
-              config: cfg,
-              leasedIssueIds: store.activeLeaseIssueIds(),
-            });
-            if (selection.selected === undefined) return undefined;
+            if (pending.length === 0) {
+              const selection = await selectNext({
+                backlog: adapters.backlog,
+                config: cfg,
+                leasedIssueIds: store.activeLeaseIssueIds(),
+              });
+              if (selection.selected === undefined) return undefined;
+
+              const chosen = selection.selected;
+              pending = [{ issue: chosen.issue, target: chosen.target, depth: 0 }];
+
+              if (cfg.github.stackDependencyChains) {
+                // Candidates include issues rejected ONLY for dependencies.
+                // Those are exactly the ones a stack exists to unblock, and
+                // they never appear in runnersUp because selection already
+                // refused them. Anything rejected for another reason stays
+                // refused: a stack unblocks a dependency, not a missing label
+                // or an unready description.
+                const blockedOnly = selection.rejected
+                  .filter((r) => {
+                    const failed = r.decision.rules.filter((rule) => !rule.passed);
+                    return failed.length > 0 && failed.every((rule) => rule.rule === "dependencies");
+                  })
+                  .map((r) => r.issue);
+
+                // Only the chain containing the issue selection already chose,
+                // so ordering stays deterministic and priority still decides
+                // what gets worked on first.
+                const plan = planStack({
+                  candidates: [
+                    chosen.issue,
+                    ...selection.runnersUp.map((c) => c.issue),
+                    ...blockedOnly,
+                  ],
+                  maxDepth: cfg.github.stackMaxDepth,
+                });
+                const chain = plan.chains.find((c) =>
+                  c.issues.some((i) => i.identifier === chosen.issue.identifier),
+                );
+                if (chain !== undefined && chain.issues.length > 1) {
+                  pending = chain.issues.map((issue, depth) => ({
+                    issue,
+                    target: chosen.target,
+                    depth,
+                  }));
+                  if (opts.quiet !== true && opts.json !== true) {
+                    process.stdout.write(
+                      `stack of ${chain.issues.length}: ` +
+                        `${chain.issues.map((i) => i.identifier).join(" → ")}\n`,
+                    );
+                  }
+                }
+              }
+            }
+
+            const layer = pending.shift();
+            if (layer === undefined) return undefined;
 
             const { orchestrator, lease } = buildOrchestrator(cfg, adapters, store, opts);
             const runId = `run_${Date.now().toString(36)}`;
-            return orchestrator.run({
+            const outcome = await orchestrator.run({
               runId,
-              issue: selection.selected.issue,
-              target: selection.selected.target,
+              issue: layer.issue,
+              target: layer.target,
               lease: lease(runId),
             });
+
+            // A layer that did not deliver leaves every layer above it with no
+            // base to build on. Abandoning them is the honest outcome: they
+            // would otherwise be verified against a branch that is not going to
+            // merge.
+            if (pending.length > 0) {
+              if (outcome.branch === undefined || !DELIVERED.has(outcome.finalState)) {
+                if (opts.quiet !== true && opts.json !== true) {
+                  process.stdout.write(
+                    `  abandoning ${pending.length} stacked layer(s): ` +
+                      `${layer.issue.identifier} did not deliver\n`,
+                  );
+                }
+                pending = [];
+              } else {
+                const base = outcome.branch;
+                pending = pending.map((p) => ({ ...p, target: { ...p.target, baseBranch: base } }));
+              }
+            }
+
+            return outcome;
           });
 
           emit(

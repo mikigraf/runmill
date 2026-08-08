@@ -121,6 +121,8 @@ export function parseConfig(source: string): RunmillConfig {
     github: {
       repositories,
       branchTemplate: String(github["branch_template"] ?? DEFAULT_BRANCH_TEMPLATE),
+      stackDependencyChains: github["stack_dependency_chains"] === true,
+      stackMaxDepth: Number(github["stack_max_depth"] ?? 4),
       draftPr: github["draft_pr"] !== false,
       merge: {
         method: (merge["method"] ?? "squash") as "squash" | "merge" | "rebase",

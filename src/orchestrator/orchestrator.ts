@@ -74,6 +74,8 @@ export interface RunOutcome {
   readonly runId: string;
   readonly issueId: string;
   readonly finalState: RunState;
+  /** Branch this run pushed, and the base a stacked layer builds on. */
+  readonly branch?: string | undefined;
   readonly prNumber?: number | undefined;
   readonly prUrl?: string | undefined;
   readonly mergeSha?: string | undefined;
@@ -156,6 +158,7 @@ export class Orchestrator {
     const cfg = this.#d.config;
     let held: HeldLease | undefined;
     let workspace: Workspace | undefined;
+    let branch: string | undefined;
     let costUsd = 0;
 
     /**
@@ -174,7 +177,14 @@ export class Orchestrator {
           // outcome is still returned truthfully.
         }
       }
-      return { runId, issueId: issue.identifier, finalState: state, costUsd, ...extra };
+      return {
+        runId,
+        issueId: issue.identifier,
+        finalState: state,
+        costUsd,
+        ...(branch === undefined ? {} : { branch }),
+        ...extra,
+      };
     };
 
     try {
@@ -216,7 +226,7 @@ export class Orchestrator {
       );
 
       // -- workspace -----------------------------------------------------
-      const branch = cfg.github.branchTemplate
+      branch = cfg.github.branchTemplate
         .replace("{issue_identifier}", issue.identifier)
         .replace("{slug}", slugify(issue.title))
         .replace("{attempt}", "1");
@@ -377,16 +387,18 @@ export class Orchestrator {
       this.#advance(runId, "PR_READY");
       await input.lease.assertHeld(held);
 
-      await this.#withOutbox(runId, "forge", "push", `${target.repo}#${branch}`, () =>
-        this.#d.forge.push({ repo: target.repo, branch, workspacePath: workspace!.path }),
+      // Set during workspace creation, long before this point.
+      const pushBranch = branch as string;
+      await this.#withOutbox(runId, "forge", "push", `${target.repo}#${pushBranch}`, () =>
+        this.#d.forge.push({ repo: target.repo, branch: pushBranch, workspacePath: workspace!.path }),
       );
       this.#advance(runId, "PUSHED");
 
       await input.lease.assertHeld(held);
-      const pr = await this.#withOutbox(runId, "forge", "open-pr", `${target.repo}#${branch}`, () =>
+      const pr = await this.#withOutbox(runId, "forge", "open-pr", `${target.repo}#${pushBranch}`, () =>
         this.#d.forge.openPullRequest({
           repo: target.repo,
-          branch,
+          branch: pushBranch,
           baseBranch: target.baseBranch,
           title: `${issue.identifier}: ${issue.title}`,
           body: renderPullRequestBody({

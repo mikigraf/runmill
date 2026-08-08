@@ -82,6 +82,27 @@ export class WorkspaceManager {
       // while every other call used `runGit`. The run then died three steps
       // later in #harden, pointing at `git config` instead of the clone.
       const root = await repoRoot(input.sourceRepo);
+
+      // A stacked layer builds on the branch the layer below pushed, and that
+      // branch exists on the remote rather than in the local checkout. Clone
+      // reads from the local repository, so fetch it down first. Absent for an
+      // ordinary base branch, this is a no-op.
+      const present = await tryGit(root, ["rev-parse", "--verify", `refs/heads/${input.baseBranch}`]);
+      if (!present.ok) {
+        const fetched = await tryGit(root, [
+          "fetch",
+          "--quiet",
+          "origin",
+          `${input.baseBranch}:refs/heads/${input.baseBranch}`,
+        ]);
+        if (!fetched.ok) {
+          throw new Error(
+            `base branch "${input.baseBranch}" is not in ${root} and could not be fetched ` +
+              `from origin: ${fetched.stderr.trim() || "unknown error"}`,
+          );
+        }
+      }
+
       await runGit(root, [
         "clone",
         "--no-hardlinks",

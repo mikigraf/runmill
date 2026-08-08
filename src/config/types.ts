@@ -53,6 +53,15 @@ export interface RunmillConfig {
   readonly github: {
     readonly repositories: readonly RepositoryRule[];
     readonly branchTemplate: string;
+    /**
+     * Submit dependency chains as stacked pull requests.
+     *
+     * Off by default. It changes what a check on an upper layer proves, since
+     * that layer is verified against a tree containing unmerged work, and that
+     * is a decision to make deliberately.
+     */
+    readonly stackDependencyChains: boolean;
+    readonly stackMaxDepth: number;
     readonly draftPr: boolean;
     readonly merge: {
       readonly method: "squash" | "merge" | "rebase";

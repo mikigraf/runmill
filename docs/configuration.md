@@ -94,6 +94,25 @@ providers:
 | `draft_pr` | `true` | |
 | `merge.method` | `squash` | `squash` · `merge` · `rebase` |
 | `merge.delete_branch` | `true` | |
+| `stack_dependency_chains` | `false` | Submit declared dependency chains as stacked pull requests |
+| `stack_max_depth` | `4` | How deep a chain may get before it is refused |
+
+**Stacking is derived, never imposed.** `ENG-104 blocked by ENG-99` is rejected today, and a human
+does ENG-99 by hand first. With `stack_dependency_chains: true`, runmill instead builds ENG-104 on
+ENG-99's branch and submits both as a stack. Only issues rejected *solely* for dependencies join a
+chain; anything refused for another reason stays refused.
+
+Unrelated issues are never batched into a stack. That would invent a dependency, so layer 7 could
+not merge until layer 1 did for no reason, and one refused layer would strand every layer above it.
+A refused layer does abandon the layers above it, because they would otherwise be verified against
+a branch that is not going to merge.
+
+Be aware of what this changes about the evidence. A check on the bottom layer means "verified
+against the base branch". A check on layer three means "verified against a tree containing two
+changes that have not merged". That is a weaker claim, which is why the setting is off by default.
+When a lower layer merges and the upper layers rebase, runmill compares tree hashes: an identical
+tree means the checks already ran against this exact content and nothing is re-run, and a changed
+tree invalidates the result and re-verifies.
 
 > `{attempt}` is validated, not suggested. Without it a retry reuses the previous run's branch and
 > silently adopts that run's pull request through GitHub's 422-duplicate path — so a second attempt

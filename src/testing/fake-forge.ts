@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import type {
   BranchProtection,
   ForgeAdapter,
@@ -51,6 +52,21 @@ export class FakeForgeAdapter implements ForgeAdapter {
   async push(input: { repo: string; branch: string; workspacePath: string }): Promise<void> {
     this.calls.push({ op: "push", args: input });
     this.#pushed.add(`${input.repo}#${input.branch}`);
+
+    // Actually push. Recording the call and doing nothing made the fake MORE
+    // permissive than the real adapter: anything depending on the branch
+    // existing afterwards passed here and failed against a real forge. A
+    // stacked layer depends on exactly that, because it clones the branch the
+    // layer below pushed.
+    try {
+      execFileSync("git", ["push", "--quiet", "--force", "origin", `HEAD:refs/heads/${input.branch}`], {
+        cwd: input.workspacePath,
+        stdio: "ignore",
+      });
+    } catch {
+      // The workspace may have no reachable origin in unit tests that never
+      // built one. The recorded call is still the assertion surface there.
+    }
     this.#maybeLoseResponse("push");
   }
 
