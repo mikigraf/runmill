@@ -89,7 +89,7 @@ describe("runmill config validate", () => {
       [
         "version: 1",
         "autonomy: yolo",
-        "provider: { implementation: codex }",
+        "providers: { implementer: { implementation: codex } }",
         "backlog: { provider: linear, team: ENG, eligible_states: [Todo], claim_state: In Progress }",
         "github:",
         "  branch_template: runmill/{issue_identifier}",

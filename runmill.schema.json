@@ -27,42 +27,6 @@
       "default": "pr-only",
       "description": "observe: plan only, no repository mutation. pr-only: implement, verify, review, open a PR, never merge. guarded-merge: may merge low-risk changes after all gates pass. continuous: repeat guarded execution until no eligible work remains, a budget is reached, or a circuit breaker opens. guarded-merge and continuous require a GitHub App token without `administration`."
     },
-    "provider": {
-      "type": "object",
-      "required": [
-        "implementation"
-      ],
-      "additionalProperties": false,
-      "properties": {
-        "implementation": {
-          "enum": [
-            "codex",
-            "claude"
-          ]
-        },
-        "execution": {
-          "enum": [
-            "local"
-          ],
-          "default": "local"
-        },
-        "max_turns": {
-          "type": "integer",
-          "minimum": 1,
-          "default": 80
-        },
-        "timeout_minutes": {
-          "type": "integer",
-          "minimum": 1,
-          "default": 120,
-          "description": "Clamped to the run's remaining wall budget when budgets.clamp_invocation_timeout_to_remaining is true."
-        },
-        "model": {
-          "type": "string",
-          "description": "Model id passed to the CLI. Omit for the CLI's default."
-        }
-      }
-    },
     "backlog": {
       "type": "object",
       "required": [
@@ -401,14 +365,6 @@
           "const": true,
           "default": true
         },
-        "provider": {
-          "enum": [
-            "inherit",
-            "codex",
-            "claude"
-          ],
-          "default": "inherit"
-        },
         "max_fix_iterations": {
           "type": "integer",
           "minimum": 0,
@@ -433,10 +389,6 @@
         "require_all_findings_resolved": {
           "type": "boolean",
           "default": true
-        },
-        "model": {
-          "type": "string",
-          "description": "Model the reviewer runs. Independent of review.provider: the same CLI with a different model is valid and often the cheapest independent second opinion."
         }
       }
     },
@@ -558,6 +510,57 @@
           ],
           "default": "auto",
           "description": "Subscription provider plans report no dollar cost, so cost budgets silently become no-ops. doctor reports which dimensions are enforceable and refuses continuous mode when none are."
+        }
+      }
+    },
+    "providers": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Which agent runs which role, plus the invocation limits both share.",
+      "properties": {
+        "max_turns": {
+          "type": "integer",
+          "default": 80
+        },
+        "timeout_minutes": {
+          "type": "integer",
+          "default": 120
+        },
+        "implementer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "implementation": {
+              "enum": [
+                "codex",
+                "claude"
+              ],
+              "default": "codex"
+            },
+            "model": {
+              "type": "string",
+              "description": "Model id passed to the CLI. Omit for the CLI's default."
+            }
+          }
+        },
+        "reviewer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "implementation": {
+              "enum": [
+                "inherit",
+                "codex",
+                "claude"
+              ],
+              "default": "inherit",
+              "description": "inherit reuses the implementer's CLI."
+            },
+            "model": {
+              "type": "string",
+              "description": "Defaults to the implementer's model. A different model on the same CLI is a valid and often the cheapest independent second opinion."
+            }
+          }
         }
       }
     }

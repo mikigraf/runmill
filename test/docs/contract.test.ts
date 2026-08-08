@@ -156,7 +156,7 @@ describe("configuration reference", () => {
   it("documents every top-level configuration section", () => {
     const body = readFileSync("docs/configuration.md", "utf8");
     for (const section of [
-      "provider",
+      "providers",
       "backlog",
       "github",
       "workspace",

@@ -5,13 +5,30 @@ import type { RepositoryRule } from "../queue/repository-mapping.js";
 export interface RunmillConfig {
   readonly version: 1;
   readonly autonomy: AutonomyMode;
-  readonly provider: {
-    readonly implementation: "codex" | "claude";
-    /** Model id passed to the CLI. Undefined means the CLI's own default. */
-    readonly model?: string | undefined;
+  /**
+   * Which agent runs which role.
+   *
+   * One block rather than two, because picking the implementer and picking the
+   * reviewer is one decision made twice. Splitting it across `provider` and
+   * `review.provider` meant the second half was easy to miss, and the section
+   * that held it was also holding review policy that has nothing to do with
+   * which agent runs.
+   */
+  readonly providers: {
     readonly execution: "local";
     readonly maxTurns: number;
     readonly timeoutMinutes: number;
+    readonly implementer: {
+      readonly implementation: "codex" | "claude";
+      /** Model id passed to the CLI. Undefined means the CLI's own default. */
+      readonly model?: string | undefined;
+    };
+    readonly reviewer: {
+      /** `inherit` reuses the implementer's CLI. */
+      readonly implementation: "inherit" | "codex" | "claude";
+      /** Defaults to the implementer's model. */
+      readonly model?: string | undefined;
+    };
   };
   readonly backlog: {
     readonly provider: "linear" | "github-issues";
@@ -70,15 +87,6 @@ export interface RunmillConfig {
     readonly localReviewSkill?: string | undefined;
     readonly prReviewSkill?: string | undefined;
     readonly freshContext: true;
-    readonly provider: "inherit" | "codex" | "claude";
-    /**
-     * Model the reviewer runs.
-     *
-     * Independent of `provider`: the same CLI with a different model is a valid
-     * and common configuration, and often the cheapest way to get an
-     * independent second opinion.
-     */
-    readonly model?: string | undefined;
     readonly maxFixIterations: number;
     readonly mergeBlockingSeverities: readonly string[];
     readonly requireAllFindingsResolved: boolean;

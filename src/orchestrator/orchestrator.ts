@@ -182,7 +182,7 @@ export class Orchestrator {
         runId,
         issueId: issue.identifier,
         repo: target.repo,
-        provider: cfg.provider.implementation,
+        provider: cfg.providers.implementer.implementation,
       });
       this.#advance(runId, "ELIGIBILITY_CHECKED");
 
@@ -279,8 +279,8 @@ export class Orchestrator {
           forbiddenPaths: packet.constraints.forbidden_paths,
           allowedCommands: [],
           network: cfg.workspace.network,
-          maxTurns: cfg.provider.maxTurns,
-          timeoutMs: cfg.provider.timeoutMinutes * 60_000,
+          maxTurns: cfg.providers.maxTurns,
+          timeoutMs: cfg.providers.timeoutMinutes * 60_000,
         });
         const agentResult = await session.result;
         costUsd += accumulateUsage(agentResult.events).costUsd;
@@ -338,8 +338,8 @@ export class Orchestrator {
           forbiddenPaths: packet.constraints.forbidden_paths,
           allowedCommands: [],
           network: cfg.workspace.network,
-          maxTurns: cfg.provider.maxTurns,
-          timeoutMs: cfg.provider.timeoutMinutes * 60_000,
+          maxTurns: cfg.providers.maxTurns,
+          timeoutMs: cfg.providers.timeoutMinutes * 60_000,
         });
         const reviewResult = await reviewSession.result;
         costUsd += accumulateUsage(reviewResult.events).costUsd;
@@ -388,7 +388,7 @@ export class Orchestrator {
             issue,
             review: review as Review,
             runId,
-            provider: cfg.provider.implementation,
+            provider: cfg.providers.implementer.implementation,
             checks: prChecks,
           }),
           draft: cfg.github.draftPr,
@@ -610,8 +610,8 @@ export class Orchestrator {
         forbiddenPaths: packet.constraints.forbidden_paths,
         allowedCommands: [],
         network: cfg.workspace.network,
-        maxTurns: cfg.provider.maxTurns,
-        timeoutMs: cfg.provider.timeoutMinutes * 60_000,
+        maxTurns: cfg.providers.maxTurns,
+        timeoutMs: cfg.providers.timeoutMinutes * 60_000,
       });
       const result = await session.result;
       costUsd += accumulateUsage(result.events).costUsd;
@@ -663,8 +663,8 @@ export class Orchestrator {
         forbiddenPaths: packet.constraints.forbidden_paths,
         allowedCommands: [],
         network: cfg.workspace.network,
-        maxTurns: cfg.provider.maxTurns,
-        timeoutMs: cfg.provider.timeoutMinutes * 60_000,
+        maxTurns: cfg.providers.maxTurns,
+        timeoutMs: cfg.providers.timeoutMinutes * 60_000,
       });
       const fixResult = await fixSession.result;
       costUsd += accumulateUsage(fixResult.events).costUsd;

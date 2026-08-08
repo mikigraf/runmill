@@ -28,7 +28,28 @@ function asRecord(value: unknown): Record<string, unknown> {
 export function parseConfig(source: string): RunmillConfig {
   const raw = asRecord(parseYaml(source));
 
-  const provider = asRecord(raw["provider"]);
+  // A file written against the old shape parses to all-defaults and silently
+  // runs codex on everything, which is the worst possible migration: it looks
+  // like it worked. Name it instead, with the replacement.
+  if (raw["providers"] === undefined && raw["provider"] !== undefined) {
+    throw RunmillError.fromCatalog("RM-CONFIG-001", {
+      whatHappened:
+        "`provider:` and `review.provider:` were replaced by one `providers:` block.\n\n" +
+        "  providers:\n" +
+        "    implementer:\n" +
+        "      implementation: codex     # was provider.implementation\n" +
+        "      model: <id>               # was provider.model\n" +
+        "    reviewer:\n" +
+        "      implementation: inherit   # was review.provider\n" +
+        "      model: <id>               # was review.model\n\n" +
+        "  max_turns and timeout_minutes move under `providers:` too.\n" +
+        "  Everything else under `review:` stays where it is.",
+    });
+  }
+
+  const providers = asRecord(raw["providers"]);
+  const implementer = asRecord(providers["implementer"]);
+  const reviewer = asRecord(providers["reviewer"]);
   const backlog = asRecord(raw["backlog"]);
   const selection = asRecord(backlog["selection"]);
   const github = asRecord(raw["github"]);
@@ -61,12 +82,21 @@ export function parseConfig(source: string): RunmillConfig {
   return {
     version: (raw["version"] ?? 1) as 1,
     autonomy: (raw["autonomy"] ?? "pr-only") as RunmillConfig["autonomy"],
-    provider: {
-      implementation: (provider["implementation"] ?? "codex") as "codex" | "claude",
-      model: provider["model"] as string | undefined,
+    providers: {
       execution: "local",
-      maxTurns: Number(provider["max_turns"] ?? 80),
-      timeoutMinutes: Number(provider["timeout_minutes"] ?? 120),
+      maxTurns: Number(providers["max_turns"] ?? 80),
+      timeoutMinutes: Number(providers["timeout_minutes"] ?? 120),
+      implementer: {
+        implementation: (implementer["implementation"] ?? "codex") as "codex" | "claude",
+        model: implementer["model"] as string | undefined,
+      },
+      reviewer: {
+        implementation: (reviewer["implementation"] ?? "inherit") as
+          | "inherit"
+          | "codex"
+          | "claude",
+        model: reviewer["model"] as string | undefined,
+      },
     },
     backlog: {
       provider: (backlog["provider"] ?? "linear") as "linear" | "github-issues",
@@ -139,8 +169,6 @@ export function parseConfig(source: string): RunmillConfig {
       localReviewSkill: review["local_review_skill"] as string | undefined,
       prReviewSkill: review["pr_review_skill"] as string | undefined,
       freshContext: true,
-      provider: (review["provider"] ?? "inherit") as "inherit" | "codex" | "claude",
-      model: review["model"] as string | undefined,
       maxFixIterations: Number(review["max_fix_iterations"] ?? 3),
       mergeBlockingSeverities: asArray<string>(review["merge_blocking_severities"], [
         "critical",
@@ -199,14 +227,27 @@ export function validateConfig(config: RunmillConfig): ValidationResult {
       `autonomy must be one of ${[...AUTONOMY_MODES].join(", ")}, got "${String(config.autonomy)}"`,
     );
   }
-  if (!PROVIDER_IMPLEMENTATIONS.has(config.provider.implementation)) {
+  if (!PROVIDER_IMPLEMENTATIONS.has(config.providers.implementer.implementation)) {
     // Unvalidated, a typo was silently harmless-looking and materially wrong:
     // anything that was not exactly "claude" resolved to codex, in the factory
     // AND in doctor, so `implementation: cluade` reported a passing codex check
     // and then ran codex for a team that had chosen claude.
     errors.push(
-      `provider.implementation must be one of ${[...PROVIDER_IMPLEMENTATIONS].join(", ")}, ` +
-        `got "${String(config.provider.implementation)}"`,
+      `providers.implementer.implementation must be one of ` +
+        `${[...PROVIDER_IMPLEMENTATIONS].join(", ")}, ` +
+        `got "${String(config.providers.implementer.implementation)}"`,
+    );
+  }
+  // `inherit` is meaningful only for the reviewer: there is nothing for the
+  // implementer to inherit from.
+  if (
+    !PROVIDER_IMPLEMENTATIONS.has(config.providers.reviewer.implementation) &&
+    config.providers.reviewer.implementation !== "inherit"
+  ) {
+    errors.push(
+      `providers.reviewer.implementation must be inherit, ` +
+        `${[...PROVIDER_IMPLEMENTATIONS].join(", or ")}, ` +
+        `got "${String(config.providers.reviewer.implementation)}"`,
     );
   }
   if (config.backlog.team === "") {

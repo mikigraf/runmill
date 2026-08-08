@@ -43,8 +43,9 @@ function config(overrides = ""): ReturnType<typeof parseConfig> {
   return parseConfig(`
 version: 1
 autonomy: pr-only
-provider:
-  implementation: codex
+providers:
+  implementer:
+    implementation: codex
 backlog:
   provider: linear
   team: ENG

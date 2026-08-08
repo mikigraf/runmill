@@ -487,8 +487,11 @@ version: 1
 # consequential key in the file and must be readable at a glance.
 autonomy: pr-only # observe | pr-only | guarded-merge | continuous
 
-provider:
-  implementation: codex # codex | claude
+providers:
+  implementer:
+    implementation: codex
+  reviewer:
+    implementation: inherit # codex | claude
   execution: local
   max_turns: 80
   timeout_minutes: 120

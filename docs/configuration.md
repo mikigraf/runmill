@@ -38,14 +38,31 @@ behavior. `runmill config show` prints what is actually in effect.
 | `version` | `1` | |
 | `autonomy` | `pr-only` | `observe` · `pr-only` · `guarded-merge` · `continuous` — see [autonomy](./autonomy.md) |
 
-### `provider`
+### `providers`
+
+Which agent runs which role. One block, because picking the implementer and
+picking the reviewer is the same decision made twice.
 
 | Key | Default | Notes |
 |---|---|---|
-| `implementation` | `codex` | `codex` or `claude` |
-| `model` | CLI default | Model id passed through to the CLI. Not validated against a list, because model ids change faster than any allowlist |
-| `max_turns` | `80` | |
-| `timeout_minutes` | `120` | |
+| `max_turns` | `80` | Shared by both roles |
+| `timeout_minutes` | `120` | Shared by both roles |
+| `implementer.implementation` | `codex` | `codex` or `claude` |
+| `implementer.model` | CLI default | Model id passed through. Not validated against a list, because model ids change faster than any allowlist |
+| `reviewer.implementation` | `inherit` | `inherit` reuses the implementer's CLI |
+| `reviewer.model` | implementer's model | Independent of `reviewer.implementation` |
+
+```yaml
+providers:
+  implementer:
+    implementation: codex
+    model: <fast-model>
+  reviewer:
+    implementation: inherit    # same CLI
+    model: <stronger-model>    # different model
+```
+
+`inherit` is valid only for the reviewer; the implementer has nothing to inherit from.
 
 ### `backlog`
 
@@ -126,8 +143,6 @@ Checks from both sources are unioned by id, and the repository's manifest wins a
 |---|---|---|
 | `local_review_skill` | built-in | `runmill skills eject` to customize |
 | `pr_review_skill` | built-in | Used by the [`PR_REVIEW` stage](./lifecycle.md#two-reviews-not-one), after CI and before the merge gate |
-| `provider` | `inherit` | `inherit` · `codex` · `claude`. Which CLI reviews |
-| `model` | `provider.model` | Which model reviews. Independent of `provider` |
 | `max_fix_iterations` | `3` | Must not exceed the `fixer` invocation budget |
 | `merge_blocking_severities` | `[critical, high]` | |
 | `require_all_findings_resolved` | `true` | |

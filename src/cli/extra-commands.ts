@@ -152,15 +152,16 @@ version: 1
 #                             branch protection. Run \`runmill doctor\` first.
 autonomy: pr-only
 
-provider:
-  implementation: codex # codex | claude
-  # model: <id>         # omit for the CLI's default
-
-review:
-  # Reviewing with a different model is the cheapest way to get a second
-  # opinion that does not share the author's blind spots. Same CLI is fine.
-  # provider: inherit   # inherit | codex | claude
-  # model: <id>
+providers:
+  implementer:
+    implementation: codex   # codex | claude
+    # model: <id>           # omit for the CLI's default
+  reviewer:
+    # Reviewing with a different model is the cheapest way to get a second
+    # opinion that does not share the author's blind spots. The same CLI with
+    # a different model counts, and needs no second subscription.
+    implementation: inherit # inherit | codex | claude
+    # model: <id>
 
 backlog:
   provider: linear

@@ -116,10 +116,10 @@ export async function buildAdapters(
   // -- provider ----------------------------------------------------------
   let provider: CodingAgentAdapter;
   let providerLive = false;
-  const dialect = config.provider.implementation === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
+  const dialect = config.providers.implementer.implementation === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
   const cli = new CliProviderAdapter({
     dialect,
-    ...(config.provider.model === undefined ? {} : { model: config.provider.model }),
+    ...(config.providers.implementer.model === undefined ? {} : { model: config.providers.implementer.model }),
   });
   // Demo mode never uses the real provider, so probing for it is a subprocess
   // spawn (and for one dialect an auth check) whose result is discarded.
@@ -163,10 +163,12 @@ export async function buildAdapters(
   let reviewProviderLive = providerLive;
 
   const reviewImpl =
-    config.review.provider === "inherit" ? config.provider.implementation : config.review.provider;
-  const reviewModel = config.review.model ?? config.provider.model;
+    config.providers.reviewer.implementation === "inherit"
+      ? config.providers.implementer.implementation
+      : config.providers.reviewer.implementation;
+  const reviewModel = config.providers.reviewer.model ?? config.providers.implementer.model;
   const differs =
-    reviewImpl !== config.provider.implementation || reviewModel !== config.provider.model;
+    reviewImpl !== config.providers.implementer.implementation || reviewModel !== config.providers.implementer.model;
 
   if (wants("provider") && differs) {
     if (demo) {
@@ -182,7 +184,7 @@ export async function buildAdapters(
       // Only re-probe when the CLI itself is different. Same binary, different
       // model needs no second detect or auth check, and skipping it keeps the
       // common case free.
-      if (reviewImpl !== config.provider.implementation) {
+      if (reviewImpl !== config.providers.implementer.implementation) {
         const found = await reviewCli.detect();
         if (!found.installed) {
           throw RunmillError.fromCatalog("RM-AUTH-003", {
@@ -204,7 +206,7 @@ export async function buildAdapters(
       }
 
       reviewProvider = reviewCli;
-      reviewProviderLive = providerLive || reviewImpl !== config.provider.implementation;
+      reviewProviderLive = providerLive || reviewImpl !== config.providers.implementer.implementation;
     }
   }
 

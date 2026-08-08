@@ -166,7 +166,7 @@ export function buildProgram(): Command {
 
       let providerImpl = "codex";
       try {
-        providerImpl = loadOrExit(opts, repoRoot).config.provider.implementation;
+        providerImpl = loadOrExit(opts, repoRoot).config.providers.implementer.implementation;
       } catch {
         // doctor must still run without a valid config; the config check
         // itself is what reports that.

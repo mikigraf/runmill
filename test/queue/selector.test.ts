@@ -7,8 +7,9 @@ import type { BacklogIssue } from "../../src/domain/types.js";
 const CONFIG = parseConfig(`
 version: 1
 autonomy: pr-only
-provider:
-  implementation: codex
+providers:
+  implementer:
+    implementation: codex
 backlog:
   provider: linear
   team: ENG

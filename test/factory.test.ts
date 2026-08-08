@@ -18,8 +18,9 @@ import { RunmillError } from "../src/errors/runmill-error.js";
 const CONFIG = parseConfig(`
 version: 1
 autonomy: pr-only
-provider:
-  implementation: codex
+providers:
+  implementer:
+    implementation: codex
 backlog:
   provider: linear
   team: ENG
@@ -200,65 +201,62 @@ describe("RUNMILL_DEMO as an explicit signal", () => {
   });
 });
 
-describe("choosing a reviewer model", () => {
-  // `review.provider` shipped in the config schema and was read nowhere, so
-  // choosing a reviewer silently did nothing.
+/** Build a config with the two agent roles set explicitly. */
+function roles(
+  implementer: { implementation: "codex" | "claude"; model?: string },
+  reviewer: { implementation: "inherit" | "codex" | "claude"; model?: string },
+) {
+  return {
+    ...CONFIG,
+    providers: { ...CONFIG.providers, implementer, reviewer },
+  } as typeof CONFIG;
+}
+
+describe("which agent runs which role", () => {
+  // `review.provider` shipped in the schema and was read nowhere, so choosing a
+  // reviewer silently did nothing. Then it forked only on implementation, so
+  // choosing a different MODEL on the same CLI also silently did nothing.
   it("inherits the implementer's adapter by default", async () => {
-    const adapters = await buildAdapters(CONFIG, { demo: true, credentials: NO_CREDENTIALS });
-    expect(adapters.reviewProvider).toBe(adapters.provider);
+    const a = await buildAdapters(CONFIG, { demo: true, credentials: NO_CREDENTIALS });
+    expect(a.reviewProvider).toBe(a.provider);
   });
 
-  it("uses a separate adapter when a different reviewer is configured", async () => {
-    // Independence is the point. A model reviewing its own work agrees with
-    // itself for the same reasons it was wrong, and clearing context does not
-    // change that.
-    const cfg = { ...CONFIG, review: { ...CONFIG.review, provider: "claude" as const } };
-    const adapters = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
-    expect(adapters.reviewProvider).not.toBe(adapters.provider);
-    expect(adapters.live.reviewProvider).toBe(false);
+  it("forks when the CLI differs", async () => {
+    const cfg = roles({ implementation: "codex" }, { implementation: "claude" });
+    const a = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
+    expect(a.reviewProvider).not.toBe(a.provider);
+    expect(a.live.reviewProvider).toBe(false);
   });
 
-  it("reports reviewer liveness separately from the implementer", async () => {
-    const adapters = await buildAdapters(CONFIG, { demo: true, credentials: NO_CREDENTIALS });
-    expect(adapters.live).toHaveProperty("reviewProvider");
-  });
-});
-
-describe("provider and model are independent choices", () => {
-  const withCfg = (over: Record<string, unknown>) => ({ ...CONFIG, ...over });
-
-  it("forks the reviewer when only the MODEL differs, on the same CLI", async () => {
+  it("forks when only the MODEL differs, on the same CLI", async () => {
     // The common case: one authenticated CLI, two models. Forking only on
-    // implementation would silently review with the author's own model.
-    const cfg = withCfg({
-      provider: { ...CONFIG.provider, implementation: "codex" as const, model: "model-a" },
-      review: { ...CONFIG.review, provider: "inherit" as const, model: "model-b" },
-    });
+    // implementation would review with the author's own model while looking
+    // configured.
+    const cfg = roles(
+      { implementation: "codex", model: "model-a" },
+      { implementation: "inherit", model: "model-b" },
+    );
     const a = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
     expect(a.reviewProvider).not.toBe(a.provider);
   });
 
   it("inherits when implementation and model both match", async () => {
-    const cfg = withCfg({
-      provider: { ...CONFIG.provider, implementation: "codex" as const, model: "model-a" },
-      review: { ...CONFIG.review, provider: "codex" as const, model: "model-a" },
-    });
+    const cfg = roles(
+      { implementation: "codex", model: "model-a" },
+      { implementation: "codex", model: "model-a" },
+    );
     const a = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
     expect(a.reviewProvider).toBe(a.provider);
   });
 
-  it("falls back to the implementer's model when review declares none", async () => {
-    const cfg = withCfg({
-      provider: { ...CONFIG.provider, model: "model-a" },
-      review: { ...CONFIG.review, provider: "inherit" as const },
-    });
+  it("falls back to the implementer's model when the reviewer declares none", async () => {
+    const cfg = roles({ implementation: "codex", model: "model-a" }, { implementation: "inherit" });
     const a = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
     expect(a.reviewProvider).toBe(a.provider);
   });
 
-  it("forks when the CLI differs even with no model set", async () => {
-    const cfg = withCfg({ review: { ...CONFIG.review, provider: "claude" as const } });
-    const a = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
-    expect(a.reviewProvider).not.toBe(a.provider);
+  it("reports reviewer liveness separately from the implementer", async () => {
+    const a = await buildAdapters(CONFIG, { demo: true, credentials: NO_CREDENTIALS });
+    expect(a.live).toHaveProperty("reviewProvider");
   });
 });

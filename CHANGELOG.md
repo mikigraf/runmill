@@ -39,6 +39,28 @@ First release.
 - `docs/errors.md`, generated from the error catalog. CI fails if it drifts.
 - CI on macOS and Linux, including a check that the published package contains the binary it declares.
 
+### Upgrade notes
+
+`provider:` and `review.provider:` are replaced by one `providers:` block. A file
+using the old shape is rejected by name, with the replacement printed, rather
+than parsed to defaults.
+
+```yaml
+providers:
+  max_turns: 80              # was provider.max_turns
+  timeout_minutes: 120       # was provider.timeout_minutes
+  implementer:
+    implementation: codex    # was provider.implementation
+    model: <id>              # was provider.model
+  reviewer:
+    implementation: inherit  # was review.provider
+    model: <id>              # was review.model
+```
+
+Everything else under `review:` (skills, `max_fix_iterations`,
+`merge_blocking_severities`) stays where it is. `runmill init --force` writes the
+new shape.
+
 ### Fixed
 
 - **The safe git-isolation default never applied to a single real run.** `WorkspaceManager`
