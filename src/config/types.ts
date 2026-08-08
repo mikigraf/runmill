@@ -7,6 +7,8 @@ export interface RunmillConfig {
   readonly autonomy: AutonomyMode;
   readonly provider: {
     readonly implementation: "codex" | "claude";
+    /** Model id passed to the CLI. Undefined means the CLI's own default. */
+    readonly model?: string | undefined;
     readonly execution: "local";
     readonly maxTurns: number;
     readonly timeoutMinutes: number;
@@ -69,6 +71,14 @@ export interface RunmillConfig {
     readonly prReviewSkill?: string | undefined;
     readonly freshContext: true;
     readonly provider: "inherit" | "codex" | "claude";
+    /**
+     * Model the reviewer runs.
+     *
+     * Independent of `provider`: the same CLI with a different model is a valid
+     * and common configuration, and often the cheapest way to get an
+     * independent second opinion.
+     */
+    readonly model?: string | undefined;
     readonly maxFixIterations: number;
     readonly mergeBlockingSeverities: readonly string[];
     readonly requireAllFindingsResolved: boolean;

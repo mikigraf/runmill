@@ -29,6 +29,15 @@ export interface ProviderDialect {
   authArgs(): readonly string[];
   isAuthenticated(stdout: string, stderr: string, code: number | null): boolean;
   buildArgs(request: AgentRunRequest, prompt: string): readonly string[];
+  /**
+   * How this CLI names its model flag.
+   *
+   * Kept per dialect rather than branching in the adapter, and deliberately not
+   * validated against a list of known model ids: those change every few weeks,
+   * and a stale allowlist would reject a model that works. An unknown id fails
+   * with the provider's own message, which is the one that will be accurate.
+   */
+  modelArgs(model: string): readonly string[];
   /** Returns undefined for lines that carry no normalized meaning. */
   mapLine(line: unknown): AgentEventBody | undefined;
   /**
@@ -59,6 +68,7 @@ export const CODEX_DIALECT: ProviderDialect = {
   versionArgs: ["--version"],
   capabilities: BASE_CAPABILITIES,
   configPaths: (home) => [join(home, ".codex")],
+  modelArgs: (model) => ["-m", model],
   authArgs: () => ["login", "status"],
   isAuthenticated: (stdout, stderr, code) =>
     code === 0 && !/not logged in|unauthenticated/i.test(`${stdout}${stderr}`),
@@ -97,6 +107,7 @@ export const CLAUDE_DIALECT: ProviderDialect = {
   versionArgs: ["--version"],
   capabilities: { ...BASE_CAPABILITIES, sessionResume: true, costReporting: true },
   configPaths: (home) => [join(home, ".claude"), join(home, ".config", "claude")],
+  modelArgs: (model) => ["--model", model],
   authArgs: () => ["-p", "ping", "--max-turns", "1"],
   isAuthenticated: (stdout, stderr, code) =>
     code === 0 || !/not logged in|authentication|api key/i.test(`${stdout}${stderr}`),
@@ -155,6 +166,8 @@ export const CLAUDE_DIALECT: ProviderDialect = {
 
 export interface CliProviderOptions {
   readonly dialect: ProviderDialect;
+  /** Passed to the CLI's model flag. Omitted means the CLI's own default. */
+  readonly model?: string | undefined;
   readonly clock?: Clock | undefined;
   readonly promptBuilder?: ((request: AgentRunRequest) => string) | undefined;
   readonly sandbox?: Sandbox | undefined;
@@ -170,12 +183,14 @@ export interface CliProviderOptions {
  */
 export class CliProviderAdapter implements CodingAgentAdapter {
   readonly #dialect: ProviderDialect;
+  readonly #model: string | undefined;
   readonly #clock: Clock;
   readonly #promptBuilder: (request: AgentRunRequest) => string;
   readonly #sandbox: Sandbox;
 
   constructor(options: CliProviderOptions) {
     this.#dialect = options.dialect;
+    this.#model = options.model;
     this.#clock = options.clock ?? new SystemClock();
     this.#promptBuilder = options.promptBuilder ?? defaultPrompt;
     this.#sandbox = options.sandbox ?? new Sandbox();
@@ -187,7 +202,14 @@ export class CliProviderAdapter implements CodingAgentAdapter {
   }
 
   get name(): string {
-    return this.#dialect.name;
+    return this.#model === undefined || this.#model === ""
+      ? this.#dialect.name
+      : `${this.#dialect.name}:${this.#model}`;
+  }
+
+  /** The model this adapter runs, or undefined for the CLI's default. */
+  get model(): string | undefined {
+    return this.#model;
   }
 
   async detect(): Promise<ProviderInstallation> {
@@ -214,7 +236,12 @@ export class CliProviderAdapter implements CodingAgentAdapter {
 
   async start(request: AgentRunRequest): Promise<AgentSession> {
     const prompt = this.#promptBuilder(request);
-    const args = this.#dialect.buildArgs(request, prompt);
+    const args = [
+      ...this.#dialect.buildArgs(request, prompt),
+      ...(this.#model === undefined || this.#model === ""
+        ? []
+        : this.#dialect.modelArgs(this.#model)),
+    ];
 
     const events: AgentEvent[] = [];
     let seq = 0;

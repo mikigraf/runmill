@@ -7,7 +7,7 @@
  * result is worse than stopping, so nothing gets a best-effort interpretation.
  */
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -576,6 +576,45 @@ exit 0
         )
       ).result;
       expect(result.outputRef).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+describe("model selection", () => {
+  it("passes the model using each CLI's own flag", () => {
+    // codex and claude spell it differently, so it belongs in the dialect
+    // rather than in a branch inside the adapter.
+    expect(CODEX_DIALECT.modelArgs("m1")).toEqual(["-m", "m1"]);
+    expect(CLAUDE_DIALECT.modelArgs("m1")).toEqual(["--model", "m1"]);
+  });
+
+  it("reports the model in the adapter name, so two adapters are tellable apart", () => {
+    const plain = new CliProviderAdapter({ dialect: CODEX_DIALECT });
+    const pinned = new CliProviderAdapter({ dialect: CODEX_DIALECT, model: "m1" });
+    expect(plain.name).toBe("codex");
+    expect(pinned.name).toBe("codex:m1");
+    expect(pinned.model).toBe("m1");
+  });
+
+  it("omits the flag entirely when no model is configured", async () => {
+    // An empty or absent model must not become `-m ""`, which the CLI would
+    // reject with a message about the wrong thing.
+    const dir = mkdtempSync(join(tmpdir(), "runmill-model-"));
+    const bin = join(dir, "fakeprovider");
+    // The fake records the argv it received so the assertion is on real args.
+    writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$@" > "${join(dir, "argv")}"\necho '{"type":"task_complete"}'\n`);
+    chmodSync(bin, 0o755);
+    try {
+      const dialect = { ...CODEX_DIALECT, binary: bin, buildArgs: () => ["exec"] };
+      await (
+        await new CliProviderAdapter({ dialect, model: "" }).start(
+          request({ workingDirectory: dir }),
+        )
+      ).result;
+      const argv = readFileSync(join(dir, "argv"), "utf8");
+      expect(argv).not.toContain("-m");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

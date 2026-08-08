@@ -63,6 +63,7 @@ export function parseConfig(source: string): RunmillConfig {
     autonomy: (raw["autonomy"] ?? "pr-only") as RunmillConfig["autonomy"],
     provider: {
       implementation: (provider["implementation"] ?? "codex") as "codex" | "claude",
+      model: provider["model"] as string | undefined,
       execution: "local",
       maxTurns: Number(provider["max_turns"] ?? 80),
       timeoutMinutes: Number(provider["timeout_minutes"] ?? 120),
@@ -139,6 +140,7 @@ export function parseConfig(source: string): RunmillConfig {
       prReviewSkill: review["pr_review_skill"] as string | undefined,
       freshContext: true,
       provider: (review["provider"] ?? "inherit") as "inherit" | "codex" | "claude",
+      model: review["model"] as string | undefined,
       maxFixIterations: Number(review["max_fix_iterations"] ?? 3),
       mergeBlockingSeverities: asArray<string>(review["merge_blocking_severities"], [
         "critical",

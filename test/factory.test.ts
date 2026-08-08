@@ -223,3 +223,42 @@ describe("choosing a reviewer model", () => {
     expect(adapters.live).toHaveProperty("reviewProvider");
   });
 });
+
+describe("provider and model are independent choices", () => {
+  const withCfg = (over: Record<string, unknown>) => ({ ...CONFIG, ...over });
+
+  it("forks the reviewer when only the MODEL differs, on the same CLI", async () => {
+    // The common case: one authenticated CLI, two models. Forking only on
+    // implementation would silently review with the author's own model.
+    const cfg = withCfg({
+      provider: { ...CONFIG.provider, implementation: "codex" as const, model: "model-a" },
+      review: { ...CONFIG.review, provider: "inherit" as const, model: "model-b" },
+    });
+    const a = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
+    expect(a.reviewProvider).not.toBe(a.provider);
+  });
+
+  it("inherits when implementation and model both match", async () => {
+    const cfg = withCfg({
+      provider: { ...CONFIG.provider, implementation: "codex" as const, model: "model-a" },
+      review: { ...CONFIG.review, provider: "codex" as const, model: "model-a" },
+    });
+    const a = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
+    expect(a.reviewProvider).toBe(a.provider);
+  });
+
+  it("falls back to the implementer's model when review declares none", async () => {
+    const cfg = withCfg({
+      provider: { ...CONFIG.provider, model: "model-a" },
+      review: { ...CONFIG.review, provider: "inherit" as const },
+    });
+    const a = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
+    expect(a.reviewProvider).toBe(a.provider);
+  });
+
+  it("forks when the CLI differs even with no model set", async () => {
+    const cfg = withCfg({ review: { ...CONFIG.review, provider: "claude" as const } });
+    const a = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
+    expect(a.reviewProvider).not.toBe(a.provider);
+  });
+});

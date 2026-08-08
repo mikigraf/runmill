@@ -117,7 +117,10 @@ export async function buildAdapters(
   let provider: CodingAgentAdapter;
   let providerLive = false;
   const dialect = config.provider.implementation === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
-  const cli = new CliProviderAdapter({ dialect });
+  const cli = new CliProviderAdapter({
+    dialect,
+    ...(config.provider.model === undefined ? {} : { model: config.provider.model }),
+  });
   // Demo mode never uses the real provider, so probing for it is a subprocess
   // spawn (and for one dialect an auth check) whose result is discarded.
   const installation =
@@ -148,45 +151,60 @@ export async function buildAdapters(
 
   // -- reviewer ----------------------------------------------------------
   //
-  // A reviewer that is a different model from a different vendor is more
-  // independent than the same model reviewing itself in a fresh context. Fresh
-  // context removes the implementer's narrative; a different model also removes
-  // its blind spots, and a review sharing the author's blind spots agrees with
-  // the author for the same reasons it was wrong.
+  // Two independent choices: which CLI, and which model. The same CLI running a
+  // different model is a valid configuration and usually the cheapest useful
+  // one, because it needs no second subscription and still gets a second
+  // opinion that does not share the author's weights.
   //
-  // Defaults to `inherit`, because one authenticated CLI is the common case and
-  // requiring two would be a setup cliff for a property most teams want later.
+  // Fresh context removes the implementer's narrative. A different model also
+  // removes its blind spots, and a review that shares them agrees with the
+  // author for the same reasons the author was wrong.
   let reviewProvider = provider;
   let reviewProviderLive = providerLive;
-  const reviewChoice = config.review.provider;
 
-  if (wants("provider") && reviewChoice !== "inherit") {
+  const reviewImpl =
+    config.review.provider === "inherit" ? config.provider.implementation : config.review.provider;
+  const reviewModel = config.review.model ?? config.provider.model;
+  const differs =
+    reviewImpl !== config.provider.implementation || reviewModel !== config.provider.model;
+
+  if (wants("provider") && differs) {
     if (demo) {
       reviewProvider = new FakeProviderAdapter();
       reviewProviderLive = false;
     } else {
-      const reviewDialect = reviewChoice === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
-      const reviewCli = new CliProviderAdapter({ dialect: reviewDialect });
-      const found = await reviewCli.detect();
-      if (!found.installed) {
-        throw RunmillError.fromCatalog("RM-AUTH-003", {
-          whatHappened:
-            `review.provider is "${reviewChoice}" but ${reviewDialect.binary} is not installed.\n` +
-            `  Install it, or set review.provider: inherit to review with ${dialect.binary}.`,
-        });
+      const reviewDialect = reviewImpl === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
+      const reviewCli = new CliProviderAdapter({
+        dialect: reviewDialect,
+        ...(reviewModel === undefined ? {} : { model: reviewModel }),
+      });
+
+      // Only re-probe when the CLI itself is different. Same binary, different
+      // model needs no second detect or auth check, and skipping it keeps the
+      // common case free.
+      if (reviewImpl !== config.provider.implementation) {
+        const found = await reviewCli.detect();
+        if (!found.installed) {
+          throw RunmillError.fromCatalog("RM-AUTH-003", {
+            whatHappened:
+              `review.provider is "${reviewImpl}" but ${reviewDialect.binary} is not installed.\n` +
+              `  Install it, or set review.provider: inherit to review with ${dialect.binary}.`,
+          });
+        }
+        const reviewAuth = await reviewCli.authStatus();
+        if (!reviewAuth.authenticated) {
+          throw RunmillError.fromCatalog("RM-AUTH-003", {
+            whatHappened:
+              `review.provider is "${reviewImpl}" but ${reviewDialect.binary} is not authenticated.` +
+              (reviewAuth.detail === undefined || reviewAuth.detail === ""
+                ? ""
+                : `\n  ${reviewAuth.detail}`),
+          });
+        }
       }
-      const reviewAuth = await reviewCli.authStatus();
-      if (!reviewAuth.authenticated) {
-        throw RunmillError.fromCatalog("RM-AUTH-003", {
-          whatHappened:
-            `review.provider is "${reviewChoice}" but ${reviewDialect.binary} is not authenticated.` +
-            (reviewAuth.detail === undefined || reviewAuth.detail === ""
-              ? ""
-              : `\n  ${reviewAuth.detail}`),
-        });
-      }
+
       reviewProvider = reviewCli;
-      reviewProviderLive = true;
+      reviewProviderLive = providerLive || reviewImpl !== config.provider.implementation;
     }
   }
 

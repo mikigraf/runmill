@@ -43,6 +43,7 @@ behavior. `runmill config show` prints what is actually in effect.
 | Key | Default | Notes |
 |---|---|---|
 | `implementation` | `codex` | `codex` or `claude` |
+| `model` | CLI default | Model id passed through to the CLI. Not validated against a list, because model ids change faster than any allowlist |
 | `max_turns` | `80` | |
 | `timeout_minutes` | `120` | |
 
@@ -125,7 +126,8 @@ Checks from both sources are unioned by id, and the repository's manifest wins a
 |---|---|---|
 | `local_review_skill` | built-in | `runmill skills eject` to customize |
 | `pr_review_skill` | built-in | Used by the [`PR_REVIEW` stage](./lifecycle.md#two-reviews-not-one), after CI and before the merge gate |
-| `provider` | `inherit` | `inherit` · `codex` · `claude`. Run review on a different vendor than the implementer |
+| `provider` | `inherit` | `inherit` · `codex` · `claude`. Which CLI reviews |
+| `model` | `provider.model` | Which model reviews. Independent of `provider` |
 | `max_fix_iterations` | `3` | Must not exceed the `fixer` invocation budget |
 | `merge_blocking_severities` | `[critical, high]` | |
 | `require_all_findings_resolved` | `true` | |
@@ -138,12 +140,30 @@ different vendor also removes its blind spots. A model reviewing its own work ag
 for the same reasons it was wrong, and no amount of context clearing fixes that. The cost is a
 second authenticated CLI, which is why the default is `inherit`.
 
+The CLI and the model are separate choices, and either one differing is enough to make review
+independent. Different vendors:
+
 ```yaml
 provider:
-  implementation: codex     # writes the code
+  implementation: codex
 review:
-  provider: claude          # judges it
+  provider: claude
 ```
+
+Or the same CLI with a different model, which needs no second subscription and is usually the
+cheapest useful configuration:
+
+```yaml
+provider:
+  implementation: codex
+  model: <fast-model>
+review:
+  provider: inherit
+  model: <stronger-model>
+```
+
+runmill forks the reviewer when the implementation **or** the model differs. When only the model
+differs it reuses the already-authenticated CLI and skips a second detect and auth probe.
 
 Acceptance criteria are enforced, not just recorded. The reviewer receives the criteria extracted
 from the issue and returns which ones it judges met; an approval that leaves any of them unmet is
