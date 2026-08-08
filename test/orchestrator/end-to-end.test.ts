@@ -201,6 +201,7 @@ describe("end-to-end: issue to governed pull request", () => {
       "PUSHED",
       "PR_OPEN",
       "CI_WAIT",
+      "PR_REVIEW",
       "PR_DELIVERED",
     ]);
   }, 60_000);
@@ -458,4 +459,151 @@ describe("guarded merge", () => {
     await orchestrator.run({ runId: "run_c", issue: ISSUE, target: TARGET, lease: lease("run_c") });
     expect(existsSync(join(root, "runs", "run_c"))).toBe(false);
   }, 90_000);
+});
+
+/**
+ * The PR-review stage.
+ *
+ * It shipped as scaffolding for a long time: `runmill init` wrote
+ * `.runmill/skills/pr-review.md`, config exposed `review.pr_review_skill`,
+ * budgets reserved `pr_review` and `pr_fixer` invocations, and the PR_REVIEW
+ * state existed — while nothing ran. A developer editing that skill file saw no
+ * effect whatsoever.
+ */
+describe("PR review", () => {
+  const BLOCKING_PR_REVIEW = {
+    verdict: "changes_required",
+    scope_assessment: "within_scope",
+    findings: [
+      {
+        id: "PR-001",
+        severity: "critical",
+        category: "correctness",
+        title: "off-by-one in the greeting index",
+        evidence: { path: "greeting.ts", start_line: 1, end_line: 1 },
+        claim: "the last caller reads past the end",
+        required_resolution: "bound the index",
+        confidence: 0.95,
+      },
+    ],
+  };
+
+  it("runs after CI and before the merge decision", async () => {
+    const provider = defaultProvider();
+    const { orchestrator } = makeOrchestrator({ provider });
+    await orchestrator.run({ runId: "run_p", issue: ISSUE, target: TARGET, lease: lease("run_p") });
+
+    const roles = provider.startedRequests.map((r) => r.role);
+    expect(roles).toContain("pr-reviewer");
+    // The point of a second review is that it sees the change as a reviewer
+    // does — after CI, not in the implementer's working tree.
+    expect(roles.indexOf("pr-reviewer")).toBeGreaterThan(roles.indexOf("local-reviewer"));
+  }, 90_000);
+
+  it("never grants the reviewer a writable path", async () => {
+    // Something whose only job is to form an opinion has no business editing
+    // the thing it judges.
+    const provider = defaultProvider();
+    const { orchestrator } = makeOrchestrator({ provider });
+    await orchestrator.run({ runId: "run_p2", issue: ISSUE, target: TARGET, lease: lease("run_p2") });
+
+    for (const req of provider.startedRequests.filter((r) => r.role === "pr-reviewer")) {
+      expect(req.allowedPaths).toEqual([]);
+    }
+  }, 90_000);
+
+  it("dispatches a fixer for a blocking finding and re-pushes the branch", async () => {
+    let reviews = 0;
+    const provider = new FakeProviderAdapter({
+      byRole: {
+        implementer: [
+          { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
+        ],
+        // The fix must change the tree, or the loop correctly refuses to
+        // re-review something identical.
+        fixer: [{ kind: "write", path: "greeting.ts", content: "export const greet = () => 'hey';\n" }],
+        "local-reviewer": [{ kind: "say", text: "reviewing" }],
+        "pr-reviewer": [{ kind: "say", text: "reviewing the pr" }],
+      },
+      outputByRole: {
+        "local-reviewer": GOOD_REVIEW,
+        // Objects once, then accepts the fix.
+        get "pr-reviewer"() {
+          reviews += 1;
+          return reviews === 1 ? BLOCKING_PR_REVIEW : GOOD_REVIEW;
+        },
+      },
+      costUsdPerCall: 0.1,
+    });
+    const forge = new FakeForgeAdapter();
+    const { orchestrator } = makeOrchestrator({ provider, forge });
+    const outcome = await orchestrator.run({
+      runId: "run_pf",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_pf"),
+    });
+
+    expect(outcome.finalState).toBe("PR_DELIVERED");
+    expect(provider.startedRequests.filter((r) => r.role === "pr-reviewer").length).toBe(2);
+    // Once for the original branch, once for the fix.
+    const pushCalls = forge.calls.filter((c) => c.op === "push");
+    expect(pushCalls.length).toBeGreaterThan(1);
+  }, 120_000);
+
+  it("escalates rather than delivering when the fixer cannot satisfy the review", async () => {
+    const provider = new FakeProviderAdapter({
+      byRole: {
+        implementer: [
+          { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
+        ],
+        fixer: [{ kind: "say", text: "cannot fix" }],
+        "local-reviewer": [{ kind: "say", text: "reviewing" }],
+        "pr-reviewer": [{ kind: "say", text: "still bad" }],
+      },
+      outputByRole: { "local-reviewer": GOOD_REVIEW, "pr-reviewer": BLOCKING_PR_REVIEW },
+    });
+    const { orchestrator } = makeOrchestrator({ provider });
+    const outcome = await orchestrator.run({
+      runId: "run_pu",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_pu"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    // A fixer that changes nothing means the next review reaches the same
+    // verdict, so looping again would only spend money.
+    expect(outcome.reason).toMatch(/no change|unresolved/i);
+  }, 120_000);
+
+  it("refuses to merge on an unparseable PR review", async () => {
+    // An unparseable review is not an absent review. Its conclusion is
+    // unknown, and unknown is not permission to merge.
+    const provider = new FakeProviderAdapter({
+      byRole: {
+        implementer: [
+          { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
+        ],
+        "local-reviewer": [{ kind: "say", text: "reviewing" }],
+        "pr-reviewer": [{ kind: "say", text: "reviewing" }],
+      },
+      outputByRole: {
+        "local-reviewer": GOOD_REVIEW,
+        "pr-reviewer": { verdict: "approved" }, // schema-invalid: no scope_assessment
+      },
+    });
+    const cfg = { ...config(), autonomy: "guarded-merge" as const };
+    const forge = new FakeForgeAdapter();
+    const { orchestrator } = makeOrchestrator({ provider, forge, cfg });
+    const outcome = await orchestrator.run({
+      runId: "run_pm",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_pm"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(forge.calls.filter((c) => c.op === "merge")).toEqual([]);
+  }, 120_000);
 });

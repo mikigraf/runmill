@@ -124,7 +124,7 @@ Checks from both sources are unioned by id, and the repository's manifest wins a
 | Key | Default | Notes |
 |---|---|---|
 | `local_review_skill` | built-in | `runmill skills eject` to customize |
-| `pr_review_skill` | built-in | |
+| `pr_review_skill` | built-in | Used by the [`PR_REVIEW` stage](./lifecycle.md#two-reviews-not-one), after CI and before the merge gate |
 | `provider` | `inherit` | |
 | `max_fix_iterations` | `3` | Must not exceed the `fixer` invocation budget |
 | `merge_blocking_severities` | `[critical, high]` | |

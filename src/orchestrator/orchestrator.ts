@@ -431,6 +431,41 @@ export class Orchestrator {
         });
       }
 
+      // -- PR review --------------------------------------------------------
+      //
+      // A second review, against the pull request as a reviewer sees it rather
+      // than the workspace as the implementer left it. It runs AFTER CI so it
+      // can read what CI actually reported, and BEFORE the merge gate so a
+      // blocking finding stops a merge rather than annotating one.
+      //
+      // Distinct from the local review, not a repeat of it: the local pass sees
+      // a working tree, this one sees the squashed, rebased, CI-checked change
+      // in its final form. Findings that only exist in that form — an
+      // interaction with something that landed on the base branch meanwhile —
+      // are invisible to the earlier pass.
+      const prReviewOutcome = await this.#runPrReview({
+        runId,
+        issue,
+        target,
+        pr,
+        cfg,
+        workspace,
+        packetPath,
+        packet,
+        lease: input.lease,
+        held,
+        branch,
+      });
+      costUsd += prReviewOutcome.costUsd;
+      if (prReviewOutcome.blocked !== undefined) {
+        return finish("NEEDS_HUMAN", {
+          prNumber: pr.number,
+          prUrl: pr.url,
+          reason: prReviewOutcome.blocked,
+        });
+      }
+      if (prReviewOutcome.review !== undefined) review = prReviewOutcome.review;
+
       // -- deliver or merge -------------------------------------------------
       if (cfg.autonomy === "pr-only") {
         if (cfg.backlog.deliveredState !== undefined) {
@@ -523,6 +558,179 @@ export class Orchestrator {
       }
     }
   }
+
+  /**
+   * Review the pull request, and fix what the review blocks on.
+   *
+   * Bounded by two independent budgets: `pr_review` caps how many times a
+   * reviewer runs, `pr_fixer` caps how many times a fix runs. An oscillating
+   * pair — reviewer objects, fixer "fixes", reviewer objects again — exhausts
+   * the fixer budget and escalates rather than billing indefinitely.
+   *
+   * Every push inside the loop is fenced. The pull request is a live artifact
+   * other people may be looking at, so a run that has lost its lease must not
+   * keep amending it.
+   */
+  async #runPrReview(input: PrReviewInput): Promise<PrReviewOutcome> {
+    const { runId, issue, target, pr, cfg, workspace, packetPath, packet } = input;
+    const budget = cfg.budgets.maxAgentInvocations;
+    const maxFixes = Math.max(0, budget.prFixer);
+    const maxReviews = Math.max(1, budget.prReview);
+
+    let costUsd = 0;
+    let review: Review | undefined;
+
+    for (let attempt = 0; attempt < maxReviews; attempt += 1) {
+      this.#advance(runId, "PR_REVIEW");
+
+      const session = await this.#d.provider.start({
+        runId,
+        issueId: issue.identifier,
+        role: "pr-reviewer",
+        attempt: attempt + 1,
+        workingDirectory: workspace.path,
+        taskPacketPath: packetPath,
+        // A reviewer reads. Granting write paths to something whose only job is
+        // to form an opinion is how a review starts editing the thing it judges.
+        allowedPaths: [],
+        forbiddenPaths: packet.constraints.forbidden_paths,
+        allowedCommands: [],
+        network: cfg.workspace.network,
+        maxTurns: cfg.provider.maxTurns,
+        timeoutMs: cfg.provider.timeoutMinutes * 60_000,
+      });
+      const result = await session.result;
+      costUsd += accumulateUsage(result.events).costUsd;
+
+      if (result.status !== "success") {
+        return { costUsd, blocked: `PR reviewer returned ${result.status}` };
+      }
+      if (result.outputRef === undefined || result.outputRef === "") {
+        return { costUsd, blocked: "PR reviewer produced no structured output" };
+      }
+
+      try {
+        review = parseReviewJson(readFileSync(result.outputRef, "utf8"));
+      } catch (err) {
+        // An unparseable review is not an absent review: it is a review whose
+        // conclusion is unknown, and unknown is not permission to merge.
+        return { costUsd, blocked: `PR review output was unparseable: ${errorMessage(err)}` };
+      }
+
+      const changed = await this.#workspaces.changedFiles(workspace);
+      const cross = crossCheckVerdict(review, changed, cfg.risk.manualApproval.paths);
+      if (!cross.accepted) {
+        return { costUsd, blocked: cross.reason ?? "PR review verdict rejected" };
+      }
+
+      const blocking = blockingFindings(review, cfg.review.mergeBlockingSeverities);
+      if (blocking.length === 0) return { costUsd, review };
+
+      this.#log(`  PR review: ${blocking.length} blocking finding(s)`);
+      if (attempt >= maxFixes) {
+        return {
+          costUsd,
+          blocked:
+            `${blocking.length} blocking PR-review finding(s) unresolved after ` +
+            `${attempt + 1} review(s): ${blocking.map((f) => f.title).join("; ")}`,
+        };
+      }
+
+      // -- fix, then amend the pull request -------------------------------
+      this.#advance(runId, "FIXING");
+      const fixSession = await this.#d.provider.start({
+        runId,
+        issueId: issue.identifier,
+        role: "fixer",
+        attempt: attempt + 1,
+        workingDirectory: workspace.path,
+        taskPacketPath: packetPath,
+        allowedPaths: packet.constraints.allowed_paths,
+        forbiddenPaths: packet.constraints.forbidden_paths,
+        allowedCommands: [],
+        network: cfg.workspace.network,
+        maxTurns: cfg.provider.maxTurns,
+        timeoutMs: cfg.provider.timeoutMinutes * 60_000,
+      });
+      const fixResult = await fixSession.result;
+      costUsd += accumulateUsage(fixResult.events).costUsd;
+      if (fixResult.status !== "success") {
+        return { costUsd, blocked: `PR fixer returned ${fixResult.status}` };
+      }
+
+      const sha = await this.#workspaces.checkpoint(
+        workspace,
+        `${issue.identifier}: pr-review fix ${attempt + 1}`,
+      );
+      if (sha === undefined) {
+        // Nothing changed, so the next review would reach the same verdict.
+        return {
+          costUsd,
+          blocked: "PR fixer produced no change, so the blocking findings still stand",
+        };
+      }
+
+      // The change must be re-verified before it goes back onto the PR: a fix
+      // is new code, and new code has not been through the coverage contract.
+      this.#advance(runId, "LOCAL_VERIFY");
+      const reverified = await this.#verification.run({
+        workspace,
+        workspaces: this.#workspaces,
+        manifest: resolveManifest({
+          configured: this.#d.checks,
+          changedPaths: await this.#workspaces.changedFiles(workspace),
+        }),
+        candidateSha: sha,
+      });
+      if (!reverified.mergeReady) {
+        return {
+          costUsd,
+          blocked: `verification failed after a PR-review fix: ${reverified.failures.join("; ")}`,
+        };
+      }
+
+      await input.lease.assertHeld(input.held);
+      await this.#withOutbox(
+        runId,
+        "forge",
+        "push-pr-fix",
+        `${target.repo}#${input.branch}@${sha}`,
+        () =>
+          this.#d.forge.push({
+            repo: target.repo,
+            branch: input.branch,
+            workspacePath: workspace.path,
+          }),
+      );
+      this.#log(`  pushed PR-review fix ${attempt + 1} to #${pr.number}`);
+    }
+
+    return {
+      costUsd,
+      blocked: `PR review did not converge within ${maxReviews} review(s)`,
+    };
+  }
+}
+
+interface PrReviewInput {
+  readonly runId: string;
+  readonly issue: BacklogIssue;
+  readonly target: RepositoryTarget;
+  readonly pr: { number: number; url: string; headSha: string };
+  readonly cfg: RunmillConfig;
+  readonly workspace: Workspace;
+  readonly packetPath: string;
+  readonly packet: { constraints: { allowed_paths: readonly string[]; forbidden_paths: readonly string[] } };
+  readonly lease: GitRefLease;
+  readonly held: HeldLease;
+  readonly branch: string;
+}
+
+interface PrReviewOutcome {
+  readonly costUsd: number;
+  /** Set when the run must escalate; the string is the reason. */
+  readonly blocked?: string | undefined;
+  readonly review?: Review | undefined;
 }
 
 /** Bound on how long a required check may go unscheduled before escalating. */

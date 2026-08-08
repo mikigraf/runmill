@@ -12,7 +12,7 @@ investigation.
 ```
 DISCOVERED → ELIGIBILITY_CHECKED → CLAIMED → WORKSPACE_READY → TASK_PACKET_READY
     → IMPLEMENTING → LOCAL_VERIFY → LOCAL_REVIEW → [FIXING ⟲] → PR_READY
-    → PUSHED → PR_OPEN → CI_WAIT → [PR_REVIEW]
+    → PUSHED → PR_OPEN → CI_WAIT → PR_REVIEW → [FIXING ⟲]
     → MERGE_READY → MERGED → BACKLOG_UPDATED → CLEANUP
 ```
 
@@ -27,10 +27,37 @@ Terminal: `PR_DELIVERED` · `COMPLETED` · `AWAITING_APPROVAL` · `NEEDS_HUMAN` 
 | `→ LOCAL_REVIEW` | The [coverage contract](./verification.md) is satisfied |
 | `→ PR_READY` | The review verdict passed its cross-check, with no unresolved blocking findings |
 | `→ CI_WAIT` | The PR is open and branch protection was read successfully |
+| `→ PR_REVIEW` | Every required CI context reported success |
 | `→ MERGE_READY` | All seven [gates](./autonomy.md#the-seven-gates) passed |
 
 `FIXING` loops back to `LOCAL_REVIEW` up to `review.max_fix_iterations` times. Exhausting it ends
 in `NEEDS_HUMAN`, not in a merge.
+
+### Two reviews, not one
+
+`LOCAL_REVIEW` and `PR_REVIEW` are different reviews of different artifacts, and the second is not
+a retry of the first.
+
+| | Sees | Bounded by |
+|---|---|---|
+| `LOCAL_REVIEW` | The working tree as the implementer left it | `review.max_fix_iterations` |
+| `PR_REVIEW` | The pull request after CI reported — the change in the form a human would merge | `budgets.max_agent_invocations.pr_review` / `pr_fixer` |
+
+`PR_REVIEW` runs **after** CI so it can read what CI actually said, and **before** the merge gate
+so a blocking finding stops a merge rather than annotating one. Findings that exist only in the
+final form — an interaction with something that landed on the base branch meanwhile — are invisible
+to the earlier pass.
+
+A blocking finding dispatches a fixer, and the fix is re-verified against the full
+[coverage contract](./verification.md) before it goes back onto the branch: a fix is new code, and
+new code has not been proven. Two things end the loop rather than continuing it:
+
+- **The fixer changed nothing.** The next review would reach the same verdict, so looping again
+  would only spend money.
+- **An unparseable review.** Its conclusion is unknown, and unknown is not permission to merge.
+
+The reviewer is never given a writable path. Something whose only job is to form an opinion has no
+business editing what it judges.
 
 ## The task packet
 
@@ -91,7 +118,9 @@ runmill resume <run-id>
 Three cases:
 
 - **Mid-agent** — the workspace is preserved on any non-clean exit, deliberately, so it can be
-  inspected. Only a fully `COMPLETED` run cleans up eagerly.
+  inspected. `COMPLETED` and `PR_DELIVERED` clean up eagerly; `NEEDS_HUMAN`, `QUARANTINED`, and
+  `AWAITING_APPROVAL` keep their trees, because there the tree is the evidence.
+  `runmill gc` reconciles whatever a crash left behind.
 - **Mid-mutation** — the outbox row is reconciled against the remote.
 - **Lease lost** — the run is fenced out and stops. Another worker owns the issue now, and the
   correct behavior is to do nothing rather than race.
