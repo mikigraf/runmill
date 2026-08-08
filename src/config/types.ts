@@ -26,7 +26,7 @@ export interface RunmillConfig {
     readonly reviewer: {
       /** `inherit` reuses the implementer's CLI. */
       readonly implementation: "inherit" | "codex" | "claude";
-      /** Defaults to the implementer's model. */
+      /** Inherits the model only when the reviewer uses the implementer's CLI. */
       readonly model?: string | undefined;
     };
   };

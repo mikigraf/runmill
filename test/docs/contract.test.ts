@@ -153,6 +153,16 @@ describe("links and references", () => {
 });
 
 describe("configuration reference", () => {
+  it("requires the providers block that the parser accepts", () => {
+    const schema = JSON.parse(readFileSync("runmill.schema.json", "utf8")) as {
+      required: string[];
+      properties: Record<string, unknown>;
+    };
+    expect(schema.required).toContain("providers");
+    expect(schema.required).not.toContain("provider");
+    expect(schema.properties).not.toHaveProperty("provider");
+  });
+
   it("documents every top-level configuration section", () => {
     const body = readFileSync("docs/configuration.md", "utf8");
     for (const section of [

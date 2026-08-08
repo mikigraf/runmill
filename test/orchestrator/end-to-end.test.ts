@@ -313,6 +313,7 @@ describe("end-to-end: the loop refuses to proceed when it should", () => {
         "local-reviewer": {
           verdict: "changes_required",
           scope_assessment: "within_scope",
+          acceptance_criteria_met: GOOD_REVIEW.acceptance_criteria_met,
           findings: [
             {
               id: "REV-001",
@@ -475,6 +476,7 @@ describe("PR review", () => {
   const BLOCKING_PR_REVIEW = {
     verdict: "changes_required",
     scope_assessment: "within_scope",
+    acceptance_criteria_met: GOOD_REVIEW.acceptance_criteria_met,
     findings: [
       {
         id: "PR-001",

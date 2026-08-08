@@ -28,7 +28,7 @@ export const findingSchema = z.object({
 export const reviewSchema = z.object({
   verdict: z.enum(["approved", "changes_required", "no_findings"]),
   scope_assessment: z.enum(["within_scope", "out_of_scope", "unclear"]),
-  acceptance_criteria_met: z.array(z.object({ criterion: z.string(), met: z.boolean() })).default([]),
+  acceptance_criteria_met: z.array(z.object({ criterion: z.string(), met: z.boolean() })),
   findings: z.array(findingSchema).default([]),
 });
 
@@ -92,6 +92,7 @@ export function crossCheckVerdict(
   review: Review,
   changedPaths: readonly string[],
   riskPaths: readonly string[],
+  acceptanceCriteria: readonly string[],
 ): { accepted: boolean; reason?: string } {
   const touchesRisk = changedPaths.some((p) =>
     riskPaths.some((r) => p.startsWith(r.replace(/\/?\*+$/, ""))),
@@ -118,13 +119,25 @@ export function crossCheckVerdict(
   // reviewer reporting every criterion met grants nothing on its own: the
   // deterministic gates still have to pass, and "the model says it's done"
   // remains the claim runmill exists not to accept.
-  const unmet = review.acceptance_criteria_met.filter((c) => !c.met);
-  if (unmet.length > 0 && (review.verdict === "approved" || review.verdict === "no_findings")) {
+  const evidenceByCriterion = new Map<string, boolean[]>();
+  for (const entry of review.acceptance_criteria_met) {
+    const evidence = evidenceByCriterion.get(entry.criterion) ?? [];
+    evidence.push(entry.met);
+    evidenceByCriterion.set(entry.criterion, evidence);
+  }
+  const incomplete = acceptanceCriteria.filter((criterion) => {
+    const evidence = evidenceByCriterion.get(criterion);
+    return evidence === undefined || evidence.length !== 1 || evidence[0] !== true;
+  });
+  if (
+    incomplete.length > 0 &&
+    (review.verdict === "approved" || review.verdict === "no_findings")
+  ) {
     return {
       accepted: false,
       reason:
-        `reviewer approved a change that does not meet ${unmet.length} of its stated ` +
-        `acceptance criteria: ${unmet.map((c) => `"${c.criterion}"`).join(", ")}`,
+        `reviewer approved a change without positive evidence for ${incomplete.length} of the ` +
+        `task packet's acceptance criteria: ${incomplete.map((c) => `"${c}"`).join(", ")}`,
     };
   }
 

@@ -53,6 +53,22 @@ export interface BuildAdaptersOptions {
   readonly need?: readonly Boundary[] | undefined;
 }
 
+export function resolveReviewerAgent(config: RunmillConfig): {
+  implementation: "codex" | "claude";
+  model?: string | undefined;
+} {
+  const implementation =
+    config.providers.reviewer.implementation === "inherit"
+      ? config.providers.implementer.implementation
+      : config.providers.reviewer.implementation;
+  const model =
+    config.providers.reviewer.model ??
+    (implementation === config.providers.implementer.implementation
+      ? config.providers.implementer.model
+      : undefined);
+  return { implementation, ...(model === undefined ? {} : { model }) };
+}
+
 /**
  * Resolve the three external boundaries.
  *
@@ -162,11 +178,7 @@ export async function buildAdapters(
   let reviewProvider = provider;
   let reviewProviderLive = providerLive;
 
-  const reviewImpl =
-    config.providers.reviewer.implementation === "inherit"
-      ? config.providers.implementer.implementation
-      : config.providers.reviewer.implementation;
-  const reviewModel = config.providers.reviewer.model ?? config.providers.implementer.model;
+  const { implementation: reviewImpl, model: reviewModel } = resolveReviewerAgent(config);
   const differs =
     reviewImpl !== config.providers.implementer.implementation || reviewModel !== config.providers.implementer.model;
 
@@ -189,15 +201,18 @@ export async function buildAdapters(
         if (!found.installed) {
           throw RunmillError.fromCatalog("RM-AUTH-003", {
             whatHappened:
-              `review.provider is "${reviewImpl}" but ${reviewDialect.binary} is not installed.\n` +
-              `  Install it, or set review.provider: inherit to review with ${dialect.binary}.`,
+              `providers.reviewer.implementation is "${reviewImpl}" but ` +
+              `${reviewDialect.binary} is not installed.\n` +
+              `  Install it, or set providers.reviewer.implementation: inherit to review ` +
+              `with ${dialect.binary}.`,
           });
         }
         const reviewAuth = await reviewCli.authStatus();
         if (!reviewAuth.authenticated) {
           throw RunmillError.fromCatalog("RM-AUTH-003", {
             whatHappened:
-              `review.provider is "${reviewImpl}" but ${reviewDialect.binary} is not authenticated.` +
+              `providers.reviewer.implementation is "${reviewImpl}" but ` +
+              `${reviewDialect.binary} is not authenticated.` +
               (reviewAuth.detail === undefined || reviewAuth.detail === ""
                 ? ""
                 : `\n  ${reviewAuth.detail}`),

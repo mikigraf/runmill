@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import type { EvalTask } from "./suite.js";
 import type { TaskAttempt } from "./score.js";
 import type { TaskRunner } from "./replay.js";
@@ -15,6 +15,7 @@ import { selectNext } from "../queue/selector.js";
 import type { RunmillConfig } from "../config/types.js";
 import type { CheckSpec } from "../verification/engine.js";
 import type { BacklogIssue, RepositoryTarget } from "../domain/types.js";
+import { WorkspaceManager, type Workspace } from "../workspace/manager.js";
 
 export interface OrchestratorRunnerOptions {
   readonly config: RunmillConfig;
@@ -41,15 +42,20 @@ export function orchestratorRunner(options: OrchestratorRunnerOptions): TaskRunn
     const startedMs = Date.now();
 
     try {
-      const repoPath = prepareRepository(task, workspace.path, options.defaultRepoPath);
-      const dataDir = join(workspace.path, "state");
-      mkdirSync(dataDir, { recursive: true });
-
-      const issue = toBacklogIssue(task);
       const target: RepositoryTarget = {
         repo: options.config.github.repositories[0]?.repo ?? "acme/eval",
         baseBranch: options.config.github.repositories[0]?.baseBranch ?? "main",
       };
+      const repoPath = prepareRepository(
+        task,
+        workspace.path,
+        options.defaultRepoPath,
+        target.baseBranch,
+      );
+      const dataDir = join(workspace.path, "state");
+      mkdirSync(dataDir, { recursive: true });
+
+      const issue = toBacklogIssue(task);
 
       // The backlog for a replay IS the task: the suite defines the issue, so
       // seeding from a live backlog or the demo fixture would run something
@@ -82,6 +88,7 @@ export function orchestratorRunner(options: OrchestratorRunnerOptions): TaskRunn
           finalState: "NEEDS_HUMAN",
           costUsd: 0,
           durationMs: Date.now() - startedMs,
+          changedPaths: [],
           reason:
             failing.length === 0
               ? "not selected"
@@ -97,15 +104,18 @@ export function orchestratorRunner(options: OrchestratorRunnerOptions): TaskRunn
       }));
 
       try {
+        const workspaces = new EvaluationWorkspaceManager();
         const orchestrator = new Orchestrator({
           backlog,
           provider: adapters.provider,
+          reviewProvider: adapters.reviewProvider,
           forge: adapters.forge,
           store,
           clock,
           config: options.config,
           sourceRepoPath: repoPath,
           workspaceRoot: join(dataDir, "runs"),
+          workspaces,
           checks,
           onEvent: () => undefined,
         });
@@ -121,16 +131,14 @@ export function orchestratorRunner(options: OrchestratorRunnerOptions): TaskRunn
         });
 
         const outcome = await orchestrator.run({ runId, issue, target, lease });
+        const changedPaths = await workspaces.collectChangedPaths();
 
         return {
           taskId: task.id,
           finalState: outcome.finalState,
           costUsd: outcome.costUsd,
           durationMs: Date.now() - startedMs,
-          // The orchestrator does not surface the diff on its outcome, so the
-          // diff-scope evaluator has nothing to judge here yet. Reporting an
-          // empty list would silently score every task as in-scope, so it is
-          // left undefined and the evaluator is skipped rather than faked.
+          changedPaths,
           ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
         };
       } finally {
@@ -145,20 +153,35 @@ export function orchestratorRunner(options: OrchestratorRunnerOptions): TaskRunn
 /**
  * Materialize the repository a task runs against.
  *
- * Copied rather than used in place, and committed fresh, so a task cannot
- * mutate the fixture it was given — which would make the second run of the
- * same task a different experiment from the first.
+ * Cloned (or copied for a non-Git fixture) rather than used in place, so a task
+ * cannot mutate the fixture it was given. Git history is retained because a
+ * historical base commit is part of the experiment, not incidental metadata.
  */
-function prepareRepository(
+export function prepareRepository(
   task: EvalTask,
   workspaceRoot: string,
   defaultRepoPath: string | undefined,
+  baseBranch = "main",
 ): string {
   const target = join(workspaceRoot, "repo");
   const source = task.repoPath ?? defaultRepoPath;
 
+  let cloned = false;
   if (source !== undefined && existsSync(source)) {
-    cpSync(source, target, { recursive: true, filter: (p) => !p.includes(`${"/"}.git${"/"}`) });
+    const sourceRepoRoot = gitRepositoryRoot(source);
+    if (sourceRepoRoot !== undefined) {
+      execFileSync(
+        "git",
+        ["clone", "--no-hardlinks", "--quiet", sourceRepoRoot, target],
+        { stdio: "ignore" },
+      );
+      cloned = true;
+    } else {
+      cpSync(source, target, {
+        recursive: true,
+        filter: (path) => !relative(source, path).split(sep).includes(".git"),
+      });
+    }
   } else {
     mkdirSync(target, { recursive: true });
     writeFileSync(join(target, "README.md"), `# ${task.id}\n`);
@@ -167,20 +190,22 @@ function prepareRepository(
   const git = (...args: string[]): void => {
     execFileSync("git", args, { cwd: target, stdio: "ignore" });
   };
-  if (!existsSync(join(target, ".git"))) {
+  if (!cloned) {
     git("init", "-q", "-b", "main", ".");
-    git("config", "user.email", "eval@runmill.local");
-    git("config", "user.name", "runmill eval");
   }
-  git("add", "-A");
-  try {
-    git("commit", "-q", "-m", `eval fixture for ${task.id}`);
-  } catch {
-    // Nothing to commit: the fixture was already a committed repository.
+  git("config", "user.email", "eval@runmill.local");
+  git("config", "user.name", "runmill eval");
+  if (!cloned) {
+    git("add", "-A");
+    try {
+      git("commit", "-q", "-m", `eval fixture for ${task.id}`);
+    } catch {
+      // An empty fixture already has all of its contents represented by HEAD.
+    }
   }
 
   if (task.baseCommit !== undefined && task.baseCommit !== "") {
-    git("checkout", "-q", task.baseCommit);
+    git("checkout", "-q", "--detach", task.baseCommit);
   }
 
   // A local bare remote, because the lease is a ref pushed to `origin` and a
@@ -188,15 +213,55 @@ function prepareRepository(
   // "'origin' does not appear to be a git repository" and the suite would
   // measure the fixture rather than the harness.
   const origin = join(workspaceRoot, "origin.git");
-  execFileSync("git", ["init", "-q", "--bare", "-b", "main", origin], { stdio: "ignore" });
+  execFileSync("git", ["init", "-q", "--bare", "-b", baseBranch, origin], { stdio: "ignore" });
   try {
     git("remote", "add", "origin", origin);
   } catch {
     git("remote", "set-url", "origin", origin);
   }
-  git("push", "-q", "origin", "HEAD:refs/heads/main");
+  git("push", "-q", "origin", `HEAD:refs/heads/${baseBranch}`);
 
   return target;
+}
+
+function gitRepositoryRoot(path: string): string | undefined {
+  try {
+    return execFileSync("git", ["-C", path, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Keep the throwaway run workspace until its diff has been scored. */
+class EvaluationWorkspaceManager extends WorkspaceManager {
+  #workspace: Workspace | undefined;
+
+  override async create(input: Parameters<WorkspaceManager["create"]>[0]): Promise<Workspace> {
+    const workspace = await super.create(input);
+    this.#workspace = workspace;
+    return workspace;
+  }
+
+  override async destroy(_workspace: Workspace, _sourceRepo?: string): Promise<void> {
+    // The outer evaluation workspace owns cleanup after collectChangedPaths().
+  }
+
+  async collectChangedPaths(): Promise<string[]> {
+    if (this.#workspace === undefined) return [];
+    const committed = await this.changedFiles(this.#workspace);
+    const untracked = execFileSync(
+      "git",
+      ["ls-files", "--others", "--exclude-standard"],
+      { cwd: this.#workspace.path, encoding: "utf8" },
+    )
+      .trim()
+      .split("\n")
+      .filter((path) => path !== "" && !path.startsWith(".runmill/run/"));
+    return [...new Set([...committed, ...untracked])].sort();
+  }
 }
 
 function toBacklogIssue(task: EvalTask): BacklogIssue {

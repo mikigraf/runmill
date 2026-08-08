@@ -164,9 +164,14 @@ export function buildProgram(): Command {
       const opts = program.opts<GlobalOpts>();
       const repoRoot = process.cwd();
 
-      let providerImpl = "codex";
+      let providerImpls: readonly string[] = ["codex"];
       try {
-        providerImpl = loadOrExit(opts, repoRoot).config.providers.implementer.implementation;
+        const providers = loadOrExit(opts, repoRoot).config.providers;
+        const reviewerImpl =
+          providers.reviewer.implementation === "inherit"
+            ? providers.implementer.implementation
+            : providers.reviewer.implementation;
+        providerImpls = [...new Set([providers.implementer.implementation, reviewerImpl])];
       } catch {
         // doctor must still run without a valid config; the config check
         // itself is what reports that.
@@ -186,7 +191,7 @@ export function buildProgram(): Command {
         process.exit(EXIT.ok);
       }
 
-      let results = await runAllChecks({ repoRoot }, providerImpl);
+      let results = await runAllChecks({ repoRoot }, providerImpls);
       if (cmdOpts.check !== undefined) {
         const prefix = cmdOpts.check;
         const matched = results.filter((r) => r.id.startsWith(prefix));

@@ -352,7 +352,12 @@ export class Orchestrator {
         }
         review = parseReviewJson(readFileSync(reviewResult.outputRef, "utf8"));
 
-        const cross = crossCheckVerdict(review, changed, cfg.risk.manualApproval.paths);
+        const cross = crossCheckVerdict(
+          review,
+          changed,
+          cfg.risk.manualApproval.paths,
+          packet.acceptance_criteria,
+        );
         if (!cross.accepted) {
           return finish("NEEDS_HUMAN", { reason: cross.reason ?? "verdict rejected" });
         }
@@ -632,7 +637,12 @@ export class Orchestrator {
       }
 
       const changed = await this.#workspaces.changedFiles(workspace);
-      const cross = crossCheckVerdict(review, changed, cfg.risk.manualApproval.paths);
+      const cross = crossCheckVerdict(
+        review,
+        changed,
+        cfg.risk.manualApproval.paths,
+        input.packet.acceptance_criteria,
+      );
       if (!cross.accepted) {
         return { costUsd, blocked: cross.reason ?? "PR review verdict rejected" };
       }
@@ -734,7 +744,10 @@ interface PrReviewInput {
   readonly cfg: RunmillConfig;
   readonly workspace: Workspace;
   readonly packetPath: string;
-  readonly packet: { constraints: { allowed_paths: readonly string[]; forbidden_paths: readonly string[] } };
+  readonly packet: {
+    acceptance_criteria: readonly string[];
+    constraints: { allowed_paths: readonly string[]; forbidden_paths: readonly string[] };
+  };
   readonly lease: GitRefLease;
   readonly held: HeldLease;
   readonly branch: string;

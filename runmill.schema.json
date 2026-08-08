@@ -7,7 +7,7 @@
   "required": [
     "version",
     "autonomy",
-    "provider",
+    "providers",
     "backlog",
     "github"
   ],
@@ -558,7 +558,7 @@
             },
             "model": {
               "type": "string",
-              "description": "Defaults to the implementer's model. A different model on the same CLI is a valid and often the cheapest independent second opinion."
+              "description": "Defaults to the implementer's model when both roles use the same CLI; a different provider uses its own CLI default. A different model on the same CLI is a valid and often the cheapest independent second opinion."
             }
           }
         }

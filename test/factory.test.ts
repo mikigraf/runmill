@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildAdapters, demoFixturePath } from "../src/factory.js";
+import { buildAdapters, demoFixturePath, resolveReviewerAgent } from "../src/factory.js";
 import { parseConfig } from "../src/config/load.js";
 import { CredentialStore } from "../src/credentials/store.js";
 import { RunmillError } from "../src/errors/runmill-error.js";
@@ -253,6 +253,14 @@ describe("which agent runs which role", () => {
     const cfg = roles({ implementation: "codex", model: "model-a" }, { implementation: "inherit" });
     const a = await buildAdapters(cfg, { demo: true, credentials: NO_CREDENTIALS });
     expect(a.reviewProvider).toBe(a.provider);
+  });
+
+  it("uses a different provider's CLI default instead of the implementer's model id", () => {
+    const cfg = roles(
+      { implementation: "codex", model: "codex-only-model" },
+      { implementation: "claude" },
+    );
+    expect(resolveReviewerAgent(cfg)).toEqual({ implementation: "claude" });
   });
 
   it("reports reviewer liveness separately from the implementer", async () => {

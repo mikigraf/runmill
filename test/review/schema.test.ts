@@ -33,7 +33,12 @@ const FINDING = {
 describe("parseReviewJson", () => {
   it("parses a well-formed review", () => {
     const parsed = parseReviewJson(
-      JSON.stringify({ verdict: "approved", scope_assessment: "within_scope", findings: [] }),
+      JSON.stringify({
+        verdict: "approved",
+        scope_assessment: "within_scope",
+        acceptance_criteria_met: [],
+        findings: [],
+      }),
     );
     expect(parsed.verdict).toBe("approved");
   });
@@ -42,6 +47,18 @@ describe("parseReviewJson", () => {
     // An unparseable review is not an absent review: its conclusion is unknown,
     // and unknown is not permission to merge.
     expect(() => parseReviewJson(JSON.stringify({ verdict: "approved" }))).toThrow();
+  });
+
+  it("rejects a review that omits acceptance-criteria evidence", () => {
+    expect(() =>
+      parseReviewJson(
+        JSON.stringify({
+          verdict: "approved",
+          scope_assessment: "within_scope",
+          findings: [],
+        }),
+      ),
+    ).toThrow();
   });
 
   it("rejects output that is not JSON at all", () => {
@@ -71,6 +88,7 @@ describe("crossCheckVerdict", () => {
       review({ verdict: "no_findings" }),
       ["src/auth/token.ts"],
       ["src/auth/"],
+      [],
     );
     expect(result.accepted).toBe(false);
     expect(result.reason).toMatch(/risk-escalating/);
@@ -78,7 +96,7 @@ describe("crossCheckVerdict", () => {
 
   it("allows a clean verdict on a diff that touches nothing risky", () => {
     expect(
-      crossCheckVerdict(review({ verdict: "no_findings" }), ["docs/a.md"], ["src/auth/"]).accepted,
+      crossCheckVerdict(review({ verdict: "no_findings" }), ["docs/a.md"], ["src/auth/"], []).accepted,
     ).toBe(true);
   });
 
@@ -86,6 +104,7 @@ describe("crossCheckVerdict", () => {
     const result = crossCheckVerdict(
       review({ scope_assessment: "out_of_scope" }),
       ["src/a.ts"],
+      [],
       [],
     );
     expect(result.accepted).toBe(false);
@@ -107,6 +126,7 @@ describe("acceptance criteria as a delivery gate", () => {
       }),
       ["src/greeting.ts"],
       [],
+      ["greet returns a greeting", "it is covered by a test"],
     );
     expect(result.accepted).toBe(false);
     expect(result.reason).toMatch(/acceptance criteria/);
@@ -121,6 +141,7 @@ describe("acceptance criteria as a delivery gate", () => {
       }),
       ["src/a.ts"],
       [],
+      ["handles the empty case"],
     );
     expect(result.accepted).toBe(false);
   });
@@ -135,6 +156,7 @@ describe("acceptance criteria as a delivery gate", () => {
       }),
       ["src/greeting.ts"],
       [],
+      ["greet returns a greeting", "it is covered by a test"],
     );
     expect(result.accepted).toBe(true);
   });
@@ -142,7 +164,7 @@ describe("acceptance criteria as a delivery gate", () => {
   it("does not treat an empty criteria list as a failure", () => {
     // An issue with no extractable criteria is a readiness problem, caught by
     // selection before a run starts. It must not become a permanent block here.
-    expect(crossCheckVerdict(review(), ["src/a.ts"], []).accepted).toBe(true);
+    expect(crossCheckVerdict(review(), ["src/a.ts"], [], []).accepted).toBe(true);
   });
 
   it("is one-directional: reporting every criterion met grants nothing", () => {
@@ -156,8 +178,28 @@ describe("acceptance criteria as a delivery gate", () => {
       }),
       ["src/a.ts"],
       [],
+      ["everything"],
     );
     expect(result.accepted).toBe(false);
     expect(result.reason).toMatch(/out of scope/);
+  });
+
+  it("rejects approval when the reviewer omits criteria from the task packet", () => {
+    const result = crossCheckVerdict(
+      review({
+        acceptance_criteria_met: [{ criterion: "first criterion", met: true }],
+      }),
+      ["src/a.ts"],
+      [],
+      ["first criterion", "second criterion"],
+    );
+    expect(result.accepted).toBe(false);
+    expect(result.reason).toContain("second criterion");
+  });
+
+  it("rejects an empty evidence list when the task packet has criteria", () => {
+    const result = crossCheckVerdict(review(), ["src/a.ts"], [], ["must be tested"]);
+    expect(result.accepted).toBe(false);
+    expect(result.reason).toContain("must be tested");
   });
 });

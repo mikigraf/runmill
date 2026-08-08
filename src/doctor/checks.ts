@@ -272,18 +272,25 @@ export function checkCiEnvironment(): CheckResult {
 
 export async function runAllChecks(
   ctx: DoctorContext,
-  providerImplementation = "codex",
+  providerImplementations: string | readonly string[] = ["codex"],
 ): Promise<CheckResult[]> {
+  const implementations = [
+    ...new Set(
+      typeof providerImplementations === "string"
+        ? [providerImplementations]
+        : providerImplementations,
+    ),
+  ];
   // Every probe is independent, so wall time is the slowest one rather than
   // the sum. Promise.all preserves order, so the rendered output is identical.
-  const [git, repository, github, provider, sandbox] = await Promise.all([
+  const [git, repository, github, providers, sandbox] = await Promise.all([
     checkGit(),
     checkRepository(ctx),
     checkGitHubCli(),
-    checkProvider(providerImplementation),
+    Promise.all(implementations.map((implementation) => checkProvider(implementation))),
     checkSandbox(),
   ]);
-  return [checkCiEnvironment(), git, repository, github, provider, ...sandbox];
+  return [checkCiEnvironment(), git, repository, github, ...providers, ...sandbox];
 }
 
 export function worstStatus(results: readonly CheckResult[]): CheckStatus {

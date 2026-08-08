@@ -50,7 +50,7 @@ picking the reviewer is the same decision made twice.
 | `implementer.implementation` | `codex` | `codex` or `claude` |
 | `implementer.model` | CLI default | Model id passed through. Not validated against a list, because model ids change faster than any allowlist |
 | `reviewer.implementation` | `inherit` | `inherit` reuses the implementer's CLI |
-| `reviewer.model` | implementer's model | Independent of `reviewer.implementation` |
+| `reviewer.model` | same-CLI: implementer's model; different CLI: provider default | Independent of `reviewer.implementation` when explicitly set |
 
 ```yaml
 providers:
@@ -150,7 +150,7 @@ Checks from both sources are unioned by id, and the repository's manifest wins a
 Review always runs in a fresh context with no implementer narrative. That is not configurable: a
 reviewer that has read the implementer's reasoning is reviewing the reasoning, not the diff.
 
-`review.provider` goes one step further. Fresh context removes the implementer's narrative; a
+`providers.reviewer` goes one step further. Fresh context removes the implementer's narrative; a
 different vendor also removes its blind spots. A model reviewing its own work agrees with itself
 for the same reasons it was wrong, and no amount of context clearing fixes that. The cost is a
 second authenticated CLI, which is why the default is `inherit`.
@@ -159,22 +159,24 @@ The CLI and the model are separate choices, and either one differing is enough t
 independent. Different vendors:
 
 ```yaml
-provider:
-  implementation: codex
-review:
-  provider: claude
+providers:
+  implementer:
+    implementation: codex
+  reviewer:
+    implementation: claude
 ```
 
 Or the same CLI with a different model, which needs no second subscription and is usually the
 cheapest useful configuration:
 
 ```yaml
-provider:
-  implementation: codex
-  model: <fast-model>
-review:
-  provider: inherit
-  model: <stronger-model>
+providers:
+  implementer:
+    implementation: codex
+    model: <fast-model>
+  reviewer:
+    implementation: inherit
+    model: <stronger-model>
 ```
 
 runmill forks the reviewer when the implementation **or** the model differs. When only the model

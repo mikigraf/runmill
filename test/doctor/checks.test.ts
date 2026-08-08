@@ -185,6 +185,13 @@ describe("runAllChecks", () => {
     expect(results.some((r) => r.id === "provider:claude")).toBe(true);
   }, 60_000);
 
+  it("probes an independently configured reviewer as well as the implementer", async () => {
+    execFileSync("git", ["init", "-q", "."], { cwd: dir });
+    const results = await runAllChecks({ repoRoot: dir }, ["codex", "claude"]);
+    expect(results.some((r) => r.id === "provider:codex")).toBe(true);
+    expect(results.some((r) => r.id === "provider:claude")).toBe(true);
+  }, 60_000);
+
   it("gives every check a unique id, so --check <id> is unambiguous", async () => {
     execFileSync("git", ["init", "-q", "."], { cwd: dir });
     const ids = (await runAllChecks({ repoRoot: dir })).map((r) => r.id);

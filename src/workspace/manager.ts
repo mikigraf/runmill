@@ -175,7 +175,10 @@ export class WorkspaceManager {
    * worker must never hold.
    */
   async checkpoint(workspace: Workspace, message: string): Promise<string | undefined> {
-    await git(workspace.path, "add", "-A");
+    // Runtime packet/reviewer files are orchestrator-owned evidence, not part
+    // of the candidate. Leaving them out also keeps diff-scope checks focused
+    // on the change the agent actually produced.
+    await git(workspace.path, "add", "-A", "--", ".", ":(exclude).runmill/run/**");
     const staged = await git(workspace.path, "diff", "--cached", "--name-only");
     if (staged === "") return undefined;
     await git(workspace.path, "commit", "--quiet", "-m", message);

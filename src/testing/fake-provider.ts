@@ -235,7 +235,22 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
 
       // Same contract the real adapter uses, so a role that produces output
       // in tests produces it in production and vice versa.
-      const output = this.#script.outputByRole?.[request.role] ?? DEFAULT_OUTPUT[request.role];
+      let output = this.#script.outputByRole?.[request.role] ?? DEFAULT_OUTPUT[request.role];
+      if (
+        this.#script.outputByRole?.[request.role] === undefined &&
+        (request.role === "local-reviewer" || request.role === "pr-reviewer")
+      ) {
+        const packet = JSON.parse(readFileSync(request.taskPacketPath, "utf8")) as {
+          acceptance_criteria?: readonly string[];
+        };
+        output = {
+          ...APPROVAL,
+          acceptance_criteria_met: (packet.acceptance_criteria ?? []).map((criterion) => ({
+            criterion,
+            met: true,
+          })),
+        };
+      }
       const contractPath = outputPathFor(request.workingDirectory, request.role);
       let outputRef = "";
       if (output !== undefined && contractPath !== undefined) {
