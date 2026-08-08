@@ -123,6 +123,7 @@ inside it, and fails if that succeeds.
 | `runmill auth status` | Show which credentials resolve, and from where |
 | `runmill auth login` | Store a credential in the OS keychain |
 | `runmill auth logout` | Remove a stored credential |
+| `runmill gc` | Reconcile workspaces left behind by crashed runs. `--dry-run` to preview |
 | `runmill state` | State store health |
 | `runmill feedback` | File an issue, with a support bundle |
 

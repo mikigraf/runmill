@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { RunmillError, errorMessage } from "../errors/runmill-error.js";
 import { CredentialStore, type CredentialName } from "../credentials/store.js";
@@ -42,6 +42,103 @@ export function registerExtraCommands(program: Command, ctx: CommandContext): vo
   registerPrepare(program, ctx);
   registerSkills(program, ctx);
   registerFeedback(program, ctx);
+  registerGc(program, ctx);
+}
+
+// -- gc --------------------------------------------------------------------
+
+/** Run states after which a workspace is no longer needed. */
+const TERMINAL_STATES = new Set([
+  "COMPLETED",
+  "PR_DELIVERED",
+  "NEEDS_HUMAN",
+  "QUARANTINED",
+  "AWAITING_APPROVAL",
+  "ABORTED",
+]);
+
+/**
+ * Reconcile workspaces left behind by crashed runs.
+ *
+ * This command existed only as advice: WorkspaceManager tells a developer to
+ * "run `runmill gc` to reconcile" when a workspace directory is already there,
+ * and no such command had been written. That advice arrives at the worst
+ * possible moment — right after a crash — and sent them looking for something
+ * that was never real.
+ *
+ * Deliberately conservative: a workspace whose run is still in flight is
+ * reported, never removed. A live run's working tree is the only copy of work
+ * in progress, and deleting it to tidy up is not a trade worth making.
+ */
+function registerGc(program: Command, ctx: CommandContext): void {
+  program
+    .command("gc")
+    .description("Reconcile workspaces and worktrees left behind by crashed runs")
+    .option("--dry-run", "report what would be removed, and remove nothing")
+    .action(async (cmdOpts: { dryRun?: boolean }) => {
+      const dry = cmdOpts.dryRun === true;
+      const runsRoot = join(ctx.dataDir(), "runs");
+      const store = StateStore.open(join(ctx.dataDir(), "runmill.db"));
+
+      try {
+        const byId = new Map(store.listRuns(1000).map((r) => [r.runId, r]));
+        const removed: string[] = [];
+        const kept: { path: string; reason: string }[] = [];
+
+        // `git worktree prune` clears verification checkouts whose directories
+        // are already gone. Safe regardless of run state.
+        const pruned = await tryGit(ctx.repoRoot(), ["worktree", "prune"]);
+
+        const entries = existsSync(runsRoot)
+          ? readdirSync(runsRoot, { withFileTypes: true }).filter((e) => e.isDirectory())
+          : [];
+
+        for (const entry of entries) {
+          const path = join(runsRoot, entry.name);
+          // Verification checkouts are named <run>-verify-<sha> and belong to
+          // whichever run owns the prefix.
+          const runId = entry.name.split("-verify-")[0] ?? entry.name;
+          const row = byId.get(runId);
+
+          if (row === undefined) {
+            // No record at all: the database was reset or the run never got
+            // far enough to be recorded. Nothing can resume it.
+            if (!dry) rmSync(path, { recursive: true, force: true });
+            removed.push(path);
+            continue;
+          }
+          if (TERMINAL_STATES.has(row.state)) {
+            if (!dry) rmSync(path, { recursive: true, force: true });
+            removed.push(path);
+            continue;
+          }
+          kept.push({ path, reason: `run ${runId} is still in ${row.state}` });
+        }
+
+        const lines = [
+          dry ? `Would remove ${removed.length} workspace(s):` : `Removed ${removed.length} workspace(s):`,
+          ...removed.map((p) => `  ${p}`),
+          ...(removed.length === 0 ? ["  (none)"] : []),
+        ];
+        if (kept.length > 0) {
+          lines.push("", `Kept ${kept.length} — a live run's working tree is the only copy of it:`);
+          for (const k of kept) lines.push(`  ${k.path}\n    ${k.reason}`);
+        }
+        if (!pruned.ok) {
+          lines.push("", `  note: git worktree prune did not run (${ctx.repoRoot()} may not be a repository)`);
+        }
+
+        ctx.emit(lines.join("\n"), {
+          dryRun: dry,
+          removed,
+          kept,
+          worktreePruned: pruned.ok,
+        });
+        process.exit(ctx.exitCodes.ok);
+      } finally {
+        store.close();
+      }
+    });
 }
 
 // -- init ------------------------------------------------------------------

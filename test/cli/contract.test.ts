@@ -150,6 +150,39 @@ describe("CLI surface", () => {
   });
 });
 
+describe("commands cited anywhere in the source", () => {
+  // The catalog scan missed `runmill gc`, cited by a plain `throw new Error` in
+  // WorkspaceManager and never implemented. That advice reaches a developer
+  // immediately after a crash — the moment a wild goose chase costs most.
+  const SOURCE_FILES = (function walk(dir: string): string[] {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const path = require("node:path") as typeof import("node:path");
+    return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+      const p = path.join(dir, e.name);
+      return e.isDirectory() ? walk(p) : p.endsWith(".ts") ? [p] : [];
+    });
+  })("src");
+
+  it("scans a meaningful number of files", () => {
+    expect(SOURCE_FILES.length).toBeGreaterThan(20);
+  });
+
+  it.each(SOURCE_FILES)("%s cites no command that does not exist", (file) => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const body = fs.readFileSync(file, "utf8");
+    // Only backticked citations — prose like "runmill reads issues" is English.
+    for (const match of body.matchAll(/\\?`runmill ([a-z][a-z0-9 -]*?)\\?`/g)) {
+      const tokens = (match[1] ?? "")
+        .trim()
+        .split(" ")
+        .filter((t) => t !== "" && !t.startsWith("-"));
+      if (tokens.length === 0) continue;
+      const path = [tokens.slice(0, 2).join(" "), tokens[0] ?? ""].find((p) => COMMANDS.has(p));
+      expect(path, `${file} cites \`runmill ${tokens.join(" ")}\` which does not exist`).toBeDefined();
+    }
+  });
+});
+
 describe("the advertised quickstart", () => {
   // The README's "Try it in 60 seconds" block once omitted RUNMILL_DEMO=1, so
   // the headline command printed "No eligible issue." — a first impression of

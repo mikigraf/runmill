@@ -105,6 +105,21 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+/** The happy-path provider script, shared so tests can hold a reference to it. */
+function defaultProvider(): FakeProviderAdapter {
+  return new FakeProviderAdapter({
+    byRole: {
+      implementer: [
+        { kind: "say", text: "implementing" },
+        { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
+      ],
+      "local-reviewer": [{ kind: "say", text: "reviewing" }],
+    },
+    outputByRole: { "local-reviewer": GOOD_REVIEW },
+    costUsdPerCall: 0.25,
+  });
+}
+
 function makeOrchestrator(opts: {
   provider?: FakeProviderAdapter;
   forge?: FakeForgeAdapter;
@@ -114,19 +129,7 @@ function makeOrchestrator(opts: {
   log?: string[];
 }) {
   const backlog = opts.backlog ?? new FakeBacklogAdapter([ISSUE]);
-  const provider =
-    opts.provider ??
-    new FakeProviderAdapter({
-      byRole: {
-        implementer: [
-          { kind: "say", text: "implementing" },
-          { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
-        ],
-        "local-reviewer": [{ kind: "say", text: "reviewing" }],
-      },
-      outputByRole: { "local-reviewer": GOOD_REVIEW },
-      costUsdPerCall: 0.25,
-    });
+  const provider = opts.provider ?? defaultProvider();
   const forge = opts.forge ?? new FakeForgeAdapter();
 
   return {
@@ -247,11 +250,14 @@ describe("end-to-end: issue to governed pull request", () => {
   }, 60_000);
 
   it("writes the task packet with acceptance criteria and forbidden paths", async () => {
-    const { orchestrator } = makeOrchestrator({});
+    // Asserted against what the agent was actually handed, not against the
+    // workspace afterwards: a successful run cleans its workspace up, so
+    // reading the file later would only prove cleanup had not run yet.
+    const provider = defaultProvider();
+    const { orchestrator } = makeOrchestrator({ provider });
     await orchestrator.run({ runId: "run_1", issue: ISSUE, target: TARGET, lease: lease("run_1") });
 
-    const packetPath = join(root, "runs", "run_1", ".runmill", "run", "task.json");
-    const packet = JSON.parse(readFileSync(packetPath, "utf8")) as {
+    const packet = provider.capturedPackets[0] as {
       acceptance_criteria: string[];
       constraints: { forbidden_paths: string[] };
     };
@@ -264,9 +270,10 @@ describe("end-to-end: issue to governed pull request", () => {
   }, 60_000);
 
   it("fences the issue body as untrusted data", async () => {
-    const { orchestrator } = makeOrchestrator({});
+    const provider = defaultProvider();
+    const { orchestrator } = makeOrchestrator({ provider });
     await orchestrator.run({ runId: "run_1", issue: ISSUE, target: TARGET, lease: lease("run_1") });
-    const doc = readFileSync(join(root, "runs", "run_1", ".runmill", "run", "issue.md"), "utf8");
+    const doc = provider.capturedIssueDocs[0] ?? "";
     expect(doc).toContain("UNTRUSTED DATA");
     expect(doc).toContain("```untrusted");
   }, 60_000);

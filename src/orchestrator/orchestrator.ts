@@ -508,8 +508,10 @@ export class Orchestrator {
       return finish("QUARANTINED", { reason });
     } finally {
       // The workspace is deliberately preserved on a non-clean exit so a human
-      // can inspect it; only a fully completed run cleans up eagerly.
-      if (workspace !== undefined && this.#state === "COMPLETED") {
+      // can inspect it. PR_DELIVERED is a clean exit — it is how every
+      // successful run ends in `pr-only`, the default mode — so omitting it
+      // meant the default configuration never reclaimed a single workspace.
+      if (workspace !== undefined && CLEAN_EXITS.has(this.#state)) {
         await this.#workspaces.destroy(workspace, this.#d.sourceRepoPath);
       }
       if (held !== undefined) {
@@ -525,6 +527,14 @@ export class Orchestrator {
 
 /** Bound on how long a required check may go unscheduled before escalating. */
 const CI_SCHEDULE_DEADLINE_MS = 10 * 60_000;
+
+/**
+ * Terminal states after which the workspace holds nothing a human needs.
+ *
+ * Everything else — NEEDS_HUMAN, QUARANTINED, AWAITING_APPROVAL — keeps its
+ * workspace, because the tree is the evidence for whatever has to be decided.
+ */
+const CLEAN_EXITS: ReadonlySet<string> = new Set(["COMPLETED", "PR_DELIVERED"]);
 
 function slugify(text: string): string {
   return text

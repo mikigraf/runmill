@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type {
   AgentRunRequest,
@@ -87,6 +87,16 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
   #clock: Clock;
   #sessionSeq = 0;
   readonly startedRequests: AgentRunRequest[] = [];
+  /**
+   * Task packets as they were on disk when the agent was handed them.
+   *
+   * Read at start time rather than after the run: a successful run cleans up
+   * its workspace, so asserting against the file afterwards tests only that
+   * cleanup has not happened yet. What matters is what the agent received.
+   */
+  readonly capturedPackets: unknown[] = [];
+  /** The rendered issue document handed alongside each packet. */
+  readonly capturedIssueDocs: string[] = [];
 
   constructor(script: FakeProviderScript = {}, clock: Clock = new SystemClock()) {
     this.#script = script;
@@ -118,6 +128,11 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
 
   async start(request: AgentRunRequest): Promise<AgentSession> {
     this.startedRequests.push(request);
+    if (existsSync(request.taskPacketPath)) {
+      this.capturedPackets.push(JSON.parse(readFileSync(request.taskPacketPath, "utf8")));
+      const issueDoc = join(dirname(request.taskPacketPath), "issue.md");
+      if (existsSync(issueDoc)) this.capturedIssueDocs.push(readFileSync(issueDoc, "utf8"));
+    }
     this.#sessionSeq += 1;
     const sessionId = `fake-session-${this.#sessionSeq}`;
     const actions =
