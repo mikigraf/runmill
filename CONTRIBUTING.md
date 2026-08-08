@@ -106,3 +106,32 @@ originally read the developer's real `~/.ssh/id_rsa`, so on a machine without
 that file it passed because `cat` found nothing — proving nothing about the
 sandbox. Plant the secret, confirm it is readable outside, then assert the
 denial inside.
+
+## Releasing
+
+The package is not published yet. When it is:
+
+```bash
+npm run typecheck && npm run test:coverage && npm run verify:linux
+npm version <patch|minor|major>          # tags the commit
+npm publish                              # prepublishOnly re-runs the gates
+git push --follow-tags
+```
+
+`prepublishOnly` runs typecheck, the coverage-gated suite, and the docs check.
+It exists because npm only allows unpublishing within 72 hours, after which a
+broken release is permanent and has to be superseded — a gate is cheaper than
+that.
+
+Check the install actually works before announcing it, from a tarball rather
+than the working copy:
+
+```bash
+npm pack --pack-destination /tmp/rel
+npm install -g --prefix /tmp/rel/prefix /tmp/rel/runmill-*.tgz
+PATH=/tmp/rel/prefix/bin:$PATH runmill --version
+```
+
+`npm link` is not a substitute: it symlinks the working copy, so it passes even
+when `files` omits something the tarball needs. That is exactly how a release
+once shipped with no code in it.
