@@ -109,6 +109,7 @@ The dashboard includes:
 
 - current daemon phase, process ID, repository, sleep inhibitor, and active issue;
 - recent runs with state, repository, and provider;
+- the selected issue's progress from claim through merge policy;
 - transition history, normalized agent events, and pending external effects for the selected run;
 - a live daemon activity log; and
 - a safe stop action that takes effect at the next orchestration boundary.

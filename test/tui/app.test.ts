@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatRunDetail } from "../../src/tui/app.js";
+import { formatPipeline, formatRunDetail } from "../../src/tui/app.js";
 import type { RunDetail } from "../../src/daemon/control.js";
 
 describe("OpenTUI presentation", () => {
@@ -36,8 +36,15 @@ describe("OpenTUI presentation", () => {
     };
     const rendered = formatRunDetail(detail);
     expect(rendered).toContain("ENG-42 · LOCAL_REVIEW");
+    expect(rendered).toContain("✓ claim  ✓ implement  ✓ verify  ● review  · PR  · policy");
     expect(rendered).toContain("LOCAL_VERIFY → LOCAL_REVIEW");
     expect(rendered).toContain("review.started");
     expect(rendered).toContain("create_pr → acme/platform");
+  });
+
+  it("shows a delivered run at the policy end of the pipeline", () => {
+    expect(formatPipeline("PR_DELIVERED")).toBe(
+      "✓ claim  ✓ implement  ✓ verify  ✓ review  ✓ PR  ● policy",
+    );
   });
 });
