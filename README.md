@@ -12,6 +12,19 @@ refuses to merge anything it cannot account for.
 
 [**Landing page**](./site/index.html) · [Documentation](./docs/README.md)
 
+## What it does
+
+You have issues in a backlog. You have Codex or Claude Code installed.
+
+runmill takes the next issue, claims it so nothing else picks it up, and hands it to the agent
+inside a sandbox. Then it checks the result: did the tests you named actually run against this
+exact commit, did a second model review the diff, does the change do what the issue asked for. If
+all of that holds it opens a pull request. If any of it doesn't, it stops and tells you which
+part failed.
+
+One issue, or the whole backlog until the work or the budget runs out. You are never the thing
+deciding whether the agent finished.
+
 ## Try it in 60 seconds
 
 No credentials, no signup, no config to write. The quickstart runs against an in-memory backlog.
