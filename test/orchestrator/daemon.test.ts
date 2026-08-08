@@ -160,4 +160,34 @@ describe("Daemon", () => {
     expect(result.outcomes).toHaveLength(0);
     expect(idle).toBe(true);
   });
+
+  it("waits for new work in service mode", async () => {
+    const daemon = new Daemon({
+      clock: clock(),
+      store: {} as never,
+      stopWhenIdle: false,
+      pollIntervalMs: 1,
+      maxRuns: 1,
+    });
+    let attempts = 0;
+    const result = await daemon.loop(async () => {
+      attempts += 1;
+      return attempts === 1 ? undefined : outcome();
+    });
+    expect(result.stoppedBecause).toBe("max-runs");
+    expect(result.outcomes).toHaveLength(1);
+  });
+
+  it("wakes immediately when stopped while idle", async () => {
+    const daemon = new Daemon({
+      clock: clock(),
+      store: {} as never,
+      stopWhenIdle: false,
+      pollIntervalMs: 60_000,
+    });
+    const loop = daemon.loop(async () => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    daemon.requestStop();
+    await expect(loop).resolves.toMatchObject({ stoppedBecause: "signal" });
+  });
 });

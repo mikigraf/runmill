@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir, platform, homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +11,15 @@ import {
 } from "../../src/workspace/sandbox.js";
 
 const onMac = platform() === "darwin";
+/**
+ * Whether this host can construct a sandbox at all.
+ *
+ * These tests were gated to macOS, which meant the bubblewrap path — half the
+ * supported platforms — had its enforcement verified by nothing, anywhere. The
+ * assertions below are about behavior every mechanism must provide, so they run
+ * wherever a mechanism exists.
+ */
+const hasSandbox = detectMechanism() !== "none";
 
 describe("buildEnvironment", () => {
   it("builds from empty rather than filtering the parent", () => {
@@ -132,7 +141,7 @@ describe("Sandbox.run", () => {
     ).rejects.toThrow(/RM-SANDBOX-001|No sandbox mechanism/);
   });
 
-  it.runIf(onMac)("runs a permitted command and captures output", async () => {
+  it.runIf(hasSandbox)("runs a permitted command and captures output", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
     const sandbox = new Sandbox(detectMechanism());
     const result = await sandbox.run({
@@ -148,7 +157,7 @@ describe("Sandbox.run", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it.runIf(onMac)("permits writes inside the workspace", async () => {
+  it.runIf(hasSandbox)("permits writes inside the workspace", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
     const sandbox = new Sandbox(detectMechanism());
     const target = join(dir, "written.txt");
@@ -164,22 +173,52 @@ describe("Sandbox.run", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it.runIf(onMac)("DENIES reading a credential path", async () => {
-    // The security claim, tested rather than asserted.
+  it.runIf(hasSandbox)("DENIES reading a credential path", async () => {
+    // The security claim, tested rather than asserted — and tested in a way
+    // that cannot pass for the wrong reason.
+    //
+    // This read `~/.ssh/id_rsa` directly, so on any machine without that file
+    // `cat` failed because the file was absent and the test passed having
+    // proven nothing about the sandbox. It now plants a real secret at a real
+    // credential path, proves it is readable OUTSIDE the sandbox, and only then
+    // asserts the denial inside.
+    //
+    // HOME is redirected to a temp directory first: the denial rules are built
+    // from $HOME, and writing to a developer's actual ~/.ssh to run a test is
+    // not a trade worth making.
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
-    const sandbox = new Sandbox(detectMechanism());
-    const result = await sandbox.run({
-      command: "/bin/cat",
-      args: [join(homedir(), ".ssh", "id_rsa")],
-      cwd: dir,
-      policy: { writablePaths: [dir], allowNetwork: false },
-      timeoutMs: 10_000,
-    });
-    expect(result.exitCode).not.toBe(0);
-    rmSync(dir, { recursive: true, force: true });
+    const fakeHome = mkdtempSync(join(tmpdir(), "runmill-home-"));
+    const realHome = process.env["HOME"];
+    const secret = join(fakeHome, ".ssh", "id_rsa");
+
+    try {
+      mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
+      writeFileSync(secret, "PRIVATE-KEY-MATERIAL\n");
+      process.env["HOME"] = fakeHome;
+
+      // Non-vacuity: unsandboxed, this read succeeds.
+      expect(readFileSync(secret, "utf8")).toContain("PRIVATE-KEY-MATERIAL");
+
+      const sandbox = new Sandbox(detectMechanism());
+      const result = await sandbox.run({
+        command: "/bin/cat",
+        args: [secret],
+        cwd: dir,
+        policy: { writablePaths: [dir], allowNetwork: false },
+        timeoutMs: 10_000,
+      });
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stdout).not.toContain("PRIVATE-KEY-MATERIAL");
+    } finally {
+      if (realHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = realHome;
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
   });
 
-  it.runIf(onMac)("DENIES writing outside the declared workspace", async () => {
+  it.runIf(hasSandbox)("DENIES writing outside the declared workspace", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
     const outside = mkdtempSync(join(tmpdir(), "runmill-outside-"));
     const sandbox = new Sandbox(detectMechanism());
@@ -196,7 +235,7 @@ describe("Sandbox.run", () => {
     rmSync(outside, { recursive: true, force: true });
   });
 
-  it.runIf(onMac)("kills the whole process group on timeout", async () => {
+  it.runIf(hasSandbox)("kills the whole process group on timeout", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
     writeFileSync(join(dir, "slow.sh"), "#!/bin/sh\nsleep 30\n");
     const sandbox = new Sandbox(detectMechanism());

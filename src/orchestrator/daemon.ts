@@ -125,8 +125,12 @@ export interface DaemonOptions {
   readonly clock: Clock;
   readonly store: StateStore;
   readonly breakers?: CircuitBreakers | undefined;
-  /** Hard ceiling on runs in one session; undefined means until work runs out. */
+  /** Hard ceiling on runs in one session; undefined means until stopped. */
   readonly maxRuns?: number | undefined;
+  /** Exit after the current queue drains instead of waiting for new work. */
+  readonly stopWhenIdle?: boolean | undefined;
+  /** How often an unattended daemon re-reads the backlog while idle. */
+  readonly pollIntervalMs?: number | undefined;
   readonly onIdle?: (() => void) | undefined;
   readonly onEvent?: ((message: string) => void) | undefined;
 }
@@ -149,6 +153,7 @@ export class Daemon {
   readonly #opts: DaemonOptions;
   readonly #breakers: CircuitBreakers;
   #stopRequested = false;
+  #wakeIdle: (() => void) | undefined;
 
   constructor(options: DaemonOptions) {
     this.#opts = options;
@@ -157,6 +162,23 @@ export class Daemon {
 
   requestStop(): void {
     this.#stopRequested = true;
+    this.#wakeIdle?.();
+  }
+
+  async #waitWhileIdle(): Promise<void> {
+    const interval = this.#opts.pollIntervalMs ?? 30_000;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.#wakeIdle = undefined;
+        resolve();
+      };
+      const timer = setTimeout(finish, interval);
+      this.#wakeIdle = finish;
+    });
   }
 
   /**
@@ -165,6 +187,7 @@ export class Daemon {
    */
   async loop(runOnce: () => Promise<RunOutcome | undefined>): Promise<DaemonResult> {
     const outcomes: RunOutcome[] = [];
+    let idle = false;
 
     for (;;) {
       if (this.#stopRequested) {
@@ -183,10 +206,19 @@ export class Daemon {
 
       const outcome = await runOnce();
       if (outcome === undefined) {
-        this.#opts.onIdle?.();
-        return { outcomes, stoppedBecause: "no-work" };
+        if (!idle) this.#opts.onIdle?.();
+        idle = true;
+        // Keep the class's historical drain-and-exit behavior by default.
+        // The CLI opts into service mode unless the operator passes --once.
+        if (this.#opts.stopWhenIdle !== false) {
+          return { outcomes, stoppedBecause: "no-work" };
+        }
+        if (this.#stopRequested) continue;
+        await this.#waitWhileIdle();
+        continue;
       }
 
+      idle = false;
       outcomes.push(outcome);
       this.#breakers.record(outcome);
       this.#opts.onEvent?.(

@@ -6,10 +6,27 @@ versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 Upgrades should be boring. Anything that requires action on your part appears under
 **Upgrade notes** with the exact command to run.
 
-## [Unreleased]
+## [0.1.0] — 2026-08-08
+
+First release.
 
 ### Added
 
+- `runmill eval validate` and `runmill eval replay` — the evaluation harness. Replays a suite of
+  tasks derived from your own history through the real selection and orchestration path, and
+  reports pass rates with 95% confidence intervals. Refusal accuracy is reported separately and
+  decides the exit code on its own: a harness that stops escalating has regressed no matter what
+  the aggregate says. `eval validate` rejects a suite in which every task expects success.
+- `runmill gc` — reconcile workspaces left behind by crashed runs.
+- The `PR_REVIEW` stage, which previously shipped as scaffolding and never ran.
+- `docs/` — conceptual documentation for the mechanisms the CLI cannot explain on its own:
+  the coverage contract, the lease model, the seven merge gates, the sandbox, the run lifecycle,
+  and a full configuration reference. `test/docs/contract.test.ts` fails if a doc cites a command,
+  flag, error code, source file, or link that does not exist.
+- The check manifest is now actually loaded. `.runmill/checks.yaml` was written by `runmill init`
+  and pointed at by `verification.manifest`, but nothing read it: checks came only from
+  `runmill.yaml`. `declared_skips` therefore never parsed, so declaring a skip was impossible.
+- `runmill config validate` validates the check manifest too, naming the offending check.
 - `runmill init` — writes `runmill.yaml`, `.runmill/checks.yaml`, and the review skills, inferring
   the repository and base branch from git.
 - `runmill prepare <issue>` — scores how ready an issue is to run and names what is missing, so an
@@ -22,8 +39,40 @@ Upgrades should be boring. Anything that requires action on your part appears un
 - `docs/errors.md`, generated from the error catalog. CI fails if it drifts.
 - CI on macOS and Linux, including a check that the published package contains the binary it declares.
 
+### Upgrade notes
+
+`provider:` and `review.provider:` are replaced by one `providers:` block. A file
+using the old shape is rejected by name, with the replacement printed, rather
+than parsed to defaults.
+
+```yaml
+providers:
+  max_turns: 80              # was provider.max_turns
+  timeout_minutes: 120       # was provider.timeout_minutes
+  implementer:
+    implementation: codex    # was provider.implementation
+    model: <id>              # was provider.model
+  reviewer:
+    implementation: inherit  # was review.provider
+    model: <id>              # was review.model
+```
+
+Everything else under `review:` (skills, `max_fix_iterations`,
+`merge_blocking_severities`) stays where it is. `runmill init --force` writes the
+new shape.
+
 ### Fixed
 
+- **The safe git-isolation default never applied to a single real run.** `WorkspaceManager`
+  documents `clone` as its default, because a linked worktree's `.git` is a file into the parent
+  repository — so the object store, config, and hooks are shared, and granting the sandbox write
+  access hands an agent `.git/hooks/pre-commit` and code execution in the orchestrator's context.
+  `parseConfig` defaulted to `separate-git-dir` and the orchestrator passed it through, so the
+  documented default was dead code. Now `clone` in both, with a test that fails if they drift.
+- **A failed clone was ignored.** Workspace creation used the non-throwing `run` for the clone
+  while every other call used `runGit`, so a failure surfaced three steps later as a confusing
+  `git config` error. It also cloned from the invocation directory rather than the repository
+  root, which fails whenever runmill is run from a subdirectory.
 - **The published package contained no code.** `bin` pointed at `dist/cli/main.js` with no build
   step at pack time, so `npm i -g runmill` installed a package whose only executable was absent.
 - **The installed binary silently did nothing.** The entrypoint guard compared `import.meta.url`

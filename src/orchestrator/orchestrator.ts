@@ -18,6 +18,7 @@ import { RunmillError , errorMessage } from "../errors/runmill-error.js";
 import { renderPullRequestBody } from "./pr-body.js";
 import { outputContractFor } from "../agent/output-contract.js";
 import { snapshotHash } from "../domain/snapshot.js";
+import { RunLog } from "../state/run-log.js";
 
 export type RunState =
   | "DISCOVERED"
@@ -48,6 +49,15 @@ export type RunState =
 export interface OrchestratorDeps {
   readonly backlog: BacklogAdapter;
   readonly provider: CodingAgentAdapter;
+  /**
+   * Runs `local-reviewer` and `pr-reviewer`.
+   *
+   * Optional, and equal to `provider` when unset. Pointing it at a different
+   * vendor is what makes review independent rather than merely fresh: a model
+   * reviewing its own work agrees with itself for the same reasons it was
+   * wrong, and no amount of context clearing fixes that.
+   */
+  readonly reviewProvider?: CodingAgentAdapter | undefined;
   readonly forge: ForgeAdapter;
   readonly store: StateStore;
   readonly clock: Clock;
@@ -65,6 +75,8 @@ export interface RunOutcome {
   readonly runId: string;
   readonly issueId: string;
   readonly finalState: RunState;
+  /** Branch this run pushed, and the base a stacked layer builds on. */
+  readonly branch?: string | undefined;
   readonly prNumber?: number | undefined;
   readonly prUrl?: string | undefined;
   readonly mergeSha?: string | undefined;
@@ -85,6 +97,7 @@ export class Orchestrator {
   readonly #d: OrchestratorDeps;
   readonly #workspaces: WorkspaceManager;
   readonly #verification: VerificationEngine;
+  readonly #runLog: RunLog;
   #state: RunState = "DISCOVERED";
   #version = 1;
 
@@ -92,6 +105,12 @@ export class Orchestrator {
     this.#d = deps;
     this.#workspaces = deps.workspaces ?? new WorkspaceManager();
     this.#verification = deps.verification ?? new VerificationEngine();
+    this.#runLog = new RunLog(join(deps.sourceRepoPath, ".runmill", "log.md"));
+  }
+
+  /** The adapter that runs review roles. Falls back to the implementer's. */
+  get #reviewer(): CodingAgentAdapter {
+    return this.#d.reviewProvider ?? this.#d.provider;
   }
 
   #log(message: string): void {
@@ -142,7 +161,9 @@ export class Orchestrator {
     const cfg = this.#d.config;
     let held: HeldLease | undefined;
     let workspace: Workspace | undefined;
+    let branch: string | undefined;
     let costUsd = 0;
+    let logged = false;
 
     /**
      * Record the terminal state before returning it.
@@ -160,7 +181,35 @@ export class Orchestrator {
           // outcome is still returned truthfully.
         }
       }
-      return { runId, issueId: issue.identifier, finalState: state, costUsd, ...extra };
+      const outcome: RunOutcome = {
+        runId,
+        issueId: issue.identifier,
+        finalState: state,
+        costUsd,
+        ...(branch === undefined ? {} : { branch }),
+        ...extra,
+      };
+      if (
+        !logged &&
+        (state === "PR_DELIVERED" || (state === "COMPLETED" && extra.reason !== "observe mode"))
+      ) {
+        try {
+          this.#runLog.append({
+            at: this.#d.clock.now(),
+            issue,
+            outcome: state,
+            runId,
+            costUsd,
+            ...(extra.prNumber === undefined ? {} : { prNumber: extra.prNumber }),
+            ...(extra.prUrl === undefined ? {} : { prUrl: extra.prUrl }),
+            ...(extra.mergeSha === undefined ? {} : { mergeSha: extra.mergeSha }),
+          });
+          logged = true;
+        } catch (err) {
+          this.#log(`could not append .runmill/log.md: ${errorMessage(err)}`);
+        }
+      }
+      return outcome;
     };
 
     try {
@@ -168,7 +217,7 @@ export class Orchestrator {
         runId,
         issueId: issue.identifier,
         repo: target.repo,
-        provider: cfg.provider.implementation,
+        provider: cfg.providers.implementer.implementation,
       });
       this.#advance(runId, "ELIGIBILITY_CHECKED");
 
@@ -202,7 +251,7 @@ export class Orchestrator {
       );
 
       // -- workspace -----------------------------------------------------
-      const branch = cfg.github.branchTemplate
+      branch = cfg.github.branchTemplate
         .replace("{issue_identifier}", issue.identifier)
         .replace("{slug}", slugify(issue.title))
         .replace("{attempt}", "1");
@@ -265,8 +314,8 @@ export class Orchestrator {
           forbiddenPaths: packet.constraints.forbidden_paths,
           allowedCommands: [],
           network: cfg.workspace.network,
-          maxTurns: cfg.provider.maxTurns,
-          timeoutMs: cfg.provider.timeoutMinutes * 60_000,
+          maxTurns: cfg.providers.maxTurns,
+          timeoutMs: cfg.providers.timeoutMinutes * 60_000,
         });
         const agentResult = await session.result;
         costUsd += accumulateUsage(agentResult.events).costUsd;
@@ -313,7 +362,7 @@ export class Orchestrator {
 
         // -- review ------------------------------------------------------
         this.#advance(runId, "LOCAL_REVIEW");
-        const reviewSession = await this.#d.provider.start({
+        const reviewSession = await this.#reviewer.start({
           runId,
           issueId: issue.identifier,
           role: "local-reviewer",
@@ -324,8 +373,8 @@ export class Orchestrator {
           forbiddenPaths: packet.constraints.forbidden_paths,
           allowedCommands: [],
           network: cfg.workspace.network,
-          maxTurns: cfg.provider.maxTurns,
-          timeoutMs: cfg.provider.timeoutMinutes * 60_000,
+          maxTurns: cfg.providers.maxTurns,
+          timeoutMs: cfg.providers.timeoutMinutes * 60_000,
         });
         const reviewResult = await reviewSession.result;
         costUsd += accumulateUsage(reviewResult.events).costUsd;
@@ -338,7 +387,12 @@ export class Orchestrator {
         }
         review = parseReviewJson(readFileSync(reviewResult.outputRef, "utf8"));
 
-        const cross = crossCheckVerdict(review, changed, cfg.risk.manualApproval.paths);
+        const cross = crossCheckVerdict(
+          review,
+          changed,
+          cfg.risk.manualApproval.paths,
+          packet.acceptance_criteria,
+        );
         if (!cross.accepted) {
           return finish("NEEDS_HUMAN", { reason: cross.reason ?? "verdict rejected" });
         }
@@ -358,23 +412,25 @@ export class Orchestrator {
       this.#advance(runId, "PR_READY");
       await input.lease.assertHeld(held);
 
-      await this.#withOutbox(runId, "forge", "push", `${target.repo}#${branch}`, () =>
-        this.#d.forge.push({ repo: target.repo, branch, workspacePath: workspace!.path }),
+      // Set during workspace creation, long before this point.
+      const pushBranch = branch as string;
+      await this.#withOutbox(runId, "forge", "push", `${target.repo}#${pushBranch}`, () =>
+        this.#d.forge.push({ repo: target.repo, branch: pushBranch, workspacePath: workspace!.path }),
       );
       this.#advance(runId, "PUSHED");
 
       await input.lease.assertHeld(held);
-      const pr = await this.#withOutbox(runId, "forge", "open-pr", `${target.repo}#${branch}`, () =>
+      const pr = await this.#withOutbox(runId, "forge", "open-pr", `${target.repo}#${pushBranch}`, () =>
         this.#d.forge.openPullRequest({
           repo: target.repo,
-          branch,
+          branch: pushBranch,
           baseBranch: target.baseBranch,
           title: `${issue.identifier}: ${issue.title}`,
           body: renderPullRequestBody({
             issue,
             review: review as Review,
             runId,
-            provider: cfg.provider.implementation,
+            provider: cfg.providers.implementer.implementation,
             checks: prChecks,
           }),
           draft: cfg.github.draftPr,
@@ -430,6 +486,41 @@ export class Orchestrator {
           reason: `CI not satisfied — ${unsatisfied.map(([n, v]) => `${n}: ${v.detail}`).join("; ")}`,
         });
       }
+
+      // -- PR review --------------------------------------------------------
+      //
+      // A second review, against the pull request as a reviewer sees it rather
+      // than the workspace as the implementer left it. It runs AFTER CI so it
+      // can read what CI actually reported, and BEFORE the merge gate so a
+      // blocking finding stops a merge rather than annotating one.
+      //
+      // Distinct from the local review, not a repeat of it: the local pass sees
+      // a working tree, this one sees the squashed, rebased, CI-checked change
+      // in its final form. Findings that only exist in that form — an
+      // interaction with something that landed on the base branch meanwhile —
+      // are invisible to the earlier pass.
+      const prReviewOutcome = await this.#runPrReview({
+        runId,
+        issue,
+        target,
+        pr,
+        cfg,
+        workspace,
+        packetPath,
+        packet,
+        lease: input.lease,
+        held,
+        branch,
+      });
+      costUsd += prReviewOutcome.costUsd;
+      if (prReviewOutcome.blocked !== undefined) {
+        return finish("NEEDS_HUMAN", {
+          prNumber: pr.number,
+          prUrl: pr.url,
+          reason: prReviewOutcome.blocked,
+        });
+      }
+      if (prReviewOutcome.review !== undefined) review = prReviewOutcome.review;
 
       // -- deliver or merge -------------------------------------------------
       if (cfg.autonomy === "pr-only") {
@@ -508,8 +599,10 @@ export class Orchestrator {
       return finish("QUARANTINED", { reason });
     } finally {
       // The workspace is deliberately preserved on a non-clean exit so a human
-      // can inspect it; only a fully completed run cleans up eagerly.
-      if (workspace !== undefined && this.#state === "COMPLETED") {
+      // can inspect it. PR_DELIVERED is a clean exit — it is how every
+      // successful run ends in `pr-only`, the default mode — so omitting it
+      // meant the default configuration never reclaimed a single workspace.
+      if (workspace !== undefined && CLEAN_EXITS.has(this.#state)) {
         await this.#workspaces.destroy(workspace, this.#d.sourceRepoPath);
       }
       if (held !== undefined) {
@@ -521,10 +614,199 @@ export class Orchestrator {
       }
     }
   }
+
+  /**
+   * Review the pull request, and fix what the review blocks on.
+   *
+   * Bounded by two independent budgets: `pr_review` caps how many times a
+   * reviewer runs, `pr_fixer` caps how many times a fix runs. An oscillating
+   * pair — reviewer objects, fixer "fixes", reviewer objects again — exhausts
+   * the fixer budget and escalates rather than billing indefinitely.
+   *
+   * Every push inside the loop is fenced. The pull request is a live artifact
+   * other people may be looking at, so a run that has lost its lease must not
+   * keep amending it.
+   */
+  async #runPrReview(input: PrReviewInput): Promise<PrReviewOutcome> {
+    const { runId, issue, target, pr, cfg, workspace, packetPath, packet } = input;
+    const budget = cfg.budgets.maxAgentInvocations;
+    const maxFixes = Math.max(0, budget.prFixer);
+    const maxReviews = Math.max(1, budget.prReview);
+
+    let costUsd = 0;
+    let review: Review | undefined;
+
+    for (let attempt = 0; attempt < maxReviews; attempt += 1) {
+      this.#advance(runId, "PR_REVIEW");
+
+      const session = await this.#reviewer.start({
+        runId,
+        issueId: issue.identifier,
+        role: "pr-reviewer",
+        attempt: attempt + 1,
+        workingDirectory: workspace.path,
+        taskPacketPath: packetPath,
+        // A reviewer reads. Granting write paths to something whose only job is
+        // to form an opinion is how a review starts editing the thing it judges.
+        allowedPaths: [],
+        forbiddenPaths: packet.constraints.forbidden_paths,
+        allowedCommands: [],
+        network: cfg.workspace.network,
+        maxTurns: cfg.providers.maxTurns,
+        timeoutMs: cfg.providers.timeoutMinutes * 60_000,
+      });
+      const result = await session.result;
+      costUsd += accumulateUsage(result.events).costUsd;
+
+      if (result.status !== "success") {
+        return { costUsd, blocked: `PR reviewer returned ${result.status}` };
+      }
+      if (result.outputRef === undefined || result.outputRef === "") {
+        return { costUsd, blocked: "PR reviewer produced no structured output" };
+      }
+
+      try {
+        review = parseReviewJson(readFileSync(result.outputRef, "utf8"));
+      } catch (err) {
+        // An unparseable review is not an absent review: it is a review whose
+        // conclusion is unknown, and unknown is not permission to merge.
+        return { costUsd, blocked: `PR review output was unparseable: ${errorMessage(err)}` };
+      }
+
+      const changed = await this.#workspaces.changedFiles(workspace);
+      const cross = crossCheckVerdict(
+        review,
+        changed,
+        cfg.risk.manualApproval.paths,
+        input.packet.acceptance_criteria,
+      );
+      if (!cross.accepted) {
+        return { costUsd, blocked: cross.reason ?? "PR review verdict rejected" };
+      }
+
+      const blocking = blockingFindings(review, cfg.review.mergeBlockingSeverities);
+      if (blocking.length === 0) return { costUsd, review };
+
+      this.#log(`  PR review: ${blocking.length} blocking finding(s)`);
+      if (attempt >= maxFixes) {
+        return {
+          costUsd,
+          blocked:
+            `${blocking.length} blocking PR-review finding(s) unresolved after ` +
+            `${attempt + 1} review(s): ${blocking.map((f) => f.title).join("; ")}`,
+        };
+      }
+
+      // -- fix, then amend the pull request -------------------------------
+      this.#advance(runId, "FIXING");
+      const fixSession = await this.#d.provider.start({
+        runId,
+        issueId: issue.identifier,
+        role: "fixer",
+        attempt: attempt + 1,
+        workingDirectory: workspace.path,
+        taskPacketPath: packetPath,
+        allowedPaths: packet.constraints.allowed_paths,
+        forbiddenPaths: packet.constraints.forbidden_paths,
+        allowedCommands: [],
+        network: cfg.workspace.network,
+        maxTurns: cfg.providers.maxTurns,
+        timeoutMs: cfg.providers.timeoutMinutes * 60_000,
+      });
+      const fixResult = await fixSession.result;
+      costUsd += accumulateUsage(fixResult.events).costUsd;
+      if (fixResult.status !== "success") {
+        return { costUsd, blocked: `PR fixer returned ${fixResult.status}` };
+      }
+
+      const sha = await this.#workspaces.checkpoint(
+        workspace,
+        `${issue.identifier}: pr-review fix ${attempt + 1}`,
+      );
+      if (sha === undefined) {
+        // Nothing changed, so the next review would reach the same verdict.
+        return {
+          costUsd,
+          blocked: "PR fixer produced no change, so the blocking findings still stand",
+        };
+      }
+
+      // The change must be re-verified before it goes back onto the PR: a fix
+      // is new code, and new code has not been through the coverage contract.
+      this.#advance(runId, "LOCAL_VERIFY");
+      const reverified = await this.#verification.run({
+        workspace,
+        workspaces: this.#workspaces,
+        manifest: resolveManifest({
+          configured: this.#d.checks,
+          changedPaths: await this.#workspaces.changedFiles(workspace),
+        }),
+        candidateSha: sha,
+      });
+      if (!reverified.mergeReady) {
+        return {
+          costUsd,
+          blocked: `verification failed after a PR-review fix: ${reverified.failures.join("; ")}`,
+        };
+      }
+
+      await input.lease.assertHeld(input.held);
+      await this.#withOutbox(
+        runId,
+        "forge",
+        "push-pr-fix",
+        `${target.repo}#${input.branch}@${sha}`,
+        () =>
+          this.#d.forge.push({
+            repo: target.repo,
+            branch: input.branch,
+            workspacePath: workspace.path,
+          }),
+      );
+      this.#log(`  pushed PR-review fix ${attempt + 1} to #${pr.number}`);
+    }
+
+    return {
+      costUsd,
+      blocked: `PR review did not converge within ${maxReviews} review(s)`,
+    };
+  }
+}
+
+interface PrReviewInput {
+  readonly runId: string;
+  readonly issue: BacklogIssue;
+  readonly target: RepositoryTarget;
+  readonly pr: { number: number; url: string; headSha: string };
+  readonly cfg: RunmillConfig;
+  readonly workspace: Workspace;
+  readonly packetPath: string;
+  readonly packet: {
+    acceptance_criteria: readonly string[];
+    constraints: { allowed_paths: readonly string[]; forbidden_paths: readonly string[] };
+  };
+  readonly lease: GitRefLease;
+  readonly held: HeldLease;
+  readonly branch: string;
+}
+
+interface PrReviewOutcome {
+  readonly costUsd: number;
+  /** Set when the run must escalate; the string is the reason. */
+  readonly blocked?: string | undefined;
+  readonly review?: Review | undefined;
 }
 
 /** Bound on how long a required check may go unscheduled before escalating. */
 const CI_SCHEDULE_DEADLINE_MS = 10 * 60_000;
+
+/**
+ * Terminal states after which the workspace holds nothing a human needs.
+ *
+ * Everything else — NEEDS_HUMAN, QUARANTINED, AWAITING_APPROVAL — keeps its
+ * workspace, because the tree is the evidence for whatever has to be decided.
+ */
+const CLEAN_EXITS: ReadonlySet<string> = new Set(["COMPLETED", "PR_DELIVERED"]);
 
 function slugify(text: string): string {
   return text

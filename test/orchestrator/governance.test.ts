@@ -56,7 +56,7 @@ function config(autonomy: string): ReturnType<typeof parseConfig> {
   return parseConfig(`
 version: 1
 autonomy: ${autonomy}
-provider: { implementation: codex }
+providers: { implementer: { implementation: codex } }
 backlog:
   provider: linear
   team: ENG

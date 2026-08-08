@@ -1,0 +1,439 @@
+<title>runmill — the exit condition for coding agents</title>
+
+<style>
+  :root {
+    --ground: #0A0C0E; --surface: #101417; --surface-2: #171C20;
+    --line: #232A2E; --line-soft: #1A2023;
+    --ink: #EDF1F2; --muted: #8B979B; --faint: #5D686C;
+    --amber: #E9A23B; --violet: #7C5CFF;
+    --pass: #45D39A; --fail: #FF6F6F;
+    --glow-a: rgba(233, 162, 59, 0.20); --glow-b: rgba(124, 92, 255, 0.20);
+    --card: rgba(255, 255, 255, 0.03);
+    --shadow: 0 40px 90px -20px rgba(0, 0, 0, 0.75);
+    color-scheme: dark;
+
+    --display: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+    --max: 1140px;
+    --s--1: clamp(0.79rem, 0.765rem + 0.11vw, 0.85rem);
+    --s-0: clamp(0.97rem, 0.94rem + 0.16vw, 1.05rem);
+    --s-1: clamp(1.1rem, 1.02rem + 0.4vw, 1.32rem);
+    --s-3: clamp(2.25rem, 1.5rem + 3.2vw, 4.5rem);
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --ground: #F7F5F2; --surface: #FFFFFF; --surface-2: #F2EFEA;
+      --line: #E0DBD3; --line-soft: #EBE7E0;
+      --ink: #14181A; --muted: #5C666A; --faint: #8B9296;
+      --amber: #9C6100; --violet: #5233CE; --pass: #0F7A57; --fail: #BC3128;
+      --glow-a: rgba(233, 162, 59, 0.26); --glow-b: rgba(124, 92, 255, 0.14);
+      --card: rgba(20, 24, 26, 0.03);
+      --shadow: 0 30px 60px -22px rgba(60, 48, 30, 0.28);
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --ground: #F7F5F2; --surface: #FFFFFF; --surface-2: #F2EFEA;
+    --line: #E0DBD3; --line-soft: #EBE7E0;
+    --ink: #14181A; --muted: #5C666A; --faint: #8B9296;
+    --amber: #9C6100; --violet: #5233CE; --pass: #0F7A57; --fail: #BC3128;
+    --glow-a: rgba(233, 162, 59, 0.26); --glow-b: rgba(124, 92, 255, 0.14);
+    --card: rgba(20, 24, 26, 0.03);
+    --shadow: 0 30px 60px -22px rgba(60, 48, 30, 0.28);
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --ground: #0A0C0E; --surface: #101417; --surface-2: #171C20;
+    --line: #232A2E; --line-soft: #1A2023;
+    --ink: #EDF1F2; --muted: #8B979B; --faint: #5D686C;
+    --amber: #E9A23B; --violet: #7C5CFF; --pass: #45D39A; --fail: #FF6F6F;
+    --glow-a: rgba(233, 162, 59, 0.20); --glow-b: rgba(124, 92, 255, 0.20);
+    --card: rgba(255, 255, 255, 0.03);
+    --shadow: 0 40px 90px -20px rgba(0, 0, 0, 0.75);
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: var(--display); font-size: var(--s-0); line-height: 1.6;
+    -webkit-font-smoothing: antialiased; overflow-x: hidden;
+    min-height: 100vh; display: flex; flex-direction: column;
+  }
+
+  .glow { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
+  .glow i { position: absolute; border-radius: 50%; filter: blur(120px); display: block; }
+  .glow i:nth-child(1) { width: 64vw; height: 44vw; top: -22vw; left: -16vw; background: var(--glow-a); }
+  .glow i:nth-child(2) { width: 54vw; height: 40vw; top: -16vw; right: -16vw; background: var(--glow-b); }
+
+  .wrap { position: relative; z-index: 1; width: 100%; max-width: var(--max); margin: 0 auto; padding: 0 24px; }
+
+  nav { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 0; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 640; letter-spacing: -0.012em; }
+  .mark { width: 24px; height: 24px; border-radius: 7px; flex: none; background: linear-gradient(145deg, var(--amber), var(--violet)); }
+  .nav-links { display: flex; align-items: center; gap: 8px; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
+    padding: 9px 16px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--card);
+    color: var(--ink); text-decoration: none;
+    font-size: var(--s--1); font-weight: 550; font-family: inherit;
+    transition: border-color .18s ease, background .18s ease, transform .18s ease, color .18s ease;
+  }
+  .pill:hover { border-color: color-mix(in oklab, var(--amber) 60%, var(--line)); transform: translateY(-1px); }
+  .pill--solid { background: var(--ink); color: var(--ground); border-color: transparent; font-weight: 640; }
+  .pill--solid:hover { background: var(--amber); color: #080A0B; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; }
+
+  main { flex: 1; }
+  .hero { padding: clamp(36px, 6vw, 76px) 0 0; display: grid; gap: clamp(34px, 5vw, 56px); }
+  @media (min-width: 1020px) {
+    .hero { grid-template-columns: minmax(0, 0.88fr) minmax(0, 1.12fr); align-items: center; gap: 54px; }
+  }
+
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 9px; margin: 0 0 20px;
+    font-family: var(--mono); font-size: 0.73rem; letter-spacing: 0.15em;
+    text-transform: uppercase; color: var(--amber);
+  }
+  .eyebrow::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 12px var(--amber); }
+
+  h1 { font-size: var(--s-3); line-height: 0.96; letter-spacing: -0.04em; font-weight: 800; margin: 0; text-wrap: balance; }
+  h1 .dim { color: var(--faint); }
+  .positioning { margin: 22px 0 0; max-width: 44ch; font-size: var(--s-1); font-weight: 600; letter-spacing: -0.017em; line-height: 1.34; text-wrap: balance; }
+  .lede { margin: 13px 0 0; max-width: 52ch; color: var(--muted); line-height: 1.62; text-wrap: pretty; }
+  .cta { display: flex; gap: 10px; flex-wrap: wrap; margin: 28px 0 0; }
+
+  .stat {
+    margin: 30px 0 0; padding-left: 15px; max-width: 50ch;
+    border-left: 2px solid color-mix(in oklab, var(--amber) 55%, transparent);
+  }
+  .stat b { font-size: var(--s-1); font-weight: 720; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .stat span { display: block; color: var(--faint); font-size: var(--s--1); margin-top: 3px; }
+
+  .term { border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow); overflow: hidden; min-width: 0; }
+  .term-bar { display: flex; align-items: center; gap: 7px; padding: 11px 14px; border-bottom: 1px solid var(--line-soft); background: var(--surface-2); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); flex: none; }
+  .term-path { font-family: var(--mono); font-size: 0.73rem; color: var(--faint); margin-left: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .replay {
+    margin-left: auto; border: 1px solid var(--line); background: transparent; color: var(--muted);
+    border-radius: 999px; padding: 4px 11px; cursor: pointer;
+    font-family: var(--mono); font-size: 0.69rem; letter-spacing: 0.05em;
+    transition: color .18s ease, border-color .18s ease;
+  }
+  .replay:hover { color: var(--amber); border-color: var(--amber); }
+
+  .steps { display: flex; border-bottom: 1px solid var(--line-soft); background: var(--surface-2); overflow-x: auto; scrollbar-width: none; }
+  .steps::-webkit-scrollbar { display: none; }
+  .step {
+    appearance: none; border: 0; background: transparent; cursor: pointer;
+    font-family: var(--mono); font-size: 0.73rem; color: var(--faint);
+    padding: 10px 14px; white-space: nowrap; border-bottom: 2px solid transparent;
+    transition: color .18s ease, border-color .18s ease;
+  }
+  .step:hover { color: var(--muted); }
+  .step[aria-selected="true"] { color: var(--amber); border-bottom-color: var(--amber); }
+  .step-i { color: var(--line); margin-right: 7px; }
+  .step[aria-selected="true"] .step-i { color: color-mix(in oklab, var(--amber) 55%, transparent); }
+
+  .term-body {
+    font-family: var(--mono); font-size: var(--s--1); line-height: 1.78;
+    padding: 18px 18px 22px; margin: 0; overflow-x: auto; white-space: pre; min-height: 330px;
+  }
+  @media (min-width: 1020px) { .term-body { min-height: 386px; } }
+  .c-mute { color: var(--faint); }
+  .c-dim { color: var(--muted); }
+  .c-pass { color: var(--pass); }
+  .c-fail { color: var(--fail); }
+  .c-amber { color: var(--amber); }
+  .c-ink { color: var(--ink); }
+  .c-prompt { color: var(--violet); }
+  .cursor { display: inline-block; width: 7px; height: 1.05em; vertical-align: -0.18em; background: var(--amber); animation: blink 1.05s step-end infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .term-note {
+    padding: 13px 18px; border-top: 1px solid var(--line-soft); background: var(--surface-2);
+    color: var(--muted); font-size: var(--s--1); line-height: 1.55; min-height: 66px; margin: 0;
+  }
+  .term-note b { color: var(--ink); font-weight: 620; }
+
+  footer {
+    margin-top: clamp(44px, 6vw, 72px); padding: 20px 0 34px; border-top: 1px solid var(--line-soft);
+    display: flex; gap: 12px 22px; justify-content: space-between; flex-wrap: wrap;
+    color: var(--faint); font-size: var(--s--1);
+  }
+  footer a { color: var(--muted); text-decoration: none; }
+  footer a:hover { color: var(--amber); }
+
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="glow"><i></i><i></i></div>
+
+<div class="wrap">
+  <nav>
+    <div class="brand"><span class="mark"></span> runmill</div>
+    <div class="nav-links">
+      <a class="pill" href="https://github.com/mikigraf/runmill/blob/main/docs/README.md">Docs</a>
+      <a class="pill pill--solid" href="https://github.com/mikigraf/runmill">GitHub</a>
+    </div>
+  </nav>
+</div>
+
+<main class="wrap">
+  <div class="hero">
+    <div>
+      <p class="eyebrow">Proof of done</p>
+      <h1>The agent says it's done. <span class="dim">runmill checks.</span></h1>
+      <p class="positioning">The exit condition for coding agents.</p>
+      <p class="lede">
+        Your harness already has a loop. runmill decides when that loop is actually finished:
+        deterministic selection and an atomic claim from the backlog, proven isolation, evidence
+        that the checks you said mattered ran against the exact candidate commit, fresh-context
+        review, and a merge gate that fails closed.
+      </p>
+      <div class="cta">
+        <a class="pill pill--solid" href="https://github.com/mikigraf/runmill#try-it-in-60-seconds">Try it in 60 seconds</a>
+        <a class="pill" href="https://github.com/mikigraf/runmill/blob/main/docs/verification.md">What counts as evidence</a>
+      </div>
+      <p class="stat">
+        <b>85% say the bottleneck moved from writing code to reviewing it.</b>
+        <span>GitLab, June 2026, surveying 1,528 developers and technology buyers.</span>
+      </p>
+    </div>
+
+    <div class="term">
+      <div class="term-bar">
+        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        <span class="term-path">~/acme/platform</span>
+        <button class="replay" id="replay" type="button">replay</button>
+      </div>
+      <div class="steps" role="tablist" aria-label="A runmill session">
+        <button class="step" role="tab" aria-selected="true" data-i="0"><span class="step-i">01</span>init</button>
+        <button class="step" role="tab" aria-selected="false" data-i="1"><span class="step-i">02</span>doctor</button>
+        <button class="step" role="tab" aria-selected="false" data-i="2"><span class="step-i">03</span>next</button>
+        <button class="step" role="tab" aria-selected="false" data-i="3"><span class="step-i">04</span>daemon</button>
+      </div>
+      <pre class="term-body" id="body" aria-live="polite"></pre>
+      <p class="term-note" id="note"></p>
+    </div>
+  </div>
+</main>
+
+<div class="wrap">
+  <footer>
+    <span>Wraps Codex and Claude Code. Swap the agent without rewriting your trust model.</span>
+    <span><a href="https://github.com/mikigraf/runmill/blob/main/docs/README.md">Documentation</a></span>
+  </footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // Output copied from real runs, not composed for the page. Inline colour uses
+  // a {class|text} marker, parsed into text nodes below. Nothing is ever
+  // assigned as HTML.
+  var STEPS = [
+    {
+      cmd: "runmill init",
+      lead: "Infers what it can, guesses nothing it shouldn't.",
+      note: " Repository and base branch come from git. Team, workflow states, and merge policy stay editable placeholders, because a guessed merge policy is not a guess worth making.",
+      out: [
+        "Created:",
+        "  runmill.yaml",
+        "  .runmill/checks.yaml",
+        "  .runmill/skills/code-review.md",
+        "  .runmill/skills/pr-review.md",
+        "",
+        "  {dim|repository}  acme/platform",
+        "  {dim|base branch} main",
+        "",
+        "Next:",
+        "  {mute|1.} Edit runmill.yaml   {mute|team, states, repository mapping}",
+        "  {mute|2.} runmill doctor      {mute|verify this host can run safely}"
+      ]
+    },
+    {
+      cmd: "runmill doctor",
+      lead: "It does not ask whether a sandbox exists.",
+      note: " It builds one, plants a secret in a credential path, tries to read it from inside, and fails if that succeeds. The network line is a warning rather than a pass: Seatbelt has no network namespace, and the report says so instead of implying parity.",
+      out: [
+        "  {pass|✓} environment                   interactive host",
+        "  {pass|✓} git                           git version 2.50.1",
+        "  {pass|✓} repository                    ~/acme/platform",
+        "  {pass|✓} github-auth                   authenticated",
+        "  {pass|✓} provider:codex                codex-cli 0.146.0",
+        "  {pass|✓} sandbox:mechanism             sandbox-exec (Seatbelt)",
+        "  {pass|✓} sandbox:deny-credential-read  {ink|read denied}",
+        "  {amber|!} sandbox:network               Seatbelt cannot scope network by host",
+        "      {mute|expected: egress via the runmill proxy}",
+        "      {mute|fix:      workspace.network must be `proxy` on macOS}",
+        "",
+        "  overall: {amber|WARN}"
+      ]
+    },
+    {
+      cmd: "runmill next --dry-run",
+      lead: "Selection is deterministic, and it shows its work.",
+      note: " Every rejection names the rule that failed. ENG-106 sorts last despite being the oldest issue by years, because backlogs encode \"no priority\" as zero and a naive sort puts it first.",
+      out: [
+        "Would select  {ink|ENG-102}  Crash on cold start in the iOS app",
+        "  {dim|repository}  acme/ios (base main)",
+        "  {dim|priority}    urgent",
+        "",
+        "Next in queue (3):",
+        "  {dim|ENG-101}  Prevent duplicate webhook delivery",
+        "  {dim|ENG-103}  Tidy up the dashboard",
+        "  {dim|ENG-106}  Unprioritized cleanup task",
+        "",
+        "Rejected (2):",
+        "  {dim|ENG-104}  Migrate billing to the new provider",
+        "      {fail|✗} {mute|dependencies: blocked by ENG-99}",
+        "  {dim|ENG-105}  Redesign onboarding",
+        "      {fail|✗} {mute|labels: carries excluded label(s): needs-design}"
+      ]
+    },
+    {
+      cmd: "runmill daemon",
+      lead: "The third run exited 0 and still failed.",
+      note: " A suite that discovers no tests is the most convincing false green there is, because it is character-for-character identical to a full pass. The breaker stops the loop rather than working through the rest of the backlog.",
+      out: [
+        "  ENG-102  {mute|→}  {pass|PR_DELIVERED}   {mute|$0.02}",
+        "  ENG-101  {mute|→}  {pass|PR_DELIVERED}   {mute|$0.02}",
+        "  ENG-118  {mute|→}  {fail|NEEDS_HUMAN}    {mute|$0.03}",
+        "           {mute|check \"unit\" exited 0 having discovered no tests}",
+        "",
+        "  {fail|stopped: breaker}  {mute|1 run could not be verified}",
+        "  {mute|runs:   3   spend: $0.07}",
+        "",
+        "  {mute|runmill inspect eng-118}  {dim|candidate SHA, tree hashes, executor}"
+      ]
+    }
+  ];
+
+  var body = document.getElementById("body");
+  var note = document.getElementById("note");
+  var tabs = Array.prototype.slice.call(document.querySelectorAll(".step"));
+  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var timers = [];
+
+  function clearTimers() { timers.forEach(clearTimeout); timers = []; }
+  function later(fn, ms) { timers.push(setTimeout(fn, ms)); }
+
+  /** Turn "{class|text}" markers into real nodes. Never assigns HTML. */
+  function parse(line, frag) {
+    var parts = line.split(/(\{\w+\|[^}]*\})/);
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      if (p === "") continue;
+      if (p.charAt(0) === "{" && p.charAt(p.length - 1) === "}") {
+        var bar = p.indexOf("|");
+        var el = document.createElement("span");
+        el.className = "c-" + p.slice(1, bar);
+        el.textContent = p.slice(bar + 1, -1);
+        frag.appendChild(el);
+      } else {
+        frag.appendChild(document.createTextNode(p));
+      }
+    }
+    return frag;
+  }
+
+  function prompt(frag) {
+    var el = document.createElement("span");
+    el.className = "c-prompt";
+    el.textContent = "$";
+    frag.appendChild(el);
+    frag.appendChild(document.createTextNode(" "));
+  }
+
+  function caret(frag) {
+    var el = document.createElement("span");
+    el.className = "cursor";
+    frag.appendChild(el);
+  }
+
+  /** Draw the command plus the first `shown` output lines. */
+  function draw(step, typed, shown, done) {
+    var frag = document.createDocumentFragment();
+    prompt(frag);
+    frag.appendChild(document.createTextNode(step.cmd.slice(0, typed)));
+    if (shown < 0) {
+      caret(frag);
+    } else {
+      frag.appendChild(document.createTextNode("\n\n"));
+      for (var i = 0; i <= shown && i < step.out.length; i++) {
+        parse(step.out[i], frag);
+        if (i < shown) frag.appendChild(document.createTextNode("\n"));
+      }
+      if (done) {
+        frag.appendChild(document.createTextNode("\n\n"));
+        prompt(frag);
+        caret(frag);
+      }
+    }
+    body.textContent = "";
+    body.appendChild(frag);
+  }
+
+  function setNote(step) {
+    note.textContent = "";
+    var b = document.createElement("b");
+    b.textContent = step.lead;
+    note.appendChild(b);
+    note.appendChild(document.createTextNode(step.note));
+  }
+
+  function select(i) {
+    for (var n = 0; n < tabs.length; n++) {
+      tabs[n].setAttribute("aria-selected", n === i ? "true" : "false");
+    }
+  }
+
+  function play(i, chain) {
+    clearTimers();
+    select(i);
+    var step = STEPS[i];
+    setNote(step);
+
+    if (reduce) { draw(step, step.cmd.length, step.out.length - 1, true); return; }
+
+    var typed = 0;
+    draw(step, 0, -1, false);
+
+    function type() {
+      typed++;
+      draw(step, typed, -1, false);
+      if (typed < step.cmd.length) later(type, 26);
+      else later(function () { line(0); }, 360);
+    }
+
+    function line(n) {
+      var last = n + 1 >= step.out.length;
+      draw(step, step.cmd.length, n, last);
+      if (!last) {
+        // A beat before the line that refuses, so it reads as a decision.
+        var pause = /NEEDS_HUMAN|stopped:|sandbox:network/.test(step.out[n + 1]) ? 520 : 60;
+        later(function () { line(n + 1); }, pause);
+      } else if (chain && i + 1 < STEPS.length) {
+        later(function () { play(i + 1, true); }, 2700);
+      }
+    }
+
+    later(type, 240);
+  }
+
+  for (var t = 0; t < tabs.length; t++) {
+    tabs[t].addEventListener("click", function () {
+      play(Number(this.getAttribute("data-i")), false);
+    });
+  }
+  document.getElementById("replay").addEventListener("click", function () { play(0, true); });
+
+  if (reduce) { select(3); play(3, false); } else { play(0, true); }
+})();
+</script>

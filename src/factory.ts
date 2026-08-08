@@ -32,9 +32,11 @@ export function demoFixturePath(): string {
 export interface AdapterSet {
   readonly backlog: BacklogAdapter;
   readonly provider: CodingAgentAdapter;
+  /** Runs the review roles. The same adapter as `provider` unless configured otherwise. */
+  readonly reviewProvider: CodingAgentAdapter;
   readonly forge: ForgeAdapter;
-  /** Which of the three resolved to a live implementation. */
-  readonly live: { backlog: boolean; provider: boolean; forge: boolean };
+  /** Which boundary resolved to a live implementation. */
+  readonly live: { backlog: boolean; provider: boolean; reviewProvider: boolean; forge: boolean };
 }
 
 export type Boundary = "backlog" | "provider" | "forge";
@@ -49,6 +51,22 @@ export interface BuildAdaptersOptions {
    * billable inference — that `next` and `prepare` never use.
    */
   readonly need?: readonly Boundary[] | undefined;
+}
+
+export function resolveReviewerAgent(config: RunmillConfig): {
+  implementation: "codex" | "claude";
+  model?: string | undefined;
+} {
+  const implementation =
+    config.providers.reviewer.implementation === "inherit"
+      ? config.providers.implementer.implementation
+      : config.providers.reviewer.implementation;
+  const model =
+    config.providers.reviewer.model ??
+    (implementation === config.providers.implementer.implementation
+      ? config.providers.implementer.model
+      : undefined);
+  return { implementation, ...(model === undefined ? {} : { model }) };
 }
 
 /**
@@ -74,6 +92,15 @@ export async function buildAdapters(
   let backlog: BacklogAdapter;
   let backlogLive = false;
   const fixture = process.env["RUNMILL_FAKE_BACKLOG"];
+  if (fixture !== undefined && fixture !== "" && !existsSync(fixture)) {
+    // Setting the variable is an explicit statement of intent. Falling through
+    // to "no Linear credential" would answer a question the operator did not
+    // ask and send them to fix the wrong thing.
+    throw RunmillError.fromCatalog("RM-CONFIG-002", {
+      whatHappened:
+        `RUNMILL_FAKE_BACKLOG points at a file that does not exist:\n  ${fixture}`,
+    });
+  }
   if (fixture !== undefined && existsSync(fixture)) {
     backlog = new FakeBacklogAdapter(JSON.parse(readFileSync(fixture, "utf8")));
   } else if (config.backlog.provider === "linear") {
@@ -105,9 +132,15 @@ export async function buildAdapters(
   // -- provider ----------------------------------------------------------
   let provider: CodingAgentAdapter;
   let providerLive = false;
-  const dialect = config.provider.implementation === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
-  const cli = new CliProviderAdapter({ dialect });
-  const installation = wants("provider") ? await cli.detect() : { installed: false };
+  const dialect = config.providers.implementer.implementation === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
+  const cli = new CliProviderAdapter({
+    dialect,
+    ...(config.providers.implementer.model === undefined ? {} : { model: config.providers.implementer.model }),
+  });
+  // Demo mode never uses the real provider, so probing for it is a subprocess
+  // spawn (and for one dialect an auth check) whose result is discarded.
+  const installation =
+    wants("provider") && !demo ? await cli.detect() : { installed: false };
 
   if (!wants("provider")) {
     provider = new FakeProviderAdapter();
@@ -132,6 +165,66 @@ export async function buildAdapters(
     });
   }
 
+  // -- reviewer ----------------------------------------------------------
+  //
+  // Two independent choices: which CLI, and which model. The same CLI running a
+  // different model is a valid configuration and usually the cheapest useful
+  // one, because it needs no second subscription and still gets a second
+  // opinion that does not share the author's weights.
+  //
+  // Fresh context removes the implementer's narrative. A different model also
+  // removes its blind spots, and a review that shares them agrees with the
+  // author for the same reasons the author was wrong.
+  let reviewProvider = provider;
+  let reviewProviderLive = providerLive;
+
+  const { implementation: reviewImpl, model: reviewModel } = resolveReviewerAgent(config);
+  const differs =
+    reviewImpl !== config.providers.implementer.implementation || reviewModel !== config.providers.implementer.model;
+
+  if (wants("provider") && differs) {
+    if (demo) {
+      reviewProvider = new FakeProviderAdapter();
+      reviewProviderLive = false;
+    } else {
+      const reviewDialect = reviewImpl === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
+      const reviewCli = new CliProviderAdapter({
+        dialect: reviewDialect,
+        ...(reviewModel === undefined ? {} : { model: reviewModel }),
+      });
+
+      // Only re-probe when the CLI itself is different. Same binary, different
+      // model needs no second detect or auth check, and skipping it keeps the
+      // common case free.
+      if (reviewImpl !== config.providers.implementer.implementation) {
+        const found = await reviewCli.detect();
+        if (!found.installed) {
+          throw RunmillError.fromCatalog("RM-AUTH-003", {
+            whatHappened:
+              `providers.reviewer.implementation is "${reviewImpl}" but ` +
+              `${reviewDialect.binary} is not installed.\n` +
+              `  Install it, or set providers.reviewer.implementation: inherit to review ` +
+              `with ${dialect.binary}.`,
+          });
+        }
+        const reviewAuth = await reviewCli.authStatus();
+        if (!reviewAuth.authenticated) {
+          throw RunmillError.fromCatalog("RM-AUTH-003", {
+            whatHappened:
+              `providers.reviewer.implementation is "${reviewImpl}" but ` +
+              `${reviewDialect.binary} is not authenticated.` +
+              (reviewAuth.detail === undefined || reviewAuth.detail === ""
+                ? ""
+                : `\n  ${reviewAuth.detail}`),
+          });
+        }
+      }
+
+      reviewProvider = reviewCli;
+      reviewProviderLive = providerLive || reviewImpl !== config.providers.implementer.implementation;
+    }
+  }
+
   // -- forge -------------------------------------------------------------
   let forge: ForgeAdapter;
   let forgeLive = false;
@@ -154,7 +247,13 @@ export async function buildAdapters(
   return {
     backlog,
     provider,
+    reviewProvider,
     forge,
-    live: { backlog: backlogLive, provider: providerLive, forge: forgeLive },
+    live: {
+      backlog: backlogLive,
+      provider: providerLive,
+      reviewProvider: reviewProviderLive,
+      forge: forgeLive,
+    },
   };
 }

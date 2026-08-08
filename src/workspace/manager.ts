@@ -2,7 +2,6 @@ import { mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { git as runGit, tryGit } from "../platform/git.js";
-import { run } from "../platform/process.js";
 
 
 export type GitIsolation = "clone" | "separate-git-dir";
@@ -28,6 +27,17 @@ export interface CreateWorkspaceInput {
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   return runGit(cwd, args);
+}
+
+/**
+ * The repository root containing `dir`.
+ *
+ * runmill is routinely invoked from a subdirectory, and a subdirectory is not
+ * something you can clone.
+ */
+async function repoRoot(dir: string): Promise<string> {
+  const found = await tryGit(dir, ["rev-parse", "--show-toplevel"]);
+  return found.ok ? found.stdout.trim() : dir;
 }
 
 /**
@@ -66,13 +76,40 @@ export class WorkspaceManager {
     mkdirSync(input.root, { recursive: true, mode: 0o700 });
 
     if (isolation === "clone") {
-      await run("git", [
+      // Clone from the repository ROOT, not from whatever directory runmill was
+      // invoked in. `git clone <repo>/subdir` is not a repository and fails —
+      // and it failed silently here, because this used the non-throwing `run`
+      // while every other call used `runGit`. The run then died three steps
+      // later in #harden, pointing at `git config` instead of the clone.
+      const root = await repoRoot(input.sourceRepo);
+
+      // A stacked layer builds on the branch the layer below pushed, and that
+      // branch exists on the remote rather than in the local checkout. Clone
+      // reads from the local repository, so fetch it down first. Absent for an
+      // ordinary base branch, this is a no-op.
+      const present = await tryGit(root, ["rev-parse", "--verify", `refs/heads/${input.baseBranch}`]);
+      if (!present.ok) {
+        const fetched = await tryGit(root, [
+          "fetch",
+          "--quiet",
+          "origin",
+          `${input.baseBranch}:refs/heads/${input.baseBranch}`,
+        ]);
+        if (!fetched.ok) {
+          throw new Error(
+            `base branch "${input.baseBranch}" is not in ${root} and could not be fetched ` +
+              `from origin: ${fetched.stderr.trim() || "unknown error"}`,
+          );
+        }
+      }
+
+      await runGit(root, [
         "clone",
         "--no-hardlinks",
         "--quiet",
         "--branch",
         input.baseBranch,
-        input.sourceRepo,
+        root,
         path,
       ]);
     } else {
@@ -159,7 +196,10 @@ export class WorkspaceManager {
    * worker must never hold.
    */
   async checkpoint(workspace: Workspace, message: string): Promise<string | undefined> {
-    await git(workspace.path, "add", "-A");
+    // Runtime packet/reviewer files are orchestrator-owned evidence, not part
+    // of the candidate. Leaving them out also keeps diff-scope checks focused
+    // on the change the agent actually produced.
+    await git(workspace.path, "add", "-A", "--", ".", ":(exclude).runmill/run/**");
     const staged = await git(workspace.path, "diff", "--cached", "--name-only");
     if (staged === "") return undefined;
     await git(workspace.path, "commit", "--quiet", "-m", message);

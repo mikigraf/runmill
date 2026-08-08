@@ -487,8 +487,11 @@ version: 1
 # consequential key in the file and must be readable at a glance.
 autonomy: pr-only # observe | pr-only | guarded-merge | continuous
 
-provider:
-  implementation: codex # codex | claude
+providers:
+  implementer:
+    implementation: codex
+  reviewer:
+    implementation: inherit # codex | claude
   execution: local
   max_turns: 80
   timeout_minutes: 120
@@ -545,7 +548,7 @@ github:
 
 workspace:
   strategy: worktree
-  git_isolation: separate-git-dir # separate-git-dir | clone
+  git_isolation: clone            # clone | separate-git-dir
   sandbox: native                 # native | container | none
   # native -> Seatbelt (macOS) | bubblewrap (Linux). Resolved by `doctor`,
   # never chosen by the user. `doctor` fails closed if the resolved

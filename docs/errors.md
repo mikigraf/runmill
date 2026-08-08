@@ -16,6 +16,8 @@ edit that, then run `npm run docs:errors`.
 | [`RM-VERIFY-001`](#rm-verify-001) | Required check is missing | yes |
 | [`RM-VERIFY-002`](#rm-verify-002) | Check ran against a different tree | yes |
 | [`RM-VERIFY-003`](#rm-verify-003) | Undeclared test skip | yes |
+| [`RM-VERIFY-004`](#rm-verify-004) | Check manifest is invalid | no |
+| [`RM-EVAL-001`](#rm-eval-001) | Evaluation suite is invalid | no |
 | [`RM-CI-002`](#rm-ci-002) | Required check never reported | yes |
 | [`RM-CI-003`](#rm-ci-003) | Merge queue check name does not match | yes |
 | [`RM-PROVIDER-001`](#rm-provider-001) | Unknown provider event shape | no |
@@ -155,6 +157,32 @@ A test that passed at the base commit is skipped or absent at the candidate, and
 - `runmill inspect <run-id>` — See the diff against the baseline inventory
 
 Recoverable: the run can continue once resolved.
+
+## RM-VERIFY-004
+
+**Check manifest is invalid**
+
+The repository declares its required checks in this file. An unreadable manifest must never be treated as 'no checks required', so it fails the run instead of being skipped.
+
+**Fix (pick one)**
+
+- `runmill config validate` — Check the manifest and report every problem at once
+- `runmill init` — Write a fresh manifest alongside the existing one
+
+Not recoverable: the run stops.
+
+## RM-EVAL-001
+
+**Evaluation suite is invalid**
+
+The suite defines what 'working' means for this repository. An unreadable or malformed suite must not be treated as an empty one, because a suite with no tasks trivially passes.
+
+**Fix (pick one)**
+
+- `runmill eval validate <suite>` — Check the suite structure and every task
+- Start from the example suite in examples/eval/
+
+Not recoverable: the run stops.
 
 ## RM-CI-002
 

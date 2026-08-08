@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, validateConfig, parseConfig } from "../../src/config/load.js";
@@ -10,8 +10,9 @@ let dir: string;
 const MINIMAL = `
 version: 1
 autonomy: pr-only
-provider:
-  implementation: codex
+providers:
+  implementer:
+    implementation: codex
 backlog:
   provider: linear
   team: ENG
@@ -49,8 +50,23 @@ describe("parseConfig", () => {
     const cfg = parseConfig(MINIMAL);
     expect(cfg.github.branchTemplate).toContain("{attempt}");
     expect(cfg.workspace.sandbox).toBe("native");
-    expect(cfg.workspace.gitIsolation).toBe("separate-git-dir");
+    expect(cfg.workspace.gitIsolation).toBe("clone");
     expect(cfg.budgets.maxAgentInvocations.total).toBeGreaterThan(0);
+  });
+
+  it("defaults git isolation to the mode WorkspaceManager considers safe", () => {
+    // These two defaults drifted apart: WorkspaceManager documents `clone` as
+    // the default and explains why (a linked worktree shares `.git` with the
+    // parent, so granting write access hands the agent `.git/hooks/pre-commit`
+    // and code execution in the orchestrator's context). parseConfig defaulted
+    // to `separate-git-dir` and the orchestrator passed it through, so the safe
+    // default never applied to a single real run.
+    const fromConfig = parseConfig(MINIMAL).workspace.gitIsolation;
+    expect(fromConfig).toBe("clone");
+
+    const manager = readFileSync("src/workspace/manager.ts", "utf8");
+    const managerDefault = manager.match(/input\.isolation \?\? "([a-z-]+)"/)?.[1];
+    expect(fromConfig, "config default must match WorkspaceManager's").toBe(managerDefault);
   });
 
   it("tolerates a yaml-language-server schema header", () => {
@@ -202,6 +218,71 @@ describe("loadConfig", () => {
     } catch (err) {
       expect((err as RunmillError).whatHappened).toMatch(/a\.md/);
       expect((err as RunmillError).whatHappened).toMatch(/b\.md/);
+    }
+  });
+});
+
+describe("the providers block", () => {
+  it("defaults the reviewer to inherit", () => {
+    const cfg = parseConfig(MINIMAL);
+    expect(cfg.providers.implementer.implementation).toBe("codex");
+    expect(cfg.providers.reviewer.implementation).toBe("inherit");
+  });
+
+  it("reads a model for each role independently", () => {
+    const cfg = parseConfig(
+      MINIMAL.replace(
+        "providers:\n  implementer:\n    implementation: codex",
+        [
+          "providers:",
+          "  implementer:",
+          "    implementation: codex",
+          "    model: fast",
+          "  reviewer:",
+          "    implementation: inherit",
+          "    model: strong",
+        ].join("\n"),
+      ),
+    );
+    expect(cfg.providers.implementer.model).toBe("fast");
+    expect(cfg.providers.reviewer.model).toBe("strong");
+  });
+
+  it("keeps max_turns and timeout_minutes shared by both roles", () => {
+    const cfg = parseConfig(
+      MINIMAL.replace("providers:", "providers:\n  max_turns: 12\n  timeout_minutes: 5"),
+    );
+    expect(cfg.providers.maxTurns).toBe(12);
+    expect(cfg.providers.timeoutMinutes).toBe(5);
+  });
+
+  it("rejects `inherit` for the implementer, which has nothing to inherit from", () => {
+    const cfg = parseConfig(MINIMAL);
+    const broken = {
+      ...cfg,
+      providers: { ...cfg.providers, implementer: { implementation: "inherit" as never } },
+    };
+    expect(validateConfig(broken).valid).toBe(false);
+  });
+
+  it("names the replacement when it finds the old provider/review.provider shape", () => {
+    // Parsing an old file to all-defaults would silently run codex on
+    // everything, which is the worst kind of migration: it looks like it worked.
+    try {
+      // The old shape: a `provider:` key and no `providers:`.
+      parseConfig(
+        MINIMAL.replace(
+          "providers:\n  implementer:\n    implementation: codex",
+          "provider:\n  implementation: claude",
+        ),
+      );
+      expect.unreachable("should reject the old shape");
+    } catch (err) {
+      expect(err).toBeInstanceOf(RunmillError);
+      const e = err as RunmillError;
+      expect(e.whatHappened).toContain("providers:");
+      expect(e.whatHappened).toContain("implementer:");
+      expect(e.whatHappened).toContain("reviewer:");
     }
   });
 });

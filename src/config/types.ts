@@ -5,11 +5,30 @@ import type { RepositoryRule } from "../queue/repository-mapping.js";
 export interface RunmillConfig {
   readonly version: 1;
   readonly autonomy: AutonomyMode;
-  readonly provider: {
-    readonly implementation: "codex" | "claude";
+  /**
+   * Which agent runs which role.
+   *
+   * One block rather than two, because picking the implementer and picking the
+   * reviewer is one decision made twice. Splitting it across `provider` and
+   * `review.provider` meant the second half was easy to miss, and the section
+   * that held it was also holding review policy that has nothing to do with
+   * which agent runs.
+   */
+  readonly providers: {
     readonly execution: "local";
     readonly maxTurns: number;
     readonly timeoutMinutes: number;
+    readonly implementer: {
+      readonly implementation: "codex" | "claude";
+      /** Model id passed to the CLI. Undefined means the CLI's own default. */
+      readonly model?: string | undefined;
+    };
+    readonly reviewer: {
+      /** `inherit` reuses the implementer's CLI. */
+      readonly implementation: "inherit" | "codex" | "claude";
+      /** Inherits the model only when the reviewer uses the implementer's CLI. */
+      readonly model?: string | undefined;
+    };
   };
   readonly backlog: {
     readonly provider: "linear" | "github-issues";
@@ -34,6 +53,15 @@ export interface RunmillConfig {
   readonly github: {
     readonly repositories: readonly RepositoryRule[];
     readonly branchTemplate: string;
+    /**
+     * Submit dependency chains as stacked pull requests.
+     *
+     * Off by default. It changes what a check on an upper layer proves, since
+     * that layer is verified against a tree containing unmerged work, and that
+     * is a decision to make deliberately.
+     */
+    readonly stackDependencyChains: boolean;
+    readonly stackMaxDepth: number;
     readonly draftPr: boolean;
     readonly merge: {
       readonly method: "squash" | "merge" | "rebase";
@@ -68,7 +96,6 @@ export interface RunmillConfig {
     readonly localReviewSkill?: string | undefined;
     readonly prReviewSkill?: string | undefined;
     readonly freshContext: true;
-    readonly provider: "inherit" | "codex" | "claude";
     readonly maxFixIterations: number;
     readonly mergeBlockingSeverities: readonly string[];
     readonly requireAllFindingsResolved: boolean;

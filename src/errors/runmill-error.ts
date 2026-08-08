@@ -154,6 +154,32 @@ export const ERROR_CATALOG = {
     recoverable: true,
   },
 
+  "RM-VERIFY-004": {
+    title: "Check manifest is invalid",
+    why:
+      "The repository declares its required checks in this file. An unreadable " +
+      "manifest must never be treated as 'no checks required', so it fails the " +
+      "run instead of being skipped.",
+    fixes: [
+      { description: "Check the manifest and report every problem at once", command: "runmill config validate" },
+      { description: "Write a fresh manifest alongside the existing one", command: "runmill init" },
+    ],
+    recoverable: false,
+  },
+
+  "RM-EVAL-001": {
+    title: "Evaluation suite is invalid",
+    why:
+      "The suite defines what 'working' means for this repository. An unreadable " +
+      "or malformed suite must not be treated as an empty one, because a suite " +
+      "with no tasks trivially passes.",
+    fixes: [
+      { description: "Check the suite structure and every task", command: "runmill eval validate <suite>" },
+      { description: "Start from the example suite in examples/eval/" },
+    ],
+    recoverable: false,
+  },
+
   // -- CI ----------------------------------------------------------------
   "RM-CI-002": {
     title: "Required check never reported",

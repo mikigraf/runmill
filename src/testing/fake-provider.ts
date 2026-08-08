@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type {
   AgentRunRequest,
@@ -87,6 +87,16 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
   #clock: Clock;
   #sessionSeq = 0;
   readonly startedRequests: AgentRunRequest[] = [];
+  /**
+   * Task packets as they were on disk when the agent was handed them.
+   *
+   * Read at start time rather than after the run: a successful run cleans up
+   * its workspace, so asserting against the file afterwards tests only that
+   * cleanup has not happened yet. What matters is what the agent received.
+   */
+  readonly capturedPackets: unknown[] = [];
+  /** The rendered issue document handed alongside each packet. */
+  readonly capturedIssueDocs: string[] = [];
 
   constructor(script: FakeProviderScript = {}, clock: Clock = new SystemClock()) {
     this.#script = script;
@@ -118,6 +128,11 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
 
   async start(request: AgentRunRequest): Promise<AgentSession> {
     this.startedRequests.push(request);
+    if (existsSync(request.taskPacketPath)) {
+      this.capturedPackets.push(JSON.parse(readFileSync(request.taskPacketPath, "utf8")));
+      const issueDoc = join(dirname(request.taskPacketPath), "issue.md");
+      if (existsSync(issueDoc)) this.capturedIssueDocs.push(readFileSync(issueDoc, "utf8"));
+    }
     this.#sessionSeq += 1;
     const sessionId = `fake-session-${this.#sessionSeq}`;
     const actions =
@@ -220,7 +235,22 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
 
       // Same contract the real adapter uses, so a role that produces output
       // in tests produces it in production and vice versa.
-      const output = this.#script.outputByRole?.[request.role] ?? DEFAULT_OUTPUT[request.role];
+      let output = this.#script.outputByRole?.[request.role] ?? DEFAULT_OUTPUT[request.role];
+      if (
+        this.#script.outputByRole?.[request.role] === undefined &&
+        (request.role === "local-reviewer" || request.role === "pr-reviewer")
+      ) {
+        const packet = JSON.parse(readFileSync(request.taskPacketPath, "utf8")) as {
+          acceptance_criteria?: readonly string[];
+        };
+        output = {
+          ...APPROVAL,
+          acceptance_criteria_met: (packet.acceptance_criteria ?? []).map((criterion) => ({
+            criterion,
+            met: true,
+          })),
+        };
+      }
       const contractPath = outputPathFor(request.workingDirectory, request.role);
       let outputRef = "";
       if (output !== undefined && contractPath !== undefined) {
