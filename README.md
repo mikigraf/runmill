@@ -227,6 +227,39 @@ protection rule, or an unparseable review all stop the run. Knowing when not to 
 | `guarded-merge` | May merge low-risk changes after every automated and repository gate passes |
 | `continuous` | Repeats guarded execution until work runs out, a budget is reached, or a breaker opens |
 
+## What it's built on
+
+runmill is deliberately thin. The parts that do the dangerous work are existing tools with real
+track records, not something invented here.
+
+**Isolation** is the OS, not a library. On Linux that's
+[bubblewrap](https://github.com/containers/bubblewrap) (LGPL-2.1), the unprivileged sandbox
+Flatpak uses, driven with `--unshare-net` and explicit bind mounts. On macOS it's Seatbelt via
+`sandbox-exec`, which is Apple system software rather than an open source project. Its own man
+page has said `DEPRECATED` for years while every sandboxed app on the platform continues to run on
+the framework underneath. That is a real risk worth knowing about, and it is why `doctor` reports
+what each mechanism can and cannot enforce instead of implying they are equivalent.
+
+**Coordination** is git. The lease is a ref pushed to `origin`, so mutual exclusion comes from a
+server-side atomic ref create and `--force-with-lease`, not from a lock service you have to run.
+
+**The coding agents** are [Codex](https://github.com/openai/codex) and
+[Claude Code](https://github.com/anthropics/claude-code). runmill treats both as opaque and does
+not tune their prompts or manage their context. Adding a third is a new dialect, not a rewrite.
+
+| Dependency | Does | License |
+|---|---|---|
+| [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) | Run state, events, and the side-effect outbox | MIT |
+| [commander](https://github.com/tj/commander.js) | CLI parsing | MIT |
+| [yaml](https://github.com/eemeli/yaml) | `runmill.yaml` and the check manifest | ISC |
+| [zod](https://github.com/colinhacks/zod) | Validates review output before it is trusted | MIT |
+| [@linear/sdk](https://github.com/linear/linear) | Backlog adapter | MIT |
+| [@octokit/rest](https://github.com/octokit/rest.js) | GitHub adapter | MIT |
+
+Six runtime dependencies, all MIT or ISC. `gh` is used to borrow an existing GitHub token, and
+`security` to read the macOS keychain; both are optional and runmill falls back to environment
+variables.
+
 ## Requirements
 
 - macOS or Linux, arm64 or x64. Windows is not supported; `doctor` says so rather than failing
