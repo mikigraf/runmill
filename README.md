@@ -35,7 +35,7 @@ Rejected (2):
 
 Two things worth noticing. `ENG-102` routed to `acme/ios` because it carries the `mobile` label and
 the first matching rule wins. And `ENG-106` sorted last despite being the oldest issue by seven
-years, because it has no priority — backlogs encode "no priority" as zero, which a naive sort puts
+years, because it has no priority. Backlogs encode "no priority" as zero, which a naive sort puts
 first.
 
 Now run the whole loop, still with no credentials:
@@ -69,15 +69,15 @@ removes it.
 
 **Run `npm run build` after every change.** The linked binary runs `dist/`, not your sources.
 `npm link` only builds when it actually installs, so re-linking an already-linked package does
-*not* rebuild — and a stale `dist/` looks exactly like a change that did not work. During
+*not* rebuild, and a stale `dist/` looks exactly like a change that didn't work. During
 development, skip the build and run the sources directly:
 
 ```bash
 npx tsx src/cli/main.ts <command>
 ```
 
-If that fails with `EACCES ... /usr/local/lib/node_modules` — the default npm prefix is root-owned
-on many macOS installs — point npm at a directory you own rather than reaching for `sudo`:
+If that fails with `EACCES ... /usr/local/lib/node_modules`, the default npm prefix is root-owned,
+which is common on macOS. Point npm at a directory you own rather than reaching for `sudo`:
 
 ```bash
 npm config set prefix ~/.npm-global
@@ -95,9 +95,9 @@ runmill next      # see what would be selected, and why everything else was not
 runmill run ENG-123
 ```
 
-`runmill init` infers your repository and base branch from git. Everything it cannot infer — your
-team, your workflow states, your merge policy — is left as an editable placeholder, because a
-guessed merge policy is not a guess worth making.
+`runmill init` infers your repository and base branch from git. Your team, workflow states, and
+merge policy are left as editable placeholders, because a guessed merge policy isn't a guess worth
+making.
 
 `runmill doctor` does not ask whether a sandbox exists. It builds one, tries to read `~/.ssh` from
 inside it, and fails if that succeeds.
@@ -137,7 +137,7 @@ Every command takes `--json`, `--quiet`, and `--config <path>`.
 
 | Variable | Does |
 |---|---|
-| `RUNMILL_DEMO=1` | Use an in-memory backlog, provider, and forge, seeded with the bundled example issues. Never inferred: a fake must not stand in for production silently |
+| `RUNMILL_DEMO=1` | In-memory backlog, provider, and forge, seeded with the bundled example issues. Never inferred, so a fake can't stand in for production without you knowing |
 | `RUNMILL_FAKE_BACKLOG=<file>` | Read issues from a JSON fixture instead of a live backlog |
 | `RUNMILL_SOURCE_REPO=<path>` | Repository to create run workspaces from. Defaults to the working directory |
 | `RUNMILL_DATA_DIR=<path>` | Where the state database and workspaces live. Defaults to `./.runmill/state` |
@@ -146,10 +146,9 @@ Every command takes `--json`, `--quiet`, and `--config <path>`.
 
 ## What it is
 
-runmill is not another coding model. It is the workflow, state, policy, and verification layer
-around Codex and Claude Code. It owns everything those agents should not: which issue to work on,
-how it is claimed, what context it gets, whether the tests that matter actually ran, whether the
-change is in scope, and whether it may merge.
+runmill wraps Codex and Claude Code. It handles the parts they don't: picking which issue to work
+on, claiming it so two workers can't take the same one, deciding what context the agent gets,
+checking that the tests you cared about actually ran, and deciding whether the result can merge.
 
 ```
 backlog issue ──▶ deterministic selection ──▶ atomic claim (git-ref lease)
@@ -166,25 +165,30 @@ governed pull request ──▶ CI reconciliation ──▶ risk-tiered merge �
 
 ## Design commitments
 
-- **The orchestrator owns side effects.** Backlog mutations, PR creation, and merging are executed
-  by deterministic code. The agent cannot widen its own authority.
-- **Verification is a coverage contract, not a green checkmark.** Success means every required
-  check was discovered, ran against the exact candidate commit in a clean detached worktree, and
-  completed without an undeclared skip. A passing command that never ran the suite that mattered
-  is a failure.
-- **Review is independent and evidence-bearing.** It runs in a fresh context with no implementer
-  narrative, and returns structured findings tied to file and line.
-- **Autonomy is risk-tiered.** `pr-only` is the default. Auto-merge unlocks only for low-risk
-  changes, and only with a credential that provably cannot edit branch protection.
-- **Failure is closed, not open.** Ambiguity, a missing check, an unreachable sandbox, or an
-  unparseable review stops the run. The most important capability is knowing when not to merge.
+The orchestrator owns every side effect. Backlog transitions, PR creation, and merges run in
+deterministic code, so the agent can't widen its own authority. It can add a required check; it
+can't remove one.
+
+Verification means coverage, not a green checkmark. Every required check has to be discovered, run
+against the exact candidate commit in a clean detached worktree, and finish without an undeclared
+skip. A command that exits 0 having run nothing has failed.
+
+Review happens in a fresh context with no implementer narrative, and returns findings tied to a
+file and a line. Its verdict is then cross-checked: a clean report on a diff touching risky paths
+escalates instead of being believed.
+
+Autonomy is tiered by risk. `pr-only` is the default. Auto-merge unlocks for low-risk changes only,
+and only with a credential that provably cannot edit branch protection.
+
+Runs fail closed. Ambiguity, a missing check, an unreachable sandbox, an unreadable branch
+protection rule, or an unparseable review all stop the run. Knowing when not to merge is the point.
 
 ## Autonomy modes
 
 | Mode | Behavior |
 |---|---|
 | `observe` | Selects and plans. No lease, no clone, no repository mutation |
-| `pr-only` | Implements, verifies, reviews, fixes, opens a PR. Never merges. **Default** |
+| `pr-only` | Implements, verifies, reviews, fixes, opens a PR. Never merges. The default |
 | `guarded-merge` | May merge low-risk changes after every automated and repository gate passes |
 | `continuous` | Repeats guarded execution until work runs out, a budget is reached, or a breaker opens |
 
@@ -193,14 +197,14 @@ governed pull request ──▶ CI reconciliation ──▶ risk-tiered merge �
 - macOS or Linux, arm64 or x64. Windows is not supported; `doctor` says so rather than failing
   obscurely.
 - Node 20.11+, git, and a GitHub repository.
-- Codex or Claude Code, installed and authenticated — unless running with `RUNMILL_DEMO=1`.
+- Codex or Claude Code, installed and authenticated, unless you're running with `RUNMILL_DEMO=1`.
 - A working sandbox: Seatbelt on macOS, bubblewrap on Linux. `runmill doctor --explain sandbox`
   covers what each platform can and cannot enforce.
 
 ## Configuration
 
 `runmill.yaml` is explicit rather than inferred, and `runmill init` writes a working starting point
-so "explicit" never means "author it from nothing". The schema ships in the repository:
+so you're never authoring it from nothing. The schema ships in the repository:
 
 ```yaml
 # yaml-language-server: $schema=./runmill.schema.json
@@ -211,22 +215,23 @@ autonomy: pr-only
 Validate with `runmill config validate`; see everything including defaults with
 `runmill config show`.
 
-Configuration is split by ownership, and location is a security property: **user policy**
-(autonomy, budgets, risk rules) lives outside the repository so an inbound pull request cannot
-change it; **repository policy** (checks, review rubrics) lives in the repository and is always
-read from the base commit and diffed; **runtime state** belongs to runmill alone.
+Where each file lives is a security property, not filing. Autonomy, budgets, and risk rules sit
+outside the repository, so an inbound pull request can't change how much authority runmill has.
+Checks and review rubrics sit inside it, versioned with the code, and are read from the base commit
+so a pull request can't relax the rules that govern its own merge. Runtime state belongs to runmill
+alone.
 
 ## Status
 
 | Phase | State |
 |---|---|
-| **Foundation** — CLI, config, state store, deterministic selection, git-ref lease | **Working** |
-| **Agent execution** — clone isolation, Seatbelt/bubblewrap sandbox, task packet | **Working** |
-| **Verified PR** — manifest resolution, freshness proof, skip detection, reviews | **Working** |
-| **Governed merge** — CI reconciliation, negative credential test, protected merge | **Working** |
-| **Live adapters** — Linear, Codex / Claude Code, GitHub | **Working** |
-| **Continuous operation** — daemon, circuit breakers | **Working** |
-| **Evaluation** — historical replay, held-out suites | **Working** |
+| Foundation: CLI, config, state store, selection, git-ref lease | Working |
+| Agent execution: clone isolation, Seatbelt/bubblewrap sandbox, task packet | Working |
+| Verified PR: manifest resolution, freshness proof, skip detection, reviews | Working |
+| Governed merge: CI reconciliation, negative credential test, protected merge | Working |
+| Live adapters: Linear, Codex / Claude Code, GitHub | Working |
+| Continuous operation: daemon, circuit breakers | Working |
+| Evaluation: historical replay, held-out suites | Working |
 | Behavior handbook | Specified |
 
 ## Documentation
@@ -235,8 +240,8 @@ Start at [`docs/`](./docs/README.md).
 
 | Document | Contents |
 |---|---|
-| [`docs/verification.md`](./docs/verification.md) | The coverage contract — why a green test run is not proof |
-| [`docs/leases.md`](./docs/leases.md) | The lease model — how two workers never take the same issue |
+| [`docs/verification.md`](./docs/verification.md) | Why a green test run isn't proof of anything |
+| [`docs/leases.md`](./docs/leases.md) | How two workers are stopped from taking the same issue |
 | [`docs/autonomy.md`](./docs/autonomy.md) | The seven merge gates, and what `guarded-merge` actually requires |
 | [`docs/sandbox.md`](./docs/sandbox.md) | What the agent can and cannot reach, per platform |
 | [`docs/lifecycle.md`](./docs/lifecycle.md) | Run states, the side-effect outbox, crash recovery |
@@ -252,6 +257,6 @@ Start at [`docs/`](./docs/README.md).
 
 MIT. See [`LICENSE`](./LICENSE).
 
-The license matters here for a specific reason: runmill reads your entire repository, holds a
+The license matters here for a specific reason. runmill reads your entire repository, holds a
 backlog credential and a GitHub token, and can merge to your default branch. The security model is
-a claim, and a permissive license is what lets you verify it instead of taking it on faith.
+a claim. A permissive license is what lets you check it instead of taking it on faith.
