@@ -74,6 +74,15 @@ export async function buildAdapters(
   let backlog: BacklogAdapter;
   let backlogLive = false;
   const fixture = process.env["RUNMILL_FAKE_BACKLOG"];
+  if (fixture !== undefined && fixture !== "" && !existsSync(fixture)) {
+    // Setting the variable is an explicit statement of intent. Falling through
+    // to "no Linear credential" would answer a question the operator did not
+    // ask and send them to fix the wrong thing.
+    throw RunmillError.fromCatalog("RM-CONFIG-002", {
+      whatHappened:
+        `RUNMILL_FAKE_BACKLOG points at a file that does not exist:\n  ${fixture}`,
+    });
+  }
   if (fixture !== undefined && existsSync(fixture)) {
     backlog = new FakeBacklogAdapter(JSON.parse(readFileSync(fixture, "utf8")));
   } else if (config.backlog.provider === "linear") {
@@ -107,7 +116,10 @@ export async function buildAdapters(
   let providerLive = false;
   const dialect = config.provider.implementation === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
   const cli = new CliProviderAdapter({ dialect });
-  const installation = wants("provider") ? await cli.detect() : { installed: false };
+  // Demo mode never uses the real provider, so probing for it is a subprocess
+  // spawn (and for one dialect an auth check) whose result is discarded.
+  const installation =
+    wants("provider") && !demo ? await cli.detect() : { installed: false };
 
   if (!wants("provider")) {
     provider = new FakeProviderAdapter();

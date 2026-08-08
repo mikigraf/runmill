@@ -28,7 +28,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
       - run: npm run typecheck
-      - run: npm test
+      # Coverage thresholds live in vitest.config.ts. Without this step they
+      # were configured but never enforced, so they could drift downward
+      # indefinitely without anything failing.
+      - run: npm run test:coverage
 
       - name: Error reference is current
         run: npm run docs:check

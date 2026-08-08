@@ -65,7 +65,19 @@ export async function checkGitHubCli(): Promise<CheckResult> {
 }
 
 export async function checkProvider(implementation: string): Promise<CheckResult> {
-  const bin = implementation === "claude" ? "claude" : "codex";
+  // An unrecognised implementation used to fall through to codex, so a typo in
+  // runmill.yaml produced a PASSING check for a provider nobody asked for.
+  if (implementation !== "codex" && implementation !== "claude") {
+    return {
+      id: `provider:${implementation}`,
+      status: "fail",
+      code: "RM-CONFIG-001",
+      observed: `unknown provider "${implementation}"`,
+      expected: "provider.implementation is codex or claude",
+      remediation: "runmill config validate",
+    };
+  }
+  const bin = implementation;
   const r = await tryRun(bin, ["--version"]);
   return {
     id: `provider:${implementation}`,

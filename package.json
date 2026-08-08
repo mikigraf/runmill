@@ -29,7 +29,8 @@
     "prepack": "npm run build",
     "docs:errors": "tsx scripts/gen-error-docs.ts",
     "docs:check": "tsx scripts/gen-error-docs.ts --check",
-    "verify:linux": "./scripts/verify-linux.sh"
+    "verify:linux": "./scripts/verify-linux.sh",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@linear/sdk": "^39.0.0",

@@ -177,6 +177,7 @@ export function parseConfig(source: string): RunmillConfig {
 }
 
 const AUTONOMY_MODES = new Set(["observe", "pr-only", "guarded-merge", "continuous"]);
+const PROVIDER_IMPLEMENTATIONS = new Set(["codex", "claude"]);
 
 /**
  * Structural and cross-field validation.
@@ -194,6 +195,16 @@ export function validateConfig(config: RunmillConfig): ValidationResult {
   if (!AUTONOMY_MODES.has(config.autonomy)) {
     errors.push(
       `autonomy must be one of ${[...AUTONOMY_MODES].join(", ")}, got "${String(config.autonomy)}"`,
+    );
+  }
+  if (!PROVIDER_IMPLEMENTATIONS.has(config.provider.implementation)) {
+    // Unvalidated, a typo was silently harmless-looking and materially wrong:
+    // anything that was not exactly "claude" resolved to codex, in the factory
+    // AND in doctor, so `implementation: cluade` reported a passing codex check
+    // and then ran codex for a team that had chosen claude.
+    errors.push(
+      `provider.implementation must be one of ${[...PROVIDER_IMPLEMENTATIONS].join(", ")}, ` +
+        `got "${String(config.provider.implementation)}"`,
     );
   }
   if (config.backlog.team === "") {
