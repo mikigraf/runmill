@@ -5,6 +5,10 @@ A control plane for autonomous software engineering.
 runmill continuously takes work from your backlog, dispatches it to coding agents, verifies and
 reviews what they produce, gets the change through CI and merge, and moves on to the next issue.
 
+The loop is the easy part, and your harness probably already has one. What makes it safe to leave
+running is everything around it: atomic claims, a bounded sandbox, proof the right tests ran, and a
+merge gate that fails closed.
+
 ## Try it in 60 seconds
 
 No credentials, no signup, no config to write. The quickstart runs against an in-memory backlog.
@@ -162,6 +166,39 @@ check-coverage proof ──▶ fresh-context review ──▶ fix loop
       ▼
 governed pull request ──▶ CI reconciliation ──▶ risk-tiered merge ──▶ next issue
 ```
+
+## Isn't this just a loop?
+
+The loop is three lines:
+
+```bash
+while :; do cat PROMPT.md | claude-code; done
+```
+
+That genuinely works when an oracle already exists. A flaky test is its own judge. A nightly e2e
+suite is its own judge. A Sentry exception tells you both when to start and when you're done. If
+that describes your problem, use the three lines. You don't need this.
+
+It stops working when nothing outside the model can tell you the work is finished. Then the exit
+condition becomes the model's own opinion, and "the agent said it was done" is a different claim
+from "it is done" in exactly the cases you care about.
+
+runmill is the exit condition. Concretely, before anything reaches a pull request:
+
+- Two workers cannot claim the same issue, because the claim is a compare-and-swap on a git ref
+  and every later mutation is fenced on a generation number.
+- The agent runs under Seatbelt or bubblewrap with your credentials denied, and `doctor` proves
+  the denial by planting a secret and failing if it can be read.
+- Every required check is discovered, run against the exact candidate commit in a clean detached
+  worktree, and checked for undeclared skips. A suite that exits 0 having discovered no tests
+  fails.
+- Review runs in a fresh context, and its verdict is cross-checked. A clean report on a diff
+  touching risky paths escalates rather than being believed.
+- Merging stays locked until the credential provably cannot edit branch protection.
+
+None of that is novel. It's mutual exclusion, least privilege, provenance, and separation of
+duties, which is the point: once the worker is nondeterministic, the old answers stop being
+optional.
 
 ## Design commitments
 
