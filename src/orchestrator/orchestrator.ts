@@ -18,6 +18,7 @@ import { RunmillError , errorMessage } from "../errors/runmill-error.js";
 import { renderPullRequestBody } from "./pr-body.js";
 import { outputContractFor } from "../agent/output-contract.js";
 import { snapshotHash } from "../domain/snapshot.js";
+import { RunLog } from "../state/run-log.js";
 
 export type RunState =
   | "DISCOVERED"
@@ -96,6 +97,7 @@ export class Orchestrator {
   readonly #d: OrchestratorDeps;
   readonly #workspaces: WorkspaceManager;
   readonly #verification: VerificationEngine;
+  readonly #runLog: RunLog;
   #state: RunState = "DISCOVERED";
   #version = 1;
 
@@ -103,6 +105,7 @@ export class Orchestrator {
     this.#d = deps;
     this.#workspaces = deps.workspaces ?? new WorkspaceManager();
     this.#verification = deps.verification ?? new VerificationEngine();
+    this.#runLog = new RunLog(join(deps.sourceRepoPath, ".runmill", "log.md"));
   }
 
   /** The adapter that runs review roles. Falls back to the implementer's. */
@@ -160,6 +163,7 @@ export class Orchestrator {
     let workspace: Workspace | undefined;
     let branch: string | undefined;
     let costUsd = 0;
+    let logged = false;
 
     /**
      * Record the terminal state before returning it.
@@ -177,7 +181,7 @@ export class Orchestrator {
           // outcome is still returned truthfully.
         }
       }
-      return {
+      const outcome: RunOutcome = {
         runId,
         issueId: issue.identifier,
         finalState: state,
@@ -185,6 +189,27 @@ export class Orchestrator {
         ...(branch === undefined ? {} : { branch }),
         ...extra,
       };
+      if (
+        !logged &&
+        (state === "PR_DELIVERED" || (state === "COMPLETED" && extra.reason !== "observe mode"))
+      ) {
+        try {
+          this.#runLog.append({
+            at: this.#d.clock.now(),
+            issue,
+            outcome: state,
+            runId,
+            costUsd,
+            ...(extra.prNumber === undefined ? {} : { prNumber: extra.prNumber }),
+            ...(extra.prUrl === undefined ? {} : { prUrl: extra.prUrl }),
+            ...(extra.mergeSha === undefined ? {} : { mergeSha: extra.mergeSha }),
+          });
+          logged = true;
+        } catch (err) {
+          this.#log(`could not append .runmill/log.md: ${errorMessage(err)}`);
+        }
+      }
+      return outcome;
     };
 
     try {

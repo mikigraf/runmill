@@ -1,7 +1,7 @@
 {
   "name": "runmill",
   "version": "0.1.0",
-  "description": "A control plane for autonomous software engineering. Turns a backlog into governed pull requests.",
+  "description": "Loop orchestrator daemon for autonomous software engineering. Turns backlog issues into reviewed pull requests.",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -35,20 +35,21 @@
     "prepublishOnly": "npm run typecheck && npm run test:coverage && npm run docs:check"
   },
   "dependencies": {
-    "@linear/sdk": "^39.0.0",
-    "@octokit/rest": "^21.1.1",
-    "better-sqlite3": "^11.8.1",
-    "commander": "^13.1.0",
-    "yaml": "^2.7.0",
-    "zod": "^4.4.3"
+    "@linear/sdk": "39.2.1",
+    "@octokit/rest": "21.1.1",
+    "@opentui/core": "0.5.1",
+    "better-sqlite3": "11.10.0",
+    "commander": "13.1.0",
+    "yaml": "2.9.0",
+    "zod": "4.4.3"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.12",
-    "@types/node": "^22.13.1",
-    "@vitest/coverage-v8": "^3.0.5",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.3",
-    "vitest": "^3.0.5"
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "22.20.1",
+    "@vitest/coverage-v8": "3.2.7",
+    "tsx": "4.23.9",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
   },
   "repository": {
     "type": "git",
@@ -62,6 +63,8 @@
     "ai",
     "coding-agent",
     "automation",
-    "cli"
+    "cli",
+    "tui",
+    "daemon"
   ]
 }

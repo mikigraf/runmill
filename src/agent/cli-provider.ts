@@ -108,7 +108,8 @@ export const CLAUDE_DIALECT: ProviderDialect = {
   capabilities: { ...BASE_CAPABILITIES, sessionResume: true, costReporting: true },
   configPaths: (home) => [join(home, ".claude"), join(home, ".config", "claude")],
   modelArgs: (model) => ["--model", model],
-  authArgs: () => ["-p", "ping", "--max-turns", "1"],
+  // A status probe must not dispatch a billable model request.
+  authArgs: () => ["auth", "status"],
   isAuthenticated: (stdout, stderr, code) =>
     code === 0 || !/not logged in|authentication|api key/i.test(`${stdout}${stderr}`),
   buildArgs: (request, prompt) => [

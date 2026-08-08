@@ -271,6 +271,15 @@ describe("end-to-end: issue to governed pull request", () => {
     expect(packet.constraints.forbidden_paths).toContain(".github/**");
   }, 60_000);
 
+  it("records a delivered issue once in the markdown activity log", async () => {
+    const { orchestrator } = makeOrchestrator({});
+    await orchestrator.run({ runId: "run_log", issue: ISSUE, target: TARGET, lease: lease("run_log") });
+    const body = readFileSync(join(source, ".runmill", "log.md"), "utf8");
+    expect(body).toMatch(/\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}/);
+    expect(body).toContain("**ENG-101** Add a greeting helper");
+    expect(body.match(/run `run_log`/g)).toHaveLength(1);
+  }, 60_000);
+
   it("fences the issue body as untrusted data", async () => {
     const provider = defaultProvider();
     const { orchestrator } = makeOrchestrator({ provider });
