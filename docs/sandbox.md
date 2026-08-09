@@ -2,6 +2,8 @@
 
 > Implemented in [`src/workspace/sandbox.ts`](../src/workspace/sandbox.ts).
 
+The sandbox bounds agent execution during the **Run** stage of Runmill's delivery loop.
+
 runmill runs the coding agent as an **untrusted process**. It gets your source tree and nothing
 else: no SSH keys, no cloud credentials, no GitHub token, no keychain. That is enforced by the
 operating system, not by asking the agent nicely in a prompt.

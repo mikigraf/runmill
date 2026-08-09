@@ -2,6 +2,8 @@
 
 > Implemented in [`src/queue/git-lease.ts`](../src/queue/git-lease.ts).
 
+The lease is the ownership boundary in the **Queue** stage of Runmill's delivery loop.
+
 Two runmill workers pointed at the same backlog must never work the same issue. That sounds like
 a job for the issue tracker — move it to "In Progress", assign the bot, and check before starting.
 It is not, and the reason is worth being precise about.

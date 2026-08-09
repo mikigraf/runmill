@@ -7,9 +7,16 @@ timestamps use local `DD/MM/YYYY HH:mm` format and 24-hour time.
 > Implemented in [`src/orchestrator/orchestrator.ts`](../src/orchestrator/orchestrator.ts) and
 > [`src/state/store.ts`](../src/state/store.ts).
 
-A run is one issue moving from the backlog to a pull request, and possibly to a merge. It is a
-state machine with durable transitions, so a crash is a resumable event rather than an
-investigation.
+A run is Runmill's durable unit of engineering work:
+
+> One issue → one claim → one isolated implementation → one evidence bundle → one delivery
+> decision.
+
+It records the selected issue, repository and base revision, agent configuration, candidate
+commit, verification evidence, independent review, side effects, PR and CI state, merge decision,
+and the reason for any stop, retry, quarantine, or escalation. The run moves from the backlog to a
+pull request, and possibly to a merge, through durable state transitions. A crash is therefore a
+resumable event rather than an investigation.
 
 The daemon is the outer loop around this state machine. It performs one run at a time and polls
 again while idle; see [daemon operation](./daemon.md).

@@ -2,6 +2,8 @@
 
 > Implemented in [`src/verification/engine.ts`](../src/verification/engine.ts).
 
+This coverage contract supplies the evidence for the **Verify** stage of Runmill's delivery loop.
+
 Most automation treats a green command as proof. It is not. A command that exits 0 answers
 exactly one question — *did this process end well?* — and merge-readiness depends on four:
 

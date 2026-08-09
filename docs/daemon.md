@@ -1,8 +1,8 @@
 # Daemon operation
 
-`runmill daemon` is the long-running mode. It watches the configured backlog, runs one issue at a
-time, and waits when there is nothing eligible. Adding a new eligible issue is enough to wake the
-work loop on its next poll.
+`runmill daemon` supplies the **Repeat** step in Runmill's backlog-to-PR loop. It watches the
+configured backlog, executes one engineering run at a time, and waits when there is nothing
+eligible. Adding a new eligible issue is enough to start another run on the next poll.
 
 ```bash
 runmill daemon

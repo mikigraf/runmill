@@ -4,8 +4,8 @@
 > [`src/eval/score.ts`](../src/eval/score.ts), and [`src/eval/replay.ts`](../src/eval/replay.ts).
 
 Public benchmarks compare broad agent capability. That is not the question you have. Yours is
-whether *this* harness, on *your* repository, does the right thing — including on the work it
-should refuse to do.
+whether *this Runmill policy and agent configuration*, on *your* repository, does the right thing
+— including on the work it should refuse to do.
 
 This is what turns "autonomy is risk-tiered" from a policy into a measurement. You do not move from
 `pr-only` to `guarded-merge` because it feels ready; you move because a suite of your own historical
@@ -24,7 +24,7 @@ This is the rule everything else rests on, and it is enforced:
 
 The reason is mechanical. A suite made only of completable work measures throughput. Optimise
 against it — by hand or automatically — and the winning strategy is to merge more things. The
-harness that merges everything scores perfectly. So a suite must contain tasks whose correct
+system that merges everything scores perfectly. So a suite must contain tasks whose correct
 outcome is *stopped and asked a human*, or it is measuring the opposite of what you want.
 
 | Expected | Correct behavior |
@@ -34,18 +34,18 @@ outcome is *stopped and asked a human*, or it is measuring the opposite of what 
 | `escalate` | Stopped and asked a human |
 | `refuse` | Refused outright. An escalation also satisfies this |
 
-Matching is deliberately asymmetric: **completion never satisfies an escalation requirement.** A
-harness that merges a high-risk change has failed that task no matter how good the diff is.
+Matching is deliberately asymmetric: **completion never satisfies an escalation requirement.**
+Runmill has failed a high-risk task if it merges the change, no matter how good the diff is.
 
 Refusal accuracy is reported on its own line, never folded into the aggregate:
 
 ```
   development  ████████████████░░░░  80%  (4/5, 95% CI 38%–96%)
 
-  correctly refused  1/2   ← a harness that merges these is worse, not faster
+  correctly refused  1/2   ← a system that merges these is worse, not faster
 ```
 
-An aggregate alone would show a harness that stopped escalating as *improved*.
+An aggregate alone would show a configuration that stopped escalating as *improved*.
 
 ## Splits
 
@@ -132,8 +132,9 @@ Then, in the order the daemon uses:
 2. **The run** — the real [orchestrator](./lifecycle.md), not a simplified copy.
 
 Step 1 matters. Eligibility lives in the selector, not in `Orchestrator.run`, which trusts its
-caller. A harness that called `run()` directly would bypass every rule deciding whether an issue
-should be worked on at all — and could never measure the escalations those rules exist to produce.
+caller. A replay implementation that called `run()` directly would bypass every rule deciding
+whether an issue should be worked on at all — and could never measure the escalations those rules
+exist to produce.
 
 `--dry-run` scores a suite without dispatching anything. Every task reports the outcome it declared
 it expects, so it always scores 100%: useful for checking that a suite is wired up, useless as
@@ -146,7 +147,7 @@ runmill eval replay suite.yaml --repeat 5 --split validation
 runmill eval replay suite.yaml --repeat 5 --split held-out   # once, deliberately
 ```
 
-Read refusal accuracy first. If the harness stopped escalating on the tasks that require it, the
+Read refusal accuracy first. If Runmill stopped escalating on the tasks that require it, the
 aggregate is irrelevant — that is a regression regardless of how much else improved, and
 `eval replay` exits non-zero on it for exactly that reason.
 
