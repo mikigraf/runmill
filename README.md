@@ -1,6 +1,6 @@
 # Runmill
 
-## Stop giving coding agents prompts. Give them a backlog.
+## Just give your agents a backlog
 
 *Backlog-to-PR orchestration for coding agents*
 
