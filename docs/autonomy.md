@@ -2,9 +2,14 @@
 
 > Implemented in [`src/orchestrator/orchestrator.ts`](../src/orchestrator/orchestrator.ts).
 
+Autonomy modes govern the **Deliver** stage of Runmill's delivery loop.
+
 Autonomy is a dial with four positions, and the interesting question is not "how much can it do"
 but "what has to be *provable* before it does". Every mode below `continuous` differs from the one
 above it by a specific gate, not by a vague sense of caution.
+
+The agent may operate autonomously inside implementation and review. These modes govern the
+deterministic workflow around the task: claims, repository effects, PR delivery, and merge policy.
 
 | Mode | Does | Never does |
 |---|---|---|

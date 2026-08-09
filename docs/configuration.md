@@ -9,6 +9,10 @@ For automation or a quick starting point, `runmill config create --defaults` acc
 values and conservative defaults without prompting. Existing files are preserved unless `--force`
 is provided.
 
+The configuration is the team's delivery policy in executable form: which backlog work is
+eligible, how issues map to repositories, which agent implements and reviews, which checks and
+paths matter, what budgets apply, and when a run may continue, retry, merge, or require a person.
+
 Two files, split by **ownership** — and the split is a security property, not an organizational
 preference.
 
