@@ -2,34 +2,27 @@
 
 ## Just give your agents a backlog
 
-*Backlog-to-PR orchestration for coding agents*
+**Your coding agent shouldn't wait for your next prompt.**
 
-Runmill continuously picks up eligible Linear issues, runs Codex or Claude Code in an isolated
-workspace, verifies the exact candidate commit, starts a fresh-context review, opens the GitHub pull
-request, waits for CI, and moves on to the next issue.
+Runmill gives Codex and Claude Code a backlog and keeps them working through it.
 
-Your agents code. Runmill keeps the delivery loop moving. Deterministic orchestration controls
-claims, workspaces, checks, repository side effects, pull requests, and merge policy.
+It picks up eligible Linear issues, gives each one an isolated workspace, runs the agent, verifies the exact commit it produced, sends the change through a fresh-context review, opens the pull request, waits for CI, and then picks up the next issue.
+
+Your agents write code. Runmill keeps the engineering loop running.
 
 ![Runmill OpenTUI showing a live agent review, verification events, and daemon logs](./assets/runmill-tui.gif)
 
-The dashboard follows one issue from claim through implementation, exact-candidate checks,
-fresh-context review, and PR delivery, then shows Runmill waiting for more work.
+[Documentation](./docs/README.md) · [Configuration](./docs/configuration.md) · [Daemon operations](./docs/daemon.md)
 
-[Documentation](./docs/README.md) · [Configuration](./docs/configuration.md) ·
-[Daemon operations](./docs/daemon.md)
+## Your backlog is the prompt
 
-## The delivery loop around your coding agents
+Coding agents are already pretty good at completing a task once you give them one.
 
-A coding agent can complete one task. Runmill keeps the entire backlog-to-PR delivery loop
-running.
+The annoying part is everything around that task.
 
-Starting another agent session is easy. Operating a queue of real engineering work is not.
-Someone still has to select eligible work, prevent duplicate claims, isolate each change, collect
-the required evidence, get an independent review, deliver the pull request, and start again.
+Someone still has to decide what they should work on next, make sure two agents do not pick up the same issue, create an isolated workspace, run the right checks, review what they produced, open the PR, wait for CI, update the backlog, and then start the whole thing again.
 
-Runmill is not another coding agent and it does not replace CI. It operates the delivery loop
-between Linear, Codex or Claude Code, your repository checks, and GitHub.
+Runmill does that part.
 
 **Queue → Run → Verify → Review → Deliver → Repeat**
 
@@ -39,66 +32,69 @@ queue → claim → implement → verify → fresh review → deliver
   └──────────────── wait for more work ←─────────────────┘
 ```
 
+Runmill is not another coding agent and it is not a replacement for CI. It is the deterministic delivery loop around the agents you already use.
+
 ### Queue
 
-Runmill watches Linear, filters eligible issues, routes each issue to the right repository, and
-uses a Git-backed lease so two workers cannot take the same task.
+Runmill watches Linear for eligible work, routes each issue to the right repository, and claims it using a Git-backed lease so two workers cannot accidentally take the same task.
 
 ### Run
 
-Each issue gets an isolated workspace, a bounded task packet, an implementer, and explicit cost,
-time, and risk limits. Durable state preserves the run through interruptions.
+Every issue gets its own isolated workspace and a bounded task packet.
+
+Codex or Claude Code implements the change within the configured time, cost, and risk limits. Run state is durable, so an interruption does not mean starting from zero.
 
 ### Verify
 
-Required checks run against the exact candidate commit in a clean checkout. Missing or stale
-evidence stops the run.
+Runmill checks the actual candidate commit, not whatever happens to be in the workspace later.
+
+Required checks run against that commit in a clean checkout. If evidence is missing or stale, the run stops.
 
 ### Review
 
-A separate reviewer starts with fresh context and must account for every acceptance criterion.
-Blocking findings enter a bounded fix loop; unresolved uncertainty escalates to a person.
+The reviewer starts from fresh context instead of inheriting the implementer's reasoning.
+
+It has to account for every acceptance criterion. Blocking findings go through a bounded fix loop. If Runmill cannot establish enough confidence to continue, it gives the run to a person.
 
 ### Deliver
 
-Runmill pushes the branch, opens the pull request, waits for CI, applies the configured merge
-policy, updates the backlog, and records the outcome.
+Once the gates pass, Runmill pushes the branch, opens the GitHub pull request, waits for CI, applies the configured merge policy, and updates the backlog.
 
 ### Repeat
 
-Runmill takes the next eligible issue. When the queue is empty, it waits instead of terminating.
+Then it takes the next issue.
 
-## One issue, one engineering run
+If there is nothing to do, it waits.
 
-An engineering run is Runmill's durable unit of work:
+That sounds obvious, but it is an important difference from scripts that process one task and terminate. Runmill is meant to keep a real engineering queue moving.
 
-- the selected issue, repository, and base revision;
-- implementer and reviewer configuration;
-- candidate commit, check evidence, and independent review;
-- intended and completed external side effects;
-- pull request, CI, and merge-policy status; and
-- the reason the work continued, stopped, retried, escalated, or entered quarantine.
+## Agents write code. Deterministic code owns the workflow.
 
-SQLite is the system of record. `.runmill/log.md` is the readable, timestamped journal of completed
-deliveries and merges.
+There is one boundary in Runmill that is deliberate:
 
-## Your agents code. Runmill owns the delivery loop.
+**The agent can propose and review code. It does not get to own the delivery system.**
 
-Codex or Claude Code implements and reviews the change. Runmill decides what is eligible, acquires
-the lease, constructs the workspace, runs required checks, controls pushes and pull requests,
-applies merge policy, and records every transition and external effect.
+Agents do not mutate the backlog, push branches, create pull requests, or merge changes directly. Runmill's deterministic orchestration code owns those effects.
 
-**Agents never own backlog mutations, pushes, pull requests, or merges; deterministic
-orchestration code does.**
+For every issue, Runmill keeps an engineering run containing:
 
-This is the boundary: language models propose and inspect software changes; deterministic code
-owns workflow state and irreversible effects. Runmill does not claim the code is correct. It
-records what was checked, what was reviewed, which policy ran, and why the change was allowed to
-continue.
+* the issue, repository, and base revision;
+* the implementer and reviewer configuration;
+* the candidate commit and verification evidence;
+* the independent review;
+* intended and completed external effects;
+* PR, CI, and merge-policy state; and
+* why the run continued, retried, stopped, escalated, or entered quarantine.
+
+SQLite is the system of record. `.runmill/log.md` gives you a readable, timestamped journal of completed deliveries and merges.
+
+Runmill does **not** claim that an agent-generated change is correct.
+
+It tells you something much more defensible: exactly what was checked, what was reviewed, which policy ran, and why Runmill allowed the change to continue.
 
 ## Quick start
 
-Runmill is not published to npm yet:
+Runmill is not on npm yet.
 
 ```bash
 git clone https://github.com/mikigraf/runmill.git
@@ -108,25 +104,22 @@ npm run build
 npm link
 ```
 
-Direct runtime and development dependencies are pinned to exact versions. `npm ci` installs the
-lockfile without silently moving the agent execution stack underneath you.
-
-In the repository you want it to manage:
+Then, inside the repository you want Runmill to manage:
 
 ```bash
-runmill config create   # guided setup with discovered GitHub, Linear and agent options
-runmill init            # add the check manifest and review rules
-runmill doctor          # verify credentials, CLIs, Git and sandbox support
-runmill next            # preview selection without changing anything
-runmill daemon --detach # start the backlog worker in the background
-runmill tui             # open the live interface from any directory
+runmill config create   # configure GitHub, Linear and your agents
+runmill init            # add checks and review rules
+runmill doctor          # make sure the environment is ready
+runmill next            # see what Runmill would pick up next
+runmill daemon --detach # give it the backlog
+runmill tui             # watch it work
 ```
 
-The setup wizard uses authenticated `gh`, Linear credentials, Codex, and Claude when available. It
-lets you use installed CLI subscriptions or API keys, preloads repositories and Linear workflow
-values, and writes conservative defaults. Secrets are never written to `runmill.yaml`.
+The setup wizard discovers authenticated `gh`, Linear credentials, Codex, and Claude when available. You can use installed CLI subscriptions or API keys.
 
-For CI or scripted setup:
+Secrets are never written to `runmill.yaml`.
+
+For CI or scripted environments:
 
 ```bash
 runmill config create --defaults
@@ -134,20 +127,35 @@ runmill config validate
 runmill daemon --once
 ```
 
-`--once` drains the work that is eligible now and exits. Without it, `daemon` checks the backlog
-every 30 seconds while idle. Change that with `--poll-seconds`; use `--max-runs` for a bounded
-session.
+`--once` processes the work that is currently eligible and exits.
 
-`runmill tui` is an OpenTUI dashboard for the running daemon. It discovers a user-private local
-socket, so it works from any directory and does not need `runmill.yaml`. The dashboard shows live
-daemon status and logs, recent runs, the active orchestration pipeline, transitions, agent events,
-and pending external effects. It can also request a safe stop at the next run boundary. Runmill
-automatically launches this one command with Bun because OpenTUI's native renderer needs it on the
-Node versions Runmill otherwise supports.
+Without it, Runmill keeps watching the backlog. By default it checks every 30 seconds while idle.
 
-## Try it without credentials
+## Watch it work
 
-The included demo uses in-memory integrations:
+`runmill tui` opens the live OpenTUI interface for a running daemon.
+
+You can see what Runmill is working on, where the current issue is in the pipeline, what the agents are doing, verification and review events, recent runs, logs, and pending external effects.
+
+You can start Runmill in the background:
+
+```bash
+runmill daemon --detach
+```
+
+and open the TUI from another directory:
+
+```bash
+runmill tui
+```
+
+The TUI talks to the daemon over a user-private `0600` Unix socket. It does not open Runmill's database or guess where your project lives.
+
+It can also ask the daemon to stop safely at the next run boundary.
+
+## Try it without giving it credentials
+
+There is an explicit demo mode with in-memory integrations:
 
 ```bash
 cd examples/quickstart
@@ -155,11 +163,11 @@ RUNMILL_DEMO=1 npx tsx ../../src/cli/main.ts next --dry-run
 RUNMILL_DEMO=1 npx tsx ../../src/cli/main.ts daemon --once
 ```
 
-Demo mode is explicit. Runmill never silently substitutes a fake integration in production.
+Runmill never silently replaces a real integration with a fake one.
 
 ## Configuration
 
-A minimal `runmill.yaml`:
+A minimal `runmill.yaml` looks like this:
 
 ```yaml
 # yaml-language-server: $schema=./runmill.schema.json
@@ -186,128 +194,156 @@ github:
       base_branch: main
 ```
 
-The implementer and reviewer may use the same CLI, different models, or different providers. A
-different provider is useful, but not required: every review starts without the implementer's
-history either way.
+The implementer and reviewer can use different providers or the same one.
 
-See the [configuration reference](./docs/configuration.md) for checks, budgets, risk paths,
-repository routing, credentials, and merge policy.
+For example, Codex can implement and Claude can review. Or Codex can do both. The important part is that the review starts without the implementer's conversation history.
 
-## Start with well-scoped work
+See the [configuration reference](./docs/configuration.md) for checks, budgets, repository routing, risk paths, credentials, and merge policies.
 
-Runmill is best suited to issues with clear acceptance criteria, bounded repository scope,
-deterministic checks, and repeatable review requirements: test repair, dependency maintenance,
-narrow bug fixes, small refactors, type-safety work, and code-adjacent maintenance. Connect one
-Linear team and one GitHub repository, start in `pr-only`, and let uncertain runs escalate.
+## Start with boring work
 
-## Built to keep the queue moving
+Runmill works best when the task has clear acceptance criteria, bounded repository scope, deterministic checks, and a reasonably repeatable definition of done.
 
-- **A real idle state.** `daemon` waits for new Linear issues instead of exiting when the queue is
-  empty. GitHub is currently the repository, CI, and pull-request integration; GitHub Issues is a
-  declared backlog type but does not yet have a live adapter.
-- **No laptop naps mid-run.** Runmill starts `caffeinate` on macOS or `systemd-inhibit` on Linux
-  and releases it when the process stops.
-- **Safe stopping.** `SIGINT` and `SIGTERM` finish the in-flight run boundary before exiting.
-- **Circuit breakers.** Repeated failures, quarantines, escalation rates, and daily spend can stop
-  the daemon before one bad condition is repeated across the backlog.
-- **Durable state.** Leases, transitions, check evidence, and intended side effects survive a
-  restart.
-- **Operator-friendly output.** Human-readable commands by default; `--json`, stable exit codes,
-  `inspect`, `list --needs-attention`, and `doctor --report` for automation and support.
-- **A remote terminal UI.** Start with `runmill daemon --detach`, then use `runmill tui` anywhere
-  on the same machine. The client reads daemon state over a `0600` Unix socket rather than guessing
-  paths or opening the database itself.
+Good first workloads include:
 
-## Autonomy modes
+* test repairs;
+* dependency maintenance;
+* narrow bug fixes;
+* small refactors;
+* type-safety work; and
+* code-adjacent maintenance.
 
-| Mode | Behavior |
-|---|---|
-| `observe` | Select and plan without claiming work or changing a repository |
-| `pr-only` | Implement, verify, review, and open a pull request; never merge |
-| `guarded-merge` | Merge eligible low-risk changes after every gate passes |
-| `continuous` | Use guarded merge policy across repeated daemon runs |
+Do not start by handing it your company's most ambiguous architectural project.
 
-`pr-only` is the default. A daemon can run continuously in any active mode; the autonomy setting
-controls what each run may do, not whether the process stays alive.
+Connect one Linear team, one GitHub repository, leave Runmill in `pr-only`, and see what happens.
 
-## Evidence before delivery
+Uncertain runs escalate instead of pretending they are certain.
 
-- Git-ref leases prevent two workers from taking the same issue.
-- Agent workspaces run under Seatbelt on macOS or bubblewrap on Linux.
-- Required checks run against the exact candidate commit in a clean checkout.
-- Reviews run with fresh context and must account for every acceptance criterion.
-- Sensitive paths and incomplete evidence escalate instead of merging.
-- Deterministic orchestration—not the agent—changes backlog state, pushes, opens PRs, and merges.
+## Built for unattended runs
 
-Runmill does not claim that an agent's code is correct. It records what was checked, what was
-reviewed, which policy ran, and why the change was allowed to continue.
+A few things become surprisingly important once you stop sitting in front of the agent.
+
+**It actually idles.**
+When the Linear queue is empty, Runmill waits for more work instead of terminating.
+
+**Your laptop does not fall asleep halfway through an issue.**
+Runmill uses `caffeinate` on macOS or `systemd-inhibit` on Linux while it is running.
+
+**Stopping it does not kill whatever happens to be in flight.**
+`SIGINT` and `SIGTERM` request a safe stop at the next run boundary.
+
+**One bad condition cannot churn through your entire backlog.**
+Circuit breakers can stop the daemon based on repeated failures, quarantines, escalation rates, or daily spend.
+
+**State survives restarts.**
+Leases, transitions, check evidence, and intended external effects are durable.
+
+**You can see when Runmill needs you.**
+
+```bash
+runmill list --needs-attention
+runmill inspect <run-id>
+runmill policy explain <run-id>
+```
+
+## How much autonomy do you want?
+
+Runmill has four autonomy modes:
+
+| Mode            | What Runmill can do                                                 |
+| --------------- | ------------------------------------------------------------------- |
+| `observe`       | Select and plan work without claiming it or changing the repository |
+| `pr-only`       | Implement, verify, review, and open a PR, but never merge           |
+| `guarded-merge` | Merge eligible low-risk changes after every configured gate passes  |
+| `continuous`    | Keep applying guarded merge policy across repeated runs             |
+
+`pr-only` is the default.
+
+The daemon can run continuously in any active mode. The autonomy setting controls what an individual run is allowed to do, not whether Runmill stays alive.
+
+## Evidence before autonomy
+
+Runmill is deliberately conservative about what counts as evidence:
+
+* Git-ref leases prevent duplicate claims.
+* Agent workspaces are sandboxed with Seatbelt on macOS or bubblewrap on Linux.
+* Required checks run against the exact candidate commit in a clean checkout.
+* Reviews start with fresh context and cover every acceptance criterion.
+* Sensitive paths and incomplete evidence escalate.
+* Deterministic orchestration—not the agent—owns backlog mutations, pushes, PRs, and merges.
+
+The goal is not to pretend autonomous coding is magically safe.
+
+The goal is to make the boundary between **what the model decided** and **what the system allowed** explicit.
 
 ## Useful commands
 
-| Command | Purpose |
-|---|---|
-| `runmill config create` | Create a config from discovered tools and integrations |
-| `runmill config validate` | Validate the config and check manifest |
-| `runmill config show` | Print the resolved config and defaults |
-| `runmill doctor` | Check the host, credentials, agent CLIs, and sandbox |
-| `runmill next` | Show the next issue and explain rejected candidates |
-| `runmill prepare <issue>` | Check whether one issue is ready |
-| `runmill run [issue]` | Process one issue |
-| `runmill daemon` | Watch the backlog and process work continuously |
-| `runmill daemon --detach` | Start the daemon in the background |
-| `runmill daemon --once` | Drain eligible work and exit |
-| `runmill tui` | Open the live OpenTUI dashboard from any directory |
-| `runmill list --needs-attention` | Show runs waiting for a person |
-| `runmill inspect <run-id>` | Show transitions, evidence, and pending effects |
-| `runmill resume <run-id>` | Resume a paused run |
-| `runmill policy explain <run-id>` | Explain a merge decision |
-| `runmill auth status` | Show available credentials |
-| `runmill auth login` / `runmill auth logout` | Add or remove a stored credential |
-| `runmill skills eject` / `runmill skills validate` | Customize or validate review rules |
-| `runmill state` | Check the local state store |
-| `runmill gc` | Reconcile workspaces left by interrupted runs |
-| `runmill eval validate <suite>` | Validate an evaluation suite |
-| `runmill eval replay <suite>` | Replay historical tasks through the orchestration loop |
-| `runmill feedback` | Create a support issue with diagnostics |
+| Command                                            | What it does                                               |
+| -------------------------------------------------- | ---------------------------------------------------------- |
+| `runmill config create`                            | Configure Runmill from discovered tools and integrations   |
+| `runmill config validate`                          | Validate the configuration and check manifest              |
+| `runmill config show`                              | Show the resolved configuration                            |
+| `runmill doctor`                                   | Check credentials, CLIs, Git, sandboxing, and the host     |
+| `runmill next`                                     | Show the next issue and why other candidates were rejected |
+| `runmill prepare <issue>`                          | Check whether an issue is ready                            |
+| `runmill run [issue]`                              | Process one issue                                          |
+| `runmill daemon`                                   | Keep watching the backlog and processing work              |
+| `runmill daemon --detach`                          | Run the daemon in the background                           |
+| `runmill daemon --once`                            | Process eligible work and exit                             |
+| `runmill tui`                                      | Watch the running daemon                                   |
+| `runmill list --needs-attention`                   | Find runs waiting for a person                             |
+| `runmill inspect <run-id>`                         | Inspect transitions, evidence, and pending effects         |
+| `runmill resume <run-id>`                          | Resume a paused run                                        |
+| `runmill policy explain <run-id>`                  | Explain why a merge was or was not allowed                 |
+| `runmill auth status`                              | Show available credentials                                 |
+| `runmill auth login` / `runmill auth logout`       | Manage stored credentials                                  |
+| `runmill skills eject` / `runmill skills validate` | Customize or validate review rules                         |
+| `runmill state`                                    | Inspect the local state store                              |
+| `runmill gc`                                       | Reconcile workspaces left by interrupted runs              |
+| `runmill eval validate <suite>`                    | Validate an evaluation suite                               |
+| `runmill eval replay <suite>`                      | Replay historical tasks through Runmill                    |
+| `runmill feedback`                                 | Open a support issue with diagnostics                      |
 
-Every command supports `--json`, `--quiet`, and `--config <path>`. Run `runmill --help` for the
-complete list.
+Every command supports `--json`, `--quiet`, and `--config <path>`.
+
+Run `runmill --help` for everything else.
 
 ## Requirements
 
-- macOS or Linux, arm64 or x64
-- Node.js 20.11 or newer
-- Git and an authenticated GitHub account
-- An authenticated Codex or Claude Code CLI
-- Seatbelt on macOS or bubblewrap on Linux
-- `caffeinate` on macOS or `systemd-inhibit` on Linux for sleep prevention
-- Bun for `runmill tui` (the daemon and other commands only require Node)
+* macOS or Linux, arm64 or x64
+* Node.js 20.11+
+* Git and an authenticated GitHub account
+* Codex or Claude Code CLI
+* Seatbelt on macOS or bubblewrap on Linux
+* `caffeinate` on macOS or `systemd-inhibit` on Linux
+* Bun for `runmill tui`
 
-Linear is currently the live backlog provider. GitHub handles source, pull requests, CI, branch
-protection, and merges.
+The daemon itself does not require Bun.
+
+Linear is currently the live backlog provider. GitHub handles repositories, pull requests, CI, branch protection, and merges.
 
 ## Environment variables
 
-| Variable | Purpose |
-|---|---|
-| `RUNMILL_DEMO=1` | Use the bundled in-memory integrations |
-| `RUNMILL_FAKE_BACKLOG=<file>` | Load backlog issues from a JSON fixture |
-| `RUNMILL_SOURCE_REPO=<path>` | Override the repository used to create run workspaces |
-| `RUNMILL_DATA_DIR=<path>` | Override the state and workspace directory |
+| Variable                         | Purpose                                                     |
+| -------------------------------- | ----------------------------------------------------------- |
+| `RUNMILL_DEMO=1`                 | Use the bundled in-memory integrations                      |
+| `RUNMILL_FAKE_BACKLOG=<file>`    | Load backlog issues from a JSON fixture                     |
+| `RUNMILL_SOURCE_REPO=<path>`     | Override the source repository for workspaces               |
+| `RUNMILL_DATA_DIR=<path>`        | Override Runmill's state and workspace directory            |
 | `RUNMILL_DAEMON_REGISTRY=<path>` | Override daemon discovery, mainly for isolation and testing |
 
 ## Documentation
 
-- [Daemon operation](./docs/daemon.md)
-- [Configuration](./docs/configuration.md)
-- [Run lifecycle and recovery](./docs/lifecycle.md)
-- [Verification and check coverage](./docs/verification.md)
-- [Autonomy and merge gates](./docs/autonomy.md)
-- [Issue leases](./docs/leases.md)
-- [Sandboxing](./docs/sandbox.md)
-- [Historical evaluation](./docs/evaluation.md)
-- [Errors](./docs/errors.md)
-- [Contributing](./CONTRIBUTING.md)
+* [Daemon operation](./docs/daemon.md)
+* [Configuration](./docs/configuration.md)
+* [Run lifecycle and recovery](./docs/lifecycle.md)
+* [Verification and check coverage](./docs/verification.md)
+* [Autonomy and merge gates](./docs/autonomy.md)
+* [Issue leases](./docs/leases.md)
+* [Sandboxing](./docs/sandbox.md)
+* [Historical evaluation](./docs/evaluation.md)
+* [Errors](./docs/errors.md)
+* [Contributing](./CONTRIBUTING.md)
 
 ## License
 
