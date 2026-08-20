@@ -7,7 +7,13 @@
  * decision matters more than how good the model is.
  */
 import { describe, expect, it } from "vitest";
-import { parseReviewJson, blockingFindings, crossCheckVerdict } from "../../src/review/schema.js";
+import {
+  parseReviewJson,
+  blockingFindings,
+  crossCheckVerdict,
+  reviewSchema,
+} from "../../src/review/schema.js";
+import { SKILL_FILES } from "../../src/review/default-skills.js";
 
 function review(over: Record<string, unknown> = {}): never {
   return {
@@ -202,4 +208,36 @@ describe("acceptance criteria as a delivery gate", () => {
     expect(result.accepted).toBe(false);
     expect(result.reason).toContain("must be tested");
   });
+});
+
+describe("the shipped review skills describe the schema they demand", () => {
+  /**
+   * The reviewer is told to emit "the review-findings@1 schema" and was never
+   * shown it. A real run proved the cost: the model returned a well-formed,
+   * sensible verdict that omitted two required fields, runmill refused it as
+   * malformed -- correctly, since a review that does not parse must never read
+   * as an approval -- and the run quarantined and tripped the circuit breaker.
+   *
+   * Every required key has to appear in the prompt, and this fails if the
+   * schema grows a field the prompt does not mention.
+   */
+  const required = Object.keys(reviewSchema.shape);
+
+  for (const skill of SKILL_FILES) {
+    for (const key of required) {
+      it(`${skill.path} names "${key}"`, () => {
+        expect(skill.content).toContain(key);
+      });
+    }
+
+    it(`${skill.path} lists every verdict the schema accepts`, () => {
+      for (const verdict of ["approved", "changes_required", "no_findings"]) {
+        expect(skill.content).toContain(verdict);
+      }
+    });
+
+    it(`${skill.path} says the optional-looking fields are required`, () => {
+      expect(skill.content).toMatch(/required/i);
+    });
+  }
 });
