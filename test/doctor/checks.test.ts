@@ -14,6 +14,7 @@ import { execFileSync } from "node:child_process";
 import {
   checkGit,
   checkRepository,
+  checkRemote,
   checkProvider,
   checkSandbox,
   checkCiEnvironment,
@@ -37,6 +38,92 @@ describe("checkGit", () => {
     expect(r.id).toBe("git");
     expect(r.status).toBe("pass");
     expect(r.observed).toMatch(/git version/);
+  });
+});
+
+describe("checkRemote", () => {
+  /**
+   * The first thing a run does is `git ls-remote origin` to take the issue
+   * lease. Without a remote that fails deep inside the daemon, as a raw git
+   * message, after the run is already claimed — and one quarantine is enough to
+   * trip the breaker. doctor is the place to say so, before any of that.
+   */
+  it("fails when the repository has no origin remote", async () => {
+    execFileSync("git", ["init", "-q", "."], { cwd: dir });
+
+    const r = await checkRemote({ repoRoot: dir });
+
+    expect(r.id).toBe("repository:remote");
+    expect(r.status).toBe("fail");
+    expect(r.observed).toContain("no origin remote");
+  });
+
+  it("names the command that fixes it", async () => {
+    execFileSync("git", ["init", "-q", "."], { cwd: dir });
+
+    const r = await checkRemote({ repoRoot: dir });
+
+    expect(r.remediation).toContain("git remote add origin");
+  });
+
+  it("explains that leases live on the remote, not just that a remote is missing", async () => {
+    execFileSync("git", ["init", "-q", "."], { cwd: dir });
+
+    const r = await checkRemote({ repoRoot: dir });
+
+    expect(r.expected).toMatch(/lease/i);
+  });
+
+  it("reports the remote url when one is configured", async () => {
+    execFileSync("git", ["init", "-q", "."], { cwd: dir });
+    execFileSync("git", ["remote", "add", "origin", "https://example.invalid/acme/x.git"], {
+      cwd: dir,
+    });
+
+    const r = await checkRemote({ repoRoot: dir });
+
+    expect(r.observed).toContain("https://example.invalid/acme/x.git");
+  });
+
+  it("does not fail the check merely because the remote is unreachable", async () => {
+    // doctor runs on laptops, planes, and locked-down networks. An unreachable
+    // remote is worth flagging, but it is not the same defect as not having
+    // configured one at all, and it must not be reported as if it were.
+    execFileSync("git", ["init", "-q", "."], { cwd: dir });
+    execFileSync("git", ["remote", "add", "origin", "https://example.invalid/acme/x.git"], {
+      cwd: dir,
+    });
+
+    const r = await checkRemote({ repoRoot: dir });
+
+    expect(r.status).not.toBe("fail");
+  });
+
+  it("cannot block forever on a remote that wants to ask a question", async () => {
+    // `doctor` is what an operator runs when something is already wrong, often
+    // against a remote whose credential has expired. git would happily sit on
+    // a username prompt or an unknown-host prompt forever, and a diagnostic
+    // command that hangs is worse than one that reports a failure.
+    execFileSync("git", ["init", "-q", "."], { cwd: dir });
+    execFileSync(
+      "git",
+      ["remote", "add", "origin", "https://user@10.255.255.1/private.git"],
+      { cwd: dir },
+    );
+
+    const started = Date.now();
+    const r = await checkRemote({ repoRoot: dir });
+
+    expect(Date.now() - started).toBeLessThan(25_000);
+    expect(r.status).not.toBe("pass");
+  }, 30_000);
+
+  it("is part of the standard doctor run", async () => {
+    execFileSync("git", ["init", "-q", "."], { cwd: dir });
+
+    const results = await runAllChecks({ repoRoot: dir }, ["codex"]);
+
+    expect(results.map((c) => c.id)).toContain("repository:remote");
   });
 });
 

@@ -50,6 +50,61 @@ export async function checkRepository(ctx: DoctorContext): Promise<CheckResult> 
   };
 }
 
+/**
+ * A usable `origin`.
+ *
+ * The issue lease is a git ref on the remote, so `git ls-remote origin` is the
+ * very first thing a run does after selecting an issue. Without a remote that
+ * surfaces as a raw git error from inside the daemon, after the issue is
+ * already claimed, and a single quarantine is enough to open the breaker and
+ * stop the loop. Checking it here costs one spawn and turns a confusing
+ * mid-run stop into a sentence at setup time.
+ */
+/** How long the one networked probe in `doctor` may take before it gives up. */
+const REMOTE_PROBE_TIMEOUT_MS = 10_000;
+
+export async function checkRemote(ctx: DoctorContext): Promise<CheckResult> {
+  const expected = "an origin remote, where runmill keeps its issue leases";
+  const url = await tryRun("git", ["remote", "get-url", "origin"], ctx.repoRoot);
+  if (!url.ok) {
+    return {
+      id: "repository:remote",
+      status: "fail",
+      observed: "no origin remote",
+      expected,
+      remediation: "git remote add origin <url>",
+    };
+  }
+
+  // Reachability is a separate question from configuration. A laptop offline
+  // in a tunnel should not be told its repository is misconfigured, so an
+  // unreachable remote warns and says which of the two it is.
+  //
+  // This is the only check that touches the network, and it runs when
+  // something is already wrong — very often an expired credential. Left to
+  // itself git would sit on a username prompt or an unknown-host prompt with
+  // no output and no deadline, so the probe is made non-interactive and
+  // bounded. A diagnostic that hangs is worse than one that reports a failure.
+  const reachable = await run("git", ["ls-remote", "--exit-code", "origin", "HEAD"], {
+    cwd: ctx.repoRoot,
+    timeoutMs: REMOTE_PROBE_TIMEOUT_MS,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5",
+    },
+  });
+  return {
+    id: "repository:remote",
+    status: reachable.ok ? "pass" : "warn",
+    observed: reachable.ok ? url.out : `${url.out} (unreachable)`,
+    expected,
+    remediation: reachable.ok
+      ? undefined
+      : "Check network access and credentials for this remote; runmill cannot take a lease without it",
+  };
+}
+
 export async function checkGitHubCli(): Promise<CheckResult> {
   // `gh auth status` already fails informatively when gh is absent, so a
   // separate presence probe would just be one more spawn.
@@ -283,14 +338,15 @@ export async function runAllChecks(
   ];
   // Every probe is independent, so wall time is the slowest one rather than
   // the sum. Promise.all preserves order, so the rendered output is identical.
-  const [git, repository, github, providers, sandbox] = await Promise.all([
+  const [git, repository, remote, github, providers, sandbox] = await Promise.all([
     checkGit(),
     checkRepository(ctx),
+    checkRemote(ctx),
     checkGitHubCli(),
     Promise.all(implementations.map((implementation) => checkProvider(implementation))),
     checkSandbox(),
   ]);
-  return [checkCiEnvironment(), git, repository, github, ...providers, ...sandbox];
+  return [checkCiEnvironment(), git, repository, remote, github, ...providers, ...sandbox];
 }
 
 export function worstStatus(results: readonly CheckResult[]): CheckStatus {
