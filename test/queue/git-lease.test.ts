@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -45,6 +45,59 @@ afterEach(() => {
 function lease(cwd: string, runId: string): GitRefLease {
   return new GitRefLease({ cwd, runId, clock, ttlMinutes: 20, hostId: `host-${runId}`, pid: 1234 });
 }
+
+describe("GitRefLease.acquire — when the push fails for a reason that is not contention", () => {
+  /**
+   * A push can fail because someone else holds the lease, or because the
+   * remote is gone, unreachable, or read-only for this credential. Only the
+   * first is contention. Reporting the others as "already leased" sends the
+   * operator looking for a competing worker that does not exist, and because a
+   * quarantine trips the breaker, one unreachable remote stops the daemon with
+   * a sentence that is not true.
+   */
+  /** Make every push to `origin` fail the way a read-only credential does. */
+  function rejectPushes(): void {
+    const hook = join(origin, "hooks", "pre-receive");
+    writeFileSync(hook, "#!/bin/sh\necho 'remote: write access denied' >&2\nexit 1\n");
+    chmodSync(hook, 0o755);
+  }
+
+  it("does not report a rejected push as contention when nothing holds the lease", async () => {
+    rejectPushes();
+
+    const error = await lease(workA, "run_a")
+      .acquire("ENG-1")
+      .then(() => undefined)
+      .catch((err: unknown) => err);
+
+    expect(error).toBeDefined();
+    expect((error as Error).message).not.toMatch(/already leased/i);
+  });
+
+  it("surfaces the underlying git failure so the operator can act on it", async () => {
+    rejectPushes();
+
+    const error = await lease(workA, "run_a")
+      .acquire("ENG-1")
+      .then(() => undefined)
+      .catch((err: unknown) => err);
+
+    expect(error).not.toBeInstanceOf(LeaseConflictError);
+    // Names the issue it was claiming and what git actually said.
+    expect((error as Error).message).toMatch(/ENG-1/);
+    expect((error as Error).message).toMatch(/denied|reject|remote/i);
+  });
+
+  it("still reports genuine contention as a lease conflict", async () => {
+    // The regression guard for the fix above: real contention must keep its
+    // own error type, because the daemon retries it differently.
+    await lease(workA, "run_a").acquire("ENG-1");
+
+    await expect(lease(workB, "run_b").acquire("ENG-1")).rejects.toBeInstanceOf(
+      LeaseConflictError,
+    );
+  });
+});
 
 describe("GitRefLease.acquire", () => {
   it("creates the lease ref and returns generation 1", async () => {

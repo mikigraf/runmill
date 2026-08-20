@@ -1,5 +1,6 @@
 import type { Clock } from "../platform/clock.js";
 import { git } from "../platform/git.js";
+import { errorMessage } from "../errors/runmill-error.js";
 
 /**
  * Distributed lease built on an atomic git ref.
@@ -152,11 +153,23 @@ export class GitRefLease {
     try {
       await this.#git("push", this.#remote, `${objectId}:${leaseRefName(issueId)}`);
     } catch (cause) {
-      const existing = await this.read(issueId);
-      throw new LeaseConflictError(
-        `issue ${issueId} is already leased${existing ? ` by ${existing.runId}` : ""}`,
-        existing?.runId,
-        existing?.generation,
+      // A rejected push is only evidence of contention if the ref is actually
+      // there. It is equally the shape of a read-only credential, a remote that
+      // has gone away, or no network — and reporting those as "already leased"
+      // sends the operator hunting for a competing worker that does not exist,
+      // while the quarantine it causes trips the breaker and stops the daemon.
+      const existing = await this.read(issueId).catch(() => undefined);
+      if (existing !== undefined) {
+        throw new LeaseConflictError(
+          `issue ${issueId} is already leased by ${existing.runId}`,
+          existing.runId,
+          existing.generation,
+        );
+      }
+      throw new Error(
+        `could not claim issue ${issueId}: pushing its lease ref to ${this.#remote} failed, ` +
+          `and no lease exists, so this is not contention. ${errorMessage(cause)}`,
+        { cause },
       );
     }
 
