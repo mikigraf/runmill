@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { tmpdir, platform, homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   Sandbox,
@@ -10,7 +10,6 @@ import {
   detectMechanism,
 } from "../../src/workspace/sandbox.js";
 
-const onMac = platform() === "darwin";
 /**
  * Whether this host can construct a sandbox at all.
  *
@@ -124,6 +123,35 @@ describe("buildBubblewrapArgs", () => {
   it("dies with the parent so an orphaned agent cannot outlive the run", () => {
     const args = buildBubblewrapArgs({ writablePaths: ["/w"], allowNetwork: false }, "/home/x");
     expect(args).toContain("--die-with-parent");
+  });
+
+  it("binds the 64-bit library directory so dynamic binaries can find their loader", () => {
+    // On x86-64 Linux the ELF interpreter is /lib64/ld-linux-x86-64.so.2. Without
+    // it inside the namespace EVERY sandboxed exec dies at load time — agents and
+    // check runs alike — with a bare exit 127/133 and no explanation.
+    const args = buildBubblewrapArgs({ writablePaths: ["/w"], allowNetwork: false }, "/home/x");
+    expect(args.join(" ")).toContain("/lib64 /lib64");
+  });
+
+  it("tolerates system directories a distribution does not have", () => {
+    // /lib64 is absent on arm64, /sbin is merged away on some images. A plain
+    // --ro-bind aborts the whole sandbox when the source is missing, so the
+    // optional ones must use the -try form.
+    const args = buildBubblewrapArgs({ writablePaths: ["/w"], allowNetwork: false }, "/home/x");
+    const joined = args.join(" ");
+    expect(joined).toContain("--ro-bind-try /lib64 /lib64");
+  });
+
+  it("tolerates a provider config directory that is not installed", () => {
+    // readablePaths carries ~/.codex and ~/.config/claude. A developer running
+    // only one of the two providers does not have the other's directory, and a
+    // hard --ro-bind on a missing source makes bwrap exit 1 before the agent
+    // starts — which reads as "the agent failed", not "that path is absent".
+    const args = buildBubblewrapArgs(
+      { writablePaths: ["/w"], readablePaths: ["/home/x/.codex"], allowNetwork: false },
+      "/home/x",
+    );
+    expect(args.join(" ")).toContain("--ro-bind-try /home/x/.codex /home/x/.codex");
   });
 });
 

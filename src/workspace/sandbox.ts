@@ -173,6 +173,17 @@ export function buildSeatbeltProfile(policy: SandboxPolicy, home: string): strin
   return lines.join("\n");
 }
 
+/**
+ * System directories that hold the runtime linker and shared objects.
+ *
+ * Which of these exist depends on the architecture and on how merged-/usr the
+ * distribution is: /lib64 carries the ELF interpreter on x86-64 and does not
+ * exist at all on arm64, and /sbin is a symlink or absent on merged images.
+ * They are bound with the -try form because a plain --ro-bind on a missing
+ * source makes bwrap exit before the child ever starts.
+ */
+const OPTIONAL_SYSTEM_PATHS = ["/bin", "/sbin", "/lib", "/lib32", "/lib64"];
+
 export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string[] {
   const args = [
     "--unshare-pid",
@@ -183,14 +194,18 @@ export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string
     "--proc", "/proc",
     "--dev", "/dev",
     "--tmpfs", "/tmp",
+    // /usr and /etc exist on every supported distribution, so a missing one is
+    // a broken host rather than a portability case, and should fail loudly.
     "--ro-bind", "/usr", "/usr",
-    "--ro-bind", "/bin", "/bin",
-    "--ro-bind", "/lib", "/lib",
     "--ro-bind", "/etc", "/etc",
   ];
+  for (const p of OPTIONAL_SYSTEM_PATHS) args.push("--ro-bind-try", p, p);
   if (!policy.allowNetwork) args.push("--unshare-net");
   for (const p of policy.writablePaths) args.push("--bind", p, p);
-  for (const p of policy.readablePaths ?? []) args.push("--ro-bind", p, p);
+  // Readable paths are provider config directories. A developer who runs only
+  // Codex has no ~/.claude, and vice versa; an absent one means "this provider
+  // is not installed here", not "refuse to start the sandbox".
+  for (const p of policy.readablePaths ?? []) args.push("--ro-bind-try", p, p);
   // Mask credential directories so even a broad bind cannot reach them.
   for (const rel of CREDENTIAL_PATHS) args.push("--tmpfs", join(home, rel));
   return args;
