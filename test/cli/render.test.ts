@@ -102,7 +102,7 @@ describe("renderSelection", () => {
     const out = renderSelection({
       ...empty,
       selected: selected({ priority: 1 }),
-    } as SelectionResult);
+    });
     expect(out).toContain("ENG-101");
     expect(out).toContain("acme/platform (base main)");
     expect(out).toContain("urgent");
@@ -112,7 +112,7 @@ describe("renderSelection", () => {
     const out = renderSelection({
       ...empty,
       selected: selected({ priority: 99 as never }),
-    } as SelectionResult);
+    });
     expect(out).toContain("99");
   });
 
@@ -150,7 +150,7 @@ describe("renderSelection", () => {
       ...empty,
       selected: selected(),
       runnersUp,
-    } as SelectionResult);
+    });
 
     expect(out).toContain("Next in queue (9)");
     expect(out).toContain("ENG-204");

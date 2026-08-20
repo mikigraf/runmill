@@ -262,7 +262,7 @@ export class CliProviderAdapter implements CodingAgentAdapter {
         role: request.role,
         attempt: request.attempt,
         ...body,
-      } as AgentEvent);
+      });
       if (body.type === "session.started") sessionIdResolve(sessionId);
     };
 

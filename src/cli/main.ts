@@ -106,7 +106,7 @@ function buildOrchestrator(
   adapters: AdapterSet,
   store: StateStore,
   opts: GlobalOpts,
-  eventSink?: ((message: string) => void) | undefined,
+  eventSink?: (message: string) => void,
 ): { orchestrator: Orchestrator; lease: (runId: string) => GitRefLease } {
   const sourceRepo = process.env["RUNMILL_SOURCE_REPO"] ?? process.cwd();
   const clock = new SystemClock();

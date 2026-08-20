@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { outputContractFor, outputPathFor } from "../../src/agent/output-contract.js";
 import { CliProviderAdapter, CODEX_DIALECT, CLAUDE_DIALECT, defaultPrompt } from "../../src/agent/cli-provider.js";
-import { FakeProviderAdapter } from "../../src/testing/fake-provider.js";
 import type { AgentRunRequest } from "../../src/agent/adapter.js";
 
 function request(role: AgentRunRequest["role"]): AgentRunRequest {

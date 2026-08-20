@@ -37,7 +37,7 @@ function request(overrides: Partial<AgentRunRequest> = {}): AgentRunRequest {
     maxTurns: 40,
     timeoutMs: 60_000,
     ...overrides,
-  } as AgentRunRequest;
+  };
 }
 
 describe("dialect definitions", () => {

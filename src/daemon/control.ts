@@ -134,7 +134,15 @@ export interface ControlServerOptions {
   readonly configPath: string;
   readonly startedAt: string;
   readonly paths?: RuntimePaths | undefined;
-  handle(request: ControlRequest): Promise<unknown> | unknown;
+  /**
+   * Handles one control request.
+   *
+   * A function-typed property rather than a method, because it is detached from
+   * `options` and passed to the connection handler. Declared as a method it
+   * would be legal to satisfy with something that needs its receiver, which
+   * would then be called without one.
+   */
+  readonly handle: (request: ControlRequest) => Promise<unknown> | unknown;
 }
 
 /** User-private newline-delimited JSON control channel for the TUI. */

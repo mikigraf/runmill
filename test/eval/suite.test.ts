@@ -56,7 +56,7 @@ function task(overrides: Partial<EvalTask> = {}): EvalTask {
     expected: "deliver",
     issue: { identifier: "EV-9", title: "t", description: "d", labels: [] },
     ...overrides,
-  } as EvalTask;
+  };
 }
 
 describe("parseSuite", () => {

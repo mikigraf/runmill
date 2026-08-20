@@ -126,7 +126,7 @@ export class LinearBacklogAdapter implements BacklogAdapter {
       });
       const node = connection.nodes[0];
       if (node === undefined) return undefined;
-      return this.#hydrate(node as unknown as RawIssueShape, node);
+      return this.#hydrate(node, node);
     });
   }
 

@@ -38,7 +38,7 @@ const NO_CREDENTIALS = new CredentialStore({
   linear: "RUNMILL_TEST_ABSENT_1",
   github: "RUNMILL_TEST_ABSENT_2",
   "runmill-policy": "RUNMILL_TEST_ABSENT_3",
-}) as CredentialStore;
+});
 
 let dir: string;
 const savedFixture = process.env["RUNMILL_FAKE_BACKLOG"];

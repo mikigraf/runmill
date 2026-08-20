@@ -266,6 +266,9 @@ export async function runTui(options: TuiOptions = {}): Promise<void> {
   });
 
   let closed = false;
+  // Assigned once below, but the cleanup closure above captures it first, so
+  // it cannot be a const declared at the assignment site.
+  // eslint-disable-next-line prefer-const
   let timer: NodeJS.Timeout | undefined;
   let finish: (() => void) | undefined;
   const done = new Promise<void>((resolve) => {

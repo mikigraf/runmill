@@ -278,5 +278,5 @@ function toBacklogIssue(task: EvalTask): BacklogIssue {
     assigneeIsHuman: false,
     canceled: false,
     completed: false,
-  } as BacklogIssue;
+  };
 }

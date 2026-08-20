@@ -28,7 +28,7 @@ function issue(identifier: string, blockedBy: string[] = []): BacklogIssue {
     assigneeIsHuman: false,
     canceled: false,
     completed: false,
-  } as BacklogIssue;
+  };
 }
 
 const ids = (c: { issues: readonly BacklogIssue[] }): string[] =>

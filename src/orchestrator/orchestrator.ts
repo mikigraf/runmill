@@ -16,7 +16,6 @@ import { GitRefLease, type HeldLease } from "../queue/git-lease.js";
 import { accumulateUsage } from "../agent/events.js";
 import { RunmillError , errorMessage } from "../errors/runmill-error.js";
 import { renderPullRequestBody } from "./pr-body.js";
-import { outputContractFor } from "../agent/output-contract.js";
 import { snapshotHash } from "../domain/snapshot.js";
 import { RunLog } from "../state/run-log.js";
 
@@ -413,7 +412,7 @@ export class Orchestrator {
       await input.lease.assertHeld(held);
 
       // Set during workspace creation, long before this point.
-      const pushBranch = branch as string;
+      const pushBranch = branch;
       await this.#withOutbox(runId, "forge", "push", `${target.repo}#${pushBranch}`, () =>
         this.#d.forge.push({ repo: target.repo, branch: pushBranch, workspacePath: workspace!.path }),
       );
@@ -428,7 +427,7 @@ export class Orchestrator {
           title: `${issue.identifier}: ${issue.title}`,
           body: renderPullRequestBody({
             issue,
-            review: review as Review,
+            review,
             runId,
             provider: cfg.providers.implementer.implementation,
             checks: prChecks,
