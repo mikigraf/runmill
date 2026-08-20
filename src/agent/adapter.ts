@@ -51,7 +51,21 @@ export interface AgentRunResult {
   readonly sessionId: string;
   readonly events: readonly AgentEvent[];
   readonly outputRef?: string | undefined;
-  readonly error?: { readonly class: string; readonly retryable: boolean } | undefined;
+  readonly error?:
+    | {
+        readonly class: string;
+        readonly retryable: boolean;
+        /**
+         * What the provider actually said, trimmed to a line or two.
+         *
+         * Without this a failed run reports only "agent implementer returned
+         * failure", which is true of a bad API key, a sandbox that denied the
+         * binary, and a model that gave up -- three problems with nothing in
+         * common except the sentence describing them.
+         */
+        readonly detail?: string | undefined;
+      }
+    | undefined;
 }
 
 /**

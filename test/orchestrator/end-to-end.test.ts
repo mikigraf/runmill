@@ -306,6 +306,10 @@ describe("end-to-end: the loop refuses to proceed when it should", () => {
       lease: lease("run_f"),
     });
     expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    // The reason has to name the check. `failures` only carries policy
+    // violations, so an ordinary non-zero exit used to leave the message
+    // ending in a bare colon and the operator with nothing to go on.
+    expect(outcome.reason).toMatch(/check "unit" failed/);
     expect(outcome.reason).toMatch(/verification failed/i);
   }, 90_000);
 

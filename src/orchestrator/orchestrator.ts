@@ -320,8 +320,16 @@ export class Orchestrator {
         costUsd += accumulateUsage(agentResult.events).costUsd;
 
         if (agentResult.status !== "success") {
+          // Carry the provider's own words. "returned failure" alone is true of
+          // a bad credential, a sandbox that denied the binary, and a model that
+          // gave up, and it sends the operator to read logs runmill already has.
+          const failure = agentResult.error;
+          const detail =
+            failure === undefined
+              ? ""
+              : `: ${failure.class}${failure.detail === undefined ? "" : ` — ${failure.detail}`}`;
           return finish("NEEDS_HUMAN", {
-            reason: `agent ${role} returned ${agentResult.status}`,
+            reason: `agent ${role} returned ${agentResult.status}${detail}`,
           });
         }
 
@@ -353,7 +361,9 @@ export class Orchestrator {
         if (!verification.mergeReady) {
           if (iteration === cfg.review.maxFixIterations) {
             return finish("NEEDS_HUMAN", {
-              reason: `verification failed after ${iteration + 1} attempts: ${verification.failures.join("; ")}`,
+              reason:
+                `verification failed after ${iteration + 1} attempts: ` +
+                describeVerificationFailure(verification),
             });
           }
           continue;
@@ -813,4 +823,25 @@ function slugify(text: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 48);
+}
+
+/**
+ * Why verification refused, in one line.
+ *
+ * `failures` carries policy violations -- a missing command, a focused subset,
+ * an undeclared skip. A check that simply exited non-zero is not one of those,
+ * so the most ordinary failure of all produced an empty string and the run
+ * reported "verification failed after 4 attempts:" with nothing after the
+ * colon. Naming the checks that failed costs one line and is the difference
+ * between a run an operator can act on and one they have to re-derive.
+ */
+function describeVerificationFailure(verification: {
+  readonly failures: readonly string[];
+  readonly results: readonly { readonly checkId: string; readonly status: string }[];
+}): string {
+  const failed = verification.results
+    .filter((result) => result.status === "failed")
+    .map((result) => `check "${result.checkId}" failed`);
+  const all = [...failed, ...verification.failures];
+  return all.length === 0 ? "no check produced a merge-ready result" : all.join("; ");
 }
