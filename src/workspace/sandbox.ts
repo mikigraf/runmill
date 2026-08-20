@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, realpathSync, accessSync, constants } from "node:fs";
 import { tmpdir, platform } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join, sep } from "node:path";
 import { RunmillError, errorMessage } from "../errors/runmill-error.js";
 import { armKillTimer, BoundedCapture } from "../platform/process.js";
 
@@ -47,7 +47,36 @@ export interface SandboxRunInput {
  * `PYTHONSTARTUP` run code at interpreter start, and `SSH_AUTH_SOCK` hands
  * over the agent socket.
  */
-const ENV_ALLOWLIST = ["PATH", "HOME", "LANG", "LC_ALL", "TZ", "TERM", "TMPDIR", "USER", "SHELL"];
+const ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "TZ",
+  "TERM",
+  "TMPDIR",
+  "USER",
+  "SHELL",
+  // How this host is configured to trust and reach the network. The agent has
+  // to talk to its own API, and on any machine with a custom CA bundle or a
+  // TLS-inspecting proxy -- which is most managed laptops, and this one --
+  // dropping these turns every request into "invalid peer certificate:
+  // UnknownIssuer" from inside the sandbox and works fine outside it.
+  //
+  // These are read from the operator's own environment, exactly like PATH.
+  // NODE_EXTRA_CA_CERTS stays denied: it loads an additional CA on top of the
+  // system set, where these name the trust configuration already in use.
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "https_proxy",
+  "http_proxy",
+  "all_proxy",
+  "no_proxy",
+];
 
 /** Never inherited, even if somehow allowlisted. Defence in depth. */
 const ENV_DENYLIST = [
@@ -130,6 +159,98 @@ export function detectMechanism(): SandboxMechanism {
   return "none";
 }
 
+/**
+ * Directories a sandboxed command needs in order to load itself.
+ *
+ * Every policy here denies by default and then grants the system prefixes,
+ * which is enough only when the toolchain happens to live in one of them. It
+ * frequently does not: codex installed through bun lives in ~/.bun/bin, node
+ * through nvm or volta lives under ~/.nvm or ~/.volta, and pipx, cargo and
+ * `npm --prefix ~/.local` all land in ~/.local/bin. On those machines the
+ * sandbox denied the binary itself, so the process never started and the run
+ * failed in milliseconds with no output at all.
+ *
+ * The grant is read-only and bounded to two things: the directories already on
+ * PATH, which are by definition where this machine looks for executables, and
+ * the tree that actually holds the resolved command. Writes are unaffected, and
+ * the credential denials are emitted after every grant, so they still win.
+ */
+export function toolchainReadPaths(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const out = new Set<string>();
+  const add = (path: string | undefined): void => {
+    if (path === undefined || path === "") return;
+    try {
+      out.add(realpathSync(path));
+    } catch {
+      // A PATH entry that is not there grants nothing. Skipping it keeps the
+      // profile to paths that exist, which is also what bwrap requires.
+    }
+  };
+
+  const entries = (env["PATH"] ?? "").split(delimiter).filter((e) => e !== "");
+  for (const entry of entries) add(entry);
+
+  // Follow the command to where it really lives. ~/.bun/bin/codex is a symlink
+  // into ../install/global/node_modules/@openai/codex/bin/codex.js, so granting
+  // only the PATH directory grants a link whose target is still denied.
+  //
+  // Every candidate on PATH is resolved, not just the first, because wrappers
+  // re-resolve through PATH: the codex on ~/.superset/bin is a shell script
+  // that searches PATH for the next codex and execs that. Stopping at the first
+  // match grants the wrapper and denies the program it exists to run.
+  const candidates = command.includes(sep) ? [command] : findOnPath(command, entries);
+  for (const candidate of candidates) {
+    let real: string;
+    try {
+      real = realpathSync(candidate);
+    } catch {
+      continue;
+    }
+    // A package needs its siblings, not just its own bin directory: the entry
+    // script immediately requires dependencies from the same node_modules tree.
+    const marker = `${sep}node_modules${sep}`;
+    const index = real.indexOf(marker);
+    add(index === -1 ? dirname(real) : real.slice(0, index));
+  }
+
+  return [...out];
+}
+
+/** Directories holding the CA bundle this environment points at, if any. */
+export function trustStoreReadPaths(env: NodeJS.ProcessEnv = process.env): string[] {
+  const out = new Set<string>();
+  for (const [key, value] of [
+    ["SSL_CERT_FILE", env["SSL_CERT_FILE"]],
+    ["SSL_CERT_DIR", env["SSL_CERT_DIR"]],
+  ] as const) {
+    if (value === undefined || value === "") continue;
+    try {
+      out.add(realpathSync(key === "SSL_CERT_DIR" ? value : dirname(value)));
+    } catch {
+      // Pointing at something absent grants nothing; the TLS stack will
+      // report it far better than a sandbox rule could.
+    }
+  }
+  return [...out];
+}
+
+function findOnPath(command: string, entries: readonly string[]): string[] {
+  const found: string[] = [];
+  for (const entry of entries) {
+    const candidate = join(entry, command);
+    try {
+      accessSync(candidate, constants.X_OK);
+      found.push(candidate);
+    } catch {
+      // Not here, or not executable. Keep looking.
+    }
+  }
+  return found;
+}
+
 /** Generate a Seatbelt profile: deny by default, then grant the minimum. */
 export function buildSeatbeltProfile(policy: SandboxPolicy, home: string): string {
   const lines = [
@@ -144,10 +265,16 @@ export function buildSeatbeltProfile(policy: SandboxPolicy, home: string): strin
     // literal are load-bearing: without them the dynamic loader aborts with
     // SIGABRT before the target binary ever starts, so every command appears
     // to "fail" and the sandbox looks broken rather than restrictive.
+    // /etc, /var and /tmp are symlinks into /private, and Seatbelt matches on
+    // the resolved path, so a rule naming the symlink grants nothing at all.
+    // `(subpath "/etc")` read as covering the system configuration for years
+    // while denying every file in it, and the visible symptom was that
+    // /private/etc/ssl/cert.pem was unreadable: certificate validation failed
+    // and no agent could reach its own API from inside the sandbox.
     '(allow file-read* (subpath "/usr") (subpath "/bin") (subpath "/sbin")',
     '                  (subpath "/System") (subpath "/Library") (subpath "/opt")',
     '                  (subpath "/private/var/select") (subpath "/private/var/db/dyld")',
-    '                  (subpath "/etc") (subpath "/dev") (literal "/"))',
+    '                  (subpath "/private/etc") (subpath "/etc") (subpath "/dev") (literal "/"))',
     '(allow file-write* (subpath "/dev/null") (subpath "/dev/dtracehelper"))',
   ];
 
@@ -201,11 +328,17 @@ export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string
   ];
   for (const p of OPTIONAL_SYSTEM_PATHS) args.push("--ro-bind-try", p, p);
   if (!policy.allowNetwork) args.push("--unshare-net");
-  for (const p of policy.writablePaths) args.push("--bind", p, p);
-  // Readable paths are provider config directories. A developer who runs only
-  // Codex has no ~/.claude, and vice versa; an absent one means "this provider
-  // is not installed here", not "refuse to start the sandbox".
+  // Read-only binds are emitted BEFORE the writable ones, because bwrap applies
+  // mounts in order and the last one wins. The two sets overlap in practice --
+  // the toolchain grant can name a directory that is also the workspace -- and
+  // when the read-only bind landed last it remounted the workspace read-only,
+  // leaving the agent unable to write the tree it had just been told to change.
+  //
+  // The -try form is used because an absent path is normal here: a developer
+  // who runs only Codex has no ~/.claude, and vice versa. That means "this
+  // provider is not installed", not "refuse to start the sandbox".
   for (const p of policy.readablePaths ?? []) args.push("--ro-bind-try", p, p);
+  for (const p of policy.writablePaths) args.push("--bind", p, p);
   // Mask credential directories so even a broad bind cannot reach them.
   for (const rel of CREDENTIAL_PATHS) args.push("--tmpfs", join(home, rel));
   return args;
@@ -259,7 +392,18 @@ export class Sandbox {
     const policy: SandboxPolicy = {
       ...input.policy,
       writablePaths: input.policy.writablePaths.map(realPath),
-      readablePaths: (input.policy.readablePaths ?? []).map(realPath),
+      readablePaths: [
+        ...(input.policy.readablePaths ?? []).map(realPath),
+        // Resolved against the PATH the child will actually see, not this
+        // process's, so the grant matches what it will try to execute. Without
+        // this a toolchain installed under the user's home is denied and the
+        // command dies before it produces a single byte.
+        ...toolchainReadPaths(input.command, env),
+        // The trust store the environment points at. /etc/ssl/cert.pem is
+        // covered by the system grant, but SSL_CERT_FILE may name a bundle
+        // anywhere, and naming it without granting it reads as no trust at all.
+        ...trustStoreReadPaths(env),
+      ],
     };
     const cwd = realPath(input.cwd);
 

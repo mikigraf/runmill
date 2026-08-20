@@ -1,14 +1,38 @@
-import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  symlinkSync,
+} from "node:fs";
+import { platform, tmpdir } from "node:os";
+import { delimiter, dirname, join } from "node:path";
 import {
   Sandbox,
   buildEnvironment,
   buildSeatbeltProfile,
   buildBubblewrapArgs,
   detectMechanism,
+  toolchainReadPaths,
+  trustStoreReadPaths,
 } from "../../src/workspace/sandbox.js";
+
+/** realpath'd parent directory, matching what the profile actually grants. */
+function dirOf(file: string): string {
+  return realpathSync(dirname(file));
+}
+
+let dir: string;
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "runmill-toolchain-"));
+});
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
 
 /**
  * Whether this host can construct a sandbox at all.
@@ -19,6 +43,7 @@ import {
  * wherever a mechanism exists.
  */
 const hasSandbox = detectMechanism() !== "none";
+const onMac = platform() === "darwin";
 
 describe("buildEnvironment", () => {
   it("builds from empty rather than filtering the parent", () => {
@@ -64,6 +89,36 @@ describe("buildEnvironment", () => {
     }
   });
 
+  it("carries the TLS trust configuration this host actually uses", () => {
+    // The agent has to reach its own API. On a machine with a custom CA bundle
+    // or a TLS-inspecting proxy, dropping these makes every request fail as
+    // "invalid peer certificate: UnknownIssuer" inside the sandbox while
+    // working perfectly outside it -- which reads as "the agent is broken".
+    const env = buildEnvironment(
+      {},
+      {
+        PATH: "/usr/bin",
+        SSL_CERT_FILE: "/etc/ssl/cert.pem",
+        SSL_CERT_DIR: "/etc/ssl/certs",
+        HTTPS_PROXY: "http://proxy:3128",
+        NO_PROXY: "localhost",
+      },
+    );
+
+    expect(env["SSL_CERT_FILE"]).toBe("/etc/ssl/cert.pem");
+    expect(env["SSL_CERT_DIR"]).toBe("/etc/ssl/certs");
+    expect(env["HTTPS_PROXY"]).toBe("http://proxy:3128");
+    expect(env["NO_PROXY"]).toBe("localhost");
+  });
+
+  it("still refuses NODE_EXTRA_CA_CERTS", () => {
+    // Distinct from SSL_CERT_FILE: this one adds a CA on top of the system
+    // set rather than naming the trust configuration already in use.
+    const env = buildEnvironment({}, { PATH: "/usr/bin", NODE_EXTRA_CA_CERTS: "/tmp/evil.pem" });
+
+    expect(env["NODE_EXTRA_CA_CERTS"]).toBeUndefined();
+  });
+
   it("refuses an explicitly passed denylisted variable", () => {
     const env = buildEnvironment({ NODE_OPTIONS: "--require /tmp/evil.js" }, { PATH: "/usr/bin" });
     expect(env["NODE_OPTIONS"]).toBeUndefined();
@@ -93,6 +148,17 @@ describe("buildSeatbeltProfile", () => {
     expect(denySsh).toBeGreaterThan(allowW);
     expect(p).toContain('/Users/x/.aws');
     expect(p).toContain('/Users/x/.config/gh');
+  });
+
+  it("grants the real path of the symlinked system directories", () => {
+    // /etc, /var and /tmp are symlinks into /private on macOS, and Seatbelt
+    // matches on the resolved path. A `(subpath "/etc")` rule therefore grants
+    // nothing at all: it names a symlink, not the directory the kernel checks.
+    // The visible consequence was that /private/etc/ssl/cert.pem was denied, so
+    // certificate validation failed and no agent could reach its API.
+    const p = buildSeatbeltProfile({ writablePaths: ["/w"], allowNetwork: false }, "/Users/x");
+
+    expect(p).toContain('(subpath "/private/etc")');
   });
 
   it("blocks the keychain as a Mach service, not as a file", () => {
@@ -142,6 +208,23 @@ describe("buildBubblewrapArgs", () => {
     expect(joined).toContain("--ro-bind-try /lib64 /lib64");
   });
 
+  it("lets a writable path win over a read-only grant for the same directory", () => {
+    // bwrap applies mounts in order, so a --ro-bind emitted after the --bind
+    // for the same target remounts it read-only. The workspace is now also
+    // reachable through the toolchain grant (the agent binary can live inside
+    // it), and when the read-only bind landed last the agent silently lost
+    // write access to the very directory it was told to work in.
+    const args = buildBubblewrapArgs(
+      { writablePaths: ["/w"], readablePaths: ["/w"], allowNetwork: false },
+      "/home/x",
+    );
+    const joined = args.join(" ");
+
+    expect(joined.indexOf("--bind /w /w")).toBeGreaterThan(
+      joined.indexOf("--ro-bind-try /w /w"),
+    );
+  });
+
   it("tolerates a provider config directory that is not installed", () => {
     // readablePaths carries ~/.codex and ~/.config/claude. A developer running
     // only one of the two providers does not have the other's directory, and a
@@ -152,6 +235,123 @@ describe("buildBubblewrapArgs", () => {
       "/home/x",
     );
     expect(args.join(" ")).toContain("--ro-bind-try /home/x/.codex /home/x/.codex");
+  });
+});
+
+describe("trustStoreReadPaths", () => {
+  it("grants the directory holding the bundle SSL_CERT_FILE names", () => {
+    const bundle = join(dir, "certs", "ca.pem");
+    mkdirSync(join(dir, "certs"), { recursive: true });
+    writeFileSync(bundle, "-----BEGIN CERTIFICATE-----\n");
+
+    expect(trustStoreReadPaths({ SSL_CERT_FILE: bundle })).toContain(
+      realpathSync(join(dir, "certs")),
+    );
+  });
+
+  it("grants SSL_CERT_DIR itself", () => {
+    const certs = join(dir, "cadir");
+    mkdirSync(certs, { recursive: true });
+
+    expect(trustStoreReadPaths({ SSL_CERT_DIR: certs })).toContain(realpathSync(certs));
+  });
+
+  it("grants nothing when the environment names nothing", () => {
+    expect(trustStoreReadPaths({})).toEqual([]);
+  });
+
+  it("grants nothing for a bundle that is not there", () => {
+    expect(trustStoreReadPaths({ SSL_CERT_FILE: join(dir, "missing", "ca.pem") })).toEqual([]);
+  });
+});
+
+describe("toolchainReadPaths", () => {
+  /**
+   * A sandboxed command has to be able to load itself.
+   *
+   * Every policy here denies by default and then grants /usr, /bin and friends,
+   * which is enough only when the toolchain happens to live in a system prefix.
+   * codex installed through bun lives at ~/.bun/bin, node through nvm lives at
+   * ~/.nvm/versions/..., and pipx and cargo put theirs under ~/.local/bin. On
+   * those machines the sandbox denied the binary itself, and the run failed in
+   * milliseconds with no output, because the process never started.
+   */
+  it("includes the directories on PATH", () => {
+    const paths = toolchainReadPaths("node", { PATH: `/usr/bin:${dirOf(process.execPath)}` });
+
+    expect(paths).toContain(dirOf(process.execPath));
+  });
+
+  it("skips PATH entries that do not exist rather than granting them", () => {
+    const paths = toolchainReadPaths("node", { PATH: "/usr/bin:/nope/not/here" });
+
+    expect(paths).not.toContain("/nope/not/here");
+  });
+
+  it("ignores an empty PATH entry instead of granting the whole filesystem", () => {
+    // A trailing or doubled colon means "the current directory" to some shells.
+    // Turning that into a subpath grant would hand over everything.
+    const paths = toolchainReadPaths("node", { PATH: "/usr/bin::" });
+
+    expect(paths).not.toContain("");
+    expect(paths).not.toContain(".");
+  });
+
+  it("follows a symlinked binary to the tree that actually holds it", () => {
+    // ~/.bun/bin/codex is a symlink into ../install/global/node_modules/...,
+    // so granting only the PATH directory grants a symlink pointing at a
+    // directory the sandbox still denies.
+    const pkg = join(dir, "install", "global", "node_modules", "demo", "bin");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "tool.js"), "#!/usr/bin/env node\n", { mode: 0o755 });
+    const binDir = join(dir, "bin");
+    mkdirSync(binDir, { recursive: true });
+    symlinkSync(join(pkg, "tool.js"), join(binDir, "tool"));
+
+    const paths = toolchainReadPaths("tool", { PATH: binDir });
+
+    // The package root, so sibling dependencies resolve too, not just the file.
+    expect(paths).toContain(realpathSync(join(dir, "install", "global")));
+  });
+
+  it("follows every candidate on PATH, not just the first", () => {
+    // Wrappers re-resolve through PATH: ~/.superset/bin/codex is a shell script
+    // that searches PATH for the next codex and execs it. Granting only the
+    // first match grants the wrapper and denies the program it runs, which
+    // fails as an unreadable file rather than as a denied binary.
+    const wrapperDir = join(dir, "wrapper");
+    const realDir = join(dir, "real");
+    const pkg = join(dir, "pkgroot", "node_modules", "demo", "bin");
+    mkdirSync(wrapperDir, { recursive: true });
+    mkdirSync(realDir, { recursive: true });
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(wrapperDir, "tool"), "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(join(pkg, "tool.js"), "#!/usr/bin/env node\n", { mode: 0o755 });
+    symlinkSync(join(pkg, "tool.js"), join(realDir, "tool"));
+
+    const paths = toolchainReadPaths("tool", { PATH: `${wrapperDir}${delimiter}${realDir}` });
+
+    expect(paths).toContain(realpathSync(join(dir, "pkgroot")));
+  });
+
+  it("grants the directory of a binary given as an absolute path", () => {
+    const binDir = join(dir, "abs");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(binDir, "tool"), "#!/bin/sh\n", { mode: 0o755 });
+
+    const paths = toolchainReadPaths(join(binDir, "tool"), { PATH: "/usr/bin" });
+
+    expect(paths).toContain(realpathSync(binDir));
+  });
+
+  it("returns no duplicates, so the profile stays readable", () => {
+    const paths = toolchainReadPaths("node", { PATH: "/usr/bin:/usr/bin:/usr/bin" });
+
+    expect(new Set(paths).size).toBe(paths.length);
+  });
+
+  it("survives a command that cannot be found at all", () => {
+    expect(() => toolchainReadPaths("definitely-not-a-real-binary", { PATH: "/usr/bin" })).not.toThrow();
   });
 });
 
@@ -168,6 +368,66 @@ describe("Sandbox.run", () => {
       }),
     ).rejects.toThrow(/RM-SANDBOX-001|No sandbox mechanism/);
   });
+
+  it.runIf(onMac && hasSandbox)("can read the CA bundle, so TLS can verify a peer", async () => {
+    // Not a proxy for "TLS works" -- this IS what failed. rustls and OpenSSL
+    // both read /etc/ssl/cert.pem, which resolves to /private/etc, and the
+    // profile granted only the symlink. Every agent request died as
+    // "invalid peer certificate: UnknownIssuer".
+    const ws = mkdtempSync(join(tmpdir(), "runmill-ca-"));
+    try {
+      const result = await new Sandbox(detectMechanism()).run({
+        command: "/bin/cat",
+        args: ["/etc/ssl/cert.pem"],
+        cwd: ws,
+        policy: { writablePaths: [ws], allowNetwork: false },
+        timeoutMs: 20_000,
+      });
+      expect(result.stderr).not.toMatch(/not permitted/i);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("BEGIN CERTIFICATE");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it.runIf(hasSandbox)(
+    "runs a toolchain that lives outside the system prefixes",
+    async () => {
+      // The regression this encodes: agent CLIs and interpreters routinely live
+      // under the user's home (bun, nvm, volta, pipx, ~/.local/bin). The policy
+      // granted /usr and friends only, so the binary itself was denied and the
+      // run died in milliseconds with an empty stderr -- indistinguishable from
+      // an agent that simply failed.
+      // Deliberately outside the workspace: a workspace grant would make the
+      // binary readable for the wrong reason and the test would pass without
+      // the toolchain grant it is here to cover.
+      const toolDir = mkdtempSync(join(tmpdir(), "runmill-toolchain-bin-"));
+      const workspace = mkdtempSync(join(tmpdir(), "runmill-toolchain-ws-"));
+      const tool = join(toolDir, "hello-tool");
+      writeFileSync(tool, "#!/bin/sh\necho toolchain-ran\n", { mode: 0o755 });
+
+      const sandbox = new Sandbox(detectMechanism());
+      let result;
+      try {
+        result = await sandbox.run({
+          command: tool,
+          args: [],
+          cwd: workspace,
+          policy: { writablePaths: [workspace], allowNetwork: false },
+          timeoutMs: 20_000,
+        });
+      } finally {
+        rmSync(toolDir, { recursive: true, force: true });
+        rmSync(workspace, { recursive: true, force: true });
+      }
+
+      expect(result.stderr).not.toMatch(/not permitted|Operation not permitted/i);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("toolchain-ran");
+    },
+    30_000,
+  );
 
   it.runIf(hasSandbox)("runs a permitted command and captures output", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
