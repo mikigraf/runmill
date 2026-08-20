@@ -202,7 +202,15 @@ export async function checkSandbox(): Promise<CheckResult[]> {
       code: userns.ok ? undefined : "RM-SANDBOX-001",
       observed: userns.ok ? "user namespaces usable" : userns.out.split("\n")[0] ?? "unavailable",
       expected: "unprivileged user namespaces enabled",
-      remediation: userns.ok ? undefined : "sudo sysctl -w kernel.unprivileged_userns_clone=1",
+      // Ubuntu 23.10 and later restrict unprivileged user namespaces through
+      // AppArmor rather than the old Debian sysctl, and on those hosts
+      // `kernel.unprivileged_userns_clone` does not exist at all — so the
+      // remediation runmill used to print failed with "cannot stat" and left
+      // the operator no better off. Name both knobs, newest first.
+      remediation: userns.ok
+        ? undefined
+        : "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 " +
+          "(Ubuntu 23.10+), or sudo sysctl -w kernel.unprivileged_userns_clone=1 (older Debian)",
     });
     if (!userns.ok) return results;
   } else {
