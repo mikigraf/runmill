@@ -39,7 +39,7 @@ beforeEach(() => {
   originalExit = process.exit;
   process.exit = ((code?: number) => {
     throw new Exited(code ?? 0);
-  }) as typeof process.exit;
+  });
 });
 
 afterEach(() => {
@@ -106,6 +106,79 @@ describe("init", () => {
     ]) {
       expect(existsSync(join(repo, file)), `${file} was not written`).toBe(true);
     }
+  });
+
+  it("writes the schema the generated config points at", async () => {
+    // runmill.yaml opens with `# yaml-language-server: $schema=./runmill.schema.json`.
+    // Without the file beside it every editor with the YAML extension opens the
+    // config on a "cannot load schema" error and none of the completion the
+    // header advertises works — on the first file runmill ever shows a user.
+    initGitRepo();
+    const h = harness();
+    await h.run(["init"]);
+
+    const config = readFileSync(join(repo, "runmill.yaml"), "utf8");
+    const referenced = config.match(/\$schema=\.\/(\S+)/)?.[1];
+    expect(referenced).toBe("runmill.schema.json");
+    expect(existsSync(join(repo, referenced as string))).toBe(true);
+  });
+
+  it("writes a schema that is valid JSON describing runmill.yaml", async () => {
+    initGitRepo();
+    const h = harness();
+    await h.run(["init"]);
+
+    const schema = JSON.parse(readFileSync(join(repo, "runmill.schema.json"), "utf8")) as {
+      properties?: Record<string, unknown>;
+    };
+    expect(schema.properties).toHaveProperty("autonomy");
+    expect(schema.properties).toHaveProperty("backlog");
+  });
+
+  it("keeps its own runtime state out of the repository it manages", async () => {
+    // runmill runs inside the repository it works on, and writes a SQLite
+    // database and WAL beside the config it just told the operator to commit.
+    // Without this, `git status` is dirty from the first run onward and the
+    // obvious `git add .` puts a binary database into the history.
+    initGitRepo();
+    const h = harness();
+    await h.run(["init"]);
+
+    const ignore = readFileSync(join(repo, ".runmill/.gitignore"), "utf8");
+    expect(ignore).toContain("state/");
+  });
+
+  it("still tracks the config files init tells the operator to edit", async () => {
+    // The manifest and the review skills are project configuration and belong
+    // in version control. Ignoring the whole .runmill directory would take
+    // them out with the database.
+    initGitRepo();
+    const h = harness();
+    await h.run(["init"]);
+
+    const ignore = readFileSync(join(repo, ".runmill/.gitignore"), "utf8");
+    expect(ignore).not.toMatch(/^\*\s*$/m);
+    expect(ignore).not.toContain("checks.yaml");
+    expect(ignore).not.toContain("skills");
+  });
+
+  it("actually causes git to ignore the state directory", async () => {
+    // Asserting on the file's text proves what was written, not what git does
+    // with it. This is the property that matters.
+    initGitRepo();
+    const h = harness();
+    await h.run(["init"]);
+    mkdirSync(join(repo, ".runmill/state"), { recursive: true });
+    writeFileSync(join(repo, ".runmill/state/runmill.db"), "binary");
+
+    // -uall so git lists each untracked file rather than collapsing the
+    // directory, which would hide whether the database was excluded.
+    const status = execFileSync("git", ["status", "--porcelain", "-uall"], {
+      cwd: repo,
+    }).toString();
+
+    expect(status).not.toContain("runmill.db");
+    expect(status).toContain(".runmill/checks.yaml");
   });
 
   it("infers the repository and base branch from git", async () => {

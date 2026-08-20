@@ -5,3 +5,9 @@ coverage/
 .DS_Store
 .env
 .env.*
+
+# The documented demo (`RUNMILL_DEMO=1 ... daemon --once`) runs inside the
+# example directory and leaves a state database there. Running the quickstart
+# should not make a contributor's clone dirty.
+examples/*/.runmill/
+.runmill/state/

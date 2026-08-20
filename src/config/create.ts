@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { LinearClient } from "@linear/sdk";
@@ -8,6 +8,7 @@ import { stringify as stringifyYaml } from "yaml";
 import { CODEX_DIALECT, CLAUDE_DIALECT, CliProviderAdapter } from "../agent/cli-provider.js";
 import { CredentialStore } from "../credentials/store.js";
 import { run } from "../platform/process.js";
+import { writeSchemaBeside } from "./schema-asset.js";
 import { tryGit } from "../platform/git.js";
 import { parseConfig, validateConfig } from "./load.js";
 
@@ -376,5 +377,8 @@ export async function createConfiguration(inputOptions: {
   if (!validation.valid) throw new Error(`generated configuration is invalid: ${validation.errors.join("; ")}`);
   mkdirSync(dirname(inputOptions.path), { recursive: true });
   writeFileSync(inputOptions.path, config);
+  // The config's first line points an editor at ./runmill.schema.json, so the
+  // schema has to land beside it or that header resolves to nothing.
+  writeSchemaBeside(inputOptions.path);
   return { path: inputOptions.path, config, discovered };
 }

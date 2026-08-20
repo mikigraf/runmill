@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { readPackagedSchema, SCHEMA_FILENAME } from "../config/schema-asset.js";
 import { RunmillError, errorMessage } from "../errors/runmill-error.js";
 import { CredentialStore, type CredentialName } from "../credentials/store.js";
 import { StateStore } from "../state/store.js";
@@ -143,6 +144,25 @@ function registerGc(program: Command, ctx: CommandContext): void {
 
 // -- init ------------------------------------------------------------------
 
+/**
+ * Splits `.runmill/` into the parts that belong in version control and the
+ * parts that do not.
+ *
+ * runmill works inside the repository it manages, so its own runtime state
+ * lands next to the configuration it just asked the operator to commit. The
+ * manifest and review skills are project configuration and should be reviewed
+ * like any other file; the SQLite database, its write-ahead log, and the run
+ * workspaces are machine-local and change on every run. Without this split the
+ * first run makes `git status` dirty and the reflexive `git add .` commits a
+ * binary database.
+ */
+const RUNTIME_GITIGNORE = `# runmill runtime state. Machine-local, changes every run.
+state/
+workspaces/
+
+# Everything else here is project configuration, and is tracked on purpose.
+`;
+
 const STARTER_CONFIG = (repo: string, baseBranch: string): string => `# yaml-language-server: $schema=./runmill.schema.json
 version: 1
 
@@ -228,7 +248,14 @@ function registerInit(program: Command, ctx: CommandContext): void {
         };
 
         write("runmill.yaml", STARTER_CONFIG(repo, baseBranch));
+        // The config's first line points an editor at ./runmill.schema.json.
+        // It has to be there, or the very first file runmill writes opens on a
+        // "cannot load schema" error with no completion for the fields the
+        // operator was just told to go and edit.
+        const schema = readPackagedSchema();
+        if (schema !== undefined) write(SCHEMA_FILENAME, schema);
         write(".runmill/checks.yaml", DEFAULT_CHECKS_MANIFEST);
+        write(".runmill/.gitignore", RUNTIME_GITIGNORE);
         for (const skill of SKILL_FILES) write(skill.path, skill.content);
 
         ctx.emit(
