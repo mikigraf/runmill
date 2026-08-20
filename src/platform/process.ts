@@ -126,6 +126,18 @@ export function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
 
 const KILL_GRACE_MS = 2_000;
 
+/**
+ * Ask a process tree to stop, then make it.
+ *
+ * The same escalation the timeout path uses. A single SIGTERM is a request,
+ * and a provider that traps or ignores it stays alive with its stdio open,
+ * which leaves the awaiting run pending forever rather than cancelled.
+ */
+export function terminateTree(child: ChildProcess): void {
+  killTree(child, "SIGTERM");
+  setTimeout(() => killTree(child, "SIGKILL"), KILL_GRACE_MS).unref();
+}
+
 /** SIGTERM, then SIGKILL after a grace period. Returns a cancel function. */
 export function armKillTimer(
   child: ChildProcess,

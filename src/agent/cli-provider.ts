@@ -17,7 +17,7 @@ import { UnknownEventError } from "./events.js";
 import type { Clock } from "../platform/clock.js";
 import { SystemClock } from "../platform/clock.js";
 import { Sandbox } from "../workspace/sandbox.js";
-import { run, killTree, armKillTimer, BoundedCapture } from "../platform/process.js";
+import { run, armKillTimer, BoundedCapture, terminateTree } from "../platform/process.js";
 import { outputPathFor, outputContractFor } from "./output-contract.js";
 
 /** Maps one provider's native JSON line onto the normalized union. */
@@ -320,7 +320,11 @@ export class CliProviderAdapter implements CodingAgentAdapter {
 
     // Cancellation works even before session.started arrives, because the
     // process handle is captured here rather than derived from a session id.
-    request.signal?.addEventListener("abort", () => killTree(child, "SIGTERM"), { once: true });
+    // SIGTERM, then SIGKILL after the same grace period the timeout path uses.
+    // Terminating only once leaves a provider that traps or ignores SIGTERM
+    // running, and session.result pending behind it, which would hold the run
+    // and the daemon open indefinitely.
+    request.signal?.addEventListener("abort", () => terminateTree(child), { once: true });
 
     const cancelTimer = armKillTimer(child, request.timeoutMs);
 
@@ -438,7 +442,7 @@ export class CliProviderAdapter implements CodingAgentAdapter {
         // mid-run request is not expected. Nothing to answer.
       },
       abort: async () => {
-        killTree(child, "SIGTERM");
+        terminateTree(child);
       },
     };
   }

@@ -633,6 +633,26 @@ exit 1
     }
   }, 30_000);
 
+  it("cancels a provider that ignores SIGTERM, rather than waiting forever", async () => {
+    // Cancellation used to send SIGTERM and stop there, so a provider that
+    // traps or ignores it left session.result pending for good and took the
+    // run -- and the daemon behind it -- with it. The timeout path already
+    // escalated to SIGKILL; the abort path has to as well.
+    const { dir, bin } = fakeProvider(`#!/bin/sh\ntrap '' TERM\nsleep 60\n`);
+    const controller = new AbortController();
+    try {
+      const session = await new CliProviderAdapter({ dialect: dialectFor(bin) }).start(
+        request({ workingDirectory: dir, signal: controller.signal, timeoutMs: 120_000 }),
+      );
+      controller.abort();
+      const result = await session.result;
+
+      expect(result.status).toBe("cancelled");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("picks up structured output written by a role whose contract expects it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
     const bin = join(dir, "fakeprovider");
