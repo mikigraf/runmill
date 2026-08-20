@@ -7,7 +7,7 @@
  * result is worse than stopping, so nothing gets a best-effort interpretation.
  */
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -69,6 +69,17 @@ describe("dialect definitions", () => {
   it("passes the turn limit through to the provider", () => {
     const args = CLAUDE_DIALECT.buildArgs(request({ maxTurns: 7 }), "p");
     expect(args).toContain("7");
+  });
+
+  it("does not ask codex to sandbox itself, because runmill already did", () => {
+    // Seatbelt does not nest. Codex's own profile inside runmill's leaves it
+    // unable to write anywhere while still exiting 0, so runmill saw a
+    // successful agent that had changed nothing and spent every fix iteration
+    // re-running it. runmill's sandbox is the mandatory enforcement layer.
+    const args = CODEX_DIALECT.buildArgs(request(), "p");
+
+    expect(args).not.toContain("workspace-write");
+    expect(args.join(" ")).toContain("-s danger-full-access");
   });
 
   it("runs codex in the workspace it was given", () => {
@@ -293,6 +304,89 @@ describe("detect against a real binary", () => {
  * chunked parsing, the sandbox wrapper, timeout handling, and result
  * classification rather than mocking them away.
  */
+describe("sandbox policy", () => {
+  /** Captures the policy the adapter asks for, without running anything. */
+  function capturingSandbox(): { calls: { command: string; policy: Record<string, unknown> }[]; wrap: unknown } {
+    const calls: { command: string; policy: Record<string, unknown> }[] = [];
+    return {
+      calls,
+      wrap: (input: { command: string; args: string[]; cwd: string; policy: Record<string, unknown> }) => {
+        calls.push({ command: input.command, policy: input.policy });
+        return { command: "/usr/bin/true", args: [], cwd: input.cwd, env: {}, cleanup: () => undefined };
+      },
+    };
+  }
+
+  /** A HOME that actually has the provider's config directory in it. */
+  function withProviderHome<T>(run: () => Promise<T>): Promise<T> {
+    const home = mkdtempSync(join(tmpdir(), "runmill-home-"));
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    const previous = process.env["HOME"];
+    process.env["HOME"] = home;
+    return run().finally(() => {
+      if (previous === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = previous;
+      rmSync(home, { recursive: true, force: true });
+    });
+  }
+
+  it("gives the provider write access to its own config directory", async () => {
+    // codex and claude keep session state and history there and refuse to
+    // start without write access. Read-only made codex fail with "failed to
+    // initialize in-process app-server client" before emitting any event.
+    const sandbox = capturingSandbox();
+    await withProviderHome(async () => {
+      const adapter = new CliProviderAdapter({
+        dialect: CODEX_DIALECT,
+        sandbox: { wrap: sandbox.wrap } as never,
+      });
+      await adapter.start(request({ workingDirectory: "/tmp/ws" }));
+    });
+
+    const writable = sandbox.calls[0]?.policy["writablePaths"] as string[];
+    expect(writable.some((p) => p.endsWith("/.codex"))).toBe(true);
+  });
+
+  it("omits a config directory that is not installed, rather than binding it", async () => {
+    // A writable bind is strict: bubblewrap aborts on a source that is not
+    // there. A developer running only Codex has no ~/.claude, and naming it
+    // would stop the run before the agent started.
+    const sandbox = capturingSandbox();
+    const home = mkdtempSync(join(tmpdir(), "runmill-home-"));
+    const previous = process.env["HOME"];
+    process.env["HOME"] = home;
+    try {
+      const adapter = new CliProviderAdapter({
+        dialect: CODEX_DIALECT,
+        sandbox: { wrap: sandbox.wrap } as never,
+      });
+      await adapter.start(request({ workingDirectory: "/tmp/ws" }));
+    } finally {
+      if (previous === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = previous;
+      rmSync(home, { recursive: true, force: true });
+    }
+
+    const writable = sandbox.calls[0]?.policy["writablePaths"] as string[];
+    expect(writable).toEqual(["/tmp/ws"]);
+  });
+
+  it("still confines writes to the workspace and that directory", async () => {
+    const sandbox = capturingSandbox();
+    await withProviderHome(async () => {
+      const adapter = new CliProviderAdapter({
+        dialect: CODEX_DIALECT,
+        sandbox: { wrap: sandbox.wrap } as never,
+      });
+      await adapter.start(request({ workingDirectory: "/tmp/ws" }));
+    });
+
+    const writable = sandbox.calls[0]?.policy["writablePaths"] as string[];
+    expect(writable).toContain("/tmp/ws");
+    expect(writable.every((p) => p === "/tmp/ws" || p.includes("/.codex"))).toBe(true);
+  });
+});
+
 describe("start — streaming from a real process", () => {
   function fakeProvider(script: string): { dir: string; bin: string } {
     const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));

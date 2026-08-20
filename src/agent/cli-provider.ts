@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { errorMessage } from "../errors/runmill-error.js";
 import type {
   AgentRunRequest,
   AgentRunResult,
@@ -78,8 +79,21 @@ export const CODEX_DIALECT: ProviderDialect = {
     "-C",
     request.workingDirectory,
     "--json",
+    // Codex must not sandbox itself, because runmill already has.
+    //
+    // macOS Seatbelt does not nest: codex applying its own profile inside
+    // runmill's leaves it unable to write anywhere, and it says so plainly --
+    // "the workspace sandbox rejected all write attempts" -- while still
+    // exiting 0. runmill then saw a successful agent that had changed nothing,
+    // burned every fix iteration re-running it, and reported the run as a
+    // verification failure.
+    //
+    // The confinement is not weakened by this. runmill's sandbox is the
+    // enforcement layer and is mandatory: writes stay limited to the workspace
+    // and the provider's own config directory, credentials stay denied, and
+    // `workspace.sandbox: none` is rejected outside observe mode.
     "-s",
-    "workspace-write",
+    "danger-full-access",
   ],
   mapLine: (line) => {
     const l = line as { type?: string; msg?: { type?: string; message?: string }; text?: string };
@@ -197,9 +211,20 @@ export class CliProviderAdapter implements CodingAgentAdapter {
     this.#sandbox = options.sandbox ?? new Sandbox();
   }
 
+  /**
+   * The provider's own config directories, restricted to the ones that exist.
+   *
+   * These are bound writable, and a writable bind is deliberately strict: the
+   * workspace must be there or the run has nothing to work on. A provider
+   * config directory is different -- a developer running only Codex has no
+   * ~/.claude, and ~/.config/claude is absent on most machines even when
+   * Claude is installed. Naming a directory that is not there made bubblewrap
+   * abort before the agent started, which reads as "the agent failed".
+   */
   #providerHome(): readonly string[] {
     const home = process.env["HOME"];
-    return home === undefined ? [] : this.#dialect.configPaths(home);
+    if (home === undefined) return [];
+    return this.#dialect.configPaths(home).filter((path) => existsSync(path));
   }
 
   get name(): string {
@@ -274,10 +299,14 @@ export class CliProviderAdapter implements CodingAgentAdapter {
       args,
       cwd: request.workingDirectory,
       policy: {
-        writablePaths: [request.workingDirectory],
-        // The provider needs its own credential file and its API endpoint;
-        // everything else stays denied.
-        readablePaths: this.#providerHome(),
+        // The provider's own config directory is writable, not just readable.
+        // codex and claude both keep session state, history and caches there
+        // and refuse to start when they cannot write it: codex fails with
+        // "failed to initialize in-process app-server client: Operation not
+        // permitted" before it emits a single event, which reaches the operator
+        // as an agent that failed for no stated reason.
+        writablePaths: [request.workingDirectory, ...this.#providerHome()],
+        readablePaths: [],
         allowNetwork: request.network !== "none",
       },
     });
@@ -334,10 +363,9 @@ export class CliProviderAdapter implements CodingAgentAdapter {
           status: "failure",
           sessionId,
           events,
-          error: { class: "transport", retryable: true },
+          error: { class: "transport", retryable: true, detail: errorMessage(err) },
           outputRef: undefined,
         });
-        void err;
       });
 
       child.on("close", (code, signal) => {
@@ -350,7 +378,11 @@ export class CliProviderAdapter implements CodingAgentAdapter {
             status: "failure",
             sessionId,
             events,
-            error: { class: "provider_internal", retryable: false },
+            error: {
+              class: "provider_internal",
+              retryable: false,
+              detail: parseError.message,
+            },
           });
           return;
         }
@@ -384,7 +416,11 @@ export class CliProviderAdapter implements CodingAgentAdapter {
               ? undefined
               : (() => {
                   const stderr = stderrCapture.text();
-                  return { class: classifyStderr(stderr), retryable: isRetryable(stderr) };
+                  return {
+                    class: classifyStderr(stderr),
+                    retryable: isRetryable(stderr),
+                    detail: lastMeaningfulLines(stderr),
+                  };
                 })(),
         });
       });
@@ -406,6 +442,22 @@ export class CliProviderAdapter implements CodingAgentAdapter {
       },
     };
   }
+}
+
+/**
+ * The tail of stderr, trimmed to something a terminal line can hold.
+ *
+ * The last lines are where the cause is: a stack trace's message, a CLI's
+ * final complaint, the sandbox's denial. Blank lines are dropped so an
+ * exit-code-only failure reports nothing rather than whitespace.
+ */
+function lastMeaningfulLines(stderr: string, max = 2): string | undefined {
+  const lines = stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  if (lines.length === 0) return undefined;
+  return lines.slice(-max).join(" | ").slice(0, 300);
 }
 
 function classifyStderr(stderr: string): string {
