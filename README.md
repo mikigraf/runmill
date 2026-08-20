@@ -1,96 +1,70 @@
 # Runmill
 
-## Just give your agents a backlog
+*The delivery loop for autonomous software factories.*
 
-**Your coding agent shouldn't wait for your next prompt.**
+**Turn your backlog into reviewed pull requests.**
 
-Runmill gives Codex and Claude Code a backlog and keeps them working through it.
+Runmill keeps Codex and Claude Code working through eligible Linear issues without someone
+prompting, monitoring, and restarting them after every task.
 
-It picks up eligible Linear issues, gives each one an isolated workspace, runs the agent, verifies the exact commit it produced, sends the change through a fresh-context review, opens the pull request, waits for CI, and then picks up the next issue.
+For each issue, Runmill creates an isolated workspace, runs the coding agent, verifies the exact
+commit it produced, starts an independent review with fresh context, opens the GitHub pull request,
+waits for CI, and decides what may happen next.
 
-Your agents write code. Runmill keeps the engineering loop running.
+```text
+Linear issue
+    ↓
+claim → implement → verify → independent review → GitHub PR → CI
+    ↑                                                       ↓
+    └──────────── wait for the next eligible issue ─────────┘
+```
+
+**The agent writes code. Runmill owns the delivery process.**
+
+Runmill, not the model, controls backlog mutations, repository effects, pull requests, and merge
+decisions. If required evidence is missing, stale, contradictory, or impossible to establish, the
+run stops for a person.
 
 ![Runmill OpenTUI showing a live agent review, verification events, and daemon logs](./assets/runmill-tui.gif)
 
 [Documentation](./docs/README.md) · [Configuration](./docs/configuration.md) · [Daemon operations](./docs/daemon.md)
 
-## Your backlog is the prompt
+## The engineering loop around your coding agents
 
-Coding agents are already pretty good at completing a task once you give them one.
+Coding agents can implement a well-scoped task. The surrounding workflow still needs an owner:
 
-The annoying part is everything around that task.
+- selecting the next eligible issue
+- preventing two workers from claiming the same task
+- creating an isolated workspace
+- providing bounded repository context
+- verifying the resulting commit
+- reviewing it independently
+- opening the pull request
+- waiting for CI and branch protection
+- recovering from crashes and ambiguous external operations
+- stopping when repeated failures indicate a systemic problem
 
-Someone still has to decide what they should work on next, make sure two agents do not pick up the same issue, create an isolated workspace, run the right checks, review what they produced, open the PR, wait for CI, update the backlog, and then start the whole thing again.
-
-Runmill does that part.
+Runmill owns that workflow as a durable, deterministic state machine.
 
 **Queue → Run → Verify → Review → Deliver → Repeat**
 
-```text
-queue → claim → implement → verify → fresh review → deliver
-  ↑                                                      │
-  └──────────────── wait for more work ←─────────────────┘
-```
+It is not another coding agent and it does not replace CI. It is the delivery system around Codex
+and Claude Code.
 
-Runmill is not another coding agent and it is not a replacement for CI. It is the deterministic delivery loop around the agents you already use.
+## Why Runmill
 
-### Queue
+- **Backlog-driven:** continuously processes eligible Linear issues
+- **Provider-neutral:** use Codex, Claude Code, or one to review the other
+- **Isolated:** every issue runs in a dedicated sandboxed workspace
+- **Verifiable:** required checks run against the exact candidate commit
+- **Independently reviewed:** reviewers receive fresh context rather than the implementer's narrative
+- **Durable:** state, evidence, leases, and intended side effects survive restarts
+- **Fail-closed:** missing or unknown evidence stops the run
+- **Governed:** deterministic code, not the agent, owns external effects and merge authority
+- **Human-aware:** ambiguous, risky, or exhausted runs escalate with a named reason
 
-Runmill watches Linear for eligible work, routes each issue to the right repository, and claims it using a Git-backed lease so two workers cannot accidentally take the same task.
-
-### Run
-
-Every issue gets its own isolated workspace and a bounded task packet.
-
-Codex or Claude Code implements the change within the configured time, cost, and risk limits. Run state is durable, so an interruption does not mean starting from zero.
-
-### Verify
-
-Runmill checks the actual candidate commit, not whatever happens to be in the workspace later.
-
-Required checks run against that commit in a clean checkout. If evidence is missing or stale, the run stops.
-
-### Review
-
-The reviewer starts from fresh context instead of inheriting the implementer's reasoning.
-
-It has to account for every acceptance criterion. Blocking findings go through a bounded fix loop. If Runmill cannot establish enough confidence to continue, it gives the run to a person.
-
-### Deliver
-
-Once the gates pass, Runmill pushes the branch, opens the GitHub pull request, waits for CI, applies the configured merge policy, and updates the backlog.
-
-### Repeat
-
-Then it takes the next issue.
-
-If there is nothing to do, it waits.
-
-That sounds obvious, but it is an important difference from scripts that process one task and terminate. Runmill is meant to keep a real engineering queue moving.
-
-## Agents write code. Deterministic code owns the workflow.
-
-There is one boundary in Runmill that is deliberate:
-
-**The agent can propose and review code. It does not get to own the delivery system.**
-
-Agents do not mutate the backlog, push branches, create pull requests, or merge changes directly. Runmill's deterministic orchestration code owns those effects.
-
-For every issue, Runmill keeps an engineering run containing:
-
-* the issue, repository, and base revision;
-* the implementer and reviewer configuration;
-* the candidate commit and verification evidence;
-* the independent review;
-* intended and completed external effects;
-* PR, CI, and merge-policy state; and
-* why the run continued, retried, stopped, escalated, or entered quarantine.
-
-SQLite is the system of record. `.runmill/log.md` gives you a readable, timestamped journal of completed deliveries and merges.
-
-Runmill does **not** claim that an agent-generated change is correct.
-
-It tells you something much more defensible: exactly what was checked, what was reviewed, which policy ran, and why Runmill allowed the change to continue.
+Runmill does not claim an agent-generated change is correct. It records what was checked, what was
+reviewed, which policy ran, and why the change was allowed to continue.
 
 ## Quick start
 
