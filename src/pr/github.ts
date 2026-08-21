@@ -205,17 +205,22 @@ export class GitHubForgeAdapter implements ForgeAdapter {
   async getBranchProtection(input: { repo: string; branch: string }): Promise<BranchProtection> {
     const { owner, name } = splitRepo(input.repo);
 
-    // Rulesets first: readable without admin, and where modern repos define
-    // their rules. Classic protection needs admin and commonly 403s.
+    const requiredChecks: string[] = [];
+    let requiresApproval = false;
+    let requiresConversationResolution = false;
+    let usesMergeQueue = false;
+
+    // Rulesets: readable without admin, and where modern repositories define
+    // their rules. An empty array here is a real answer -- "no rulesets" -- and
+    // NOT an answer about classic branch protection, which is read separately
+    // below. Treating it as the whole story reported every classically
+    // protected branch as unprotected, which is the single answer that
+    // silently unlocks the merge gate.
     try {
       const rules = await this.#octokit.request(
         "GET /repos/{owner}/{repo}/rules/branches/{branch}",
         { owner, repo: name, branch: input.branch },
       );
-      const requiredChecks: string[] = [];
-      let requiresApproval = false;
-      let requiresConversationResolution = false;
-      let usesMergeQueue = false;
 
       for (const rule of rules.data as { type: string; parameters?: Record<string, unknown> }[]) {
         if (rule.type === "required_status_checks") {
@@ -233,7 +238,40 @@ export class GitHubForgeAdapter implements ForgeAdapter {
         }
         if (rule.type === "merge_queue") usesMergeQueue = true;
       }
+    } catch {
+      // Rules could not be enumerated at all. Nothing below can make that safe.
+      return {
+        requiredChecks: [],
+        requiresApproval: false,
+        requiresConversationResolution: false,
+        usesMergeQueue: false,
+        unreadable: true,
+      };
+    }
 
+    // Whether classic protection exists is readable WITHOUT admin, even though
+    // its contents are not. That distinction is what keeps this honest: a
+    // repository can be known to be protected while its rules stay opaque, and
+    // "unknown" must never collapse into "none".
+    let classicallyProtected: boolean;
+    try {
+      const branch = await this.#octokit.request("GET /repos/{owner}/{repo}/branches/{branch}", {
+        owner,
+        repo: name,
+        branch: input.branch,
+      });
+      classicallyProtected = (branch.data as { protected?: boolean }).protected === true;
+    } catch {
+      return {
+        requiredChecks: [],
+        requiresApproval: false,
+        requiresConversationResolution: false,
+        usesMergeQueue: false,
+        unreadable: true,
+      };
+    }
+
+    if (!classicallyProtected) {
       return {
         requiredChecks,
         requiresApproval,
@@ -241,12 +279,51 @@ export class GitHubForgeAdapter implements ForgeAdapter {
         usesMergeQueue,
         unreadable: false,
       };
-    } catch {
+    }
+
+    try {
+      const classic = await this.#octokit.request(
+        "GET /repos/{owner}/{repo}/branches/{branch}/protection",
+        { owner, repo: name, branch: input.branch },
+      );
+      const data = classic.data as {
+        required_status_checks?: { contexts?: string[]; checks?: { context: string }[] };
+        required_pull_request_reviews?: { required_approving_review_count?: number } | null;
+        required_conversation_resolution?: { enabled?: boolean };
+      };
+
+      // `contexts` is the legacy shape and `checks` the current one. GitHub
+      // still returns both on most repositories, and either may be the only
+      // one present, so both are read and the union taken.
+      for (const context of data.required_status_checks?.contexts ?? []) {
+        requiredChecks.push(context);
+      }
+      for (const check of data.required_status_checks?.checks ?? []) {
+        requiredChecks.push(check.context);
+      }
+      if ((data.required_pull_request_reviews?.required_approving_review_count ?? 0) > 0) {
+        requiresApproval = true;
+      }
+      if (data.required_conversation_resolution?.enabled === true) {
+        requiresConversationResolution = true;
+      }
+
       return {
-        requiredChecks: [],
-        requiresApproval: false,
-        requiresConversationResolution: false,
-        usesMergeQueue: false,
+        requiredChecks: [...new Set(requiredChecks)],
+        requiresApproval,
+        requiresConversationResolution,
+        usesMergeQueue,
+        unreadable: false,
+      };
+    } catch {
+      // The branch says it is protected and the rules cannot be read: usually a
+      // 403 from a token without admin. Fail closed rather than merging past a
+      // gate whose contents are unknown.
+      return {
+        requiredChecks: [...new Set(requiredChecks)],
+        requiresApproval,
+        requiresConversationResolution,
+        usesMergeQueue,
         unreadable: true,
       };
     }
