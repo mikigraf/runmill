@@ -34,6 +34,17 @@ export interface SandboxRunInput {
   readonly timeoutMs: number;
   /** Extra variables to add on top of the allowlist. */
   readonly env?: Readonly<Record<string, string>> | undefined;
+  /**
+   * The child's OWN credential, exempt from the denylist.
+   *
+   * The denylist exists so an agent cannot read credentials that are not its
+   * business. A provider's own API key is the one credential that is: without
+   * it the provider cannot authenticate, and stripping it made the documented
+   * "or API keys" path silently impossible. Passed only by the caller that
+   * owns the boundary -- check runs never set it -- and never inherited from
+   * the parent environment, which is still filtered as before.
+   */
+  readonly credentialEnv?: Readonly<Record<string, string>> | undefined;
 }
 
 /**
@@ -219,6 +230,22 @@ export function toolchainReadPaths(
   return [...out];
 }
 
+/**
+ * A temporary directory of the child's own.
+ *
+ * TMPDIR is on the environment allowlist, so the sandbox handed the child a
+ * path and then denied it. node, npm, compilers, test runners and both agent
+ * CLIs write there, and the Claude CLI could not start at all without it.
+ *
+ * Granting the shared TMPDIR would have been the easy fix and the wrong one:
+ * every run's workspace lives under it during tests, so it would have made
+ * "outside the workspace" writable. A fresh directory per invocation keeps the
+ * grant to something nothing else is using.
+ */
+export function createPrivateTempDir(): string {
+  return realpathSync(mkdtempSync(join(tmpdir(), "runmill-child-tmp-")));
+}
+
 /** Directories holding the CA bundle this environment points at, if any. */
 export function trustStoreReadPaths(env: NodeJS.ProcessEnv = process.env): string[] {
   const out = new Set<string>();
@@ -274,7 +301,12 @@ export function buildSeatbeltProfile(policy: SandboxPolicy, home: string): strin
     '(allow file-read* (subpath "/usr") (subpath "/bin") (subpath "/sbin")',
     '                  (subpath "/System") (subpath "/Library") (subpath "/opt")',
     '                  (subpath "/private/var/select") (subpath "/private/var/db/dyld")',
-    '                  (subpath "/private/etc") (subpath "/etc") (subpath "/dev") (literal "/"))',
+    // /etc/localtime is a symlink into /private/var/db/timezone, so a process
+    // that formats a local time reads there. Denying it is not a restriction
+    // anyone chose: it takes out `date`, every logger with a timestamp, and
+    // the Claude CLI, which exits with a bare "internal error (EPERM)".
+    '                  (subpath "/private/etc") (subpath "/etc") (subpath "/dev")',
+    '                  (subpath "/private/var/db/timezone") (literal "/"))',
     '(allow file-write* (subpath "/dev/null") (subpath "/dev/dtracehelper"))',
   ];
 
@@ -374,6 +406,7 @@ export class Sandbox {
     cwd: string;
     policy: SandboxPolicy;
     env?: Readonly<Record<string, string>> | undefined;
+    credentialEnv?: Readonly<Record<string, string>> | undefined;
   }): {
     command: string;
     args: string[];
@@ -388,10 +421,19 @@ export class Sandbox {
     }
 
     const home = process.env["HOME"] ?? tmpdir();
-    const env = buildEnvironment(input.env);
+    const childTmp = createPrivateTempDir();
+    // The child is told to use it, so the grant and the environment agree.
+    // The credential is applied after buildEnvironment, which is what makes it
+    // an exemption rather than a hole: the parent environment is still
+    // filtered, and only what the caller explicitly hands over survives.
+    const env = {
+      ...buildEnvironment(input.env),
+      ...(input.credentialEnv ?? {}),
+      TMPDIR: childTmp,
+    };
     const policy: SandboxPolicy = {
       ...input.policy,
-      writablePaths: input.policy.writablePaths.map(realPath),
+      writablePaths: [...input.policy.writablePaths.map(realPath), childTmp],
       readablePaths: [
         ...(input.policy.readablePaths ?? []).map(realPath),
         // Resolved against the PATH the child will actually see, not this
@@ -416,7 +458,10 @@ export class Sandbox {
         args: ["-f", profile, input.command, ...input.args],
         cwd,
         env,
-        cleanup: () => rmSync(profileDir, { recursive: true, force: true }),
+        cleanup: () => {
+          rmSync(profileDir, { recursive: true, force: true });
+          rmSync(childTmp, { recursive: true, force: true });
+        },
       };
     }
 
@@ -425,7 +470,7 @@ export class Sandbox {
       args: [...buildBubblewrapArgs(policy, home), input.command, ...input.args],
       cwd,
       env,
-      cleanup: () => undefined,
+      cleanup: () => rmSync(childTmp, { recursive: true, force: true }),
     };
   }
 

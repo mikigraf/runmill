@@ -24,6 +24,13 @@ import { outputPathFor, outputContractFor } from "./output-contract.js";
 export interface ProviderDialect {
   readonly name: string;
   readonly binary: string;
+  /**
+   * The environment variable holding this provider's own API key.
+   *
+   * Passed through to the provider and to nothing else. Subscription auth
+   * needs no key; this is the documented alternative to it.
+   */
+  readonly credentialEnvVar?: string | undefined;
   readonly versionArgs: readonly string[];
   /** Per-dialect facts. Keeps the adapter from switching on a provider name. */
   readonly capabilities: ProviderCapabilities;
@@ -66,6 +73,7 @@ export const BASE_CAPABILITIES: ProviderCapabilities = {
 export const CODEX_DIALECT: ProviderDialect = {
   name: "codex",
   binary: "codex",
+  credentialEnvVar: "OPENAI_API_KEY",
   versionArgs: ["--version"],
   capabilities: BASE_CAPABILITIES,
   configPaths: (home) => [join(home, ".codex")],
@@ -118,6 +126,7 @@ export const CODEX_DIALECT: ProviderDialect = {
 export const CLAUDE_DIALECT: ProviderDialect = {
   name: "claude",
   binary: "claude",
+  credentialEnvVar: "ANTHROPIC_API_KEY",
   versionArgs: ["--version"],
   capabilities: { ...BASE_CAPABILITIES, sessionResume: true, costReporting: true },
   configPaths: (home) => [join(home, ".claude"), join(home, ".config", "claude")],
@@ -227,6 +236,18 @@ export class CliProviderAdapter implements CodingAgentAdapter {
     return this.#dialect.configPaths(home).filter((path) => existsSync(path));
   }
 
+  /**
+   * The provider's own key, when the operator has one in the environment.
+   *
+   * Absent for subscription auth, which is the common case and needs nothing.
+   */
+  #credentialEnv(): { credentialEnv?: Record<string, string> } {
+    const variable = this.#dialect.credentialEnvVar;
+    if (variable === undefined) return {};
+    const value = process.env[variable];
+    return value === undefined || value === "" ? {} : { credentialEnv: { [variable]: value } };
+  }
+
   get name(): string {
     return this.#model === undefined || this.#model === ""
       ? this.#dialect.name
@@ -295,6 +316,7 @@ export class CliProviderAdapter implements CodingAgentAdapter {
     // primitive as the check runner. Previously only checks were isolated
     // while the agent itself ran unconfined — the inverse of the intent.
     const wrapped = this.#sandbox.wrap({
+      ...this.#credentialEnv(),
       command: this.#dialect.binary,
       args,
       cwd: request.workingDirectory,

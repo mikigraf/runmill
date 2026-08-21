@@ -161,6 +161,15 @@ describe("buildSeatbeltProfile", () => {
     expect(p).toContain('(subpath "/private/etc")');
   });
 
+  it("grants the timezone database, which every local clock reads", () => {
+    // /etc/localtime is a symlink into /private/var/db/timezone. Without it a
+    // process that formats a local time fails, and some runtimes die outright:
+    // the Claude CLI exits with a bare "internal error (EPERM)" and no clue.
+    const p = buildSeatbeltProfile({ writablePaths: ["/w"], allowNetwork: false }, "/Users/x");
+
+    expect(p).toContain('(subpath "/private/var/db/timezone")');
+  });
+
   it("blocks the keychain as a Mach service, not as a file", () => {
     const p = buildSeatbeltProfile({ writablePaths: ["/w"], allowNetwork: false }, "/Users/x");
     expect(p).toContain('(deny mach-lookup (global-name "com.apple.SecurityServer"))');
@@ -368,6 +377,82 @@ describe("Sandbox.run", () => {
       }),
     ).rejects.toThrow(/RM-SANDBOX-001|No sandbox mechanism/);
   });
+
+  it.runIf(hasSandbox)("hands the provider its own credential, which the denylist strips", async () => {
+    // The denylist keeps an agent away from credentials that are not its
+    // business. Its own API key is the one that is: without it the documented
+    // "or API keys" path cannot work at all.
+    const ws = mkdtempSync(join(tmpdir(), "runmill-cred-"));
+    try {
+      const result = await new Sandbox(detectMechanism()).run({
+        command: "/bin/sh",
+        args: ["-c", 'printf "%s" "${ANTHROPIC_API_KEY:-absent}"'],
+        cwd: ws,
+        policy: { writablePaths: [ws], allowNetwork: false },
+        timeoutMs: 20_000,
+        credentialEnv: { ANTHROPIC_API_KEY: "sk-test-value" },
+      });
+      expect(result.stdout.trim()).toBe("sk-test-value");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it.runIf(hasSandbox)("still strips that same variable when nobody hands it over", async () => {
+    // Inheriting it from the parent is exactly what the denylist is for. Only
+    // an explicit hand-off survives.
+    const ws = mkdtempSync(join(tmpdir(), "runmill-cred2-"));
+    try {
+      const result = await new Sandbox(detectMechanism()).run({
+        command: "/bin/sh",
+        args: ["-c", 'printf "%s" "${ANTHROPIC_API_KEY:-absent}"'],
+        cwd: ws,
+        policy: { writablePaths: [ws], allowNetwork: false },
+        timeoutMs: 20_000,
+        env: { ANTHROPIC_API_KEY: "leaked" },
+      });
+      expect(result.stdout.trim()).toBe("absent");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it.runIf(hasSandbox)("can write to the temporary directory it was handed", async () => {
+    // TMPDIR is on the environment allowlist, so the child is TOLD where its
+    // temp directory is and was then denied access to it. Node, npm, compilers
+    // and the agent CLIs all write there; the Claude CLI could not start at all.
+    const ws = mkdtempSync(join(tmpdir(), "runmill-tmp-"));
+    try {
+      const result = await new Sandbox(detectMechanism()).run({
+        command: "/bin/sh",
+        args: ["-c", 'printf ok > "$TMPDIR/runmill-probe" && cat "$TMPDIR/runmill-probe"'],
+        cwd: ws,
+        policy: { writablePaths: [ws], allowNetwork: false },
+        timeoutMs: 20_000,
+      });
+      expect(result.stderr).not.toMatch(/not permitted|denied/i);
+      expect(result.stdout.trim()).toBe("ok");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it.runIf(hasSandbox)("can read the local timezone", async () => {
+    const ws = mkdtempSync(join(tmpdir(), "runmill-tz-"));
+    try {
+      const result = await new Sandbox(detectMechanism()).run({
+        command: "/bin/sh",
+        args: ["-c", "date +%Z"],
+        cwd: ws,
+        policy: { writablePaths: [ws], allowNetwork: false },
+        timeoutMs: 20_000,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).not.toBe("");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it.runIf(onMac && hasSandbox)("can read the CA bundle, so TLS can verify a peer", async () => {
     // Not a proxy for "TLS works" -- this IS what failed. rustls and OpenSSL
