@@ -387,15 +387,39 @@ export class GitHubForgeAdapter implements ForgeAdapter {
    * it, "zero protection-bypassing merges" is unverifiable and merge modes
    * must stay locked.
    */
-  async canWriteBranchProtection(input: { repo: string }): Promise<boolean> {
+  async canWriteBranchProtection(input: { repo: string; branch: string }): Promise<boolean> {
     const { owner, name } = splitRepo(input.repo);
+
+    // Ask the capability, not the role.
+    //
+    // `permissions.admin` describes the CALLER's role on the repository, not
+    // what this token may do. On a repository you own it is true no matter how
+    // the token is scoped, so a fine-grained PAT with Administration=No access
+    // -- the documented way to satisfy this gate -- reported "can bypass" and
+    // guarded-merge could never unlock. Confirmed against real GitHub: that
+    // token receives 403 writing protection while admin reads true.
+    //
+    // Adding an empty set of required contexts is a write that changes
+    // nothing: the response is the unchanged context list. It is the only
+    // honest way to learn whether this credential could remove the rules it is
+    // supposed to be unable to remove.
+    try {
+      await this.#octokit.request(
+        "POST /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks/contexts",
+        { owner, repo: name, branch: input.branch, contexts: [] },
+      );
+      return true;
+    } catch (err) {
+      if ((err as { status?: number }).status === 403) return false;
+      // Anything else is inconclusive: no protection configured, a moved
+      // repository, an outage. Fall back to the role, which fails closed.
+    }
+
     try {
       const perms = await this.#octokit.repos.get({ owner, repo: name });
-      // `admin` is what grants protection writes. An installation token
-      // scoped to contents+pull_requests reports false here.
       return perms.data.permissions?.admin === true;
     } catch {
-      // Unable to determine. Fail closed: assume it might, and keep merge locked.
+      // Unable to determine at all. Assume it might, and keep merge locked.
       return true;
     }
   }

@@ -610,7 +610,10 @@ export class Orchestrator {
       }
 
       // guarded-merge and continuous
-      const canWriteProtection = await this.#d.forge.canWriteBranchProtection({ repo: target.repo });
+      const canWriteProtection = await this.#d.forge.canWriteBranchProtection({
+        repo: target.repo,
+        branch: target.baseBranch,
+      });
       if (canWriteProtection) {
         return finish("NEEDS_HUMAN", {
           prNumber: pr.number,

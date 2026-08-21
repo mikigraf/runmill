@@ -85,7 +85,7 @@ export interface ForgeAdapter {
    * that constrain it, "zero protection-bypassing merges" is unverifiable, so
    * merge modes stay locked until this returns false.
    */
-  canWriteBranchProtection(input: { repo: string }): Promise<boolean>;
+  canWriteBranchProtection(input: { repo: string; branch: string }): Promise<boolean>;
 }
 
 export class ForgeError extends Error {

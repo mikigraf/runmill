@@ -97,7 +97,7 @@ describe.runIf(githubToken !== undefined)("live: GitHub forge", () => {
 
   it("answers the negative capability test on a repo it does not admin", async () => {
     // The gate that keeps merge locked when the credential is too powerful.
-    const canWrite = await forge().canWriteBranchProtection({ repo: REPO });
+    const canWrite = await forge().canWriteBranchProtection({ branch: "main", repo: REPO });
     expect(canWrite).toBe(false);
   }, 60_000);
 

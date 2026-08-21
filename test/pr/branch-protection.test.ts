@@ -188,3 +188,61 @@ describe("getBranchProtection", () => {
     expect(protection.unreadable).toBe(true);
   });
 });
+
+describe("canWriteBranchProtection", () => {
+  /**
+   * The gate that unlocks guarded-merge asked whether the caller has the admin
+   * ROLE. On a repository you own that is always true, whatever the token can
+   * actually do, so a fine-grained PAT with Administration=No access -- the
+   * documented way to satisfy this gate -- reported "can bypass" and merge
+   * modes could never unlock. Verified against real GitHub: that token gets
+   * 403 writing protection while permissions.admin is true.
+   *
+   * The question is a capability, so it is answered by attempting the write.
+   * Adding an empty set of required contexts changes nothing and returns 403
+   * for a token that may not write.
+   */
+  function probe(status: number): Route {
+    return (url) =>
+      url.includes("/required_status_checks/contexts") ? { status, body: [] } : undefined;
+  }
+
+  it("reports false when the credential cannot write protection", async () => {
+    routes = [probe(403)];
+
+    expect(await adapter().canWriteBranchProtection({ repo: "o/r", branch: "main" })).toBe(false);
+  });
+
+  it("reports true when the credential can write protection", async () => {
+    routes = [probe(200)];
+
+    expect(await adapter().canWriteBranchProtection({ repo: "o/r", branch: "main" })).toBe(true);
+  });
+
+  it("does not believe the admin role over the actual capability", async () => {
+    // The exact shape that broke it: admin true, write refused.
+    routes = [
+      probe(403),
+      (url) => (/\/repos\/o\/r$/.test(url) ? { status: 200, body: { permissions: { admin: true } } } : undefined),
+    ];
+
+    expect(await adapter().canWriteBranchProtection({ repo: "o/r", branch: "main" })).toBe(false);
+  });
+
+  it("falls back to the role and fails closed when the probe is inconclusive", async () => {
+    // Neither 200 nor 403: no protection configured, a moved repository, an
+    // outage. Unknown must not unlock a merge.
+    routes = [
+      probe(404),
+      (url) => (/\/repos\/o\/r$/.test(url) ? { status: 200, body: { permissions: { admin: true } } } : undefined),
+    ];
+
+    expect(await adapter().canWriteBranchProtection({ repo: "o/r", branch: "main" })).toBe(true);
+  });
+
+  it("fails closed when nothing can be determined at all", async () => {
+    routes = [probe(500)];
+
+    expect(await adapter().canWriteBranchProtection({ repo: "o/r", branch: "main" })).toBe(true);
+  });
+});
