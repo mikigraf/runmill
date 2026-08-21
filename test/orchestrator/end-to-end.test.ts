@@ -356,6 +356,37 @@ describe("end-to-end: the loop refuses to proceed when it should", () => {
     expect(forge.openPullRequests()).toHaveLength(0);
   }, 90_000);
 
+  it("says what was actually wrong with the review, not just the category", async () => {
+    // "Review output did not match the schema" is the same sentence whether
+    // the reviewer emitted the wrong shape or emitted nothing at all, and a
+    // provider the sandbox killed produces the second. The specific line is
+    // the difference between suspecting the prompt and suspecting the sandbox.
+    // A reviewer that runs, succeeds, and writes nothing -- what a provider
+    // killed by the sandbox actually looks like from here.
+    const provider = new FakeProviderAdapter({
+      byRole: {
+        implementer: [
+          { kind: "say", text: "implementing" },
+          { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
+        ],
+        "local-reviewer": [{ kind: "say", text: "reviewing" }],
+      },
+      silentRoles: ["local-reviewer"],
+      costUsdPerCall: 0.25,
+    });
+    const { orchestrator } = makeOrchestrator({ provider });
+
+    const outcome = await orchestrator.run({
+      runId: "run_norev",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_norev"),
+    });
+
+    expect(outcome.finalState).toBe("QUARANTINED");
+    expect(outcome.reason).toMatch(/no structured output/i);
+  }, 90_000);
+
   it("quarantines on a malformed review rather than treating it as a pass", async () => {
     const provider = new FakeProviderAdapter({
       byRole: {

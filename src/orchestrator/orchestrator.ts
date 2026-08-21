@@ -636,7 +636,15 @@ export class Orchestrator {
         mergeSha: merged.mergeSha,
       });
     } catch (err) {
-      const reason = errorMessage(err);
+      // RunmillError's message is `CODE Title`, which names the category and
+      // not the event. "Review output did not match the schema" is the same
+      // sentence whether the reviewer emitted the wrong shape or emitted
+      // nothing at all, and those point at completely different causes, so the
+      // specific line goes into the reason too.
+      const reason =
+        err instanceof RunmillError && err.whatHappened !== ""
+          ? `${errorMessage(err)}: ${err.whatHappened.trim().split("\n")[0] ?? ""}`
+          : errorMessage(err);
       this.#log(`run failed: ${reason}`);
       return finish("QUARANTINED", { reason });
     } finally {

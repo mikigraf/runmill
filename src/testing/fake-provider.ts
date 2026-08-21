@@ -37,6 +37,14 @@ export interface FakeProviderScript {
   readonly defaultActions?: readonly ScriptedAction[] | undefined;
   /** Structured output written to the output ref, e.g. review findings JSON. */
   readonly outputByRole?: Partial<Record<string, unknown>> | undefined;
+  /**
+   * Roles that finish successfully and write nothing.
+   *
+   * What a provider killed by the sandbox looks like from the orchestrator:
+   * exit 0, no structured output. Observed with a real CLI, so the fake has to
+   * be able to reproduce it.
+   */
+  readonly silentRoles?: readonly string[] | undefined;
   readonly costUsdPerCall?: number | undefined;
 }
 
@@ -235,8 +243,11 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
 
       // Same contract the real adapter uses, so a role that produces output
       // in tests produces it in production and vice versa.
-      let output = this.#script.outputByRole?.[request.role] ?? DEFAULT_OUTPUT[request.role];
+      let output = this.#script.silentRoles?.includes(request.role) === true
+        ? undefined
+        : this.#script.outputByRole?.[request.role] ?? DEFAULT_OUTPUT[request.role];
       if (
+        this.#script.silentRoles?.includes(request.role) !== true &&
         this.#script.outputByRole?.[request.role] === undefined &&
         (request.role === "local-reviewer" || request.role === "pr-reviewer")
       ) {
