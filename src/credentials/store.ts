@@ -1,10 +1,11 @@
 import { platform } from "node:os";
 import { RunmillError } from "../errors/runmill-error.js";
-import { run } from "../platform/process.js";
+import { run, runWithInput } from "../platform/process.js";
 
 export type CredentialName = "linear" | "github" | "runmill-policy";
 
 const SERVICE = "runmill";
+const KEYCHAIN_WRITE_TIMEOUT_MS = 15_000;
 
 /**
  * Credential storage.
@@ -74,7 +75,14 @@ export class CredentialStore {
         `keychain storage is only implemented on macOS; set $${this.#envOverrides[name]} instead`,
       );
     }
-    await run("security", [
+    if (value === "" || /[\0\r\n]/u.test(value)) {
+      throw new Error("keychain credentials must be non-empty and contain no line break or NUL byte");
+    }
+
+    // `security -w <value>` exposes the value in the process argument list.
+    // With -w last it prompts twice; a detached child has no controlling TTY,
+    // so both answers arrive only through this private stdin pipe.
+    const result = await runWithInput("security", [
       "add-generic-password",
       "-U",
       "-s",
@@ -82,8 +90,26 @@ export class CredentialStore {
       "-a",
       SERVICE,
       "-w",
-      value,
-    ]);
+    ], `${value}\n${value}\n`, {
+      detached: true,
+      // A locked keychain can otherwise leave setup waiting on an OS prompt
+      // that this deliberately non-interactive child can never answer.
+      timeoutMs: KEYCHAIN_WRITE_TIMEOUT_MS,
+    });
+    if (!result.ok) {
+      const rawDetail =
+        result.stderr.trim() || result.stdout.trim() || `exit ${String(result.code)}`;
+      let detail = rawDetail;
+      for (const representation of new Set([
+        value,
+        encodeURIComponent(value),
+        Buffer.from(value).toString("base64"),
+        Buffer.from(`x-access-token:${value}`).toString("base64"),
+      ])) {
+        detail = detail.split(representation).join("<redacted>");
+      }
+      throw new Error(`could not store ${name} in the macOS keychain: ${detail}`);
+    }
   }
 
   async remove(name: CredentialName): Promise<void> {

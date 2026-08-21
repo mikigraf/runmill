@@ -1,0 +1,33 @@
+name: Documentation report
+description: Report incorrect, missing, or confusing documentation
+labels: [documentation]
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Page or section
+      placeholder: docs/verification.md#candidate-identity
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or unclear?
+    validations:
+      required: true
+  - type: textarea
+    id: correction
+    attributes:
+      label: Suggested correction
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      options:
+        - Blocks setup or operation
+        - Could cause unsafe operation
+        - Incorrect command or reference
+        - Confusing or incomplete explanation
+        - Typo or presentation issue
+    validations:
+      required: true

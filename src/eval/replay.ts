@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { EvalSuite, EvalTask, TaskSplit } from "./suite.js";
 import { redactForReport } from "./suite.js";
 import { scoreTask, summarize, type SuiteReport, type TaskAttempt } from "./score.js";
+import { RunmillError } from "../errors/runmill-error.js";
 
 /**
  * How one task is executed.
@@ -45,7 +46,12 @@ export async function replaySuite(options: ReplayOptions): Promise<SuiteReport> 
           finalState: "HARNESS_ERROR",
           costUsd: 0,
           durationMs: 0,
-          reason: err instanceof Error ? err.message : String(err),
+          reason:
+            err instanceof RunmillError && task.split !== "held-out"
+              ? `${err.message}: ${err.whatHappened}`
+              : err instanceof Error
+                ? err.message
+                : String(err),
         });
       }
     }
@@ -61,6 +67,9 @@ export async function replaySuite(options: ReplayOptions): Promise<SuiteReport> 
 
 /** Scratch directory for a task's fixture repository. */
 export function makeTaskWorkspace(taskId: string): { path: string; cleanup: () => void } {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/u.test(taskId)) {
+    throw new Error(`unsafe evaluation task id ${JSON.stringify(taskId)}`);
+  }
   const path = mkdtempSync(join(tmpdir(), `runmill-eval-${taskId}-`));
   return { path, cleanup: () => rmSync(path, { recursive: true, force: true }) };
 }

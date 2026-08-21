@@ -1,4 +1,4 @@
-import { execFile, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -61,6 +61,11 @@ export interface RunOptions {
   readonly timeoutMs?: number | undefined;
 }
 
+export interface RunWithInputOptions extends RunOptions {
+  /** Start a new session so interactive tools cannot reopen the caller's TTY. */
+  readonly detached?: boolean | undefined;
+}
+
 /**
  * Run a command and capture its output, without throwing on a non-zero exit.
  *
@@ -89,6 +94,77 @@ export async function run(
       code: typeof e.code === "number" ? e.code : null,
     };
   }
+}
+
+/**
+ * Run a command while supplying sensitive input through a private stdin pipe.
+ *
+ * The input is deliberately a separate parameter: it is never joined into the
+ * command arguments or copied into a failure diagnostic.
+ */
+export async function runWithInput(
+  command: string,
+  args: readonly string[],
+  input: string,
+  options: RunWithInputOptions = {},
+): Promise<RunResult> {
+  return new Promise((resolve) => {
+    const stdout = new BoundedCapture(MAX_BUFFER_BYTES);
+    const stderr = new BoundedCapture(MAX_BUFFER_BYTES);
+    let child: ChildProcess;
+    try {
+      child = spawn(command, [...args], {
+        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        ...(options.env === undefined ? {} : { env: options.env }),
+        detached: options.detached === true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      resolve({
+        ok: false,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+        code: null,
+      });
+      return;
+    }
+
+    let spawnError: Error | undefined;
+    let timedOut = false;
+    const cancelTimer =
+      options.timeoutMs === undefined
+        ? () => undefined
+        : armKillTimer(child, options.timeoutMs, () => {
+            timedOut = true;
+          });
+
+    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", (error) => {
+      spawnError = error;
+    });
+    child.on("close", (code) => {
+      cancelTimer();
+      const failure = [
+        stderr.text(),
+        ...(timedOut ? [`command timed out after ${String(options.timeoutMs)} ms`] : []),
+        ...(spawnError === undefined ? [] : [spawnError.message]),
+      ]
+        .filter((part) => part !== "")
+        .join("\n");
+      resolve({
+        ok: code === 0 && !timedOut && spawnError === undefined,
+        stdout: stdout.text(),
+        stderr: failure,
+        code,
+      });
+    });
+
+    // A command may reject input before consuming it. EPIPE is an ordinary
+    // command failure reported through close/stderr, not an unhandled event.
+    child.stdin?.on("error", () => undefined);
+    child.stdin?.end(input);
+  });
 }
 
 /** Same, but a non-zero exit throws with the stderr attached. */

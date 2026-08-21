@@ -75,8 +75,15 @@ describe("parseReviewJson", () => {
 describe("blockingFindings", () => {
   it("blocks on the configured severities and ignores the rest", () => {
     const r = review({
-      verdict: "changes_required",
       findings: [FINDING, { ...FINDING, id: "REV-2", severity: "low" }],
+    });
+    expect(blockingFindings(r, ["critical", "high"]).map((f) => f.id)).toEqual(["REV-1"]);
+  });
+
+  it("treats every finding as blocking when the reviewer requires changes", () => {
+    const r = review({
+      verdict: "changes_required",
+      findings: [{ ...FINDING, severity: "low" }],
     });
     expect(blockingFindings(r, ["critical", "high"]).map((f) => f.id)).toEqual(["REV-1"]);
   });
@@ -84,6 +91,13 @@ describe("blockingFindings", () => {
   it("returns nothing when no finding reaches the threshold", () => {
     const r = review({ findings: [{ ...FINDING, severity: "low" }] });
     expect(blockingFindings(r, ["critical", "high"])).toEqual([]);
+  });
+
+  it("treats every finding as unresolved when policy requires all findings resolved", () => {
+    const r = review({ findings: [{ ...FINDING, severity: "low" }] });
+    expect(blockingFindings(r, ["critical", "high"], true).map((f) => f.id)).toEqual([
+      "REV-1",
+    ]);
   });
 });
 
@@ -106,6 +120,28 @@ describe("crossCheckVerdict", () => {
     ).toBe(true);
   });
 
+  it("uses the same glob semantics as the automatic-merge risk gate", () => {
+    const result = crossCheckVerdict(
+      review({ verdict: "no_findings" }),
+      ["src/auth/token.ts"],
+      ["src/**/*.ts"],
+      [],
+    );
+    expect(result.accepted).toBe(false);
+    expect(result.reason).toMatch(/risk-escalating/);
+  });
+
+  it("fails closed when a risk path rule uses unsupported syntax", () => {
+    const result = crossCheckVerdict(
+      review({ verdict: "approved" }),
+      ["src/auth/token.ts"],
+      ["src/[ab]*/**"],
+      [],
+    );
+    expect(result.accepted).toBe(false);
+    expect(result.reason).toMatch(/unsupported or invalid syntax/);
+  });
+
   it("rejects an approval of a change the reviewer called out of scope", () => {
     const result = crossCheckVerdict(
       review({ scope_assessment: "out_of_scope" }),
@@ -115,6 +151,39 @@ describe("crossCheckVerdict", () => {
     );
     expect(result.accepted).toBe(false);
     expect(result.reason).toMatch(/out of scope/);
+  });
+
+  it("rejects an approval when scope is unclear", () => {
+    const result = crossCheckVerdict(
+      review({ scope_assessment: "unclear" }),
+      ["src/a.ts"],
+      [],
+      [],
+    );
+    expect(result.accepted).toBe(false);
+    expect(result.reason).toMatch(/could not establish/i);
+  });
+
+  it("rejects a no-findings verdict that also contains findings", () => {
+    const result = crossCheckVerdict(
+      review({ verdict: "no_findings", findings: [FINDING] }),
+      ["src/a.ts"],
+      [],
+      [],
+    );
+    expect(result.accepted).toBe(false);
+    expect(result.reason).toMatch(/also returning findings/i);
+  });
+
+  it("rejects changes-required without an actionable finding", () => {
+    const result = crossCheckVerdict(
+      review({ verdict: "changes_required", findings: [] }),
+      ["src/a.ts"],
+      [],
+      [],
+    );
+    expect(result.accepted).toBe(false);
+    expect(result.reason).toMatch(/no actionable finding/i);
   });
 });
 

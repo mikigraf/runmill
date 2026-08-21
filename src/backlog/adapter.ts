@@ -39,6 +39,21 @@ export class AmbiguousMutationError extends Error {
   }
 }
 
+/**
+ * The adapter failed while resolving read-only inputs, before calling a
+ * mutation API. The orchestrator may close that outbox intent as not applied;
+ * ordinary errors remain ambiguous and must still block recovery.
+ */
+export class BacklogMutationNotStartedError extends Error {
+  readonly operation: string;
+
+  constructor(operation: string, message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "BacklogMutationNotStartedError";
+    this.operation = operation;
+  }
+}
+
 export class BacklogRateLimitError extends Error {
   readonly code = "RM-BACKLOG-002";
   readonly retryAfterMs: number;

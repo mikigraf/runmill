@@ -10,7 +10,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { platform } from "node:os";
 
 const runMock = vi.fn();
-vi.mock("../../src/platform/process.js", () => ({ run: runMock }));
+const runWithInputMock = vi.fn();
+vi.mock("../../src/platform/process.js", () => ({
+  run: runMock,
+  runWithInput: runWithInputMock,
+}));
 
 const { CredentialStore } = await import("../../src/credentials/store.js");
 const { RunmillError } = await import("../../src/errors/runmill-error.js");
@@ -26,6 +30,7 @@ beforeEach(() => {
   }
   // Default: nothing found anywhere.
   runMock.mockResolvedValue({ ok: false, stdout: "", stderr: "", code: 1 });
+  runWithInputMock.mockResolvedValue({ ok: true, stdout: "", stderr: "", code: 0 });
 });
 
 afterEach(() => {
@@ -134,10 +139,9 @@ describe("require", () => {
 describe("set", () => {
   it("stores into the keychain on macOS with an update flag", async () => {
     if (platform() !== "darwin") return;
-    runMock.mockResolvedValue({ ok: true, stdout: "", stderr: "", code: 0 });
     await new CredentialStore().set("linear", "lin_api_new");
 
-    const [cmd, args] = runMock.mock.calls[0] as [string, string[]];
+    const [cmd, args] = runWithInputMock.mock.calls[0] as [string, string[]];
     expect(cmd).toBe("security");
     expect(args).toContain("add-generic-password");
     // Without -U a second `auth login` fails instead of replacing the entry.
@@ -148,6 +152,47 @@ describe("set", () => {
   it("refuses on a platform with no keychain, and says what to do instead", async () => {
     if (platform() === "darwin") return;
     await expect(new CredentialStore().set("linear", "x")).rejects.toThrow(/LINEAR_API_KEY/);
+  });
+
+  it("does not claim a credential was stored when the keychain command fails", async () => {
+    if (platform() !== "darwin") return;
+    runWithInputMock.mockResolvedValue({
+      ok: false,
+      stdout: "",
+      stderr: "User interaction is not allowed",
+      code: 36,
+    });
+    await expect(new CredentialStore().set("linear", "secret")).rejects.toThrow(
+      /could not store linear.*User interaction is not allowed/,
+    );
+  });
+
+  it("redacts a credential if a failed keychain tool reflects its input", async () => {
+    if (platform() !== "darwin") return;
+    const secret = "lin_api_reflected";
+    const encoded = Buffer.from(secret).toString("base64");
+    runWithInputMock.mockResolvedValue({
+      ok: false,
+      stdout: "",
+      stderr: `failed for ${secret} (${encoded})`,
+      code: 1,
+    });
+
+    const failure = await new CredentialStore().set("linear", secret).then(
+      () => new Error("expected keychain storage to fail"),
+      (error: unknown) => error as Error,
+    );
+
+    expect(failure.message).not.toContain(secret);
+    expect(failure.message).not.toContain(encoded);
+  });
+
+  it("refuses values that cannot be transported as one private prompt line", async () => {
+    if (platform() !== "darwin") return;
+    await expect(new CredentialStore().set("linear", "first\nsecond")).rejects.toThrow(
+      /line break/i,
+    );
+    expect(runWithInputMock).not.toHaveBeenCalled();
   });
 });
 
@@ -166,15 +211,48 @@ describe("remove", () => {
 });
 
 describe("what the store never does", () => {
-  it("never passes a secret value as a shell string", async () => {
-    // Every call is argv-form. A shell string containing a token would leak it
-    // into process listings and shell history.
+  it("keeps the raw and reversibly encoded secret out of the process argv", async () => {
+    // An argv array prevents shell injection, but argv is still visible in
+    // process listings. The secret belongs only on the child's stdin pipe.
     if (platform() !== "darwin") return;
-    runMock.mockResolvedValue({ ok: true, stdout: "", stderr: "", code: 0 });
-    await new CredentialStore().set("linear", "secret with spaces && rm -rf /");
-    for (const call of runMock.mock.calls) {
-      expect(Array.isArray(call[1])).toBe(true);
-      expect(call[0]).not.toContain("secret");
-    }
+    const secret = "secret with spaces && rm -rf /";
+    await new CredentialStore().set("linear", secret);
+
+    const [command, args, input, options] = runWithInputMock.mock.calls[0] as [
+      string,
+      string[],
+      string,
+      { detached?: boolean; timeoutMs?: number },
+    ];
+    const argv = [command, ...args].join("\0");
+    expect(argv).not.toContain(secret);
+    expect(argv).not.toContain(encodeURIComponent(secret));
+    expect(argv).not.toContain(Buffer.from(secret).toString("base64"));
+    expect(args.at(-1)).toBe("-w");
+    expect(input).toBe(`${secret}\n${secret}\n`);
+    expect(options.detached).toBe(true);
+    expect(options.timeoutMs).toBe(15_000);
+  });
+
+  it("bounds a locked keychain write and keeps reflected encodings out of the error", async () => {
+    if (platform() !== "darwin") return;
+    const secret = "ghp_timeout-sensitive";
+    const encoded = Buffer.from(`x-access-token:${secret}`).toString("base64");
+    runWithInputMock.mockResolvedValue({
+      ok: false,
+      stdout: "",
+      stderr: `timed out while handling ${encoded}`,
+      code: null,
+    });
+
+    const failure = await new CredentialStore().set("github", secret).then(
+      () => new Error("expected keychain storage to fail"),
+      (error: unknown) => error as Error,
+    );
+
+    expect(runWithInputMock.mock.calls[0]?.[3]).toMatchObject({ timeoutMs: 15_000 });
+    expect(failure.message).toContain("timed out");
+    expect(failure.message).not.toContain(secret);
+    expect(failure.message).not.toContain(encoded);
   });
 });

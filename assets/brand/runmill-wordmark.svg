@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 292 64" role="img" aria-labelledby="title">
+  <title id="title">runmill</title>
+  <g fill="#111310">
+    <path d="M4 52V20h8v5c3-4 8-6 14-6h3v9h-4c-8 0-13 4-13 12v12H4Z"/>
+    <path d="M36 20h9v19c0 5 2 7 7 7 6 0 9-4 9-10V20h9v32h-9v-5c-3 4-7 6-13 6-8 0-12-5-12-14V20Z"/>
+    <path d="M80 20h9v5c3-4 7-6 13-6 9 0 13 5 13 14v19h-9V34c0-5-2-8-7-8-6 0-10 4-10 11v15h-9V20Z"/>
+    <path d="M125 20h9v5c3-4 7-6 12-6 6 0 10 2 12 7 3-5 8-7 14-7 8 0 12 5 12 14v19h-9V34c0-5-2-8-6-8-6 0-9 4-9 11v15h-9V34c0-5-2-8-6-8-6 0-11 4-11 11v15h-9V20Z"/>
+    <path d="M194 20h9v32h-9V20Zm0-12h9v8h-9V8Z"/>
+    <path d="M214 8h9v44h-9V8Z"/>
+    <path d="M234 8h9v44h-9V8Z"/>
+  </g>
+</svg>

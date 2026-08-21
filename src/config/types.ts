@@ -5,6 +5,10 @@ import type { RepositoryRule } from "../queue/repository-mapping.js";
 export interface RunmillConfig {
   readonly version: 1;
   readonly autonomy: AutonomyMode;
+  readonly experimental: {
+    /** Second, explicit acknowledgement required before Runmill may merge. */
+    readonly automaticMerge: boolean;
+  };
   /**
    * Which agent runs which role.
    *
@@ -16,6 +20,7 @@ export interface RunmillConfig {
    */
   readonly providers: {
     readonly execution: "local";
+    /** Claude per-invocation turn cap; Codex has no equivalent CLI flag. */
     readonly maxTurns: number;
     readonly timeoutMinutes: number;
     readonly implementer: {
@@ -31,12 +36,11 @@ export interface RunmillConfig {
     };
   };
   readonly backlog: {
-    readonly provider: "linear" | "github-issues";
+    readonly provider: "linear";
     readonly team: string;
     readonly eligibleStates: readonly string[];
     readonly claimState: string;
     readonly completedState?: string | undefined;
-    readonly blockedState?: string | undefined;
     readonly deliveredState?: string | undefined;
     readonly includeLabels: readonly string[];
     readonly excludeLabels: readonly string[];
@@ -53,34 +57,18 @@ export interface RunmillConfig {
   readonly github: {
     readonly repositories: readonly RepositoryRule[];
     readonly branchTemplate: string;
-    /**
-     * Submit dependency chains as stacked pull requests.
-     *
-     * Off by default. It changes what a check on an upper layer proves, since
-     * that layer is verified against a tree containing unmerged work, and that
-     * is a decision to make deliberately.
-     */
-    readonly stackDependencyChains: boolean;
-    readonly stackMaxDepth: number;
     readonly draftPr: boolean;
     readonly merge: {
       readonly method: "squash" | "merge" | "rebase";
-      readonly deleteBranch: boolean;
     };
   };
   readonly workspace: {
     readonly strategy: "worktree";
-    readonly gitIsolation: "separate-git-dir" | "clone";
-    readonly sandbox: "native" | "container" | "none";
+    readonly gitIsolation: "clone";
+    readonly sandbox: "native" | "none";
     readonly network: "proxy" | "none";
     readonly networkAllowlist: readonly string[];
     readonly allowUnenforced: readonly string[];
-    readonly cleanUntrackedFiles: boolean;
-  };
-  readonly context: {
-    readonly entryFiles: readonly string[];
-    readonly maxInitialBytes: number;
-    readonly progressiveDisclosure: boolean;
   };
   readonly verification: {
     readonly manifest: string;
@@ -122,7 +110,7 @@ export interface RunmillConfig {
       readonly prFixer: number;
     };
     readonly clampInvocationTimeoutToRemaining: boolean;
-    readonly costEnforcement: "auto" | "tokens-estimated" | "wall-and-invocations-only";
+    readonly costEnforcement: "auto" | "wall-and-invocations-only";
   };
 }
 

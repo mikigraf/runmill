@@ -1,23 +1,37 @@
-import { join } from "node:path";
-import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
-import type { BacklogAdapter } from "../backlog/adapter.js";
+import { isAbsolute, join, resolve } from "node:path";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  BacklogMutationNotStartedError,
+  type BacklogAdapter,
+} from "../backlog/adapter.js";
 import type { CodingAgentAdapter } from "../agent/adapter.js";
-import type { ForgeAdapter } from "../pr/adapter.js";
+import type { BranchProtection, ForgeAdapter, PullRequest } from "../pr/adapter.js";
 import type { RunmillConfig } from "../config/types.js";
 import type { StateStore } from "../state/store.js";
 import type { Clock } from "../platform/clock.js";
 import type { BacklogIssue, RepositoryTarget } from "../domain/types.js";
 import { WorkspaceManager, type Workspace } from "../workspace/manager.js";
-import { VerificationEngine, resolveManifest, type CheckSpec } from "../verification/engine.js";
+import {
+  VerificationEngine,
+  assertEffectiveVerificationChecks,
+  resolveManifest,
+  type CheckSpec,
+} from "../verification/engine.js";
 import { buildTaskPacket, renderIssueDocument } from "../agent/task-packet.js";
 import { parseReviewJson, blockingFindings, crossCheckVerdict, type Review } from "../review/schema.js";
 import { reconcileChecks, type CheckMapping, type ReconcileVerdict } from "../pr/reconcile.js";
 import { GitRefLease, type HeldLease } from "../queue/git-lease.js";
-import { accumulateUsage } from "../agent/events.js";
 import { RunmillError , errorMessage } from "../errors/runmill-error.js";
 import { renderPullRequestBody } from "./pr-body.js";
 import { snapshotHash } from "../domain/snapshot.js";
 import { RunLog } from "../state/run-log.js";
+import { evaluateAutomaticMergeRisk } from "./risk-policy.js";
+import { RunBudget } from "./run-budget.js";
+import {
+  buildPullRequestEvidence,
+  PR_EVIDENCE_PATH,
+  serializePullRequestEvidence,
+} from "./pr-evidence.js";
 
 export type RunState =
   | "DISCOVERED"
@@ -64,7 +78,16 @@ export interface OrchestratorDeps {
   readonly workspaces?: WorkspaceManager | undefined;
   readonly verification?: VerificationEngine | undefined;
   readonly sourceRepoPath: string;
+  /** GitHub owner/name parsed from the exact local origin being cloned. */
+  readonly sourceRepository: string;
+  /**
+   * Exact trusted source commit/ref for the run workspace. Production binds
+   * this to the remote base fetch; evaluation may bind it to historical data.
+   */
+  readonly sourceBaseRef?: string | undefined;
   readonly workspaceRoot: string;
+  /** Human-readable activity journal. Defaults beside machine state, never in source. */
+  readonly runLogPath?: string | undefined;
   readonly checks: readonly CheckSpec[];
   readonly checkMappings?: readonly CheckMapping[] | undefined;
   readonly onEvent?: ((message: string) => void) | undefined;
@@ -78,12 +101,13 @@ export interface RunOutcome {
   readonly runId: string;
   readonly issueId: string;
   readonly finalState: RunState;
-  /** Branch this run pushed, and the base a stacked layer builds on. */
+  /** Branch this run pushed. */
   readonly branch?: string | undefined;
   readonly prNumber?: number | undefined;
   readonly prUrl?: string | undefined;
   readonly mergeSha?: string | undefined;
   readonly costUsd: number;
+  readonly agentInvocations?: number | undefined;
   readonly reason?: string | undefined;
 }
 
@@ -108,7 +132,7 @@ export class Orchestrator {
     this.#d = deps;
     this.#workspaces = deps.workspaces ?? new WorkspaceManager();
     this.#verification = deps.verification ?? new VerificationEngine();
-    this.#runLog = new RunLog(join(deps.sourceRepoPath, ".runmill", "log.md"));
+    this.#runLog = new RunLog(deps.runLogPath ?? join(deps.workspaceRoot, "..", "log.md"));
   }
 
   /** The adapter that runs review roles. Falls back to the implementer's. */
@@ -118,6 +142,129 @@ export class Orchestrator {
 
   #log(message: string): void {
     this.#d.onEvent?.(message);
+  }
+
+  /** Capture repository guidance before the implementer can edit the tree. */
+  #reviewGuidance(
+    configuredPath: string | undefined,
+    workspace: Workspace,
+  ): { source: string; content: string } | undefined {
+    if (configuredPath === undefined) return undefined;
+    const path = isAbsolute(configuredPath)
+      ? configuredPath
+      : resolve(workspace.path, configuredPath);
+    const content = readFileSync(path, "utf8");
+    if (Buffer.byteLength(content) > MAX_REVIEW_GUIDANCE_BYTES) {
+      throw RunmillError.fromCatalog("RM-CONFIG-001", {
+        whatHappened:
+          `${configuredPath} is larger than ${MAX_REVIEW_GUIDANCE_BYTES} bytes. ` +
+          "Repository review guidance is prompt input, so keep it bounded.",
+      });
+    }
+    return { source: configuredPath, content };
+  }
+
+  /** Re-read the remote PR and bind it to the exact local candidate. */
+  async #pullRequestAtCandidate(input: {
+    repo: string;
+    number: number;
+    candidateSha: string;
+  }): Promise<{ pullRequest?: PullRequest; blocked?: string }> {
+    const current = await this.#d.forge.getPullRequest({
+      repo: input.repo,
+      number: input.number,
+    });
+    if (current === undefined) {
+      return { blocked: `pull request #${input.number} could not be read from ${input.repo}` };
+    }
+    if (current.state !== "open") {
+      return {
+        blocked: `pull request #${input.number} is ${current.state}, not the open candidate Runmill created`,
+      };
+    }
+    if (current.headSha !== input.candidateSha) {
+      return {
+        blocked:
+          `pull request #${input.number} head ${current.headSha} does not match the exact ` +
+          `candidate ${input.candidateSha}; refusing stale or externally amended evidence`,
+      };
+    }
+    return { pullRequest: current };
+  }
+
+  /** Wait for required CI contexts on one exact candidate SHA. */
+  async #waitForCi(input: {
+    target: RepositoryTarget;
+    candidateSha: string;
+    lease: GitRefLease;
+    held: HeldLease;
+    budget: RunBudget;
+  }): Promise<
+    | { blocked: string }
+    | { protection: BranchProtection; verdicts: ReadonlyMap<string, ReconcileVerdict> }
+  > {
+    input.budget.assertActive("reading branch protection");
+    const ciWaitStartedMs = this.#d.clock.now().getTime();
+    const protection = await this.#d.forge.getBranchProtection({
+      repo: input.target.repo,
+      branch: input.target.baseBranch,
+    });
+
+    // Unreadable rules are not absent rules. A 403 on the protection endpoint
+    // is common, and treating it as "nothing required" would fail open.
+    if (protection.unreadable) {
+      return {
+        blocked:
+          "branch protection could not be read, so required checks and approvals are " +
+          "unknown; refusing to treat unreadable rules as absent rules",
+      };
+    }
+
+    const pollIntervalMs = this.#d.ciPollIntervalMs ?? CI_POLL_INTERVAL_MS;
+    const pause = this.#d.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+    const mappings =
+      this.#d.checkMappings ??
+      protection.requiredChecks.map((context) => ({
+        localId: context,
+        contextName: context,
+      }));
+
+    let verdicts = new Map<string, ReconcileVerdict>();
+    let unsatisfied: [string, ReconcileVerdict][] = [];
+    const maxAttempts = Math.max(1, Math.ceil(CI_SCHEDULE_DEADLINE_MS / pollIntervalMs)) + 1;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      input.budget.assertActive("polling CI");
+      const observed = await this.#d.forge.listChecks({
+        repo: input.target.repo,
+        ref: input.candidateSha,
+      });
+      verdicts = reconcileChecks({
+        requiredContexts: protection.requiredChecks,
+        mappings,
+        observed,
+        headSha: input.candidateSha,
+        waitedMs: this.#d.clock.now().getTime() - ciWaitStartedMs,
+        scheduleDeadlineMs: CI_SCHEDULE_DEADLINE_MS,
+        ...(protection.usesMergeQueue ? { event: "merge_group" as const } : {}),
+      });
+      unsatisfied = [...verdicts].filter(([, verdict]) => verdict.state !== "satisfied");
+      if (unsatisfied.length === 0) break;
+      if (unsatisfied.some(([, verdict]) => verdict.state !== "waiting")) break;
+      if (this.#d.clock.now().getTime() - ciWaitStartedMs >= CI_SCHEDULE_DEADLINE_MS) break;
+
+      await input.lease.assertHeld(input.held);
+      input.budget.assertActive("waiting for CI");
+      await pause(pollIntervalMs);
+    }
+
+    if (unsatisfied.length > 0) {
+      return {
+        blocked: `CI not satisfied — ${unsatisfied
+          .map(([name, verdict]) => `${name}: ${verdict.detail}`)
+          .join("; ")}`,
+      };
+    }
+    return { protection, verdicts };
   }
 
   #advance(runId: string, to: RunState, reason?: string): void {
@@ -137,9 +284,8 @@ export class Orchestrator {
    * Hand the issue back, in both places that record who holds it.
    *
    * The git ref is the distributed lock and the store row is what selection
-   * reads. Releasing only the ref left every claimed issue "actively leased"
-   * for good: a run that escalated could never be retried, and `runmill
-   * resume` reported success while the next run refused the issue.
+   * reads. Releasing only the ref leaves the issue locally ineligible even
+   * after the remote ownership boundary is gone.
    */
   async #releaseLease(lease: GitRefLease, held: HeldLease, issueId: string, runId: string): Promise<void> {
     try {
@@ -155,17 +301,32 @@ export class Orchestrator {
     system: string,
     operation: string,
     target: string,
+    assertLease: () => Promise<void>,
     act: () => Promise<T>,
   ): Promise<T> {
     const key = this.#d.store.intendSideEffect({ runId, system, operation, target });
+    try {
+      // The intent must exist before the fence: a crash after a successful
+      // fence is still observable. If the fence itself refuses, however, the
+      // external call provably never started and the intent can be closed as
+      // not applied instead of blocking every later run.
+      await assertLease();
+    } catch (err) {
+      this.#d.store.resolveSideEffect(key, "not-applied", "orchestrator");
+      throw err;
+    }
     this.#d.store.markSideEffectInFlight(key);
     try {
       const result = await act();
       this.#d.store.confirmSideEffect(key);
       return result;
     } catch (err) {
-      // Failure does not prove the effect did not land; the row stays pending
-      // so the recovery sweep reconciles it against the remote.
+      if (err instanceof BacklogMutationNotStartedError) {
+        this.#d.store.resolveSideEffect(key, "not-applied", "orchestrator");
+        throw err;
+      }
+      // Failure does not prove the effect did not land. The row stays pending
+      // and blocks new work until an operator checks the named remote system.
       this.#d.store.failSideEffect(key, errorMessage(err));
       throw err;
     }
@@ -184,6 +345,31 @@ export class Orchestrator {
     let branch: string | undefined;
     let costUsd = 0;
     let logged = false;
+    let claimTransitioned = false;
+    let assignmentChanged = false;
+    let pullRequestOpened = false;
+    const budget = new RunBudget({
+      clock: this.#d.clock,
+      maxWallMs: cfg.budgets.maxWallMinutesPerIssue * 60_000,
+      maxCostUsd: cfg.budgets.maxCostUsdPerIssue,
+      maxInvocations: cfg.budgets.maxAgentInvocations,
+      clampInvocationTimeout: cfg.budgets.clampInvocationTimeoutToRemaining,
+      costEnforcement: cfg.budgets.costEnforcement,
+    });
+    const providerTimeout = (role: Parameters<RunBudget["beginInvocation"]>[0]): number =>
+      budget.beginInvocation(role, cfg.providers.timeoutMinutes * 60_000);
+    const accountUsage = (events: Parameters<RunBudget["finishInvocation"]>[0]): void => {
+      try {
+        budget.finishInvocation(events);
+      } finally {
+        // Preserve observed spend even when this invocation crossed the cap.
+        costUsd = budget.costUsd;
+      }
+    };
+    const assertLease = async (): Promise<void> => {
+      if (held === undefined) throw new Error("external mutation attempted without a held lease");
+      await input.lease.assertHeld(held);
+    };
 
     /**
      * Record the terminal state before returning it.
@@ -206,6 +392,7 @@ export class Orchestrator {
         issueId: issue.identifier,
         finalState: state,
         costUsd,
+        agentInvocations: budget.invocationCount,
         ...(branch === undefined ? {} : { branch }),
         ...extra,
       };
@@ -226,13 +413,43 @@ export class Orchestrator {
           });
           logged = true;
         } catch (err) {
-          this.#log(`could not append .runmill/log.md: ${errorMessage(err)}`);
+          this.#log(`could not append the activity log: ${errorMessage(err)}`);
         }
       }
       return outcome;
     };
 
     try {
+      // Config validation and doctor are advisory entry gates, not runtime
+      // authority. Direct embedders can bypass both, so prove the effective
+      // operator + repository union before acquiring a lease, mutating the
+      // backlog, creating a workspace, or invoking an agent.
+      const initialManifest = resolveManifest({
+        configured: this.#d.checks,
+        changedPaths: [],
+      });
+      assertEffectiveVerificationChecks(initialManifest);
+
+      const pendingEffects = this.#d.store.pendingSideEffects();
+      if (pendingEffects.length > 0) {
+        throw RunmillError.fromCatalog("RM-STATE-002", {
+          whatHappened:
+            `${pendingEffects.length} earlier external effect(s) have an ambiguous outcome; ` +
+            `the oldest is ${pendingEffects[0]?.operation ?? "unknown"} → ` +
+            `${pendingEffects[0]?.target ?? "unknown"}`,
+          runId,
+        });
+      }
+
+      if (target.repo.toLowerCase() !== this.#d.sourceRepository.toLowerCase()) {
+        throw RunmillError.fromCatalog("RM-WORKSPACE-003", {
+          whatHappened:
+            `issue ${issue.identifier} maps to ${target.repo}, but this daemon is attached to ` +
+            `${this.#d.sourceRepository}; refusing to push one repository's tree to another`,
+          runId,
+        });
+      }
+
       // Counted BEFORE this run is recorded, so the first attempt is 1.
       // github.branch_template is validated to contain {attempt} precisely so a
       // retry does not reuse a branch; hardcoding it to "1" meant every retry
@@ -256,6 +473,7 @@ export class Orchestrator {
         return finish("COMPLETED", { reason: "observe mode" });
       }
 
+      budget.assertActive("claiming the issue");
       held = await input.lease.acquire(issue.identifier, {
         priorStateId: issue.state,
         ...(issue.assigneeId === undefined ? {} : { priorAssigneeId: issue.assigneeId }),
@@ -270,12 +488,30 @@ export class Orchestrator {
       });
       this.#advance(runId, "CLAIMED");
 
-      await this.#withOutbox(runId, "backlog", "transition-claim", issue.identifier, () =>
+      await this.#withOutbox(runId, "backlog", "transition-claim", issue.identifier, assertLease, () =>
         this.#d.backlog.transitionState({
           identifier: issue.identifier,
           toState: cfg.backlog.claimState,
         }),
       );
+      claimTransitioned = true;
+
+      const claimAssignee = cfg.backlog.claimAssignee;
+      if (claimAssignee !== undefined && issue.assigneeId !== claimAssignee) {
+        await this.#withOutbox(
+          runId,
+          "backlog",
+          "assign-claim",
+          `${issue.identifier}#${claimAssignee}`,
+          assertLease,
+          () =>
+            this.#d.backlog.assign({
+              identifier: issue.identifier,
+              assignee: claimAssignee,
+            }),
+        );
+        assignmentChanged = true;
+      }
 
       // -- workspace -----------------------------------------------------
       branch = cfg.github.branchTemplate
@@ -288,10 +524,22 @@ export class Orchestrator {
         sourceRepo: this.#d.sourceRepoPath,
         branch,
         baseBranch: target.baseBranch,
+        ...(this.#d.sourceBaseRef === undefined
+          ? {}
+          : { sourceRef: this.#d.sourceBaseRef }),
         root: this.#d.workspaceRoot,
-        isolation: cfg.workspace.gitIsolation === "clone" ? "clone" : "separate-git-dir",
+        isolation: cfg.workspace.gitIsolation,
       });
       this.#advance(runId, "WORKSPACE_READY");
+
+      // These files are repository-controlled prompt input. Capture their
+      // base-commit contents before implementation begins, then append them as
+      // untrusted, narrowing-only guidance after the immutable rubric.
+      const localReviewGuidance = this.#reviewGuidance(
+        cfg.review.localReviewSkill,
+        workspace,
+      );
+      const prReviewGuidance = this.#reviewGuidance(cfg.review.prReviewSkill, workspace);
 
       // -- task packet ---------------------------------------------------
       const snapshot = snapshotHash(issue);
@@ -302,10 +550,6 @@ export class Orchestrator {
         payload: { identifier: issue.identifier, snapshotHash: snapshot },
       });
 
-      const manifest = resolveManifest({
-        configured: this.#d.checks,
-        changedPaths: [],
-      });
       const packet = buildTaskPacket({
         runId,
         issue,
@@ -313,12 +557,11 @@ export class Orchestrator {
         baseCommit: workspace.baseCommit,
         branch,
         snapshotHash: snapshot,
-        requiredChecks: manifest.map((c) => c.id),
+        requiredChecks: initialManifest.map((c) => c.id),
         network: cfg.workspace.network,
       });
       const packetPath = this.#workspaces.writeTaskPacket(workspace, packet);
-      mkdirSync(join(workspace.path, ".runmill", "run"), { recursive: true });
-      writeFileSync(join(workspace.path, ".runmill", "run", "issue.md"), renderIssueDocument(issue));
+      this.#workspaces.writeIssueDocument(workspace, renderIssueDocument(issue));
       this.#advance(runId, "TASK_PACKET_READY");
 
       // -- implement / verify / review loop -------------------------------
@@ -342,10 +585,10 @@ export class Orchestrator {
           allowedCommands: [],
           network: cfg.workspace.network,
           maxTurns: cfg.providers.maxTurns,
-          timeoutMs: cfg.providers.timeoutMinutes * 60_000,
+          timeoutMs: providerTimeout(role),
         });
         const agentResult = await session.result;
-        costUsd += accumulateUsage(agentResult.events).costUsd;
+        accountUsage(agentResult.events);
 
         if (agentResult.status !== "success") {
           // Carry the provider's own words. "returned failure" alone is true of
@@ -365,6 +608,10 @@ export class Orchestrator {
         const sha = await this.#workspaces.checkpoint(
           workspace,
           `${issue.identifier}: ${role} iteration ${iteration + 1}`,
+          {
+            allowedPaths: packet.constraints.allowed_paths,
+            forbiddenPaths: packet.constraints.forbidden_paths,
+          },
         );
         if (sha !== undefined) candidateSha = sha;
 
@@ -376,6 +623,8 @@ export class Orchestrator {
           workspaces: this.#workspaces,
           manifest: resolveManifest({ configured: this.#d.checks, changedPaths: changed }),
           candidateSha,
+          failOnMissingCheck: cfg.verification.failOnMissingCheck,
+          failOnSkippedCheck: cfg.verification.failOnSkippedCheck,
         });
 
         prChecks = verification.results.map((r) => ({
@@ -411,10 +660,13 @@ export class Orchestrator {
           allowedCommands: [],
           network: cfg.workspace.network,
           maxTurns: cfg.providers.maxTurns,
-          timeoutMs: cfg.providers.timeoutMinutes * 60_000,
+          timeoutMs: providerTimeout("localReview"),
+          ...(localReviewGuidance === undefined
+            ? {}
+            : { supplementalReviewGuidance: localReviewGuidance }),
         });
         const reviewResult = await reviewSession.result;
-        costUsd += accumulateUsage(reviewResult.events).costUsd;
+        accountUsage(reviewResult.events);
 
         if (reviewResult.outputRef === undefined || reviewResult.outputRef === "") {
           throw RunmillError.fromCatalog("RM-REVIEW-001", {
@@ -434,7 +686,11 @@ export class Orchestrator {
           return finish("NEEDS_HUMAN", { reason: cross.reason ?? "verdict rejected" });
         }
 
-        const blocking = blockingFindings(review, cfg.review.mergeBlockingSeverities);
+        const blocking = blockingFindings(
+          review,
+          cfg.review.mergeBlockingSeverities,
+          cfg.review.requireAllFindingsResolved,
+        );
         if (blocking.length === 0) break;
 
         this.#log(`  ${blocking.length} blocking finding(s); dispatching a fix`);
@@ -447,17 +703,19 @@ export class Orchestrator {
 
       // -- pull request ---------------------------------------------------
       this.#advance(runId, "PR_READY");
+      budget.assertActive("pushing the candidate branch");
       await input.lease.assertHeld(held);
 
       // Set during workspace creation, long before this point.
       const pushBranch = branch;
-      await this.#withOutbox(runId, "forge", "push", `${target.repo}#${pushBranch}`, () =>
+      await this.#withOutbox(runId, "forge", "push", `${target.repo}#${pushBranch}`, assertLease, () =>
         this.#d.forge.push({ repo: target.repo, branch: pushBranch, workspacePath: workspace!.path }),
       );
       this.#advance(runId, "PUSHED");
 
+      budget.assertActive("opening the pull request");
       await input.lease.assertHeld(held);
-      const pr = await this.#withOutbox(runId, "forge", "open-pr", `${target.repo}#${pushBranch}`, () =>
+      const pr = await this.#withOutbox(runId, "forge", "open-pr", `${target.repo}#${pushBranch}`, assertLease, () =>
         this.#d.forge.openPullRequest({
           repo: target.repo,
           branch: pushBranch,
@@ -473,112 +731,84 @@ export class Orchestrator {
           draft: cfg.github.draftPr,
         }),
       );
+      pullRequestOpened = true;
       this.#advance(runId, "PR_OPEN", `pr #${pr.number}`);
 
       if (pr.draft) {
-        await this.#d.forge.markReadyForReview({ repo: target.repo, number: pr.number });
+        budget.assertActive("marking the pull request ready");
+        await this.#withOutbox(
+          runId,
+          "forge",
+          "mark-ready",
+          `${target.repo}#${pr.number}`,
+          assertLease,
+          () => this.#d.forge.markReadyForReview({ repo: target.repo, number: pr.number }),
+        );
+      }
+
+      // The PR API response and the pushed branch are separate observations.
+      // Re-read the remote rather than trusting that they still agree.
+      const exactBeforeCi = await this.#pullRequestAtCandidate({
+        repo: target.repo,
+        number: pr.number,
+        candidateSha,
+      });
+      if (exactBeforeCi.blocked !== undefined) {
+        return finish("NEEDS_HUMAN", {
+          prNumber: pr.number,
+          prUrl: pr.url,
+          reason: exactBeforeCi.blocked,
+        });
       }
 
       // -- CI --------------------------------------------------------------
       this.#advance(runId, "CI_WAIT");
-      const ciWaitStartedMs = this.#d.clock.now().getTime();
-      const protection = await this.#d.forge.getBranchProtection({
-        repo: target.repo,
-        branch: target.baseBranch,
+      const ci = await this.#waitForCi({
+        target,
+        candidateSha,
+        lease: input.lease,
+        held,
+        budget,
       });
-
-      // Unreadable rules are not absent rules. A 403 on the protection
-      // endpoint is common (it needs admin), and treating the empty result as
-      // "nothing is required" would let a run sail through the merge gate on
-      // the strength of a permission error.
-      if (protection.unreadable) {
+      if ("blocked" in ci) {
         return finish("NEEDS_HUMAN", {
           prNumber: pr.number,
           prUrl: pr.url,
-          reason:
-            "branch protection could not be read, so required checks and approvals are " +
-            "unknown; refusing to treat unreadable rules as absent rules",
+          reason: ci.blocked,
         });
       }
-      // Actually wait, rather than glancing once.
-      //
-      // A required check does not exist the instant a pull request opens:
-      // GitHub needs a moment to create the run. Reading the checks a single
-      // time meant every required context was "has not reported yet", so a
-      // protected repository escalated on every run, and the schedule deadline
-      // below was unreachable -- `waitedMs` could never grow. Terminal states
-      // still stop immediately; only "waiting" costs time.
-      const pollIntervalMs = this.#d.ciPollIntervalMs ?? CI_POLL_INTERVAL_MS;
-      const pause = this.#d.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-      const mappings =
-        this.#d.checkMappings ??
-        // Identity by default: the context name IS the check name until an
-        // explicit mapping says otherwise. Without this every context is
-        // `unmapped` and any protected repository escalates on every run.
-        protection.requiredChecks.map((c) => ({ localId: c, contextName: c }));
-
-      let verdicts = new Map<string, ReconcileVerdict>();
-      let unsatisfied: [string, ReconcileVerdict][] = [];
-      // Bounded by attempts as well as by elapsed time. The deadline alone
-      // relies on the clock advancing, and a stopped or injected clock would
-      // otherwise spin here forever rather than giving up.
-      const maxAttempts = Math.max(1, Math.ceil(CI_SCHEDULE_DEADLINE_MS / pollIntervalMs)) + 1;
-      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-        const observed = await this.#d.forge.listChecks({ repo: target.repo, ref: pr.headSha });
-        verdicts = reconcileChecks({
-          requiredContexts: protection.requiredChecks,
-          mappings,
-          observed,
-          headSha: pr.headSha,
-          waitedMs: this.#d.clock.now().getTime() - ciWaitStartedMs,
-          scheduleDeadlineMs: CI_SCHEDULE_DEADLINE_MS,
-          ...(protection.usesMergeQueue ? { event: "merge_group" as const } : {}),
-        });
-        unsatisfied = [...verdicts].filter(([, v]) => v.state !== "satisfied");
-        if (unsatisfied.length === 0) break;
-        // Anything other than "still running" is an answer, not a delay.
-        if (unsatisfied.some(([, v]) => v.state !== "waiting")) break;
-        if (this.#d.clock.now().getTime() - ciWaitStartedMs >= CI_SCHEDULE_DEADLINE_MS) break;
-
-        // The lease has to still be ours while we sit here, or a takeover
-        // could be pushing to the same branch behind us.
-        await input.lease.assertHeld(held);
-        await pause(pollIntervalMs);
-      }
-      if (unsatisfied.length > 0) {
-        return finish("NEEDS_HUMAN", {
-          prNumber: pr.number,
-          prUrl: pr.url,
-          reason: `CI not satisfied — ${unsatisfied.map(([n, v]) => `${n}: ${v.detail}`).join("; ")}`,
-        });
-      }
+      let protection = ci.protection;
+      const verdicts = ci.verdicts;
 
       // -- PR review --------------------------------------------------------
       //
-      // A second review, against the pull request as a reviewer sees it rather
-      // than the workspace as the implementer left it. It runs AFTER CI so it
-      // can read what CI actually reported, and BEFORE the merge gate so a
-      // blocking finding stops a merge rather than annotating one.
-      //
-      // Distinct from the local review, not a repeat of it: the local pass sees
-      // a working tree, this one sees the squashed, rebased, CI-checked change
-      // in its final form. Findings that only exist in that form — an
-      // interaction with something that landed on the base branch meanwhile —
-      // are invisible to the earlier pass.
-      const prReviewOutcome = await this.#runPrReview({
-        runId,
-        issue,
-        target,
-        pr,
-        cfg,
-        workspace,
-        packetPath,
-        packet,
-        lease: input.lease,
-        held,
-        branch,
-      });
-      costUsd += prReviewOutcome.costUsd;
+      // A second fresh-context review of the same exact candidate, now with
+      // orchestrator-owned PR identity and CI evidence. Runmill does not claim
+      // to provide comments, a separate remote checkout, or a speculative
+      // merge/rebase result; those absences are explicit in the evidence file.
+      let prReviewOutcome: PrReviewOutcome;
+      try {
+        prReviewOutcome = await this.#runPrReview({
+          runId,
+          issue,
+          target,
+          pr,
+          cfg,
+          workspace,
+          packetPath,
+          packet,
+          lease: input.lease,
+          held,
+          branch,
+          candidateSha,
+          protection,
+          verdicts,
+          budget,
+          reviewGuidance: prReviewGuidance,
+        });
+      } finally {
+        costUsd = budget.costUsd;
+      }
       if (prReviewOutcome.blocked !== undefined) {
         return finish("NEEDS_HUMAN", {
           prNumber: pr.number,
@@ -587,18 +817,21 @@ export class Orchestrator {
         });
       }
       if (prReviewOutcome.review !== undefined) review = prReviewOutcome.review;
+      if (prReviewOutcome.candidateSha !== undefined) candidateSha = prReviewOutcome.candidateSha;
+      if (prReviewOutcome.protection !== undefined) protection = prReviewOutcome.protection;
 
       // -- deliver or merge -------------------------------------------------
       if (cfg.autonomy === "pr-only") {
+        budget.assertActive("delivering the pull request");
         if (cfg.backlog.deliveredState !== undefined) {
-          await this.#withOutbox(runId, "backlog", "transition-delivered", issue.identifier, () =>
+          await this.#withOutbox(runId, "backlog", "transition-delivered", issue.identifier, assertLease, () =>
             this.#d.backlog.transitionState({
               identifier: issue.identifier,
               toState: cfg.backlog.deliveredState as string,
             }),
           );
         }
-        await this.#withOutbox(runId, "backlog", "comment-delivered", issue.identifier, () =>
+        await this.#withOutbox(runId, "backlog", "comment-delivered", issue.identifier, assertLease, () =>
           this.#d.backlog.comment({
             identifier: issue.identifier,
             body: `runmill opened ${pr.url} for this issue.\n\nRun: ${runId}`,
@@ -610,6 +843,7 @@ export class Orchestrator {
       }
 
       // guarded-merge and continuous
+      budget.assertActive("checking merge authority");
       const canWriteProtection = await this.#d.forge.canWriteBranchProtection({
         repo: target.repo,
         branch: target.baseBranch,
@@ -627,25 +861,93 @@ export class Orchestrator {
       if (protection.requiresApproval) {
         return finish("AWAITING_APPROVAL", { prNumber: pr.number, prUrl: pr.url });
       }
+      if (protection.usesMergeQueue) {
+        return finish("NEEDS_HUMAN", {
+          prNumber: pr.number,
+          prUrl: pr.url,
+          reason:
+            "branch protection requires a merge queue, but queue enrollment is not implemented; " +
+            "refusing a direct merge",
+        });
+      }
+
+      // -- risk policy ----------------------------------------------------
+      // Models and reviewers cannot classify their own authority. The final
+      // diff is read after PR review/fixing and evaluated against
+      // operator-owned policy immediately before MERGE_READY. Every rule can
+      // only withhold automatic merge; unknown conditions never disappear
+      // into a permissive default.
+      const riskDecision = evaluateAutomaticMergeRisk(cfg.risk, {
+        changedPaths: await this.#workspaces.changedFiles(workspace),
+        issueLabels: issue.labels,
+        acceptanceCriteria: packet.acceptance_criteria,
+        checkManifestPath: cfg.verification.manifest,
+      });
+      if (riskDecision.decision === "unknown") {
+        return finish("NEEDS_HUMAN", {
+          prNumber: pr.number,
+          prUrl: pr.url,
+          reason:
+            "automatic-merge risk could not be evaluated deterministically — " +
+            riskDecision.reasons.join("; "),
+        });
+      }
+      if (riskDecision.decision === "manual-approval") {
+        return finish("AWAITING_APPROVAL", {
+          prNumber: pr.number,
+          prUrl: pr.url,
+          reason: `manual approval required by risk policy — ${riskDecision.reasons.join("; ")}`,
+        });
+      }
 
       this.#advance(runId, "MERGE_READY");
+      budget.assertActive("merging the pull request");
       await input.lease.assertHeld(held);
+      const exactBeforeMerge = await this.#pullRequestAtCandidate({
+        repo: target.repo,
+        number: pr.number,
+        candidateSha,
+      });
+      if (exactBeforeMerge.blocked !== undefined) {
+        return finish("NEEDS_HUMAN", {
+          prNumber: pr.number,
+          prUrl: pr.url,
+          reason: exactBeforeMerge.blocked,
+        });
+      }
+      const mergeability = await this.#d.forge.getMergeability({
+        repo: target.repo,
+        number: pr.number,
+      });
+      if (!mergeability.mergeable || mergeability.state !== "clean") {
+        return finish("NEEDS_HUMAN", {
+          prNumber: pr.number,
+          prUrl: pr.url,
+          reason:
+            `GitHub reports the pull request as ${mergeability.state}, not clean and mergeable` +
+            (protection.requiresConversationResolution
+              ? "; required conversation resolution could not be proven"
+              : ""),
+        });
+      }
       const merged = await this.#withOutbox(
         runId,
         "forge",
         "merge",
         `${target.repo}#${pr.number}`,
+        assertLease,
         () =>
           this.#d.forge.merge({
             repo: target.repo,
             number: pr.number,
             method: cfg.github.merge.method,
+            expectedHeadSha: candidateSha,
           }),
       );
       this.#advance(runId, "MERGED", merged.mergeSha);
 
       if (cfg.backlog.completedState !== undefined) {
-        await this.#withOutbox(runId, "backlog", "transition-complete", issue.identifier, () =>
+        await this.#withOutbox(runId, "backlog", "transition-complete", issue.identifier, assertLease, () =>
           this.#d.backlog.transitionState({
             identifier: issue.identifier,
             toState: cfg.backlog.completedState as string,
@@ -673,7 +975,13 @@ export class Orchestrator {
           ? `${errorMessage(err)}: ${err.whatHappened.trim().split("\n")[0] ?? ""}`
           : errorMessage(err);
       this.#log(`run failed: ${reason}`);
-      return finish("QUARANTINED", { reason });
+      return finish(
+        err instanceof RunmillError &&
+          (err.code === "RM-PROVIDER-002" || err.code === "RM-STATE-002")
+          ? "NEEDS_HUMAN"
+          : "QUARANTINED",
+        { reason },
+      );
     } finally {
       // The workspace is deliberately preserved on a non-clean exit so a human
       // can inspect it. PR_DELIVERED is a clean exit — it is how every
@@ -683,6 +991,43 @@ export class Orchestrator {
         await this.#workspaces.destroy(workspace, this.#d.sourceRepoPath);
       }
       if (held !== undefined) {
+        const heldForRestore = held;
+        // Before a PR exists, a failed attempt should be selectable again.
+        // Restore the workflow ownership while the lease still fences us. If
+        // either request has an ambiguous outcome its outbox row remains
+        // pending and globally blocks a retry until an operator reconciles it.
+        if (claimTransitioned && !pullRequestOpened && !CLEAN_EXITS.has(this.#state)) {
+          try {
+            if (assignmentChanged) {
+              await this.#withOutbox(
+                runId,
+                "backlog",
+                "restore-assignee",
+                `${issue.identifier}#${heldForRestore.priorAssigneeId ?? "unassigned"}`,
+                assertLease,
+                () =>
+                  this.#d.backlog.assign({
+                    identifier: issue.identifier,
+                    assignee: heldForRestore.priorAssigneeId ?? null,
+                  }),
+              );
+            }
+            await this.#withOutbox(
+              runId,
+              "backlog",
+              "restore-state",
+              `${issue.identifier}#${heldForRestore.priorStateId ?? issue.state}`,
+              assertLease,
+              () =>
+                this.#d.backlog.transitionState({
+                  identifier: issue.identifier,
+                  toState: heldForRestore.priorStateId ?? issue.state,
+                }),
+            );
+          } catch (restoreError) {
+            this.#log(`could not restore backlog ownership: ${errorMessage(restoreError)}`);
+          }
+        }
         try {
           await this.#releaseLease(input.lease, held, issue.identifier, runId);
         } catch {
@@ -707,14 +1052,40 @@ export class Orchestrator {
    */
   async #runPrReview(input: PrReviewInput): Promise<PrReviewOutcome> {
     const { runId, issue, target, pr, cfg, workspace, packetPath, packet } = input;
-    const budget = cfg.budgets.maxAgentInvocations;
-    const maxFixes = Math.max(0, budget.prFixer);
-    const maxReviews = Math.max(1, budget.prReview);
+    const invocationLimits = cfg.budgets.maxAgentInvocations;
+    const maxFixes = Math.max(0, invocationLimits.prFixer);
+    const maxReviews = Math.max(1, invocationLimits.prReview);
 
-    let costUsd = 0;
     let review: Review | undefined;
+    let candidateSha = input.candidateSha;
+    let protection = input.protection;
+    let verdicts = input.verdicts;
 
     for (let attempt = 0; attempt < maxReviews; attempt += 1) {
+      input.budget.assertActive("reading pull request evidence");
+      const exact = await this.#pullRequestAtCandidate({
+        repo: target.repo,
+        number: pr.number,
+        candidateSha,
+      });
+      if (exact.blocked !== undefined || exact.pullRequest === undefined) {
+        return {
+          blocked: exact.blocked ?? "pull request evidence could not be established",
+        };
+      }
+
+      const evidenceText = serializePullRequestEvidence(
+        buildPullRequestEvidence({
+          generatedAt: this.#d.clock.now().toISOString(),
+          repository: target.repo,
+          candidateSha,
+          pullRequest: exact.pullRequest,
+          requiredContexts: protection.requiredChecks,
+          verdicts,
+        }),
+      );
+      const evidencePath = join(workspace.path, PR_EVIDENCE_PATH);
+      writeFileSync(evidencePath, evidenceText);
       this.#advance(runId, "PR_REVIEW");
 
       const session = await this.#reviewer.start({
@@ -731,16 +1102,33 @@ export class Orchestrator {
         allowedCommands: [],
         network: cfg.workspace.network,
         maxTurns: cfg.providers.maxTurns,
-        timeoutMs: cfg.providers.timeoutMinutes * 60_000,
+        timeoutMs: input.budget.beginInvocation(
+          "prReview",
+          cfg.providers.timeoutMinutes * 60_000,
+        ),
+        ...(input.reviewGuidance === undefined
+          ? {}
+          : { supplementalReviewGuidance: input.reviewGuidance }),
       });
       const result = await session.result;
-      costUsd += accumulateUsage(result.events).costUsd;
+      input.budget.finishInvocation(result.events);
 
       if (result.status !== "success") {
-        return { costUsd, blocked: `PR reviewer returned ${result.status}` };
+        return { blocked: `PR reviewer returned ${result.status}` };
       }
       if (result.outputRef === undefined || result.outputRef === "") {
-        return { costUsd, blocked: "PR reviewer produced no structured output" };
+        return { blocked: "PR reviewer produced no structured output" };
+      }
+      try {
+        if (readFileSync(evidencePath, "utf8") !== evidenceText) {
+          return {
+            blocked: "PR reviewer modified its orchestrator-owned evidence; refusing the review",
+          };
+        }
+      } catch {
+        return {
+          blocked: "PR reviewer removed its orchestrator-owned evidence; refusing the review",
+        };
       }
 
       try {
@@ -748,7 +1136,7 @@ export class Orchestrator {
       } catch (err) {
         // An unparseable review is not an absent review: it is a review whose
         // conclusion is unknown, and unknown is not permission to merge.
-        return { costUsd, blocked: `PR review output was unparseable: ${errorMessage(err)}` };
+        return { blocked: `PR review output was unparseable: ${errorMessage(err)}` };
       }
 
       const changed = await this.#workspaces.changedFiles(workspace);
@@ -759,16 +1147,19 @@ export class Orchestrator {
         input.packet.acceptance_criteria,
       );
       if (!cross.accepted) {
-        return { costUsd, blocked: cross.reason ?? "PR review verdict rejected" };
+        return { blocked: cross.reason ?? "PR review verdict rejected" };
       }
 
-      const blocking = blockingFindings(review, cfg.review.mergeBlockingSeverities);
-      if (blocking.length === 0) return { costUsd, review };
+      const blocking = blockingFindings(
+        review,
+        cfg.review.mergeBlockingSeverities,
+        cfg.review.requireAllFindingsResolved,
+      );
+      if (blocking.length === 0) return { review, candidateSha, protection };
 
       this.#log(`  PR review: ${blocking.length} blocking finding(s)`);
       if (attempt >= maxFixes) {
         return {
-          costUsd,
           blocked:
             `${blocking.length} blocking PR-review finding(s) unresolved after ` +
             `${attempt + 1} review(s): ${blocking.map((f) => f.title).join("; ")}`,
@@ -776,6 +1167,11 @@ export class Orchestrator {
       }
 
       // -- fix, then amend the pull request -------------------------------
+      // Reviewer artifacts are evidence inputs/outputs, not candidate source.
+      // Remove them before checkpointing a fix so they cannot enter the diff
+      // or trip the task's always-forbidden `.runmill/**` scope rule.
+      rmSync(evidencePath, { force: true });
+      rmSync(result.outputRef, { force: true });
       this.#advance(runId, "FIXING");
       const fixSession = await this.#d.provider.start({
         runId,
@@ -789,22 +1185,28 @@ export class Orchestrator {
         allowedCommands: [],
         network: cfg.workspace.network,
         maxTurns: cfg.providers.maxTurns,
-        timeoutMs: cfg.providers.timeoutMinutes * 60_000,
+        timeoutMs: input.budget.beginInvocation(
+          "prFixer",
+          cfg.providers.timeoutMinutes * 60_000,
+        ),
       });
       const fixResult = await fixSession.result;
-      costUsd += accumulateUsage(fixResult.events).costUsd;
+      input.budget.finishInvocation(fixResult.events);
       if (fixResult.status !== "success") {
-        return { costUsd, blocked: `PR fixer returned ${fixResult.status}` };
+        return { blocked: `PR fixer returned ${fixResult.status}` };
       }
 
       const sha = await this.#workspaces.checkpoint(
         workspace,
         `${issue.identifier}: pr-review fix ${attempt + 1}`,
+        {
+          allowedPaths: packet.constraints.allowed_paths,
+          forbiddenPaths: packet.constraints.forbidden_paths,
+        },
       );
       if (sha === undefined) {
         // Nothing changed, so the next review would reach the same verdict.
         return {
-          costUsd,
           blocked: "PR fixer produced no change, so the blocking findings still stand",
         };
       }
@@ -820,20 +1222,23 @@ export class Orchestrator {
           changedPaths: await this.#workspaces.changedFiles(workspace),
         }),
         candidateSha: sha,
+        failOnMissingCheck: cfg.verification.failOnMissingCheck,
+        failOnSkippedCheck: cfg.verification.failOnSkippedCheck,
       });
       if (!reverified.mergeReady) {
         return {
-          costUsd,
           blocked: `verification failed after a PR-review fix: ${reverified.failures.join("; ")}`,
         };
       }
 
       await input.lease.assertHeld(input.held);
+      input.budget.assertActive("pushing a PR-review fix");
       await this.#withOutbox(
         runId,
         "forge",
         "push-pr-fix",
         `${target.repo}#${input.branch}@${sha}`,
+        () => input.lease.assertHeld(input.held),
         () =>
           this.#d.forge.push({
             repo: target.repo,
@@ -842,10 +1247,33 @@ export class Orchestrator {
           }),
       );
       this.#log(`  pushed PR-review fix ${attempt + 1} to #${pr.number}`);
+
+      candidateSha = sha;
+      const exactAfterFix = await this.#pullRequestAtCandidate({
+        repo: target.repo,
+        number: pr.number,
+        candidateSha,
+      });
+      if (exactAfterFix.blocked !== undefined) {
+        return { blocked: exactAfterFix.blocked };
+      }
+
+      // A new commit invalidates the old CI evidence. Wait again and carry
+      // only verdicts bound to the fixed candidate into the next review.
+      this.#advance(runId, "CI_WAIT");
+      const ci = await this.#waitForCi({
+        target,
+        candidateSha,
+        lease: input.lease,
+        held: input.held,
+        budget: input.budget,
+      });
+      if ("blocked" in ci) return { blocked: ci.blocked };
+      protection = ci.protection;
+      verdicts = ci.verdicts;
     }
 
     return {
-      costUsd,
       blocked: `PR review did not converge within ${maxReviews} review(s)`,
     };
   }
@@ -855,7 +1283,7 @@ interface PrReviewInput {
   readonly runId: string;
   readonly issue: BacklogIssue;
   readonly target: RepositoryTarget;
-  readonly pr: { number: number; url: string; headSha: string };
+  readonly pr: PullRequest;
   readonly cfg: RunmillConfig;
   readonly workspace: Workspace;
   readonly packetPath: string;
@@ -866,13 +1294,19 @@ interface PrReviewInput {
   readonly lease: GitRefLease;
   readonly held: HeldLease;
   readonly branch: string;
+  readonly candidateSha: string;
+  readonly protection: BranchProtection;
+  readonly verdicts: ReadonlyMap<string, ReconcileVerdict>;
+  readonly budget: RunBudget;
+  readonly reviewGuidance?: { readonly source: string; readonly content: string } | undefined;
 }
 
 interface PrReviewOutcome {
-  readonly costUsd: number;
   /** Set when the run must escalate; the string is the reason. */
   readonly blocked?: string | undefined;
   readonly review?: Review | undefined;
+  readonly candidateSha?: string | undefined;
+  readonly protection?: BranchProtection | undefined;
 }
 
 /** Bound on how long a required check may go unscheduled before escalating. */
@@ -880,6 +1314,9 @@ const CI_SCHEDULE_DEADLINE_MS = 10 * 60_000;
 
 /** How often CI_WAIT re-reads the required checks while they are still running. */
 const CI_POLL_INTERVAL_MS = 15_000;
+
+/** Repository guidance is copied into a provider command-line prompt. */
+const MAX_REVIEW_GUIDANCE_BYTES = 64 * 1024;
 
 /**
  * Terminal states after which the workspace holds nothing a human needs.

@@ -1,439 +1,366 @@
-<title>runmill — the exit condition for coding agents</title>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>runmill | the exit condition for coding agents</title>
+  <meta name="description" content="Runmill turns eligible Linear issues into verified, independently reviewed GitHub pull requests, then takes the next one.">
+  <link rel="canonical" href="https://mikigraf.github.io/runmill/">
+  <link rel="icon" type="image/svg+xml" href="https://raw.githubusercontent.com/mikigraf/runmill/main/assets/brand/favicon.svg">
+  <link rel="apple-touch-icon" href="https://raw.githubusercontent.com/mikigraf/runmill/main/assets/brand/icon-512.png">
+  <meta name="theme-color" content="#F3EFE4">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="runmill">
+  <meta property="og:title" content="runmill | the exit condition for coding agents">
+  <meta property="og:description" content="Backlog to reviewed pull request. On repeat.">
+  <meta property="og:url" content="https://mikigraf.github.io/runmill/">
+  <meta property="og:image" content="https://raw.githubusercontent.com/mikigraf/runmill/main/assets/brand/social-card.png">
+  <meta property="og:image:width" content="1280">
+  <meta property="og:image:height" content="640">
+  <meta property="og:image:alt" content="Runmill: backlog to reviewed pull request, on repeat">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="runmill | the exit condition for coding agents">
+  <meta name="twitter:description" content="Backlog to reviewed pull request. On repeat.">
+  <meta name="twitter:image" content="https://raw.githubusercontent.com/mikigraf/runmill/main/assets/brand/social-card.png">
+  <meta name="twitter:image:alt" content="Runmill: backlog to reviewed pull request, on repeat">
 
-<style>
-  :root {
-    --ground: #0A0C0E; --surface: #101417; --surface-2: #171C20;
-    --line: #232A2E; --line-soft: #1A2023;
-    --ink: #EDF1F2; --muted: #8B979B; --faint: #5D686C;
-    --amber: #E9A23B; --violet: #7C5CFF;
-    --pass: #45D39A; --fail: #FF6F6F;
-    --glow-a: rgba(233, 162, 59, 0.20); --glow-b: rgba(124, 92, 255, 0.20);
-    --card: rgba(255, 255, 255, 0.03);
-    --shadow: 0 40px 90px -20px rgba(0, 0, 0, 0.75);
-    color-scheme: dark;
-
-    --display: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-
-    --max: 1140px;
-    --s--1: clamp(0.79rem, 0.765rem + 0.11vw, 0.85rem);
-    --s-0: clamp(0.97rem, 0.94rem + 0.16vw, 1.05rem);
-    --s-1: clamp(1.1rem, 1.02rem + 0.4vw, 1.32rem);
-    --s-3: clamp(2.25rem, 1.5rem + 3.2vw, 4.5rem);
-  }
-
-  @media (prefers-color-scheme: light) {
+  <style>
     :root {
-      --ground: #F7F5F2; --surface: #FFFFFF; --surface-2: #F2EFEA;
-      --line: #E0DBD3; --line-soft: #EBE7E0;
-      --ink: #14181A; --muted: #5C666A; --faint: #8B9296;
-      --amber: #9C6100; --violet: #5233CE; --pass: #0F7A57; --fail: #BC3128;
-      --glow-a: rgba(233, 162, 59, 0.26); --glow-b: rgba(124, 92, 255, 0.14);
-      --card: rgba(20, 24, 26, 0.03);
-      --shadow: 0 30px 60px -22px rgba(60, 48, 30, 0.28);
+      --ink: #111310;
+      --stock: #F3EFE4;
+      --orange: #FF4D1F;
+      --steel: #6F7A80;
+      --pass: #24B47E;
+      --warning: #F0B429;
+      --fail: #D64545;
+      --rule: #CBC6BA;
+      --paper: #FAF7EF;
+      --sans: "IBM Plex Sans", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+      --condensed: "IBM Plex Sans Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --max: 1160px;
       color-scheme: light;
     }
-  }
-  :root[data-theme="light"] {
-    --ground: #F7F5F2; --surface: #FFFFFF; --surface-2: #F2EFEA;
-    --line: #E0DBD3; --line-soft: #EBE7E0;
-    --ink: #14181A; --muted: #5C666A; --faint: #8B9296;
-    --amber: #9C6100; --violet: #5233CE; --pass: #0F7A57; --fail: #BC3128;
-    --glow-a: rgba(233, 162, 59, 0.26); --glow-b: rgba(124, 92, 255, 0.14);
-    --card: rgba(20, 24, 26, 0.03);
-    --shadow: 0 30px 60px -22px rgba(60, 48, 30, 0.28);
-    color-scheme: light;
-  }
-  :root[data-theme="dark"] {
-    --ground: #0A0C0E; --surface: #101417; --surface-2: #171C20;
-    --line: #232A2E; --line-soft: #1A2023;
-    --ink: #EDF1F2; --muted: #8B979B; --faint: #5D686C;
-    --amber: #E9A23B; --violet: #7C5CFF; --pass: #45D39A; --fail: #FF6F6F;
-    --glow-a: rgba(233, 162, 59, 0.20); --glow-b: rgba(124, 92, 255, 0.20);
-    --card: rgba(255, 255, 255, 0.03);
-    --shadow: 0 40px 90px -20px rgba(0, 0, 0, 0.75);
-    color-scheme: dark;
-  }
 
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--ground); color: var(--ink);
-    font-family: var(--display); font-size: var(--s-0); line-height: 1.6;
-    -webkit-font-smoothing: antialiased; overflow-x: hidden;
-    min-height: 100vh; display: flex; flex-direction: column;
-  }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--stock);
+      color: var(--ink);
+      font: 400 17px/1.55 var(--sans);
+      -webkit-font-smoothing: antialiased;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      opacity: .2;
+      background-image:
+        linear-gradient(var(--rule) 1px, transparent 1px),
+        linear-gradient(90deg, var(--rule) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: linear-gradient(to bottom, black, transparent 560px);
+    }
+    img, svg { display: block; max-width: 100%; }
+    a { color: inherit; }
+    a:focus-visible, button:focus-visible { outline: 3px solid var(--orange); outline-offset: 4px; }
+    .wrap { width: min(calc(100% - 40px), var(--max)); margin-inline: auto; }
 
-  .glow { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
-  .glow i { position: absolute; border-radius: 50%; filter: blur(120px); display: block; }
-  .glow i:nth-child(1) { width: 64vw; height: 44vw; top: -22vw; left: -16vw; background: var(--glow-a); }
-  .glow i:nth-child(2) { width: 54vw; height: 40vw; top: -16vw; right: -16vw; background: var(--glow-b); }
+    .nav {
+      min-height: 84px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      border-bottom: 1px solid var(--ink);
+    }
+    .brand { width: 154px; }
+    .nav-links { display: flex; align-items: center; gap: 22px; font: 600 14px/1 var(--mono); }
+    .nav-links a { text-decoration: none; }
+    .nav-links a:hover { color: var(--orange); }
 
-  .wrap { position: relative; z-index: 1; width: 100%; max-width: var(--max); margin: 0 auto; padding: 0 24px; }
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 46px;
+      padding: 0 18px;
+      border: 2px solid var(--ink);
+      background: transparent;
+      color: var(--ink);
+      text-decoration: none;
+      font: 700 14px/1 var(--mono);
+      transition: transform 120ms ease, background 120ms ease, color 120ms ease;
+    }
+    .button:hover { transform: translate(-2px, -2px); }
+    .button--primary { background: var(--ink); color: var(--stock); }
+    .button--primary:hover { background: var(--orange); color: var(--ink); }
 
-  nav { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 0; }
-  .brand { display: flex; align-items: center; gap: 10px; font-weight: 640; letter-spacing: -0.012em; }
-  .mark { width: 24px; height: 24px; border-radius: 7px; flex: none; background: linear-gradient(145deg, var(--amber), var(--violet)); }
-  .nav-links { display: flex; align-items: center; gap: 8px; }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(360px, .95fr);
+      gap: clamp(42px, 7vw, 92px);
+      align-items: center;
+      padding: clamp(64px, 9vw, 124px) 0 84px;
+    }
+    .flag {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 20px;
+      color: var(--steel);
+      font: 600 12px/1 var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .flag::before { content: ""; width: 10px; height: 10px; background: var(--orange); }
+    h1, h2 { font-family: var(--condensed); letter-spacing: -.045em; }
+    h1 { max-width: 750px; margin: 0; font-size: clamp(3.4rem, 8vw, 7.2rem); line-height: .88; font-weight: 800; }
+    .lede { max-width: 660px; margin: 28px 0 0; color: var(--steel); font-size: clamp(1.08rem, 1.8vw, 1.35rem); line-height: 1.5; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 30px; }
 
-  .pill {
-    display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
-    padding: 9px 16px; border-radius: 999px;
-    border: 1px solid var(--line); background: var(--card);
-    color: var(--ink); text-decoration: none;
-    font-size: var(--s--1); font-weight: 550; font-family: inherit;
-    transition: border-color .18s ease, background .18s ease, transform .18s ease, color .18s ease;
-  }
-  .pill:hover { border-color: color-mix(in oklab, var(--amber) 60%, var(--line)); transform: translateY(-1px); }
-  .pill--solid { background: var(--ink); color: var(--ground); border-color: transparent; font-weight: 640; }
-  .pill--solid:hover { background: var(--amber); color: #080A0B; }
-  a:focus-visible, button:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; }
+    .instrument { border: 2px solid var(--ink); background: var(--paper); }
+    .instrument-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 13px 16px;
+      border-bottom: 1px solid var(--ink);
+      font: 600 11px/1.2 var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .instrument-head span:last-child { color: var(--orange); }
+    .loop-stage { position: relative; padding: 42px 52px 32px; }
+    .loop-stage svg { width: 100%; height: auto; }
+    .loop-caption { display: flex; justify-content: space-between; gap: 24px; margin-top: 28px; font: 600 12px/1.4 var(--mono); }
+    .loop-caption span:last-child { color: var(--steel); text-align: right; }
+    .token { offset-path: path("M38 38 H282 V224 H38 V38 M282 38 V224"); offset-rotate: 0deg; animation: token-run 7s linear infinite; }
+    .evidence { animation: evidence 7s linear infinite; }
+    .gate { animation: gate 7s linear infinite; transform-box: fill-box; transform-origin: center; }
+    @keyframes token-run {
+      0%, 5% { offset-distance: 0%; opacity: 1; }
+      50% { offset-distance: 50%; }
+      64%, 75% { offset-distance: 50%; }
+      96% { offset-distance: 100%; opacity: 1; }
+      97%, 100% { offset-distance: 100%; opacity: 0; }
+    }
+    @keyframes evidence { 0%, 52%, 78%, 100% { opacity: 0; } 58%, 73% { opacity: 1; } }
+    @keyframes gate { 0%, 68%, 100% { transform: translateX(0); } 74%, 94% { transform: translateX(18px); } }
 
-  main { flex: 1; }
-  .hero { padding: clamp(36px, 6vw, 76px) 0 0; display: grid; gap: clamp(34px, 5vw, 56px); }
-  @media (min-width: 1020px) {
-    .hero { grid-template-columns: minmax(0, 0.88fr) minmax(0, 1.12fr); align-items: center; gap: 54px; }
-  }
+    .strip { border-block: 1px solid var(--ink); background: var(--ink); color: var(--stock); }
+    .stages { display: grid; grid-template-columns: repeat(7, 1fr); }
+    .stage { min-width: 0; padding: 21px 15px; border-right: 1px solid #454942; font: 600 12px/1.35 var(--mono); }
+    .stage:last-child { border: 0; }
+    .stage b { display: block; margin-bottom: 7px; color: var(--orange); font-weight: 600; }
 
-  .eyebrow {
-    display: inline-flex; align-items: center; gap: 9px; margin: 0 0 20px;
-    font-family: var(--mono); font-size: 0.73rem; letter-spacing: 0.15em;
-    text-transform: uppercase; color: var(--amber);
-  }
-  .eyebrow::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 12px var(--amber); }
+    section { padding: clamp(76px, 10vw, 126px) 0; }
+    .section-head { display: grid; grid-template-columns: minmax(250px, .8fr) minmax(0, 1.2fr); gap: 64px; margin-bottom: 50px; }
+    .kicker { margin: 0 0 14px; color: var(--orange); font: 600 12px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    h2 { margin: 0; font-size: clamp(2.5rem, 5vw, 4.7rem); line-height: .98; }
+    .section-copy { margin: 5px 0 0; max-width: 650px; color: var(--steel); font-size: 1.08rem; }
 
-  h1 { font-size: var(--s-3); line-height: 0.96; letter-spacing: -0.04em; font-weight: 800; margin: 0; text-wrap: balance; }
-  h1 .dim { color: var(--faint); }
-  .positioning { margin: 22px 0 0; max-width: 44ch; font-size: var(--s-1); font-weight: 600; letter-spacing: -0.017em; line-height: 1.34; text-wrap: balance; }
-  .lede { margin: 13px 0 0; max-width: 52ch; color: var(--muted); line-height: 1.62; text-wrap: pretty; }
-  .cta { display: flex; gap: 10px; flex-wrap: wrap; margin: 28px 0 0; }
+    .guarantees { display: grid; grid-template-columns: repeat(2, 1fr); border-top: 2px solid var(--ink); border-left: 2px solid var(--ink); }
+    .guarantee { min-height: 230px; padding: 28px; border-right: 2px solid var(--ink); border-bottom: 2px solid var(--ink); background: var(--paper); }
+    .guarantee .number { color: var(--orange); font: 600 12px/1 var(--mono); }
+    .guarantee h3 { margin: 42px 0 10px; font: 700 1.35rem/1.1 var(--condensed); letter-spacing: -.02em; }
+    .guarantee p { margin: 0; color: var(--steel); font-size: .95rem; }
 
-  .stat {
-    margin: 30px 0 0; padding-left: 15px; max-width: 50ch;
-    border-left: 2px solid color-mix(in oklab, var(--amber) 55%, transparent);
-  }
-  .stat b { font-size: var(--s-1); font-weight: 720; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
-  .stat span { display: block; color: var(--faint); font-size: var(--s--1); margin-top: 3px; }
+    .quickstart { display: grid; grid-template-columns: .8fr 1.2fr; border: 2px solid var(--ink); }
+    .quickstart-copy { padding: clamp(32px, 6vw, 64px); background: var(--orange); }
+    .quickstart-copy h2 { font-size: clamp(2.4rem, 5vw, 4.3rem); }
+    .quickstart-copy p { max-width: 420px; margin: 22px 0 0; }
+    .terminal { padding: clamp(32px, 6vw, 64px); background: var(--ink); color: var(--stock); font: 500 clamp(.8rem, 1.7vw, 1rem)/1.9 var(--mono); overflow-x: auto; }
+    .terminal code { white-space: pre; }
+    .prompt { color: var(--orange); }
+    .comment { color: #939B96; }
 
-  .term { border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow); overflow: hidden; min-width: 0; }
-  .term-bar { display: flex; align-items: center; gap: 7px; padding: 11px 14px; border-bottom: 1px solid var(--line-soft); background: var(--surface-2); }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); flex: none; }
-  .term-path { font-family: var(--mono); font-size: 0.73rem; color: var(--faint); margin-left: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .replay {
-    margin-left: auto; border: 1px solid var(--line); background: transparent; color: var(--muted);
-    border-radius: 999px; padding: 4px 11px; cursor: pointer;
-    font-family: var(--mono); font-size: 0.69rem; letter-spacing: 0.05em;
-    transition: color .18s ease, border-color .18s ease;
-  }
-  .replay:hover { color: var(--amber); border-color: var(--amber); }
+    .preview { border-top: 1px solid var(--ink); }
+    .preview-grid { display: grid; grid-template-columns: .8fr 1.2fr; gap: 64px; }
+    .preview-grid p { color: var(--steel); }
+    .preview-grid strong { color: var(--ink); }
 
-  .steps { display: flex; border-bottom: 1px solid var(--line-soft); background: var(--surface-2); overflow-x: auto; scrollbar-width: none; }
-  .steps::-webkit-scrollbar { display: none; }
-  .step {
-    appearance: none; border: 0; background: transparent; cursor: pointer;
-    font-family: var(--mono); font-size: 0.73rem; color: var(--faint);
-    padding: 10px 14px; white-space: nowrap; border-bottom: 2px solid transparent;
-    transition: color .18s ease, border-color .18s ease;
-  }
-  .step:hover { color: var(--muted); }
-  .step[aria-selected="true"] { color: var(--amber); border-bottom-color: var(--amber); }
-  .step-i { color: var(--line); margin-right: 7px; }
-  .step[aria-selected="true"] .step-i { color: color-mix(in oklab, var(--amber) 55%, transparent); }
+    footer { padding: 26px 0 40px; border-top: 1px solid var(--ink); }
+    .footer-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+    .footer-wordmark { font: 800 22px/1 var(--condensed); letter-spacing: -.035em; }
+    .footer-links { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 18px; font: 600 12px/1 var(--mono); }
+    .footer-links a { text-decoration: none; }
+    .footer-links a:hover { color: var(--orange); }
 
-  .term-body {
-    font-family: var(--mono); font-size: var(--s--1); line-height: 1.78;
-    padding: 18px 18px 22px; margin: 0; overflow-x: auto; white-space: pre; min-height: 330px;
-  }
-  @media (min-width: 1020px) { .term-body { min-height: 386px; } }
-  .c-mute { color: var(--faint); }
-  .c-dim { color: var(--muted); }
-  .c-pass { color: var(--pass); }
-  .c-fail { color: var(--fail); }
-  .c-amber { color: var(--amber); }
-  .c-ink { color: var(--ink); }
-  .c-prompt { color: var(--violet); }
-  .cursor { display: inline-block; width: 7px; height: 1.05em; vertical-align: -0.18em; background: var(--amber); animation: blink 1.05s step-end infinite; }
-  @keyframes blink { 50% { opacity: 0; } }
-
-  .term-note {
-    padding: 13px 18px; border-top: 1px solid var(--line-soft); background: var(--surface-2);
-    color: var(--muted); font-size: var(--s--1); line-height: 1.55; min-height: 66px; margin: 0;
-  }
-  .term-note b { color: var(--ink); font-weight: 620; }
-
-  footer {
-    margin-top: clamp(44px, 6vw, 72px); padding: 20px 0 34px; border-top: 1px solid var(--line-soft);
-    display: flex; gap: 12px 22px; justify-content: space-between; flex-wrap: wrap;
-    color: var(--faint); font-size: var(--s--1);
-  }
-  footer a { color: var(--muted); text-decoration: none; }
-  footer a:hover { color: var(--amber); }
-
-  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
-</style>
-
-<div class="glow"><i></i><i></i></div>
-
-<div class="wrap">
-  <nav>
-    <div class="brand"><span class="mark"></span> runmill</div>
-    <div class="nav-links">
-      <a class="pill" href="https://github.com/mikigraf/runmill/blob/main/docs/README.md">Docs</a>
-      <a class="pill pill--solid" href="https://github.com/mikigraf/runmill">GitHub</a>
-    </div>
-  </nav>
-</div>
-
-<main class="wrap">
-  <div class="hero">
-    <div>
-      <p class="eyebrow">Proof of done</p>
-      <h1>The agent says it's done. <span class="dim">runmill checks.</span></h1>
-      <p class="positioning">The exit condition for coding agents.</p>
-      <p class="lede">
-        Your harness already has a loop. runmill decides when that loop is actually finished:
-        deterministic selection and an atomic claim from the backlog, proven isolation, evidence
-        that the checks you said mattered ran against the exact candidate commit, fresh-context
-        review, and a merge gate that fails closed.
-      </p>
-      <div class="cta">
-        <a class="pill pill--solid" href="https://github.com/mikigraf/runmill#try-it-in-60-seconds">Try it in 60 seconds</a>
-        <a class="pill" href="https://github.com/mikigraf/runmill/blob/main/docs/verification.md">What counts as evidence</a>
+    @media (max-width: 840px) {
+      .hero { grid-template-columns: 1fr; }
+      .stages { grid-template-columns: repeat(2, 1fr); }
+      .stage:nth-child(even) { border-right: 0; }
+      .stage:last-child { border-right: 1px solid #454942; }
+      .section-head, .quickstart, .preview-grid { grid-template-columns: 1fr; }
+      .section-head, .preview-grid { gap: 24px; }
+    }
+    @media (max-width: 560px) {
+      .nav-links a:first-child { display: none; }
+      .guarantees { grid-template-columns: 1fr; }
+      .loop-stage { padding: 32px 28px 26px; }
+      .footer-row { align-items: flex-start; flex-direction: column; }
+      .footer-links { justify-content: flex-start; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <header class="wrap">
+    <nav class="nav" aria-label="Primary navigation">
+      <a class="brand" href="https://github.com/mikigraf/runmill" aria-label="Runmill on GitHub">
+        <svg viewBox="0 0 336 64" role="img" aria-label="runmill">
+          <path fill="#111310" d="M4 7h50v18h-8V15H12v34h34V39h8v18H4V7Z"/>
+          <path fill="#FF4D1F" d="M34 28h12v9H34z"/>
+          <g fill="#111310" transform="translate(68)">
+            <path d="M4 52V20h8v5c3-4 8-6 14-6h3v9h-4c-8 0-13 4-13 12v12H4Z"/>
+            <path d="M36 20h9v19c0 5 2 7 7 7 6 0 9-4 9-10V20h9v32h-9v-5c-3 4-7 6-13 6-8 0-12-5-12-14V20Z"/>
+            <path d="M80 20h9v5c3-4 7-6 13-6 9 0 13 5 13 14v19h-9V34c0-5-2-8-7-8-6 0-10 4-10 11v15h-9V20Z"/>
+            <path d="M125 20h9v5c3-4 7-6 12-6 6 0 10 2 12 7 3-5 8-7 14-7 8 0 12 5 12 14v19h-9V34c0-5-2-8-6-8-6 0-9 4-9 11v15h-9V34c0-5-2-8-6-8-6 0-11 4-11 11v15h-9V20Z"/>
+            <path d="M194 20h9v32h-9V20Zm0-12h9v8h-9V8Z"/>
+            <path d="M214 8h9v44h-9V8Z"/>
+            <path d="M234 8h9v44h-9V8Z"/>
+          </g>
+        </svg>
+      </a>
+      <div class="nav-links">
+        <a href="https://github.com/mikigraf/runmill/blob/main/docs/README.md">Docs</a>
+        <a class="button button--primary" href="https://github.com/mikigraf/runmill">View on GitHub</a>
       </div>
-      <p class="stat">
-        <b>85% say the bottleneck moved from writing code to reviewing it.</b>
-        <span>GitLab, June 2026, surveying 1,528 developers and technology buyers.</span>
-      </p>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero wrap">
+      <div>
+        <p class="flag">Developer preview</p>
+        <h1>The exit condition for coding agents.</h1>
+        <p class="lede">Runmill takes eligible Linear issues, gives each one to Codex or Claude Code in an isolated workspace, verifies the exact commit, starts a clean review, opens the GitHub pull request, and goes back for the next issue.</p>
+        <div class="actions">
+          <a class="button button--primary" href="https://github.com/mikigraf/runmill#quick-start">Run the demo</a>
+          <a class="button" href="https://github.com/mikigraf/runmill/blob/main/docs/verification.md">Read the evidence rules</a>
+        </div>
+      </div>
+
+      <div class="instrument" aria-label="Runmill gated delivery loop">
+        <div class="instrument-head"><span>RM / delivery loop</span><span>fail closed</span></div>
+        <div class="loop-stage">
+          <svg viewBox="0 0 320 262" role="img" aria-labelledby="loop-title loop-desc">
+            <title id="loop-title">The Runmill gated loop</title>
+            <desc id="loop-desc">A work item travels around a delivery loop, waits for three evidence checks, then exits through the gate.</desc>
+            <path d="M38 38H282V224H38V38" fill="none" stroke="#111310" stroke-width="15" stroke-linejoin="miter"/>
+            <rect x="274" y="104" width="16" height="54" fill="#FAF7EF"/>
+            <g class="gate" fill="#FF4D1F">
+              <rect x="274" y="105" width="16" height="7"/>
+              <rect x="274" y="151" width="16" height="7"/>
+            </g>
+            <g class="evidence" fill="#24B47E">
+              <rect x="113" y="121" width="22" height="22"/>
+              <rect x="149" y="121" width="22" height="22"/>
+              <rect x="185" y="121" width="22" height="22"/>
+            </g>
+            <rect class="token" x="-7" y="-7" width="14" height="14" fill="#FF4D1F"/>
+          </svg>
+          <div class="loop-caption"><span>queue → evidence → gate</span><span>repeat after delivery</span></div>
+        </div>
+      </div>
+    </section>
+
+    <div class="strip" aria-label="Run stages">
+      <div class="stages wrap">
+        <div class="stage"><b>01</b>Backlog</div>
+        <div class="stage"><b>02</b>Claim</div>
+        <div class="stage"><b>03</b>Implement</div>
+        <div class="stage"><b>04</b>Verify</div>
+        <div class="stage"><b>05</b>Review</div>
+        <div class="stage"><b>06</b>Pull request</div>
+        <div class="stage"><b>07</b>Repeat</div>
+      </div>
     </div>
 
-    <div class="term">
-      <div class="term-bar">
-        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-        <span class="term-path">~/acme/platform</span>
-        <button class="replay" id="replay" type="button">replay</button>
+    <section class="wrap" id="why">
+      <div class="section-head">
+        <div>
+          <p class="kicker">What Runmill owns</p>
+          <h2>The delivery process around the agent.</h2>
+        </div>
+        <p class="section-copy">The agent writes and reviews code. Runmill handles selection, claims, workspaces, required checks, pull requests, CI state, and merge policy. Missing evidence stops the run for a person.</p>
       </div>
-      <div class="steps" role="tablist" aria-label="A runmill session">
-        <button class="step" role="tab" aria-selected="true" data-i="0"><span class="step-i">01</span>init</button>
-        <button class="step" role="tab" aria-selected="false" data-i="1"><span class="step-i">02</span>doctor</button>
-        <button class="step" role="tab" aria-selected="false" data-i="2"><span class="step-i">03</span>next</button>
-        <button class="step" role="tab" aria-selected="false" data-i="3"><span class="step-i">04</span>daemon</button>
-      </div>
-      <pre class="term-body" id="body" aria-live="polite"></pre>
-      <p class="term-note" id="note"></p>
-    </div>
-  </div>
-</main>
 
-<div class="wrap">
+      <div class="guarantees">
+        <article class="guarantee">
+          <span class="number">01 / CLAIM</span>
+          <h3>One issue, one worker</h3>
+          <p>Durable leases keep two workers from taking the same issue. A stale worker loses authority before it can mutate external state.</p>
+        </article>
+        <article class="guarantee">
+          <span class="number">02 / ISOLATE</span>
+          <h3>A workspace with a hard edge</h3>
+          <p>Each task runs in its own sandboxed workspace. Runmill verifies the host boundary before an agent starts.</p>
+        </article>
+        <article class="guarantee">
+          <span class="number">03 / PROVE</span>
+          <h3>Checks tied to the candidate</h3>
+          <p>Required checks run against the exact commit in a clean checkout. A green command with missing coverage does not count.</p>
+        </article>
+        <article class="guarantee">
+          <span class="number">04 / GATE</span>
+          <h3>Fresh review, deterministic delivery</h3>
+          <p>The reviewer gets fresh context. Runmill, rather than the model, owns pushes, pull requests, backlog changes, and merge decisions.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="wrap" id="quick-start">
+      <div class="quickstart">
+        <div class="quickstart-copy">
+          <p class="kicker">Zero credentials</p>
+          <h2>See one complete run.</h2>
+          <p>The bundled demo uses temporary storage and simulated integrations. It exercises the orchestration and Git verification path without touching your repository.</p>
+        </div>
+        <pre class="terminal"><code><span class="comment"># install the source preview</span>
+<span class="prompt">$</span> git clone https://github.com/mikigraf/runmill.git
+<span class="prompt">$</span> cd runmill &amp;&amp; npm ci
+<span class="prompt">$</span> npm run build &amp;&amp; npm link
+
+<span class="comment"># run the delivery loop in a temp workspace</span>
+<span class="prompt">$</span> runmill demo</code></pre>
+      </div>
+    </section>
+
+    <section class="preview">
+      <div class="preview-grid wrap">
+        <div>
+          <p class="kicker">Maturity</p>
+          <h2>Start in <code>pr-only</code>.</h2>
+        </div>
+        <div>
+          <p><strong>Runmill is a developer preview.</strong> The recommended mode opens reviewed pull requests and leaves merging to a person. Automatic merge modes are experimental and need explicit evaluation against your repositories and protection rules.</p>
+          <a class="button" href="https://github.com/mikigraf/runmill/blob/main/docs/autonomy.md">Compare autonomy modes</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
   <footer>
-    <span>Wraps Codex and Claude Code. Swap the agent without rewriting your trust model.</span>
-    <span><a href="https://github.com/mikigraf/runmill/blob/main/docs/README.md">Documentation</a></span>
+    <div class="footer-row wrap">
+      <span class="footer-wordmark">runmill</span>
+      <div class="footer-links">
+        <a href="https://github.com/mikigraf/runmill/blob/main/docs/README.md">Documentation</a>
+        <a href="https://github.com/mikigraf/runmill/blob/main/SECURITY.md">Security</a>
+        <a href="https://github.com/mikigraf/runmill/releases">Releases</a>
+        <a href="https://github.com/mikigraf/runmill/blob/main/CONTRIBUTING.md">Contributing</a>
+        <a href="https://github.com/mikigraf/runmill/blob/main/LICENSE">License</a>
+        <a href="https://github.com/mikigraf/runmill">GitHub</a>
+      </div>
+    </div>
   </footer>
-</div>
-
-<script>
-(function () {
-  "use strict";
-
-  // Output copied from real runs, not composed for the page. Inline colour uses
-  // a {class|text} marker, parsed into text nodes below. Nothing is ever
-  // assigned as HTML.
-  var STEPS = [
-    {
-      cmd: "runmill init",
-      lead: "Infers what it can, guesses nothing it shouldn't.",
-      note: " Repository and base branch come from git. Team, workflow states, and merge policy stay editable placeholders, because a guessed merge policy is not a guess worth making.",
-      out: [
-        "Created:",
-        "  runmill.yaml",
-        "  .runmill/checks.yaml",
-        "  .runmill/skills/code-review.md",
-        "  .runmill/skills/pr-review.md",
-        "",
-        "  {dim|repository}  acme/platform",
-        "  {dim|base branch} main",
-        "",
-        "Next:",
-        "  {mute|1.} Edit runmill.yaml   {mute|team, states, repository mapping}",
-        "  {mute|2.} runmill doctor      {mute|verify this host can run safely}"
-      ]
-    },
-    {
-      cmd: "runmill doctor",
-      lead: "It does not ask whether a sandbox exists.",
-      note: " It builds one, plants a secret in a credential path, tries to read it from inside, and fails if that succeeds. The network line is a warning rather than a pass: Seatbelt has no network namespace, and the report says so instead of implying parity.",
-      out: [
-        "  {pass|✓} environment                   interactive host",
-        "  {pass|✓} git                           git version 2.50.1",
-        "  {pass|✓} repository                    ~/acme/platform",
-        "  {pass|✓} github-auth                   authenticated",
-        "  {pass|✓} provider:codex                codex-cli 0.146.0",
-        "  {pass|✓} sandbox:mechanism             sandbox-exec (Seatbelt)",
-        "  {pass|✓} sandbox:deny-credential-read  {ink|read denied}",
-        "  {amber|!} sandbox:network               Seatbelt cannot scope network by host",
-        "      {mute|expected: egress via the runmill proxy}",
-        "      {mute|fix:      workspace.network must be `proxy` on macOS}",
-        "",
-        "  overall: {amber|WARN}"
-      ]
-    },
-    {
-      cmd: "runmill next --dry-run",
-      lead: "Selection is deterministic, and it shows its work.",
-      note: " Every rejection names the rule that failed. ENG-106 sorts last despite being the oldest issue by years, because backlogs encode \"no priority\" as zero and a naive sort puts it first.",
-      out: [
-        "Would select  {ink|ENG-102}  Crash on cold start in the iOS app",
-        "  {dim|repository}  acme/ios (base main)",
-        "  {dim|priority}    urgent",
-        "",
-        "Next in queue (3):",
-        "  {dim|ENG-101}  Prevent duplicate webhook delivery",
-        "  {dim|ENG-103}  Tidy up the dashboard",
-        "  {dim|ENG-106}  Unprioritized cleanup task",
-        "",
-        "Rejected (2):",
-        "  {dim|ENG-104}  Migrate billing to the new provider",
-        "      {fail|✗} {mute|dependencies: blocked by ENG-99}",
-        "  {dim|ENG-105}  Redesign onboarding",
-        "      {fail|✗} {mute|labels: carries excluded label(s): needs-design}"
-      ]
-    },
-    {
-      cmd: "runmill daemon",
-      lead: "The third run exited 0 and still failed.",
-      note: " A suite that discovers no tests is the most convincing false green there is, because it is character-for-character identical to a full pass. The breaker stops the loop rather than working through the rest of the backlog.",
-      out: [
-        "  ENG-102  {mute|→}  {pass|PR_DELIVERED}   {mute|$0.02}",
-        "  ENG-101  {mute|→}  {pass|PR_DELIVERED}   {mute|$0.02}",
-        "  ENG-118  {mute|→}  {fail|NEEDS_HUMAN}    {mute|$0.03}",
-        "           {mute|check \"unit\" exited 0 having discovered no tests}",
-        "",
-        "  {fail|stopped: breaker}  {mute|1 run could not be verified}",
-        "  {mute|runs:   3   spend: $0.07}",
-        "",
-        "  {mute|runmill inspect eng-118}  {dim|candidate SHA, tree hashes, executor}"
-      ]
-    }
-  ];
-
-  var body = document.getElementById("body");
-  var note = document.getElementById("note");
-  var tabs = Array.prototype.slice.call(document.querySelectorAll(".step"));
-  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  var timers = [];
-
-  function clearTimers() { timers.forEach(clearTimeout); timers = []; }
-  function later(fn, ms) { timers.push(setTimeout(fn, ms)); }
-
-  /** Turn "{class|text}" markers into real nodes. Never assigns HTML. */
-  function parse(line, frag) {
-    var parts = line.split(/(\{\w+\|[^}]*\})/);
-    for (var i = 0; i < parts.length; i++) {
-      var p = parts[i];
-      if (p === "") continue;
-      if (p.charAt(0) === "{" && p.charAt(p.length - 1) === "}") {
-        var bar = p.indexOf("|");
-        var el = document.createElement("span");
-        el.className = "c-" + p.slice(1, bar);
-        el.textContent = p.slice(bar + 1, -1);
-        frag.appendChild(el);
-      } else {
-        frag.appendChild(document.createTextNode(p));
-      }
-    }
-    return frag;
-  }
-
-  function prompt(frag) {
-    var el = document.createElement("span");
-    el.className = "c-prompt";
-    el.textContent = "$";
-    frag.appendChild(el);
-    frag.appendChild(document.createTextNode(" "));
-  }
-
-  function caret(frag) {
-    var el = document.createElement("span");
-    el.className = "cursor";
-    frag.appendChild(el);
-  }
-
-  /** Draw the command plus the first `shown` output lines. */
-  function draw(step, typed, shown, done) {
-    var frag = document.createDocumentFragment();
-    prompt(frag);
-    frag.appendChild(document.createTextNode(step.cmd.slice(0, typed)));
-    if (shown < 0) {
-      caret(frag);
-    } else {
-      frag.appendChild(document.createTextNode("\n\n"));
-      for (var i = 0; i <= shown && i < step.out.length; i++) {
-        parse(step.out[i], frag);
-        if (i < shown) frag.appendChild(document.createTextNode("\n"));
-      }
-      if (done) {
-        frag.appendChild(document.createTextNode("\n\n"));
-        prompt(frag);
-        caret(frag);
-      }
-    }
-    body.textContent = "";
-    body.appendChild(frag);
-  }
-
-  function setNote(step) {
-    note.textContent = "";
-    var b = document.createElement("b");
-    b.textContent = step.lead;
-    note.appendChild(b);
-    note.appendChild(document.createTextNode(step.note));
-  }
-
-  function select(i) {
-    for (var n = 0; n < tabs.length; n++) {
-      tabs[n].setAttribute("aria-selected", n === i ? "true" : "false");
-    }
-  }
-
-  function play(i, chain) {
-    clearTimers();
-    select(i);
-    var step = STEPS[i];
-    setNote(step);
-
-    if (reduce) { draw(step, step.cmd.length, step.out.length - 1, true); return; }
-
-    var typed = 0;
-    draw(step, 0, -1, false);
-
-    function type() {
-      typed++;
-      draw(step, typed, -1, false);
-      if (typed < step.cmd.length) later(type, 26);
-      else later(function () { line(0); }, 360);
-    }
-
-    function line(n) {
-      var last = n + 1 >= step.out.length;
-      draw(step, step.cmd.length, n, last);
-      if (!last) {
-        // A beat before the line that refuses, so it reads as a decision.
-        var pause = /NEEDS_HUMAN|stopped:|sandbox:network/.test(step.out[n + 1]) ? 520 : 60;
-        later(function () { line(n + 1); }, pause);
-      } else if (chain && i + 1 < STEPS.length) {
-        later(function () { play(i + 1, true); }, 2700);
-      }
-    }
-
-    later(type, 240);
-  }
-
-  for (var t = 0; t < tabs.length; t++) {
-    tabs[t].addEventListener("click", function () {
-      play(Number(this.getAttribute("data-i")), false);
-    });
-  }
-  document.getElementById("replay").addEventListener("click", function () { play(0, true); });
-
-  if (reduce) { select(3); play(3, false); } else { play(0, true); }
-})();
-</script>
+</body>
+</html>

@@ -14,7 +14,6 @@ backlog:
   eligible_states: [Todo, Ready]
   claim_state: In Progress
   completed_state: Done
-  blocked_state: Blocked
   delivered_state: In Review
   include_labels: [agent-ready]
   exclude_labels: [needs-design, no-agent]
@@ -22,9 +21,13 @@ backlog:
 
 github:
   repositories:
-    - match: { team: ENG, label: mobile }
-      repo: acme/ios
-      base_branch: main
     - match: { team: ENG }
       repo: acme/platform
       base_branch: main
+
+# This fixture has no application or test framework. A real `runmill init`
+# infers locked npm scripts or blocks until the operator declares real checks.
+verification:
+  commands:
+    - id: diff-check
+      run: git diff --check

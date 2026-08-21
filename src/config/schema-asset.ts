@@ -2,13 +2,13 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** The filename `runmill.yaml` references in its yaml-language-server header. */
+/** The filename generated policy files reference in their yaml-language-server header. */
 export const SCHEMA_FILENAME = "runmill.schema.json";
 
 /**
  * The JSON Schema shipped with the package.
  *
- * Every generated `runmill.yaml` opens with
+ * Every generated operator policy opens with
  * `# yaml-language-server: $schema=./runmill.schema.json`, which is only worth
  * anything if the file is actually beside it. It is listed in package.json
  * `files`, so this resolves from an installed package as well as from a clone.

@@ -105,6 +105,8 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
   readonly capturedPackets: unknown[] = [];
   /** The rendered issue document handed alongside each packet. */
   readonly capturedIssueDocs: string[] = [];
+  /** Orchestrator-owned PR evidence present when each PR review started. */
+  readonly capturedPrEvidence: unknown[] = [];
 
   constructor(script: FakeProviderScript = {}, clock: Clock = new SystemClock()) {
     this.#script = script;
@@ -136,10 +138,18 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
 
   async start(request: AgentRunRequest): Promise<AgentSession> {
     this.startedRequests.push(request);
+    const expectedOutput = outputPathFor(request.workingDirectory, request.role);
+    if (expectedOutput !== undefined) rmSync(expectedOutput, { force: true });
     if (existsSync(request.taskPacketPath)) {
       this.capturedPackets.push(JSON.parse(readFileSync(request.taskPacketPath, "utf8")));
       const issueDoc = join(dirname(request.taskPacketPath), "issue.md");
       if (existsSync(issueDoc)) this.capturedIssueDocs.push(readFileSync(issueDoc, "utf8"));
+    }
+    if (request.role === "pr-reviewer") {
+      const evidencePath = join(request.workingDirectory, ".runmill", "run", "pr-evidence.json");
+      if (existsSync(evidencePath)) {
+        this.capturedPrEvidence.push(JSON.parse(readFileSync(evidencePath, "utf8")));
+      }
     }
     this.#sessionSeq += 1;
     const sessionId = `fake-session-${this.#sessionSeq}`;
@@ -262,10 +272,9 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
           })),
         };
       }
-      const contractPath = outputPathFor(request.workingDirectory, request.role);
       let outputRef = "";
-      if (output !== undefined && contractPath !== undefined) {
-        outputRef = contractPath;
+      if (output !== undefined && expectedOutput !== undefined) {
+        outputRef = expectedOutput;
         mkdirSync(dirname(outputRef), { recursive: true });
         writeFileSync(outputRef, JSON.stringify(output, null, 2));
       }

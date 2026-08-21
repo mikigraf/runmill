@@ -37,10 +37,11 @@ describe.runIf(codexInstalled)("live: Codex provider", () => {
     expect(typeof auth.authenticated).toBe("boolean");
   });
 
-  it("advertises the capabilities the orchestrator depends on", async () => {
+  it("advertises only the capabilities the Codex CLI actually enforces", async () => {
     const caps = await codex.capabilities();
     expect(caps.streamingOutput).toBe(true);
-    expect(caps.toolAllowDeny).toBe(true);
+    expect(caps.turnLimits).toBe(false);
+    expect(caps.toolAllowDeny).toBe(false);
   });
 
   it("refuses to resume for a reviewer role", async () => {

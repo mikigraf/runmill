@@ -25,7 +25,7 @@ specific commit, a specific command, and a tree that did not move is not evidenc
 
 | Source | Origin | Trust |
 |---|---|---|
-| `repository-policy` | `.runmill/checks.yaml`, read from the **base** commit, plus `verification.commands` in `runmill.yaml` | Authoritative |
+| `repository-policy` | `.runmill/checks.yaml`, read from the **base** commit, plus `verification.commands` in the operator policy | Authoritative |
 | `changed-path` | Path rules — touching `migrations/` adds the migration check | Authoritative |
 | `github` | Contexts branch protection requires | Authoritative, remote-observed |
 | `agent` | The coding agent proposing additional checks | Advisory, additive only |
@@ -62,12 +62,13 @@ Two files, split by ownership:
 | File | Declares | Lives |
 |---|---|---|
 | `.runmill/checks.yaml` | Which checks this repository requires | In the repository, versioned and reviewed with the code |
-| `runmill.yaml` | Autonomy, budgets, risk rules | Outside the repository, where an inbound pull request cannot reach it |
+| Operator `policy.yaml` | Autonomy, budgets, risk rules | Outside the repository, where an inbound pull request cannot reach it |
 
-Both contribute checks; they are unioned by id, and the repository wins a conflict — it is the
-thing that knows how to build itself. A manifest that exists but does not parse is a hard failure
-([`RM-VERIFY-004`](./errors.md#rm-verify-004)): *unreadable* must never quietly become
-*no checks required*.
+Both contribute checks and are unioned by id. On a conflict, the operator definition wins.
+Repository content may add a requirement, but it cannot replace a command or evidence rule chosen
+outside the repository. A manifest that exists but does not parse is a hard failure
+([`RM-VERIFY-004`](./errors.md#rm-verify-004)): *unreadable* must never quietly become *no checks
+required*.
 
 ## 2. Coverage — proving each one ran
 
@@ -105,7 +106,7 @@ time. Merge-readiness counts only checks the orchestrator ran itself.
 
 ## 3. Freshness — pinning the result to a commit
 
-Checks do not run in the agent's workspace. The engine creates a **detached checkout of the
+Checks do not run in the agent's workspace. Every check gets a fresh **detached checkout of the
 candidate commit**:
 
 ```ts
@@ -115,8 +116,9 @@ const verifyPath = await workspaces.createVerificationCheckout(workspace, candid
 and hashes the tree on both sides of every check:
 
 ```ts
-const before = treeBefore ?? (await workspaces.treeHash(verifyWorkspace));
+const before = await workspaces.treeHash(verifyWorkspace);
 const outcome = await this.#sandbox.run({ ... });
+// Parse and remove the declared, newly generated report artifact.
 const after = await workspaces.treeHash(verifyWorkspace);
 
 if (before !== after) {
@@ -132,11 +134,61 @@ This catches the honest cases (a check that regenerates a lockfile, a formatter 
 left on) and the dishonest ones (a test that rewrites a fixture until it passes) with the same
 mechanism, because it does not care *why* the tree moved.
 
-The `after` hash of one check becomes the `before` of the next — nothing runs in between — so N
-checks cost N+1 full-tree hashes rather than 2N.
+The checkout is destroyed after that invocation. A check that mutates its tree therefore cannot
+contaminate the next check.
 
-Checks run in the [sandbox](./sandbox.md) with network disabled and only the verification
-checkout writable.
+### Dependencies without a networked verification bootstrap
+
+A detached Git checkout correctly omits ignored directories such as `node_modules`. Running the
+usual Node checks there without preparing dependencies makes every otherwise normal `npm test`
+fail before it discovers a test.
+
+The developer-preview path supports locked npm projects without giving repository code an install
+hook or network access:
+
+1. The operator runs `npm ci` in the source checkout explicitly.
+2. `runmill init` and `runmill doctor --check verification:dependencies` freshly fetch the
+   configured remote base, load repository check policy at that same SHA, and compare its exact
+   lockfiles with that install. They fail before an issue is claimed when the checkout is ahead,
+   behind, missing dependencies, or stale. This proof does not copy packages, warm Runmill's cache,
+   run npm, or contact a registry.
+3. Before agent work starts, Runmill requires that checkout's `package.json`, `package-lock.json`,
+   installed package inventory, platform, architecture, and Node ABI to match the exact trusted
+   base.
+4. Runmill imports the installed bytes into a machine-local, content-keyed cache and records a
+   full tree fingerprint. Reuse verifies the receipt and every cached byte.
+5. Each detached verification checkout receives a hard-linked view of that exact `node_modules`
+   tree on Runmill's machine-local state filesystem. Files are not copied again for every fix
+   iteration, and the sandbox overlays the whole nested tree read-only alongside `.git`.
+
+No package-manager command or repository-controlled bootstrap string runs in verification, and the
+verification sandbox has no network. `node_modules/` must be ignored so this verification-only
+input cannot enter the measured candidate tree. A missing install, a stale local lockfile, a
+changed candidate lockfile, a mutated cache, an unignored dependency directory, or an npm workspace link fails with
+[`RM-VERIFY-005`](./errors.md#rm-verify-005). Update the source checkout, run `npm ci`, and start a
+fresh delivery run. Other package managers need an operator-declared preparation strategy in a
+future release; Runmill does not guess one.
+
+Checks run in the [sandbox](./sandbox.md) with network disabled and the entire verification
+checkout read-only. The checkout, `.git`, and prepared `node_modules` are readable but cannot be
+changed. This matters even with before/after hashes: hostile test code could otherwise edit source,
+generate a passing report, and restore the original bytes before the second hash.
+
+A declared report is the one permitted ephemeral artifact. It must not exist before the command,
+must resolve inside the checkout, and must be a regular file in one of the supported formats.
+Runmill safely creates any missing parent directories, pre-creates an empty report file, and grants
+the sandbox write access to that exact file only. The reporter must overwrite it; a reporter that
+requires ownership of the output directory is unsupported and fails closed. Runmill parses and
+removes the report before the post-check hash. Test-runner scratch data belongs in the private,
+writable `TMPDIR` provided to each invocation.
+
+Report-producing checks run twice: first in a fresh checkout of `workspace.baseCommit`, then in a
+fresh checkout of the candidate. Both runs use the same command, timeout, sandbox, network denial,
+read-only `.git`, read-only prepared dependencies, report validation, and before/after tree hash.
+The baseline must produce a valid, non-mutating inventory. Missing, malformed, stale, duplicate-id,
+focused, zero-test, timed-out, or mutating baseline evidence fails closed. A nonzero baseline exit
+is allowed when its report is valid: failed baseline tests do not establish preservation authority,
+but the tests the report says passed still do.
 
 ## 4. Outcome — what "passed" excludes
 
@@ -161,37 +213,41 @@ success for having done nothing.
 reduces the suite to one case and still exits 0. The whole suite did not run, so the suite did
 not pass.
 
-**Undeclared skips.**
+**Skipped or missing tests.**
 
-```ts
-const reportedSkips = countReportedSkips(combined);
-const declared = spec.declaredSkips?.length ?? 0;
-if (status === "passed" && reportedSkips > declared) { status = "failed"; }
-```
-
-Skips are allowed — they must be *declared*, with a stated cause, in the manifest. `declared_skips`
-is top level and applies to every check, because a skip is a statement about a *test*, and the same
-test does not become acceptable to lose because a different command happened to run it:
+Runmill compares exact identities, never counts. Every test that passed at the base must still be
+present and not skipped at the candidate. The only exception is an exact `test_id` declared under
+that same check:
 
 ```yaml
 checks:
   - id: unit
-    run: npm test
-
-declared_skips:
-  - test_id: "flaky network integration"
-    cause: "requires a live staging endpoint; tracked in ENG-88"
+    run: npm test -- --reporter=tap
+    report:
+      path: reports/unit.tap
+      format: tap
+    declared_skips:
+      - test_id: "flaky network integration"
+        cause: "requires a live staging endpoint; tracked in ENG-88"
 ```
 
-A declared skip with no `cause` is rejected — that is exactly the undocumented skip the file
-exists to prevent.
+The observed exception set must equal the declaration set. Declaring A cannot authorize B; a
+stale declaration for a test that now passes also fails. Empty and duplicate ids are invalid, and
+declarations on a check without a report are rejected because summary text cannot identify tests.
+This is [`RM-VERIFY-003`](./errors.md#rm-verify-003).
 
-Three skips against one declaration is two skips nobody decided on. That is
-[`RM-VERIFY-003`](./errors.md#rm-verify-003).
+Canonical ids come from the report:
 
-The asymmetry is deliberate: declaring a skip is cheap and explicit, and the cause is written
-down where a reviewer sees it. Silently tolerating skips means the number can drift from 0 to 40
-without anyone choosing it.
+| Format | `test_id` |
+|---|---|
+| JUnit | `classname::name`, or `name` when `classname` is absent |
+| TAP | The non-empty description after `ok` / `not ok` and the optional result number |
+| Go JSON | `Package::Test` from the completed test event |
+
+Every id must be unique within the report. TAP evidence must use one flat plan with a non-empty,
+unique description for each point; nested plans are rejected rather than guessed. TAP `SKIP` and
+`TODO` directives both count as skipped. Go package summaries have no `Test` field and are not test
+identities. JUnit accepts a deliberately strict XML subset and rejects DTD/entity declarations.
 
 **Timeouts** are failures, not unknowns.
 
@@ -207,7 +263,8 @@ if (spec.report === undefined) {
 ```
 
 The engine parsed stdout and found nothing alarming. It could not confirm *what* ran. Declaring a
-report upgrades this from an absence of bad news to a positive statement:
+report upgrades this from an absence of bad news only when the command creates the file and Runmill
+can parse it:
 
 ```yaml
 checks:
@@ -218,8 +275,18 @@ checks:
       format: junit
 ```
 
-`unproven` does not block a merge on its own. It is the honest label for the difference between
-"nothing looked wrong" and "here is what ran".
+Supported formats are `junit`, `tap`, and `go-json`. A generic JSON object has no standard test
+semantics and is rejected rather than guessed. A missing, pre-existing, empty, malformed,
+duplicate-id, unsupported, or escaping candidate report is `unproven`; when a report was declared,
+it also prevents the base-to-candidate inventory comparison and fails the check.
+
+When omitted, `verification.fail_on_skipped_check` defaults to `true`, and an `unproven` required
+result blocks merge-readiness. A freshly generated `pr-only` policy sets it to `false`: the starter
+manifest can run portable commands, but cannot guess each test framework's reporter flags, and a
+person still owns the merge. Add newly generated reports and set the gate to `true` before moving
+to automatic merge; `guarded-merge` and `continuous` are rejected without it. Setting it to
+`false` never turns observed zero-test, focused, identity-free skip, or baseline-inventory failure
+into a pass.
 
 <a id="remote-checks"></a>
 
@@ -240,12 +307,14 @@ Checks that GitHub runs are reconciled rather than executed — see
 
 ```ts
 const anyFailed = results.some((r) => r.status === "failed");
-return { mergeReady: !anyFailed && failures.length === 0, results, failures };
+const lacksRequiredProof = failOnSkippedCheck &&
+  results.some((r) => r.required && r.coverage !== "proven");
+return { mergeReady: !anyFailed && !lacksRequiredProof && failures.length === 0, results, failures };
 ```
 
-Both terms are required. `results` covers checks that ran and failed; `failures` covers checks
-that never ran, produced no result, or had no runnable command. A missing check is not a passing
-check.
+All three conditions are required. `results` covers checks that ran and failed; the proof gate
+covers required checks whose coverage is still `unproven`; and `failures` covers checks that never
+ran, produced no result, or had no runnable command. A missing check is not a passing check.
 
 ## Reading the evidence
 

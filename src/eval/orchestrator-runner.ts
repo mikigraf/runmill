@@ -11,17 +11,22 @@ import { StateStore } from "../state/store.js";
 import { SystemClock } from "../platform/clock.js";
 import { buildAdapters } from "../factory.js";
 import { FakeBacklogAdapter } from "../testing/fake-backlog.js";
+import { FakeForgeAdapter } from "../testing/fake-forge.js";
 import { selectNext } from "../queue/selector.js";
 import type { RunmillConfig } from "../config/types.js";
 import type { CheckSpec } from "../verification/engine.js";
-import type { BacklogIssue, RepositoryTarget } from "../domain/types.js";
+import type { BacklogIssue } from "../domain/types.js";
 import { WorkspaceManager, type Workspace } from "../workspace/manager.js";
+import { validateInstalledDependencies } from "../workspace/dependencies.js";
+import { errorMessage, RunmillError } from "../errors/runmill-error.js";
 
 export interface OrchestratorRunnerOptions {
   readonly config: RunmillConfig;
   /** Repository used when a task declares no fixture of its own. */
   readonly defaultRepoPath?: string | undefined;
   readonly demo?: boolean | undefined;
+  /** Test seam: live-provider tests inject a fake without contacting a CLI. */
+  readonly adapterBuilder?: typeof buildAdapters | undefined;
 }
 
 /**
@@ -42,32 +47,14 @@ export function orchestratorRunner(options: OrchestratorRunnerOptions): TaskRunn
     const startedMs = Date.now();
 
     try {
-      const target: RepositoryTarget = {
-        repo: options.config.github.repositories[0]?.repo ?? "acme/eval",
-        baseBranch: options.config.github.repositories[0]?.baseBranch ?? "main",
-      };
-      const repoPath = prepareRepository(
-        task,
-        workspace.path,
-        options.defaultRepoPath,
-        target.baseBranch,
-      );
-      const dataDir = join(workspace.path, "state");
-      mkdirSync(dataDir, { recursive: true });
-
-      const issue = toBacklogIssue(task);
+      const issue = toBacklogIssue(task, options.config);
 
       // The backlog for a replay IS the task: the suite defines the issue, so
       // seeding from a live backlog or the demo fixture would run something
-      // else entirely. Provider and forge still come from the factory, so a
-      // replay can be pointed at a real coding agent.
-      const adapters = await buildAdapters(options.config, {
-        demo: options.demo !== false,
-        need: ["provider", "forge"],
-      });
+      // else entirely. Only the provider may be live. Every forge observation
+      // and mutation is simulated, even under guarded-merge/continuous, while
+      // pushes made by the fake stay inside the throwaway local bare origin.
       const backlog = new FakeBacklogAdapter([issue]);
-      const store = StateStore.open(join(dataDir, "runmill.db"), { clock: new SystemClock() });
-      const clock = new SystemClock();
 
       // Selection FIRST, then the run — the order the daemon uses.
       //
@@ -96,6 +83,36 @@ export function orchestratorRunner(options: OrchestratorRunnerOptions): TaskRunn
         };
       }
 
+      // Repository routing belongs to selection. Preparing the first configured
+      // repository before selection silently replays valid project/label routes
+      // against the wrong base branch.
+      const target = selection.selected.target;
+      const repoPath = prepareRepository(
+        task,
+        workspace.path,
+        options.defaultRepoPath,
+        target.baseBranch,
+      );
+      const sourceBaseRef = repositoryHead(repoPath);
+      const dependencySource = resolveEvaluationDependencySource(
+        task,
+        repoPath,
+        options.defaultRepoPath,
+        sourceBaseRef,
+      );
+
+      const dataDir = join(workspace.path, "state");
+      mkdirSync(dataDir, { recursive: true });
+      const adapterBuilder = options.adapterBuilder ?? buildAdapters;
+      const adapters = await adapterBuilder(options.config, {
+        demo: options.demo !== false,
+        need: ["provider"],
+        externalEffects: "deny",
+      });
+      const forge = new FakeForgeAdapter({ credentialCanWriteProtection: false });
+      const clock = new SystemClock();
+      const store = StateStore.open(join(dataDir, "runmill.db"), { clock });
+
       const checks: CheckSpec[] = (task.checks ?? []).map((c) => ({
         id: c.id,
         run: c.run,
@@ -104,16 +121,21 @@ export function orchestratorRunner(options: OrchestratorRunnerOptions): TaskRunn
       }));
 
       try {
-        const workspaces = new EvaluationWorkspaceManager();
+        const workspaces = new EvaluationWorkspaceManager(dependencySource);
         const orchestrator = new Orchestrator({
           backlog,
           provider: adapters.provider,
           reviewProvider: adapters.reviewProvider,
-          forge: adapters.forge,
+          forge,
           store,
           clock,
           config: options.config,
           sourceRepoPath: repoPath,
+          sourceRepository: target.repo,
+          // Always bind the run to the commit prepared above. A historical SHA
+          // or routed base branch is an explicit experiment input, not a hint
+          // to fall back from when cloning the workspace.
+          sourceBaseRef,
           workspaceRoot: join(dataDir, "runs"),
           workspaces,
           checks,
@@ -187,8 +209,15 @@ export function prepareRepository(
     writeFileSync(join(target, "README.md"), `# ${task.id}\n`);
   }
 
+  const gitOutput = (...args: string[]): string => {
+    return execFileSync("git", args, {
+      cwd: target,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  };
   const git = (...args: string[]): void => {
-    execFileSync("git", args, { cwd: target, stdio: "ignore" });
+    gitOutput(...args);
   };
   if (!cloned) {
     git("init", "-q", "-b", "main", ".");
@@ -205,7 +234,28 @@ export function prepareRepository(
   }
 
   if (task.baseCommit !== undefined && task.baseCommit !== "") {
-    git("checkout", "-q", "--detach", task.baseCommit);
+    let baseCommit: string;
+    try {
+      baseCommit = gitOutput("rev-parse", "--verify", `${task.baseCommit}^{commit}`);
+    } catch {
+      throw new Error(
+        `evaluation task ${JSON.stringify(task.id)} base_commit ` +
+          `${JSON.stringify(task.baseCommit)} is not present in the fixture history`,
+      );
+    }
+    git("checkout", "-q", "--detach", baseCommit);
+  } else if (cloned) {
+    const remoteBase = `refs/remotes/origin/${baseBranch}`;
+    let baseCommit: string;
+    try {
+      baseCommit = gitOutput("rev-parse", "--verify", `${remoteBase}^{commit}`);
+    } catch {
+      throw new Error(
+        `evaluation repository does not contain configured base branch ` +
+          `${JSON.stringify(baseBranch)}`,
+      );
+    }
+    git("checkout", "-q", "--detach", baseCommit);
   }
 
   // A local bare remote, because the lease is a ref pushed to `origin` and a
@@ -224,6 +274,57 @@ export function prepareRepository(
   return target;
 }
 
+function repositoryHead(path: string): string {
+  return execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: path,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+}
+
+/**
+ * Select dependency bytes only after proving they describe the exact replay
+ * base. In particular, a historical task never inherits the current
+ * checkout's node_modules merely because that directory happens to exist.
+ */
+export function resolveEvaluationDependencySource(
+  task: EvalTask,
+  preparedRepo: string,
+  defaultRepoPath: string | undefined,
+  exactBase = repositoryHead(preparedRepo),
+): string | undefined {
+  // Repositories without an npm lock need no imported dependency tree.
+  if (!existsSync(join(preparedRepo, "package-lock.json"))) return undefined;
+
+  const requested = task.dependencyPath ?? task.repoPath ?? defaultRepoPath;
+  if (requested === undefined || !existsSync(requested)) {
+    throw RunmillError.fromCatalog("RM-VERIFY-005", {
+      whatHappened:
+        `Evaluation task ${JSON.stringify(task.id)} base ${exactBase} uses package-lock.json, ` +
+        "but no installed dependency checkout is available. Create a checkout at that exact " +
+        "base, run npm ci there, and set dependency_path for this task.",
+    });
+  }
+
+  // WorkspaceManager canonicalizes Git paths to their repository root before
+  // importing dependencies. Validate that same path here so a subdirectory
+  // cannot pass preflight and later resolve to different manifests.
+  const installedSource = gitRepositoryRoot(requested) ?? requested;
+  try {
+    validateInstalledDependencies({ trustedCheckout: preparedRepo, installedSource });
+  } catch (cause) {
+    const detail = cause instanceof RunmillError ? cause.whatHappened : errorMessage(cause);
+    throw RunmillError.fromCatalog("RM-VERIFY-005", {
+      whatHappened:
+        `Evaluation task ${JSON.stringify(task.id)} cannot reuse dependencies for exact base ` +
+        `${exactBase}. ${detail}\n  Current-checkout dependencies are never ` +
+        "substituted for a mismatched historical base. Create a checkout at the exact base, " +
+        "run npm ci there, and set dependency_path for this task.",
+    });
+  }
+  return installedSource;
+}
+
 function gitRepositoryRoot(path: string): string | undefined {
   try {
     return execFileSync("git", ["-C", path, "rev-parse", "--show-toplevel"], {
@@ -239,8 +340,17 @@ function gitRepositoryRoot(path: string): string | undefined {
 class EvaluationWorkspaceManager extends WorkspaceManager {
   #workspace: Workspace | undefined;
 
+  constructor(readonly dependencySourceRepo?: string | undefined) {
+    super();
+  }
+
   override async create(input: Parameters<WorkspaceManager["create"]>[0]): Promise<Workspace> {
-    const workspace = await super.create(input);
+    const workspace = await super.create({
+      ...input,
+      ...(this.dependencySourceRepo === undefined
+        ? {}
+        : { dependencySourceRepo: this.dependencySourceRepo }),
+    });
     this.#workspace = workspace;
     return workspace;
   }
@@ -264,15 +374,23 @@ class EvaluationWorkspaceManager extends WorkspaceManager {
   }
 }
 
-function toBacklogIssue(task: EvalTask): BacklogIssue {
+export function toBacklogIssue(task: EvalTask, config: RunmillConfig): BacklogIssue {
+  const state = task.issue.state ?? config.backlog.eligibleStates[0];
+  if (state === undefined || state === "") {
+    throw new Error(
+      `evaluation task ${JSON.stringify(task.id)} has no issue.state and the configured backlog ` +
+        "has no eligible state",
+    );
+  }
   return {
     identifier: task.issue.identifier,
     title: task.issue.title,
     description: task.issue.description,
     priority: 2,
     labels: [...task.issue.labels],
-    state: "Todo",
-    teamKey: "ENG",
+    state,
+    teamKey: task.issue.team ?? config.backlog.team,
+    ...(task.issue.project === undefined ? {} : { projectName: task.issue.project }),
     blockedBy: [],
     createdAt: "2026-01-01T00:00:00.000Z",
     assigneeIsHuman: false,

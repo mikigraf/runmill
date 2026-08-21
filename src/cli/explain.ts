@@ -1,7 +1,6 @@
 import { platform, release, homedir } from "node:os";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { CheckResult } from "../doctor/checks.js";
+import packageJson from "../../package.json" with { type: "json" };
 
 /**
  * Long-form answers to "what does this check actually require, and why".
@@ -14,10 +13,10 @@ import type { CheckResult } from "../doctor/checks.js";
 export const EXPLANATIONS: Readonly<Record<string, string>> = {
   sandbox: `Sandbox isolation
 
-runmill runs the coding agent as an untrusted process. It has your source tree
-and nothing else: no SSH keys, no cloud credentials, no GitHub token, no
-keychain. That is enforced by the operating system, not by asking the agent
-nicely.
+runmill runs the coding agent as an untrusted process. SSH keys, cloud
+credentials, GitHub and Linear tokens, API-key environment variables, and the
+macOS keychain are denied. Provider subscription config is a known exception
+inside the boundary until a credential broker exists.
 
   macOS   Seatbelt (sandbox-exec) with a generated deny-by-default profile
   Linux   bubblewrap with mount and user namespaces
@@ -30,9 +29,10 @@ What each platform can enforce differs, and runmill does not pretend otherwise:
   network scoping      NO           yes (--unshare-net)
   resource limits      NO           with cgroup v2
 
-Seatbelt has no network namespace, so \`workspace.network: proxy\` is the only
-enforceable setting on macOS: egress goes through a runmill-operated proxy with
-a host allowlist rather than being scoped by the kernel.
+The \`proxy\` value currently permits provider network access; the
+hostname-filtering proxy is not implemented yet. \`network_allowlist\` is
+therefore rejected rather than silently ignored, and doctor reports unrestricted
+provider egress as a warning on both platforms.
 
 doctor does not ask whether a sandbox exists. It builds one, tries to read
 ~/.ssh from inside it, and fails if that succeeds.
@@ -89,9 +89,14 @@ rather than only at doctor time. An event shape this adapter does not recognise
 quarantines the run instead of being parsed best-effort: misreading a tool call
 or a terminal result is worse than stopping.
 
-The provider's own credential file is readable inside the sandbox, because the
-CLI cannot authenticate without it. That is the one credential inside the
-boundary and it is scoped to the provider. Every other credential is denied.
+For each probe or agent session, runmill copies the provider config into a
+private disposable HOME. The real ~/.codex or ~/.claude directory is not
+mounted, provider and tool writes are discarded at exit, and refresh state is
+not copied back. Tool processes can still read the subscription credential in
+that temporary copy. This prevents persistent config tampering; it is not
+credential isolation. Use a dedicated subscription, keep runs in pr-only, and
+treat that credential as exposed until a host-side broker exists. GitHub,
+Linear, cloud, and API-key credentials remain denied to the agent process.
 
 Full reference: docs/lifecycle.md`,
 
@@ -102,8 +107,8 @@ backlog to decide ownership — a git ref does that, because the backlog API has
 no compare-and-swap and two workers would both conclude they had claimed the
 same issue.
 
-    export LINEAR_API_KEY=lin_api_...
-    runmill auth login linear --token lin_api_...
+    export LINEAR_API_KEY
+    printenv LINEAR_API_KEY | runmill auth login linear
 
 Or explore with no credential at all:
 
@@ -136,21 +141,31 @@ export function buildSupportBundle(
     doctorFailures: {},
   },
 ): SupportBundle {
-  let version = "unknown";
-  try {
-    const pkg = join(repoRoot, "package.json");
-    if (existsSync(pkg)) {
-      version = (JSON.parse(readFileSync(pkg, "utf8")) as { version?: string }).version ?? "unknown";
-    }
-  } catch {
-    // A missing or unreadable package.json is not worth failing a report over.
-  }
-
   const home = homedir();
-  const redact = (text: string): string => (home === "" ? text : text.split(home).join("~"));
+  const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const redact = (text: string): string => {
+    let safe = text;
+    if (repoRoot !== "") safe = safe.replace(new RegExp(escapeRegExp(repoRoot), "g"), "<repo>");
+    if (home !== "") safe = safe.replace(new RegExp(escapeRegExp(home), "g"), "~");
+
+    // A Git remote can contain both a private repository name and URL
+    // userinfo (`https://user:token@host/...`). Keep neither in an artifact the
+    // operator is invited to paste into a public issue.
+    safe = safe.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s,;()[\]{}"'`]+/gi, "<url>");
+    safe = safe.replace(/\bgit@[A-Za-z0-9.-]+:[^\s,;()[\]{}"'`]+/g, "<git-remote>");
+
+    // Doctor observations may name an explicit config under /tmp, /work, or
+    // another mount outside HOME. A public support bundle must not reveal it.
+    // URLs are deliberately excluded: a slash preceded by ':' or '/' is not a
+    // filesystem path. Paths already generalized as ~/... or <repo>/... stay
+    // useful without naming the machine.
+    safe = safe.replace(/(?<![:\/~>])\/(?:[^\s,;()[\]{}"'`]+\/?)+/g, "<path>");
+    safe = safe.replace(/\b[A-Za-z]:\\(?:[^\s,;()[\]{}"'`]+\\?)+/g, "<path>");
+    return safe;
+  };
 
   const data = {
-    runmill: version,
+    runmill: packageJson.version,
     node: process.version,
     platform: `${platform()} ${release()}`,
     checks: checks.map((c) => ({

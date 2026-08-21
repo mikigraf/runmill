@@ -1,5 +1,8 @@
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
+  - name: Security report
+    url: https://github.com/mikigraf/runmill/security/advisories/new
+    about: Report suspected vulnerabilities privately. Never post credentials or exploit details publicly.
   - name: Error code reference
     url: https://github.com/mikigraf/runmill/blob/main/docs/errors.md
     about: Every error code, its cause, and its fix. Check here first.

@@ -71,8 +71,82 @@ export function parseReviewJson(text: string): Review {
 export function blockingFindings(
   review: Review,
   blockingSeverities: readonly string[],
+  requireAllFindingsResolved = false,
 ): Finding[] {
+  // A reviewer that explicitly requires changes cannot have that decision
+  // weakened by a severity threshold. Thresholds apply only to an otherwise
+  // approving verdict; `changes_required` is itself a withholding decision.
+  if (requireAllFindingsResolved || review.verdict === "changes_required") {
+    return [...review.findings];
+  }
   return review.findings.filter((f) => blockingSeverities.includes(f.severity));
+}
+
+function normalizeRiskPath(value: string): string {
+  return value.replaceAll("\\", "/").replace(/^\.\//, "").replace(/^\/+/, "");
+}
+
+function validRiskPathRule(rule: string): boolean {
+  const trimmed = rule.trim().replaceAll("\\", "/");
+  const normalized = normalizeRiskPath(trimmed);
+  if (
+    normalized === "" ||
+    normalized.includes("\0") ||
+    /[\r\n]/.test(normalized) ||
+    trimmed.startsWith("/") ||
+    /^[a-zA-Z]:\//.test(trimmed)
+  ) {
+    return false;
+  }
+  const segments = normalized.split("/");
+  if (segments.includes(".") || segments.includes("..")) return false;
+  if (segments.slice(0, -1).includes("")) return false;
+  // Runmill supports literals, *, ** and ?. Unknown glob dialects must not be
+  // interpreted as literal characters and accidentally miss a sensitive diff.
+  return !/[\[\]{}!]/.test(normalized);
+}
+
+function riskPathExpression(rule: string): RegExp {
+  const normalized = normalizeRiskPath(rule.trim());
+  let expression = "^";
+
+  for (let index = 0; index < normalized.length; index += 1) {
+    const character = normalized[index] as string;
+    if (character === "*") {
+      if (normalized[index + 1] === "*") {
+        index += 1;
+        if (normalized[index + 1] === "/") {
+          index += 1;
+          expression += "(?:.*/)?";
+        } else {
+          expression += ".*";
+        }
+      } else {
+        expression += "[^/]*";
+      }
+      continue;
+    }
+    if (character === "?") {
+      expression += "[^/]";
+      continue;
+    }
+    expression += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  return new RegExp(`${expression}$`);
+}
+
+/** Match a repository-relative changed path against the documented glob subset. */
+export function matchesRiskPath(path: string, rule: string): boolean | undefined {
+  if (!validRiskPathRule(rule)) return undefined;
+  const normalizedPath = normalizeRiskPath(path);
+  const normalizedRule = normalizeRiskPath(rule.trim());
+
+  if (!/[?*]/.test(normalizedRule)) {
+    const prefix = normalizedRule.replace(/\/+$/, "");
+    return normalizedPath === prefix || normalizedPath.startsWith(`${prefix}/`);
+  }
+  return riskPathExpression(normalizedRule).test(normalizedPath);
 }
 
 /**
@@ -94,8 +168,44 @@ export function crossCheckVerdict(
   riskPaths: readonly string[],
   acceptanceCriteria: readonly string[],
 ): { accepted: boolean; reason?: string } {
-  const touchesRisk = changedPaths.some((p) =>
-    riskPaths.some((r) => p.startsWith(r.replace(/\/?\*+$/, ""))),
+  if (review.verdict === "no_findings" && review.findings.length > 0) {
+    return {
+      accepted: false,
+      reason: "reviewer reported no findings while also returning findings",
+    };
+  }
+  if (review.verdict === "changes_required" && review.findings.length === 0) {
+    return {
+      accepted: false,
+      reason: "reviewer required changes but supplied no actionable finding",
+    };
+  }
+  if (
+    review.verdict !== "changes_required" &&
+    review.scope_assessment !== "within_scope"
+  ) {
+    return {
+      accepted: false,
+      reason:
+        review.scope_assessment === "out_of_scope"
+          ? "reviewer approved a change it also called out of scope"
+          : "reviewer could not establish that the approved change stayed within scope",
+    };
+  }
+
+  const unknownRiskPathRule = riskPaths.find(
+    (rule) => matchesRiskPath("", rule) === undefined,
+  );
+  if (unknownRiskPathRule !== undefined) {
+    return {
+      accepted: false,
+      reason:
+        `risk.manual_approval.paths rule ${JSON.stringify(unknownRiskPathRule)} uses ` +
+        "unsupported or invalid syntax",
+    };
+  }
+  const touchesRisk = changedPaths.some((path) =>
+    riskPaths.some((rule) => matchesRiskPath(path, rule) === true),
   );
   if (review.verdict === "no_findings" && touchesRisk) {
     return {
@@ -105,10 +215,6 @@ export function crossCheckVerdict(
         "escalating rather than trusting the verdict",
     };
   }
-  if (review.verdict === "approved" && review.scope_assessment === "out_of_scope") {
-    return { accepted: false, reason: "reviewer approved a change it also called out of scope" };
-  }
-
   // The semantic gate, and the only one no amount of deterministic checking can
   // replace: a change can pass every check, stay in scope, and still not be the
   // thing the issue asked for. The acceptance criteria come from the issue and

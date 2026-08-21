@@ -1,16 +1,44 @@
-import { Command } from "commander";
-import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { Command, Option } from "commander";
+import {
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { readPackagedSchema, SCHEMA_FILENAME } from "../config/schema-asset.js";
+import { SCHEMA_FILENAME, writeSchemaBeside } from "../config/schema-asset.js";
+import { createConfiguration, type DiscoveredSetup } from "../config/create.js";
 import { RunmillError, errorMessage } from "../errors/runmill-error.js";
 import { CredentialStore, type CredentialName } from "../credentials/store.js";
 import { StateStore } from "../state/store.js";
-import { SKILL_FILES, DEFAULT_CHECKS_MANIFEST, validateSkill } from "../review/default-skills.js";
+import { recordDoctorFailure, recordMilestone } from "../state/funnel.js";
+import {
+  SKILL_FILES,
+  starterChecksForRepository,
+  validateSkill,
+} from "../review/default-skills.js";
 import { assessReadiness, renderReadiness } from "../queue/readiness.js";
-import { buildAdapters } from "../factory.js";
+import { buildAdapters, resolveReviewerAgent } from "../factory.js";
 import { loadConfig } from "../config/load.js";
 import { run as runProcess } from "../platform/process.js";
 import { tryGit } from "../platform/git.js";
+import { leaseRefName } from "../queue/git-lease.js";
+import {
+  runAllChecks,
+  checkVerificationDependencies,
+  checkVerificationPolicy,
+  worstStatus,
+  type CheckResult,
+  type ProviderCheckTarget,
+} from "../doctor/checks.js";
+import { renderDoctor } from "./render.js";
+
+export interface InitDoctorInput {
+  readonly repoRoot: string;
+  readonly configPath: string;
+}
 
 export interface CommandContext {
   readonly emit: (human: string, data: unknown) => void;
@@ -18,10 +46,38 @@ export interface CommandContext {
   readonly dataDir: () => string;
   readonly configPath: () => string;
   readonly repoRoot: () => string;
-  readonly exitCodes: { ok: number; failed: number; configInvalid: number; blocked: number };
+  readonly exitCodes: {
+    ok: number;
+    failed: number;
+    configInvalid: number;
+    blocked: number;
+  };
+  /** Injectable so init's file semantics can be tested without probing host CLIs or accounts. */
+  readonly createConfiguration?: typeof createConfiguration | undefined;
+  /** Tests inject readiness results; production runs the complete doctor suite. */
+  readonly runDoctor?:
+    | ((input: InitDoctorInput) => Promise<readonly CheckResult[]>)
+    | undefined;
+  /** Credential command seams keep tests away from the real OS keychain/stdin. */
+  readonly credentialStore?:
+    | Pick<CredentialStore, "get" | "set" | "remove">
+    | undefined;
+  readonly readStdin?: (() => string | Promise<string>) | undefined;
+  readonly stdinIsTTY?: (() => boolean) | undefined;
 }
 
-const CREDENTIAL_NAMES: readonly CredentialName[] = ["linear", "github", "runmill-policy"];
+const CREDENTIAL_NAMES: readonly CredentialName[] = [
+  "linear",
+  "github",
+  "runmill-policy",
+];
+
+async function readCredentialStdin(): Promise<string> {
+  process.stdin.setEncoding("utf8");
+  let value = "";
+  for await (const chunk of process.stdin) value += chunk;
+  return value;
+}
 
 function isCredentialName(value: string): value is CredentialName {
   return (CREDENTIAL_NAMES as readonly string[]).includes(value);
@@ -34,16 +90,172 @@ function isCredentialName(value: string): value is CredentialName {
  * found 8 of 19 error codes whose only remedy was a command that had never
  * been implemented. `test/cli/contract.test.ts` now fails if that drifts again.
  */
-export function registerExtraCommands(program: Command, ctx: CommandContext): void {
+export function registerExtraCommands(
+  program: Command,
+  ctx: CommandContext,
+): void {
   registerInit(program, ctx);
   registerAuth(program, ctx);
   registerInspect(program, ctx);
+  registerEffects(program, ctx);
+  registerLeases(program, ctx);
   registerResume(program, ctx);
   registerPolicy(program, ctx);
   registerPrepare(program, ctx);
   registerSkills(program, ctx);
   registerFeedback(program, ctx);
   registerGc(program, ctx);
+}
+
+// -- interrupted lease recovery -------------------------------------------
+
+function registerLeases(program: Command, ctx: CommandContext): void {
+  const leases = program
+    .command("leases")
+    .description(
+      "Inspect and manually reconcile leases left by an interrupted process",
+    );
+
+  leases
+    .command("list")
+    .description("List leases that still block local issue selection")
+    .action(() => {
+      const store = StateStore.open(join(ctx.dataDir(), "runmill.db"));
+      try {
+        const active = [...store.activeLeaseIssueIds()]
+          .map((issueId) => store.getLease(issueId))
+          .filter((lease) => lease !== undefined);
+        ctx.emit(
+          active.length === 0
+            ? "Active local leases: (none)"
+            : [
+                "Active local leases:",
+                ...active.map(
+                  (lease) =>
+                    `  ${lease.issueId}  run=${lease.runId} generation=${lease.generation} ` +
+                    `expires=${lease.expiresAt}`,
+                ),
+              ].join("\n"),
+          { active },
+        );
+      } finally {
+        store.close();
+      }
+    });
+
+  leases
+    .command("resolve")
+    .argument("<issue>", "issue identifier shown by `runmill leases list`")
+    .requiredOption(
+      "--confirm-remote-cleared",
+      "confirm the worker is dead and the backlog ownership was restored",
+    )
+    .description("Clear a local lease row only after its remote ref is absent")
+    .action(async (issueId: string) => {
+      const store = StateStore.open(join(ctx.dataDir(), "runmill.db"));
+      try {
+        const lease = store.getLease(issueId);
+        if (lease === undefined)
+          ctx.fail(new Error(`no active local lease for ${issueId}`));
+
+        const remote = await tryGit(ctx.repoRoot(), [
+          "ls-remote",
+          "origin",
+          leaseRefName(issueId),
+        ]);
+        if (!remote.ok) {
+          ctx.fail(
+            new Error(
+              `could not prove the remote lease state for ${issueId}: ` +
+                `${remote.stderr.trim() || "git ls-remote failed"}`,
+            ),
+          );
+        }
+        if (remote.stdout.trim() !== "") {
+          ctx.fail(
+            new Error(
+              `remote lease ${leaseRefName(issueId)} still exists; refuse to clear the local fence. ` +
+                `Verify the worker is dead, restore the backlog state/assignee, then delete that ` +
+                `exact ref before retrying.`,
+            ),
+          );
+        }
+
+        store.releaseLease(issueId, lease.runId);
+        ctx.emit(
+          `Cleared the local lease for ${issueId}; the remote ref was absent.`,
+          { resolved: true, issueId, runId: lease.runId },
+        );
+      } catch (err) {
+        ctx.fail(err);
+      } finally {
+        store.close();
+      }
+    });
+}
+
+// -- external-effect reconciliation ---------------------------------------
+
+function registerEffects(program: Command, ctx: CommandContext): void {
+  const effects = program
+    .command("effects")
+    .description("Inspect and explicitly reconcile ambiguous external effects");
+
+  effects
+    .command("list")
+    .description("List effects that block new delivery runs")
+    .action(() => {
+      const store = StateStore.open(join(ctx.dataDir(), "runmill.db"));
+      try {
+        const pending = store.pendingSideEffects();
+        ctx.emit(
+          pending.length === 0
+            ? "Pending external effects: (none)"
+            : [
+                "Pending external effects (verify each outcome in the named remote system):",
+                ...pending.map(
+                  (effect) =>
+                    `  ${effect.key}  ${effect.status.padEnd(9)} ${effect.system} ` +
+                    `${effect.operation} → ${effect.target}`,
+                ),
+              ].join("\n"),
+          { pending },
+        );
+      } finally {
+        store.close();
+      }
+    });
+
+  effects
+    .command("resolve")
+    .argument("<key>", "side-effect key shown by `runmill effects list`")
+    .requiredOption(
+      "--outcome <outcome>",
+      "outcome you verified in the remote system: applied or not-applied",
+    )
+    .description("Record a human-verified outcome and unblock future runs")
+    .action((key: string, opts: { outcome: string }) => {
+      if (opts.outcome !== "applied" && opts.outcome !== "not-applied") {
+        ctx.fail(new Error("--outcome must be either applied or not-applied"));
+      }
+
+      const store = StateStore.open(join(ctx.dataDir(), "runmill.db"));
+      try {
+        const effect = store.getSideEffect(key);
+        if (effect === undefined)
+          ctx.fail(new Error(`side effect ${key} does not exist`));
+        store.resolveSideEffect(key, opts.outcome);
+        ctx.emit(
+          `Resolved ${key} as ${opts.outcome}. New delivery runs are allowed only when no other ` +
+            `effects remain pending.`,
+          { resolved: true, key, outcome: opts.outcome },
+        );
+      } catch (err) {
+        ctx.fail(err);
+      } finally {
+        store.close();
+      }
+    });
 }
 
 // -- gc --------------------------------------------------------------------
@@ -74,7 +286,9 @@ const TERMINAL_STATES = new Set([
 function registerGc(program: Command, ctx: CommandContext): void {
   program
     .command("gc")
-    .description("Reconcile workspaces and worktrees left behind by crashed runs")
+    .description(
+      "Reconcile workspaces and worktrees left behind by crashed runs",
+    )
     .option("--dry-run", "report what would be removed, and remove nothing")
     .action(async (cmdOpts: { dryRun?: boolean }) => {
       const dry = cmdOpts.dryRun === true;
@@ -91,7 +305,9 @@ function registerGc(program: Command, ctx: CommandContext): void {
         const pruned = await tryGit(ctx.repoRoot(), ["worktree", "prune"]);
 
         const entries = existsSync(runsRoot)
-          ? readdirSync(runsRoot, { withFileTypes: true }).filter((e) => e.isDirectory())
+          ? readdirSync(runsRoot, { withFileTypes: true }).filter((e) =>
+              e.isDirectory(),
+            )
           : [];
 
         for (const entry of entries) {
@@ -117,16 +333,24 @@ function registerGc(program: Command, ctx: CommandContext): void {
         }
 
         const lines = [
-          dry ? `Would remove ${removed.length} workspace(s):` : `Removed ${removed.length} workspace(s):`,
+          dry
+            ? `Would remove ${removed.length} workspace(s):`
+            : `Removed ${removed.length} workspace(s):`,
           ...removed.map((p) => `  ${p}`),
           ...(removed.length === 0 ? ["  (none)"] : []),
         ];
         if (kept.length > 0) {
-          lines.push("", `Kept ${kept.length} — a live run's working tree is the only copy of it:`);
+          lines.push(
+            "",
+            `Kept ${kept.length} — a live run's working tree is the only copy of it:`,
+          );
           for (const k of kept) lines.push(`  ${k.path}\n    ${k.reason}`);
         }
         if (!pruned.ok) {
-          lines.push("", `  note: git worktree prune did not run (${ctx.repoRoot()} may not be a repository)`);
+          lines.push(
+            "",
+            `  note: git worktree prune did not run (${ctx.repoRoot()} may not be a repository)`,
+          );
         }
 
         ctx.emit(lines.join("\n"), {
@@ -144,18 +368,7 @@ function registerGc(program: Command, ctx: CommandContext): void {
 
 // -- init ------------------------------------------------------------------
 
-/**
- * Splits `.runmill/` into the parts that belong in version control and the
- * parts that do not.
- *
- * runmill works inside the repository it manages, so its own runtime state
- * lands next to the configuration it just asked the operator to commit. The
- * manifest and review skills are project configuration and should be reviewed
- * like any other file; the SQLite database, its write-ahead log, and the run
- * workspaces are machine-local and change on every run. Without this split the
- * first run makes `git status` dirty and the reflexive `git add .` commits a
- * binary database.
- */
+/** Repository-owned files stay versioned; mutable state lives outside the repo. */
 const RUNTIME_GITIGNORE = `# runmill runtime state. Machine-local, changes every run.
 state/
 workspaces/
@@ -163,116 +376,187 @@ workspaces/
 # Everything else here is project configuration, and is tracked on purpose.
 `;
 
-const STARTER_CONFIG = (repo: string, baseBranch: string): string => `# yaml-language-server: $schema=./runmill.schema.json
-version: 1
-
-# observe   plan only, no repository mutation
-# pr-only   implement, verify, review, open a PR. Never merge. (default)
-# guarded-merge / continuous  require a GitHub App token that cannot edit
-#                             branch protection. Run \`runmill doctor\` first.
-autonomy: pr-only
-
-providers:
-  implementer:
-    implementation: codex   # codex | claude
-    # model: <id>           # omit for the CLI's default
-  reviewer:
-    # Reviewing with a different model is the cheapest way to get a second
-    # opinion that does not share the author's blind spots. The same CLI with
-    # a different model counts, and needs no second subscription.
-    implementation: inherit # inherit | codex | claude
-    # model: <id>
-
-backlog:
-  provider: linear
-  team: ENG
-  eligible_states: [Todo, Ready]
-  claim_state: In Progress
-  delivered_state: In Review
-  completed_state: Done
-  include_labels: [agent-ready]
-  exclude_labels: [needs-design, no-agent]
-
-github:
-  # Ordered rules, first match wins. No match, or two matches at the same
-  # precedence, makes an issue ineligible with a named reason rather than a guess.
-  repositories:
-    - match: { team: ENG }
-      repo: ${repo}
-      base_branch: ${baseBranch}
-
-workspace:
-  git_isolation: clone
-  sandbox: native # Seatbelt on macOS, bubblewrap on Linux. Verified by \`doctor\`.
-
-verification:
-  manifest: .runmill/checks.yaml
-`;
+async function runDoctorAfterInit(
+  input: InitDoctorInput,
+): Promise<readonly CheckResult[]> {
+  let backlogProvider = "linear" as const;
+  let providers: readonly ProviderCheckTarget[] = [];
+  try {
+    const config = loadConfig(input.configPath, {
+      repoRoot: input.repoRoot,
+    }).config;
+    backlogProvider = config.backlog.provider;
+    providers = [config.providers.implementer, resolveReviewerAgent(config)];
+  } catch {
+    // checkConfiguration below owns the actionable parse error. Do not spend a
+    // provider turn against a guessed default when the written policy cannot
+    // tell us which configured model to probe.
+  }
+  return runAllChecks(
+    {
+      repoRoot: input.repoRoot,
+      configPath: input.configPath,
+      backlogProvider,
+    },
+    providers,
+  );
+}
 
 function registerInit(program: Command, ctx: CommandContext): void {
   program
     .command("init")
-    .description("Create runmill.yaml, the check manifest, and the review skills")
-    .option("--force", "overwrite files that already exist")
-    .action(async (opts: { force?: boolean }) => {
+    .description(
+      "Configure Runmill and add any missing project checks and review skills",
+    )
+    .option(
+      "--defaults",
+      "accept discovered values and sane defaults without prompting",
+    )
+    .action(async (opts: { defaults?: boolean }) => {
       try {
         const root = ctx.repoRoot();
-        const configPath = join(root, "runmill.yaml");
+        const configPath = ctx.configPath();
+        const created: string[] = [];
+        const preserved: string[] = [];
+        let discovered: DiscoveredSetup | undefined;
 
-        if (existsSync(configPath) && opts.force !== true) {
-          ctx.emit(
-            `runmill.yaml already exists at ${configPath}\n` +
-              `  Re-run with --force to overwrite, or edit it directly.`,
-            { created: [], skipped: [configPath] },
+        // The operator policy is the only interactive part of setup. Never
+        // recreate it: re-running init is how missing repository assets are
+        // repaired, not a way to reset authority or credentials.
+        if (existsSync(configPath)) {
+          preserved.push(configPath);
+          const schemaPath = join(dirname(configPath), SCHEMA_FILENAME);
+          if (writeSchemaBeside(configPath)) created.push(schemaPath);
+          else if (existsSync(schemaPath)) preserved.push(schemaPath);
+        } else {
+          const result = await (ctx.createConfiguration ?? createConfiguration)(
+            {
+              root,
+              path: configPath,
+              // Piped and CI invocations cannot answer questions. Interactive
+              // terminals get discovery with preselected answers by default.
+              defaults: opts.defaults === true || process.stdin.isTTY !== true,
+            },
           );
-          process.exit(ctx.exitCodes.ok);
+          discovered = result.discovered;
+          created.push(result.path);
+          const schemaPath = join(dirname(result.path), SCHEMA_FILENAME);
+          if (existsSync(schemaPath)) created.push(schemaPath);
         }
 
-        // Infer what can be inferred; everything else is a placeholder the
-        // operator edits. Guessing a repository is cheap and visible; guessing
-        // a merge policy would not be.
-        const remote = await tryGit(root, ["remote", "get-url", "origin"]);
-        const repo = remote.ok
-          ? (remote.stdout.trim().match(/[:/]([^/]+\/[^/]+?)(?:\.git)?$/)?.[1] ?? "owner/repo")
-          : "owner/repo";
-        const head = await tryGit(root, ["symbolic-ref", "--short", "HEAD"]);
-        const baseBranch = head.ok ? head.stdout.trim() : "main";
-
-        const created: string[] = [];
         const write = (relative: string, content: string): void => {
           const path = join(root, relative);
-          if (existsSync(path) && opts.force !== true) return;
+          if (existsSync(path)) {
+            preserved.push(path);
+            return;
+          }
           mkdirSync(dirname(path), { recursive: true });
           writeFileSync(path, content);
-          created.push(relative);
+          created.push(path);
         };
 
-        write("runmill.yaml", STARTER_CONFIG(repo, baseBranch));
-        // The config's first line points an editor at ./runmill.schema.json.
-        // It has to be there, or the very first file runmill writes opens on a
-        // "cannot load schema" error with no completion for the fields the
-        // operator was just told to go and edit.
-        const schema = readPackagedSchema();
-        if (schema !== undefined) write(SCHEMA_FILENAME, schema);
-        write(".runmill/checks.yaml", DEFAULT_CHECKS_MANIFEST);
+        write(".runmill/checks.yaml", starterChecksForRepository(root).content);
         write(".runmill/.gitignore", RUNTIME_GITIGNORE);
         for (const skill of SKILL_FILES) write(skill.path, skill.content);
+        recordMilestone(ctx.dataDir(), "init_completed_at", new Date());
 
+        // Setup is not complete merely because files were written. Run the
+        // same proof as `runmill doctor` now, including a one-turn request for
+        // every distinct configured provider/model inside the real sandbox.
+        const probed = await (ctx.runDoctor ?? runDoctorAfterInit)({
+          repoRoot: root,
+          configPath,
+        });
+        // Test seams and custom embedders may supply only host/provider
+        // probes. Verification readiness is local, deterministic, and must
+        // never disappear from init merely because those probes are injected.
+        const probedIds = new Set(probed.map((result) => result.id));
+        const localVerification = await Promise.all([
+          ...(probedIds.has("verification")
+            ? []
+            : [Promise.resolve(checkVerificationPolicy({ repoRoot: root, configPath }))]),
+          ...(probedIds.has("verification:dependencies")
+            ? []
+            : [
+                checkVerificationDependencies({
+                  repoRoot: root,
+                  // Production's full doctor result already contains the
+                  // exact-remote dependency proof. An injected partial doctor
+                  // is a test/embedder seam; keep its mandatory fallback
+                  // deterministic and local rather than silently networking.
+                  ...(ctx.runDoctor === undefined ? { configPath } : {}),
+                }),
+              ]),
+        ]);
+        const doctorResults = [
+          ...probed,
+          ...localVerification,
+        ];
+        const doctorStatus = worstStatus(doctorResults);
+        recordMilestone(ctx.dataDir(), "first_doctor_run_at", new Date());
+        for (const result of doctorResults) {
+          if (result.status === "fail" && result.code !== undefined) {
+            recordDoctorFailure(ctx.dataDir(), result.code);
+          }
+        }
+        if (doctorStatus !== "fail") {
+          recordMilestone(ctx.dataDir(), "first_doctor_pass_at", new Date());
+        }
+
+        const relative = (path: string): string =>
+          path.startsWith(`${root}/`) ? path.slice(root.length + 1) : path;
         ctx.emit(
           [
-            "Created:",
-            ...created.map((f) => `  ${f}`),
+            created.length === 0
+              ? "Runmill is already initialized."
+              : "Runmill is initialized.",
             "",
-            `  repository  ${repo}${remote.ok ? "" : "  (no git remote found — edit this)"}`,
-            `  base branch ${baseBranch}`,
+            ...(created.length === 0
+              ? []
+              : [
+                  "Created:",
+                  ...created.map((path) => `  ${relative(path)}`),
+                  "",
+                ]),
+            ...(preserved.length === 0
+              ? []
+              : [
+                  "Preserved:",
+                  ...preserved.map((path) => `  ${relative(path)}`),
+                  "",
+                ]),
+            `Operator policy: ${configPath}`,
+            ...(discovered === undefined
+              ? []
+              : [
+                  `GitHub: ${discovered.githubAuthenticated ? "credential found; repository metadata loaded when available" : "not configured; local git defaults used"}`,
+                  `Linear: ${discovered.linearCredential ? "authenticated; team options loaded" : "not configured yet"}`,
+                ]),
             "",
-            "Next:",
-            "  1. Edit runmill.yaml — team, states, and repository mapping",
-            "  2. runmill doctor          verify this host can run safely",
-            "  3. runmill next --dry-run  see what would be selected, and why",
+            "Readiness check:",
+            renderDoctor(doctorResults),
+            `  overall: ${doctorStatus.toUpperCase()}`,
+            "",
+            ...(doctorStatus === "fail"
+              ? [
+                  "Setup files are ready, but Runmill cannot start yet.",
+                  "Fix the failed checks above, then rerun `runmill init`.",
+                ]
+              : [
+                  `Review ${configPath}, then:`,
+                  "  runmill next    preview the first eligible issue",
+                  "  runmill start   begin the delivery loop in the background",
+                ]),
           ].join("\n"),
-          { created, repo, baseBranch },
+          {
+            configPath,
+            created,
+            preserved,
+            discovery: discovered,
+            doctor: { overall: doctorStatus, checks: doctorResults },
+          },
         );
+        if (doctorStatus === "fail") process.exit(ctx.exitCodes.blocked);
       } catch (err) {
         ctx.fail(err);
       }
@@ -283,7 +567,7 @@ function registerInit(program: Command, ctx: CommandContext): void {
 
 function registerAuth(program: Command, ctx: CommandContext): void {
   const auth = program.command("auth").description("Manage credentials");
-  const store = new CredentialStore();
+  const store = ctx.credentialStore ?? new CredentialStore();
 
   auth
     .command("status")
@@ -298,11 +582,16 @@ function registerAuth(program: Command, ctx: CommandContext): void {
         );
         ctx.emit(
           rows
-            .map((r) => `  ${r.resolved ? "✓" : "✗"} ${r.name.padEnd(16)} ${r.resolved ? "resolved" : "not found"}`)
+            .map(
+              (r) =>
+                `  ${r.resolved ? "✓" : "✗"} ${r.name.padEnd(16)} ${r.resolved ? "resolved" : "not found"}`,
+            )
             .join("\n"),
           rows,
         );
-        process.exit(rows.some((r) => !r.resolved) ? ctx.exitCodes.ok : ctx.exitCodes.ok);
+        process.exit(
+          rows.some((r) => !r.resolved) ? ctx.exitCodes.ok : ctx.exitCodes.ok,
+        );
       } catch (err) {
         ctx.fail(err);
       }
@@ -311,8 +600,13 @@ function registerAuth(program: Command, ctx: CommandContext): void {
   auth
     .command("login")
     .argument("<system>", "linear | github | runmill-policy")
-    .option("--token <token>", "credential value; omit to read from stdin")
-    .description("Store a credential in the OS keychain")
+    // Recognize the removed form only so Commander cannot reflect a legacy
+    // `--token=value` secret in its unknown-option diagnostic. It is hidden,
+    // rejected before stdin is read, and never reaches credential storage.
+    .addOption(new Option("--token <discarded>").hideHelp())
+    .description(
+      "Read a credential from stdin and store it in the macOS keychain",
+    )
     .action(async (system: string, opts: { token?: string }) => {
       try {
         if (!isCredentialName(system)) {
@@ -320,23 +614,45 @@ function registerAuth(program: Command, ctx: CommandContext): void {
             whatHappened: `Unknown credential "${system}". Expected one of: ${CREDENTIAL_NAMES.join(", ")}`,
           });
         }
-        if (system === "github" && opts.token === undefined) {
-          ctx.emit(
-            "GitHub credentials are read from `gh` automatically.\n" +
-              "  Run: gh auth login\n" +
-              "  Or pass an App installation token with --token.",
-            { system, delegated: "gh" },
-          );
-          process.exit(ctx.exitCodes.ok);
+        if (opts.token !== undefined) {
+          throw RunmillError.fromCatalog("RM-AUTH-003", {
+            whatHappened:
+              "The --token credential option is not accepted because process arguments are public. " +
+              "Pass the credential only on redirected stdin.",
+          });
         }
-        const token = opts.token ?? readFileSync(0, "utf8").trim();
+        const envName =
+          system === "linear"
+            ? "LINEAR_API_KEY"
+            : system === "github"
+              ? "GITHUB_TOKEN"
+              : "RUNMILL_POLICY_KEY";
+        const safeCommand = `printenv ${envName} | runmill auth login ${system}`;
+        if (ctx.stdinIsTTY?.() ?? process.stdin.isTTY === true) {
+          throw RunmillError.fromCatalog("RM-AUTH-003", {
+            whatHappened:
+              "Credential input is accepted only on redirected stdin; Runmill never accepts " +
+              "a secret as a command option.\n" +
+              `  Pipe an existing environment value without echoing it: ${safeCommand}`,
+          });
+        }
+        const token = (
+          ctx.readStdin === undefined
+            ? await readCredentialStdin()
+            : await ctx.readStdin()
+        ).trim();
         if (token === "") {
           throw RunmillError.fromCatalog("RM-AUTH-003", {
-            whatHappened: "No token supplied. Pass --token or pipe it on stdin.",
+            whatHappened:
+              "No credential was received on stdin.\n" +
+              `  Pipe an existing environment value without echoing it: ${safeCommand}`,
           });
         }
         await store.set(system, token);
-        ctx.emit(`Stored ${system} credential in the OS keychain.`, { system, stored: true });
+        ctx.emit(`Stored ${system} credential in the OS keychain.`, {
+          system,
+          stored: true,
+        });
       } catch (err) {
         ctx.fail(err);
       }
@@ -354,7 +670,10 @@ function registerAuth(program: Command, ctx: CommandContext): void {
           });
         }
         await store.remove(system);
-        ctx.emit(`Removed the ${system} credential.`, { system, removed: true });
+        ctx.emit(`Removed the ${system} credential.`, {
+          system,
+          removed: true,
+        });
       } catch (err) {
         ctx.fail(err);
       }
@@ -373,13 +692,18 @@ function registerInspect(program: Command, ctx: CommandContext): void {
       try {
         const run = store.getRun(runId);
         if (run === undefined) {
-          ctx.emit(`No run ${runId}. Run \`runmill list\` to see recent runs.`, { found: false });
+          ctx.emit(
+            `No run ${runId}. Run \`runmill list\` to see recent runs.`,
+            { found: false },
+          );
           process.exit(ctx.exitCodes.ok);
         }
 
         const transitions = store.transitionHistory(runId);
         const events = store.eventsFor(runId);
-        const pending = store.pendingSideEffects().filter((e) => e.runId === runId);
+        const pending = store
+          .pendingSideEffects()
+          .filter((e) => e.runId === runId);
         const lease = store.getLease(run.issueId);
 
         ctx.emit(
@@ -393,13 +717,22 @@ function registerInspect(program: Command, ctx: CommandContext): void {
             "",
             "  transitions",
             ...transitions.map((t) => `    ${t.at}  ${t.from} → ${t.to}`),
-            ...(events.length === 0 ? [] : ["", "  events", ...events.map((e) => `    ${e.seq}  ${e.type}`)]),
+            ...(events.length === 0
+              ? []
+              : [
+                  "",
+                  "  events",
+                  ...events.map((e) => `    ${e.seq}  ${e.type}`),
+                ]),
             ...(pending.length === 0
               ? []
               : [
                   "",
-                  "  pending external effects (the recovery sweep reconciles these)",
-                  ...pending.map((p) => `    ${p.status.padEnd(10)} ${p.operation} → ${p.target}`),
+                  "  pending external effects (new runs block until you reconcile these)",
+                  ...pending.map(
+                    (p) =>
+                      `    ${p.status.padEnd(10)} ${p.operation} → ${p.target}`,
+                  ),
                 ]),
           ].join("\n"),
           { run, transitions, events, pending, lease },
@@ -415,19 +748,31 @@ function registerInspect(program: Command, ctx: CommandContext): void {
 function registerResume(program: Command, ctx: CommandContext): void {
   program
     .command("resume")
-    .argument("<run-id>", "run to resume")
-    .option("--answer <choice>", "answer the decision the run is waiting on")
-    .description("Resume a run that is waiting on a human")
-    .action((runId: string, opts: { answer?: string }) => {
+    .argument("<run-id>", "run whose recovery status to inspect")
+    .option(
+      "--answer <choice>",
+      "deprecated; answers are not replayed in the developer preview",
+    )
+    .description(
+      "Explain safe recovery for a stopped run (checkpoint resume is unavailable)",
+    )
+    .action((runId: string) => {
       const store = StateStore.open(join(ctx.dataDir(), "runmill.db"));
       try {
         const run = store.getRun(runId);
         if (run === undefined) {
-          ctx.emit(`No run ${runId}. Run \`runmill list\` to see recent runs.`, { resumed: false });
+          ctx.emit(
+            `No run ${runId}. Run \`runmill list\` to see recent runs.`,
+            { resumed: false },
+          );
           process.exit(ctx.exitCodes.ok);
         }
 
-        const resumable = new Set(["NEEDS_HUMAN", "AWAITING_APPROVAL", "RETRY_WAIT"]);
+        const resumable = new Set([
+          "NEEDS_HUMAN",
+          "AWAITING_APPROVAL",
+          "RETRY_WAIT",
+        ]);
         if (!resumable.has(run.state)) {
           ctx.emit(
             `${runId} is ${run.state}, which is not waiting on a human.\n` +
@@ -437,31 +782,15 @@ function registerResume(program: Command, ctx: CommandContext): void {
           process.exit(ctx.exitCodes.ok);
         }
 
-        if (opts.answer === undefined) {
-          ctx.emit(
-            `${runId} is ${run.state} and needs a decision.\n` +
-              `  Answer it:  runmill resume ${runId} --answer <choice>\n` +
-              `  See why:    runmill inspect ${runId}`,
-            { resumed: false, state: run.state, needsAnswer: true },
-          );
-          process.exit(ctx.exitCodes.blocked);
-        }
-
-        store.appendEvent({
-          runId,
-          seq: store.eventsFor(runId).length + 1,
-          type: "human.decision",
-          payload: { answer: opts.answer },
-        });
-
-        // Recording the decision is the durable half. Re-dispatch happens on
-        // the next `runmill run`/`daemon`, which re-reads state rather than
-        // trusting anything held in this process.
         ctx.emit(
-          `Recorded "${opts.answer}" for ${runId}.\n` +
-            `  The next \`runmill run\` or \`runmill daemon\` picks it up.`,
-          { resumed: true, runId, answer: opts.answer },
+          `${runId} is ${run.state}, but checkpoint continuation is not implemented in this ` +
+            `developer preview. No state was changed.\n` +
+            `  Inspect it:     runmill inspect ${runId}\n` +
+            `  Reconcile I/O: runmill effects list\n` +
+            `  Then return the issue to an eligible state and start a fresh attempt.`,
+          { resumed: false, supported: false, runId, state: run.state },
         );
+        process.exit(ctx.exitCodes.blocked);
       } finally {
         store.close();
       }
@@ -471,7 +800,9 @@ function registerResume(program: Command, ctx: CommandContext): void {
 // -- policy explain --------------------------------------------------------
 
 function registerPolicy(program: Command, ctx: CommandContext): void {
-  const policy = program.command("policy").description("Explain policy decisions");
+  const policy = program
+    .command("policy")
+    .description("Explain policy decisions");
 
   policy
     .command("explain")
@@ -487,9 +818,11 @@ function registerPolicy(program: Command, ctx: CommandContext): void {
         }
 
         const terminal: Record<string, string> = {
-          PR_DELIVERED: "Delivered a pull request. `pr-only` never merges by design.",
+          PR_DELIVERED:
+            "Delivered a pull request. `pr-only` never merges by design.",
           COMPLETED: "Every gate passed and the change was merged.",
-          NEEDS_HUMAN: "A gate could not be satisfied deterministically, so it escalated.",
+          NEEDS_HUMAN:
+            "A gate could not be satisfied deterministically, so it escalated.",
           AWAITING_APPROVAL: "Branch protection requires an approving review.",
           QUARANTINED: "Something happened that policy could not classify.",
         };
@@ -511,7 +844,11 @@ function registerPolicy(program: Command, ctx: CommandContext): void {
             "",
             `  Detail:  runmill inspect ${runId}`,
           ].join("\n"),
-          { runId, state: run.state, explanation: terminal[run.state] ?? "in progress" },
+          {
+            runId,
+            state: run.state,
+            explanation: terminal[run.state] ?? "in progress",
+          },
         );
       } finally {
         store.close();
@@ -528,17 +865,23 @@ function registerPrepare(program: Command, ctx: CommandContext): void {
     .description("Score how ready an issue is to run, and say what is missing")
     .action(async (identifier: string) => {
       try {
-        const { config } = loadConfig(ctx.configPath(), { repoRoot: ctx.repoRoot() });
+        const { config } = loadConfig(ctx.configPath(), {
+          repoRoot: ctx.repoRoot(),
+        });
         const { backlog } = await buildAdapters(config, { need: ["backlog"] });
         const issue = await backlog.getIssue(identifier);
         if (issue === undefined) {
-          ctx.emit(`No issue ${identifier} in the configured backlog.`, { found: false });
+          ctx.emit(`No issue ${identifier} in the configured backlog.`, {
+            found: false,
+          });
           process.exit(ctx.exitCodes.ok);
         }
 
         const report = assessReadiness(issue);
         ctx.emit(renderReadiness(report), report);
-        process.exit(report.dispatchable ? ctx.exitCodes.ok : ctx.exitCodes.blocked);
+        process.exit(
+          report.dispatchable ? ctx.exitCodes.ok : ctx.exitCodes.blocked,
+        );
       } catch (err) {
         ctx.fail(err);
       }
@@ -592,7 +935,11 @@ function registerSkills(program: Command, ctx: CommandContext): void {
         const results = SKILL_FILES.map((skill) => {
           const path = join(root, skill.path);
           if (!existsSync(path)) {
-            return { path: skill.path, valid: false, errors: ["file does not exist"] };
+            return {
+              path: skill.path,
+              valid: false,
+              errors: ["file does not exist"],
+            };
           }
           const { valid, errors } = validateSkill(readFileSync(path, "utf8"));
           return { path: skill.path, valid, errors };
@@ -606,10 +953,13 @@ function registerSkills(program: Command, ctx: CommandContext): void {
                 ? `  ✓ ${r.path}`
                 : `  ✗ ${r.path}\n${r.errors.map((e) => `      ${e}`).join("\n")}`,
             )
-            .join("\n") + (bad.length > 0 ? "\n\n  Fix:  runmill skills eject --force" : ""),
+            .join("\n") +
+            (bad.length > 0 ? "\n\n  Fix:  runmill skills eject --force" : ""),
           results,
         );
-        process.exit(bad.length > 0 ? ctx.exitCodes.configInvalid : ctx.exitCodes.ok);
+        process.exit(
+          bad.length > 0 ? ctx.exitCodes.configInvalid : ctx.exitCodes.ok,
+        );
       } catch (err) {
         ctx.fail(err);
       }
@@ -634,10 +984,10 @@ function registerFeedback(program: Command, ctx: CommandContext): void {
           process.exit(ctx.exitCodes.ok);
         }
         const opened = await runProcess("open", [url]);
-        ctx.emit(
-          opened.ok ? `Opened ${url}` : `File an issue at:\n  ${url}`,
-          { url, opened: opened.ok },
-        );
+        ctx.emit(opened.ok ? `Opened ${url}` : `File an issue at:\n  ${url}`, {
+          url,
+          opened: opened.ok,
+        });
       } catch (err) {
         ctx.fail(errorMessage(err));
       }

@@ -14,6 +14,8 @@ export interface FakeForgeOptions {
   readonly requiresApproval?: boolean | undefined;
   readonly usesMergeQueue?: boolean | undefined;
   readonly protectionUnreadable?: boolean | undefined;
+  readonly requiresConversationResolution?: boolean | undefined;
+  readonly mergeability?: MergeabilitySignal | undefined;
   /** When true, the merge credential can rewrite protection: merge stays locked. */
   readonly credentialCanWriteProtection?: boolean | undefined;
   /** Operations that apply, then throw as if the response was lost. */
@@ -33,6 +35,7 @@ export class FakeForgeAdapter implements ForgeAdapter {
   #nextNumber = 1;
   #opts: FakeForgeOptions;
   #pushed = new Set<string>();
+  #pushedHeads = new Map<string, string>();
   readonly calls: { op: string; args: unknown }[] = [];
 
   constructor(options: FakeForgeOptions = {}) {
@@ -51,7 +54,27 @@ export class FakeForgeAdapter implements ForgeAdapter {
 
   async push(input: { repo: string; branch: string; workspacePath: string }): Promise<void> {
     this.calls.push({ op: "push", args: input });
-    this.#pushed.add(`${input.repo}#${input.branch}`);
+    const branchKey = `${input.repo}#${input.branch}`;
+    this.#pushed.add(branchKey);
+
+    // The production forge reports the actual pushed commit as the PR head.
+    // Preserve that identity in the fake too, so tests cannot pass with a
+    // synthetic SHA that would fail the production exact-candidate gate.
+    try {
+      const head = execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: input.workspacePath,
+        encoding: "utf8",
+      }).trim();
+      this.#pushedHeads.set(branchKey, head);
+      for (const [number, pr] of this.#prs) {
+        if (pr.url.endsWith(input.branch)) {
+          this.#prs.set(number, { ...pr, headSha: head });
+        }
+      }
+    } catch {
+      // Some adapter unit tests use a synthetic workspace. They still assert
+      // the call itself; the fallback PR SHA keeps those tests usable.
+    }
 
     // Actually push. Recording the call and doing nothing made the fake MORE
     // permissive than the real adapter: anything depending on the branch
@@ -92,7 +115,7 @@ export class FakeForgeAdapter implements ForgeAdapter {
     const pr: PullRequest = {
       number,
       url: `https://fake/${input.repo}/pull/${number}/${input.branch}`,
-      headSha: `head-${number}`,
+      headSha: this.#pushedHeads.get(`${input.repo}#${input.branch}`) ?? `head-${number}`,
       baseSha: `base-${number}`,
       draft: input.draft,
       state: "open",
@@ -114,7 +137,9 @@ export class FakeForgeAdapter implements ForgeAdapter {
 
   async listChecks(input: { repo: string; ref: string }): Promise<RemoteCheck[]> {
     this.calls.push({ op: "listChecks", args: input });
-    return [...(this.#opts.checks ?? [])];
+    return (this.#opts.checks ?? []).map((check) =>
+      check.headSha === "$ref" ? { ...check, headSha: input.ref } : check,
+    );
   }
 
   async getBranchProtection(input: { repo: string; branch: string }): Promise<BranchProtection> {
@@ -122,13 +147,14 @@ export class FakeForgeAdapter implements ForgeAdapter {
     return {
       requiredChecks: this.#opts.requiredChecks ?? [],
       requiresApproval: this.#opts.requiresApproval ?? false,
-      requiresConversationResolution: false,
+      requiresConversationResolution: this.#opts.requiresConversationResolution ?? false,
       usesMergeQueue: this.#opts.usesMergeQueue ?? false,
       unreadable: this.#opts.protectionUnreadable ?? false,
     };
   }
 
   async getMergeability(input: { repo: string; number: number }): Promise<MergeabilitySignal> {
+    if (this.#opts.mergeability !== undefined) return this.#opts.mergeability;
     const pr = this.#prs.get(input.number);
     if (pr === undefined) return { state: "unknown", mergeable: false };
     if (pr.draft) return { state: "draft", mergeable: false };
@@ -139,10 +165,16 @@ export class FakeForgeAdapter implements ForgeAdapter {
     repo: string;
     number: number;
     method: "squash" | "merge" | "rebase";
+    expectedHeadSha: string;
   }): Promise<{ mergeSha: string }> {
     this.calls.push({ op: "merge", args: input });
     const pr = this.#prs.get(input.number);
     if (pr === undefined) throw new ForgeError(`no such pull request ${input.number}`);
+    if (pr.headSha !== input.expectedHeadSha) {
+      throw new ForgeError(
+        `pull request head changed from ${input.expectedHeadSha} to ${pr.headSha}`,
+      );
+    }
     const mergeSha = `merge-${input.number}`;
     this.#prs.set(input.number, { ...pr, state: "merged", mergeSha });
     this.#maybeLoseResponse("merge");

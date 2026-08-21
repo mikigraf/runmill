@@ -76,6 +76,8 @@ export interface ForgeAdapter {
     repo: string;
     number: number;
     method: "squash" | "merge" | "rebase";
+    /** GitHub rejects the merge atomically if the PR head changed. */
+    expectedHeadSha: string;
   }): Promise<{ mergeSha: string }>;
 
   /**

@@ -6,9 +6,9 @@ versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 Upgrades should be boring. Anything that requires action on your part appears under
 **Upgrade notes** with the exact command to run.
 
-## [0.1.0] — 2026-08-08
+## [Unreleased]
 
-First release.
+Changes queued for the first developer-preview release.
 
 ### Added
 
@@ -25,25 +25,28 @@ First release.
   flag, error code, source file, or link that does not exist.
 - The check manifest is now actually loaded. `.runmill/checks.yaml` was written by `runmill init`
   and pointed at by `verification.manifest`, but nothing read it: checks came only from
-  `runmill.yaml`. `declared_skips` therefore never parsed, so declaring a skip was impossible.
+  operator policy. `declared_skips` therefore never parsed, so declaring a skip was impossible.
 - `runmill config validate` validates the check manifest too, naming the offending check.
-- `runmill init` — writes `runmill.yaml`, `.runmill/checks.yaml`, and the review skills, inferring
-  the repository and base branch from git.
+- `runmill init` — writes an operator-owned policy outside the repository plus
+  `.runmill/checks.yaml` and review skills in the repository, inferring the repository and base
+  branch from git. Re-running it preserves every existing file and repairs only missing assets.
 - `runmill prepare <issue>` — scores how ready an issue is to run and names what is missing, so an
   underspecified issue is caught before a run spends money rather than after.
-- `runmill inspect <run-id>`, `runmill resume <run-id>`, `runmill policy explain <run-id>` —
-  the run introspection and recovery surface.
+- `runmill inspect <run-id>`, `runmill policy explain <run-id>`, `runmill effects list|resolve`,
+  and `runmill leases list|resolve` — the run introspection and explicit recovery surface.
+  `runmill resume` remains as a compatibility diagnostic that refuses checkpoint continuation;
+  the developer preview does not claim it can continue a stopped agent or state-machine checkpoint.
 - `runmill auth status|login|logout`, `runmill skills eject|validate`, `runmill feedback`.
 - `runmill doctor --explain <topic>` for sandbox, github, provider, and linear;
   `runmill doctor --report` produces a support bundle with no credentials, source, or absolute paths.
 - `docs/errors.md`, generated from the error catalog. CI fails if it drifts.
 - CI on macOS and Linux, including a check that the published package contains the binary it declares.
 
-### Upgrade notes
+### Changed
 
-`provider:` and `review.provider:` are replaced by one `providers:` block. A file
-using the old shape is rejected by name, with the replacement printed, rather
-than parsed to defaults.
+During preview development, `provider:` and `review.provider:` were replaced by one `providers:`
+block. A file using the old shape is rejected by name, with the replacement printed, rather than
+parsed to defaults.
 
 ```yaml
 providers:
@@ -58,8 +61,8 @@ providers:
 ```
 
 Everything else under `review:` (skills, `max_fix_iterations`,
-`merge_blocking_severities`) stays where it is. `runmill init --force` writes the
-new shape.
+`merge_blocking_severities`) stays where it is. `runmill init` creates the new shape when no
+operator policy exists and never overwrites an existing policy.
 
 ### Fixed
 
@@ -84,8 +87,8 @@ new shape.
   repository.
 - `doctor --check <unknown>` matched nothing and reported `overall: PASS`, telling developers their
   setup was fine when nothing had been checked. It now fails with the available check ids.
-- Running with no `runmill.yaml` reported "Referenced file does not exist" and suggested fixes that
-  could not apply. It now reports `RM-CONFIG-003` and suggests `runmill init`.
+- Running with no operator policy reported "Referenced file does not exist" and suggested fixes
+  that could not apply. It now reports `RM-CONFIG-003` and suggests `runmill init`.
 - **The advertised 60-second quickstart demonstrated nothing.** `RUNMILL_DEMO=1` resolved to an
   *empty* in-memory backlog, so the headline command printed "No eligible issue." Demo mode is now
   seeded with the bundled example issues, and the fixture ships in the package.
@@ -97,7 +100,8 @@ new shape.
 
 ### Upgrade notes
 
-None. This is the first release; there is nothing to migrate from.
+None. Runmill has not published its first release, so there is no supported version to migrate
+from yet.
 
 Going forward, any change to the state database schema ships with a forward-only migration that
 runs automatically, backs the database up first, and refuses to start if the database was written

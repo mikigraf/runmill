@@ -1,6 +1,7 @@
 import { constants, accessSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
+import { terminateTree } from "./process.js";
 
 export interface KeepAwakeCommand {
   readonly name: "caffeinate" | "systemd-inhibit";
@@ -16,6 +17,24 @@ export interface KeepAwakeHandle {
 }
 
 type CommandLookup = (name: string) => string | undefined;
+type ProcessTerminator = (child: ChildProcess) => void;
+
+/**
+ * A shell-free Linux parent watcher.
+ *
+ * `systemd-inhibit` holds its lock for the command it runs. A plain
+ * `sleep infinity` becomes an orphan if Runmill is killed before `release()`.
+ * This tiny Node command checks the original Runmill PID four times a second
+ * and exits as soon as it disappears, which makes systemd-inhibit release the
+ * lock too. The PID is a separate argv value rather than interpolated code.
+ */
+const LINUX_PARENT_WATCH = [
+  "const parent=Number(process.argv[1]);",
+  "if(!Number.isSafeInteger(parent)||parent<=1)process.exit(2);",
+  "const alive=()=>{try{process.kill(parent,0);return true}catch{return false}};",
+  "const check=()=>{if(!alive())process.exit(0)};",
+  "check();setInterval(check,250);",
+].join("");
 
 function findOnPath(name: string): string | undefined {
   for (const directory of (process.env["PATH"] ?? "").split(delimiter)) {
@@ -35,6 +54,8 @@ function findOnPath(name: string): string | undefined {
 export function keepAwakeCommand(
   platform: NodeJS.Platform,
   lookup: CommandLookup = findOnPath,
+  parentPid: number = process.pid,
+  nodeExecutable: string = process.execPath,
 ): KeepAwakeCommand | undefined {
   if (platform === "darwin") {
     const executable = lookup("caffeinate");
@@ -43,10 +64,9 @@ export function keepAwakeCommand(
       : {
           name: "caffeinate",
           executable,
-          // -u normally expires after five seconds without -t. A very long
-          // timeout keeps the user-active assertion (and therefore the screen
-          // saver) inhibited for the child lifetime; release still kills it.
-          args: ["-dimsu", "-t", "2147483647"],
+          // The kernel releases every assertion when this exact Runmill PID
+          // exits, even after SIGKILL. No wall-clock timeout can orphan it.
+          args: ["-dimsu", "-w", String(parentPid)],
         };
   }
 
@@ -62,8 +82,10 @@ export function keepAwakeCommand(
             "--who=runmill",
             "--why=Runmill loop orchestrator daemon is active",
             "--mode=block",
-            "sleep",
-            "infinity",
+            nodeExecutable,
+            "-e",
+            LINUX_PARENT_WATCH,
+            String(parentPid),
           ],
         };
   }
@@ -80,6 +102,7 @@ export function startKeepAwake(
   platform: NodeJS.Platform = process.platform,
   lookup: CommandLookup = findOnPath,
   launch: typeof spawn = spawn,
+  terminate: ProcessTerminator = terminateTree,
 ): KeepAwakeHandle {
   const command = keepAwakeCommand(platform, lookup);
   if (command === undefined) {
@@ -91,13 +114,23 @@ export function startKeepAwake(
   }
 
   let child: ChildProcess | undefined;
+  let failed = false;
   try {
     child = launch(command.executable, [...command.args], {
       stdio: "ignore",
       windowsHide: true,
+      // A separate process group lets release terminate systemd-inhibit and
+      // its watcher together. The watcher covers abrupt parent death.
+      detached: true,
     });
+    child.unref();
     child.on("error", () => {
       child = undefined;
+      failed = true;
+    });
+    child.on("exit", () => {
+      child = undefined;
+      failed = true;
     });
   } catch {
     return {
@@ -109,14 +142,20 @@ export function startKeepAwake(
   }
 
   return {
-    active: true,
+    get active() {
+      return child !== undefined && child.exitCode === null && child.signalCode === null;
+    },
     name: command.name,
-    message: `sleep inhibitor active: ${command.name}`,
+    get message() {
+      return failed
+        ? `${command.name} stopped; the host may suspend`
+        : `sleep inhibitor active: ${command.name}`;
+    },
     release() {
       const running = child;
       child = undefined;
       if (running !== undefined && running.exitCode === null && running.signalCode === null) {
-        running.kill("SIGTERM");
+        terminate(running);
       }
     },
   };

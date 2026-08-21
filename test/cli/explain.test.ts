@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { homedir } from "node:os";
 import { EXPLANATIONS, buildSupportBundle } from "../../src/cli/explain.js";
 import type { CheckResult } from "../../src/doctor/checks.js";
+import packageJson from "../../package.json" with { type: "json" };
 
 const CHECKS: CheckResult[] = [
   { id: "git", status: "pass", observed: "git version 2.50.1", expected: "git >= 2.30" },
@@ -82,11 +83,48 @@ describe("buildSupportBundle", () => {
     expect(human).toContain("!");
   });
 
-  it("survives a repository root with no readable package.json", () => {
-    // A bundle is requested when things are broken. Failing to build one
-    // because a file is missing is the worst possible moment to be brittle.
+  it("reports the installed Runmill version, not the managed repository version", () => {
     const { data } = buildSupportBundle(CHECKS, "/nonexistent-path-for-test");
-    expect(data.runmill).toBe("unknown");
+    expect(data.runmill).toBe(packageJson.version);
+  });
+
+  it("redacts absolute paths outside HOME and the repository", () => {
+    const checks: CheckResult[] = [
+      {
+        id: "configuration",
+        status: "fail",
+        observed: "invalid file at /private/tmp/runmill-secret/policy.yaml",
+        expected: "valid policy",
+      },
+      {
+        id: "repository",
+        status: "fail",
+        observed: "missing /work/customer/secret-repo/.runmill/checks.yaml",
+        expected: "manifest",
+      },
+    ];
+    const { human, data } = buildSupportBundle(checks, "/different/repository");
+    expect(human).not.toContain("/private/tmp/runmill-secret");
+    expect(human).not.toContain("/work/customer/secret-repo");
+    expect(JSON.stringify(data)).not.toContain("/private/tmp/runmill-secret");
+    expect(JSON.stringify(data)).not.toContain("/work/customer/secret-repo");
+    expect(human).toContain("<path>");
+  });
+
+  it("redacts remote URLs including embedded credentials and private repository names", () => {
+    const checks: CheckResult[] = [
+      {
+        id: "repository:remote",
+        status: "pass",
+        observed: "https://alice:ghp_SYNTHETIC_SECRET@github.example.com/acme/private.git",
+        expected: "origin",
+      },
+    ];
+    const { human, data } = buildSupportBundle(checks, process.cwd());
+    const serialized = `${human}\n${JSON.stringify(data)}`;
+    expect(serialized).not.toContain("ghp_SYNTHETIC_SECRET");
+    expect(serialized).not.toContain("acme/private");
+    expect(serialized).toContain("<url>");
   });
 
   it("omits the onboarding section when nothing has been recorded", () => {

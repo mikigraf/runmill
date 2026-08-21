@@ -76,12 +76,19 @@ Historical issue + pre-change commit + original failing behavior
   expected: deliver
   allowed_paths: [src/]        # anything outside this is out of scope
   base_commit: a1b2c3d          # the tree as it was before the fix
+  # If package inputs changed since a1b2c3d, point at a separate checkout of
+  # a1b2c3d where you ran npm ci. Runmill verifies it before any agent starts.
+  dependency_path: /worktrees/project-at-a1b2c3d
   issue:
     identifier: EV-1
     title: Crash when the config has no repositories block
     description: |
       Acceptance criteria:
       - Loading such a config raises RM-CONFIG-001
+    # Optional. These default to backlog.team and the first eligible state.
+    team: PLATFORM
+    state: Ready
+    project: Runtime           # available to repository mapping rules
   checks:
     - id: unit
       run: npm test
@@ -102,7 +109,7 @@ plus high-risk changes that should never merge autonomously.
 | Outcome | Did the run end where the task required? | Implemented |
 | Diff scope | Did the change stay inside `allowed_paths`? | Implemented; needs the run to report changed paths |
 | Deterministic checks | Do the task's `checks` pass against the result? | Via the run's own coverage contract |
-| Repository rubric | Maintainability and local standards | Via the configured review skill |
+| Review rubric | Correctness, security, scope, testing and maintainability | Immutable built-in minimum, with configured repository guidance appended as untrusted narrowing material |
 | Human calibration | Does automated judgment match yours? | Not implemented |
 | Delayed outcome | Reverts, incidents, follow-up defects | Not implemented |
 
@@ -125,6 +132,30 @@ true rate near 44% — which is why the bare fraction is never reported alone.
 Each task gets its own throwaway git repository (with a local bare `origin`, because the
 [lease](./leases.md) is a ref pushed to a remote) and its own state database, so tasks cannot see
 each other's leases, runs, or workspaces.
+
+The replay issue defaults to the configured `backlog.team` and first `eligible_states` entry. A
+task may override `issue.team`, `issue.state`, or `issue.project`. Normal ordered repository rules
+then choose the target repository and base branch; replay does not assume the first configured
+repository.
+
+Historical dependencies are exact-base evidence. If the selected base contains
+`package-lock.json`, Runmill validates `package.json`, `package-lock.json`, npm's installed package
+inventory, platform, architecture, and Node ABI before importing `node_modules`. The task's
+`dependency_path` is checked first; otherwise the fixture/current repository is accepted only when
+it proves the same identity. A current checkout with different package inputs is never reused for
+a historical commit. Prepare a separate checkout at `base_commit`, run `npm ci`, and point
+`dependency_path` at it. Missing or mismatched dependency evidence fails the attempt before the
+provider is started. Repositories without `package-lock.json` need no dependency path.
+
+Replay may dispatch the configured Codex or Claude Code provider, so every agent and review
+invocation can consume provider usage. It never uses the configured production
+backlog or GitHub boundary. The suite issue is loaded into an in-memory backlog, and branch pushes,
+pull requests, checks, comments, transitions, and merges are simulated by an in-memory forge plus
+the task's throwaway local `origin`. This boundary is forced even when the loaded policy uses
+`guarded-merge` or `continuous` and valid Linear/GitHub credentials are available.
+
+There is no replay flag that enables production mutations. Use `--dry-run` when you also want to
+avoid provider usage.
 
 Then, in the order the daemon uses:
 

@@ -43,11 +43,22 @@ export interface EvalTask {
   /** Fixture repository, or a git ref in the repository under evaluation. */
   readonly repoPath?: string | undefined;
   readonly baseCommit?: string | undefined;
+  /**
+   * Checkout containing an npm install for the exact base commit. Replay
+   * validates its manifests and installed inventory before reusing it.
+   */
+  readonly dependencyPath?: string | undefined;
   readonly issue: {
     readonly identifier: string;
     readonly title: string;
     readonly description: string;
     readonly labels: readonly string[];
+    /** Defaults to the configured backlog team. */
+    readonly team?: string | undefined;
+    /** Defaults to the first configured eligible state. */
+    readonly state?: string | undefined;
+    /** Participates in repository routing when present. */
+    readonly project?: string | undefined;
   };
   readonly expected: ExpectedOutcome;
   /** Why this outcome is correct. Read by a human reviewing a regression. */
@@ -77,6 +88,7 @@ const KINDS = new Set<string>([
   "underspecified",
   "high-risk",
 ]);
+const SAFE_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/u;
 
 function asArray<T>(value: unknown): readonly T[] {
   return Array.isArray(value) ? (value as T[]) : [];
@@ -84,6 +96,10 @@ function asArray<T>(value: unknown): readonly T[] {
 
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+}
+
+function asOptionalString(value: unknown): string | undefined {
+  return value === undefined ? undefined : String(value);
 }
 
 export function parseSuite(source: string): EvalSuite {
@@ -95,13 +111,17 @@ export function parseSuite(source: string): EvalSuite {
       id: String(t["id"] ?? ""),
       kind: (t["kind"] ?? "bug-fix") as TaskKind,
       split: (t["split"] ?? "development") as TaskSplit,
-      repoPath: t["repo_path"] as string | undefined,
-      baseCommit: t["base_commit"] as string | undefined,
+      repoPath: asOptionalString(t["repo_path"]),
+      baseCommit: asOptionalString(t["base_commit"]),
+      dependencyPath: asOptionalString(t["dependency_path"]),
       issue: {
         identifier: String(issue["identifier"] ?? t["id"] ?? ""),
         title: String(issue["title"] ?? ""),
         description: String(issue["description"] ?? ""),
         labels: asArray<string>(issue["labels"]),
+        team: asOptionalString(issue["team"]),
+        state: asOptionalString(issue["state"]),
+        project: asOptionalString(issue["project"]),
       },
       expected: (t["expected"] ?? "deliver") as ExpectedOutcome,
       rationale: t["rationale"] as string | undefined,
@@ -124,6 +144,12 @@ export function validateSuite(suite: EvalSuite): readonly string[] {
   for (const [index, task] of suite.tasks.entries()) {
     const where = task.id === "" ? `tasks[${index}]` : `task "${task.id}"`;
     if (task.id === "") errors.push(`${where}: missing id`);
+    else if (!SAFE_TASK_ID.test(task.id)) {
+      errors.push(
+        `${where}: id must be 1-80 ASCII letters, digits, dots, underscores, or hyphens, ` +
+          "and must start with a letter or digit",
+      );
+    }
     if (seen.has(task.id)) errors.push(`${where}: duplicate id`);
     seen.add(task.id);
 
@@ -137,6 +163,18 @@ export function validateSuite(suite: EvalSuite): readonly string[] {
       errors.push(`${where}: unknown kind "${task.kind}"`);
     }
     if (task.issue.title === "") errors.push(`${where}: issue.title is required`);
+    for (const [field, value] of [
+      ["repo_path", task.repoPath],
+      ["base_commit", task.baseCommit],
+      ["dependency_path", task.dependencyPath],
+      ["issue.team", task.issue.team],
+      ["issue.state", task.issue.state],
+      ["issue.project", task.issue.project],
+    ] as const) {
+      if (value !== undefined && value.trim() === "") {
+        errors.push(`${where}: ${field} must not be empty when provided`);
+      }
+    }
   }
 
   if (suite.tasks.length === 0) {

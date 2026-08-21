@@ -13,6 +13,7 @@ import { RunmillError } from "./errors/runmill-error.js";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { GitHubGitCredential } from "./platform/github-git-credential.js";
 
 /**
  * The issue fixture demo mode falls back to.
@@ -35,6 +36,8 @@ export interface AdapterSet {
   /** Runs the review roles. The same adapter as `provider` unless configured otherwise. */
   readonly reviewProvider: CodingAgentAdapter;
   readonly forge: ForgeAdapter;
+  /** Host-only Git transport using the exact token resolved for the forge. */
+  readonly gitCredential?: GitHubGitCredential | undefined;
   /** Which boundary resolved to a live implementation. */
   readonly live: { backlog: boolean; provider: boolean; reviewProvider: boolean; forge: boolean };
 }
@@ -45,6 +48,15 @@ export interface BuildAdaptersOptions {
   readonly credentials?: CredentialStore | undefined;
   /** Force in-memory implementations for every boundary. */
   readonly demo?: boolean | undefined;
+  /**
+   * Deny production backlog and forge effects even when credentials exist.
+   *
+   * Evaluation uses this mode so it may dispatch the configured coding agent
+   * without ever constructing a live mutation boundary. The provider remains
+   * eligible because inference is the subject being measured; backlog and
+   * forge adapters are forced in-memory.
+   */
+  readonly externalEffects?: "allow" | "deny" | undefined;
   /**
    * Which boundaries to resolve. Read-only commands need only the backlog,
    * and resolving a provider costs a subprocess — for one dialect, a real
@@ -87,12 +99,17 @@ export async function buildAdapters(
   const demo = options.demo === true || process.env["RUNMILL_DEMO"] === "1";
   const need = options.need ?? (["backlog", "provider", "forge"] as const);
   const wants = (b: Boundary): boolean => need.includes(b);
+  const externalEffectsDenied = options.externalEffects === "deny";
 
   // -- backlog -----------------------------------------------------------
   let backlog: BacklogAdapter;
   let backlogLive = false;
-  const fixture = process.env["RUNMILL_FAKE_BACKLOG"];
-  if (fixture !== undefined && fixture !== "" && !existsSync(fixture)) {
+  const fixture = wants("backlog") && !externalEffectsDenied
+    ? process.env["RUNMILL_FAKE_BACKLOG"]
+    : undefined;
+  if (!wants("backlog") || externalEffectsDenied) {
+    backlog = new FakeBacklogAdapter();
+  } else if (fixture !== undefined && fixture !== "" && !existsSync(fixture)) {
     // Setting the variable is an explicit statement of intent. Falling through
     // to "no Linear credential" would answer a question the operator did not
     // ask and send them to fix the wrong thing.
@@ -100,8 +117,7 @@ export async function buildAdapters(
       whatHappened:
         `RUNMILL_FAKE_BACKLOG points at a file that does not exist:\n  ${fixture}`,
     });
-  }
-  if (fixture !== undefined && existsSync(fixture)) {
+  } else if (fixture !== undefined && existsSync(fixture)) {
     backlog = new FakeBacklogAdapter(JSON.parse(readFileSync(fixture, "utf8")));
   } else if (config.backlog.provider === "linear") {
     const apiKey = await credentials.get("linear");
@@ -145,7 +161,7 @@ export async function buildAdapters(
   if (!wants("provider")) {
     provider = new FakeProviderAdapter();
   } else if (installation.installed && !demo) {
-    const auth = await cli.authStatus();
+    const auth = await cli.sandboxAuthStatus();
     if (!auth.authenticated) {
       throw RunmillError.fromCatalog("RM-AUTH-003", {
         whatHappened:
@@ -207,7 +223,7 @@ export async function buildAdapters(
               `with ${dialect.binary}.`,
           });
         }
-        const reviewAuth = await reviewCli.authStatus();
+        const reviewAuth = await reviewCli.sandboxAuthStatus();
         if (!reviewAuth.authenticated) {
           throw RunmillError.fromCatalog("RM-AUTH-003", {
             whatHappened:
@@ -228,11 +244,15 @@ export async function buildAdapters(
   // -- forge -------------------------------------------------------------
   let forge: ForgeAdapter;
   let forgeLive = false;
-  const token = wants("forge") ? await credentials.get("github") : undefined;
-  if (!wants("forge")) {
+  let gitCredential: GitHubGitCredential | undefined;
+  const token = wants("forge") && !externalEffectsDenied
+    ? await credentials.get("github")
+    : undefined;
+  if (!wants("forge") || externalEffectsDenied) {
     forge = new FakeForgeAdapter();
   } else if (token !== undefined && !demo) {
     forge = new GitHubForgeAdapter({ token });
+    gitCredential = new GitHubGitCredential({ token });
     forgeLive = true;
   } else if (demo) {
     forge = new FakeForgeAdapter();
@@ -249,6 +269,7 @@ export async function buildAdapters(
     provider,
     reviewProvider,
     forge,
+    ...(gitCredential === undefined ? {} : { gitCredential }),
     live: {
       backlog: backlogLive,
       provider: providerLive,

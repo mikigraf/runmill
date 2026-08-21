@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { CircuitBreakers, Daemon, DEFAULT_BREAKERS } from "../../src/orchestrator/daemon.js";
+import {
+  budgetDayBucket,
+  CircuitBreakers,
+  Daemon,
+  DEFAULT_BREAKERS,
+} from "../../src/orchestrator/daemon.js";
 import { FakeClock } from "../../src/testing/fake-clock.js";
 import type { RunOutcome } from "../../src/orchestrator/orchestrator.js";
 
@@ -93,6 +98,22 @@ describe("CircuitBreakers", () => {
     b.record(outcome({ costUsd: 0.5 }));
     expect(b.spendUsd).toBeCloseTo(0.75);
   });
+
+  it("resets a daily-cost trip only when the calendar bucket changes", () => {
+    const b = new CircuitBreakers({ ...DEFAULT_BREAKERS, dailyCostUsd: 1 });
+    b.setDailySpend("2026-08-06", 1.2);
+    expect(b.evaluate(clock())?.name).toBe("daily-cost");
+    b.setDailySpend("2026-08-07", 0);
+    expect(b.evaluate(clock())).toBeUndefined();
+  });
+});
+
+describe("budgetDayBucket", () => {
+  it("supports UTC and host-local daily windows", () => {
+    const at = new Date(2026, 7, 6, 23, 30);
+    expect(budgetDayBucket(at, "local")).toBe("2026-08-06");
+    expect(budgetDayBucket(at, "utc")).toBe(at.toISOString().slice(0, 10));
+  });
 });
 
 describe("Daemon", () => {
@@ -102,6 +123,32 @@ describe("Daemon", () => {
     const result = await daemon.loop(async () => queue.shift());
     expect(result.stoppedBecause).toBe("no-work");
     expect(result.outcomes.map((o) => o.issueId)).toEqual(["ENG-1", "ENG-2"]);
+  });
+
+  it("checks durable spend before dispatching another run", async () => {
+    const fakeStore = {
+      budgetUsage: () => ({
+        dayBucket: "2026-08-06",
+        repo: "acme/platform",
+        costUsd: 1,
+        invocations: 4,
+      }),
+      recordBudgetUsage: () => undefined,
+    };
+    const daemon = new Daemon({
+      clock: clock(),
+      store: fakeStore as never,
+      breakers: new CircuitBreakers({ ...DEFAULT_BREAKERS, dailyCostUsd: 1 }),
+      dailyBudgetLedger: { repo: "acme/platform", window: "utc" },
+    });
+    let dispatched = false;
+    const result = await daemon.loop(async () => {
+      dispatched = true;
+      return outcome();
+    });
+
+    expect(dispatched).toBe(false);
+    expect(result.breaker?.name).toBe("daily-cost");
   });
 
   it("never overlaps runs", async () => {

@@ -5,8 +5,9 @@
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=20.11"
+    "node": ">=22"
   },
+  "packageManager": "npm@11.15.0",
   "bin": {
     "runmill": "./dist/cli/main.js"
   },
@@ -14,7 +15,6 @@
     "dist",
     "docs",
     "runmill.schema.json",
-    "assets",
     "examples/quickstart",
     "examples/eval"
   ],
@@ -26,18 +26,21 @@
     "coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src test --max-warnings 0",
+    "check": "npm run lint && npm run typecheck && npm run test:coverage && npm run docs:check",
+    "package:check": "npm run build && node scripts/check-package.mjs",
     "prepare": "npm run build",
     "prepack": "npm run build",
     "docs:errors": "tsx scripts/gen-error-docs.ts",
     "docs:check": "tsx scripts/gen-error-docs.ts --check",
     "verify:linux": "./scripts/verify-linux.sh",
     "test:coverage": "vitest run --coverage",
-    "prepublishOnly": "npm run typecheck && npm run test:coverage && npm run docs:check"
+    "prepublishOnly": "npm run check && npm run package:check"
   },
   "dependencies": {
     "@linear/sdk": "39.2.1",
     "@octokit/rest": "21.1.1",
     "@opentui/core": "0.5.1",
+    "ajv": "8.20.0",
     "better-sqlite3": "11.10.0",
     "commander": "13.1.0",
     "yaml": "2.9.0",
@@ -47,10 +50,10 @@
     "@types/better-sqlite3": "7.6.13",
     "@types/node": "22.20.1",
     "@vitest/coverage-v8": "3.2.7",
-    "eslint": "^9.39.5",
+    "eslint": "9.39.5",
     "tsx": "4.23.9",
     "typescript": "5.9.3",
-    "typescript-eslint": "^8.67.0",
+    "typescript-eslint": "8.67.0",
     "vitest": "3.2.7"
   },
   "repository": {

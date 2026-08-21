@@ -1,6 +1,12 @@
 <!-- /autoplan restore point: /Users/miki/.gstack/projects/runmill/main-autoplan-restore-20260806-202816.md -->
 # runmill: Product Requirements Document for a Linear-Driven Coding Agent Harness
 
+> **Archived design draft (6 August 2026).** This file records the original product exploration
+> and is not an implementation or security contract. Commands, configuration keys, support claims,
+> and recovery behavior may be obsolete. Use [README.md](./README.md),
+> [docs/README.md](./docs/README.md), and [runmill.schema.json](./runmill.schema.json) for the current
+> developer-preview surface.
+
 | Field | Definition |
 |---|---|
 | Product | runmill |

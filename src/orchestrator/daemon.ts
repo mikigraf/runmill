@@ -20,6 +20,17 @@ export interface CircuitBreakerConfig {
   readonly minRunsBeforeRateCheck?: number | undefined;
 }
 
+export type DailyWindow = "utc" | "local";
+
+/** Calendar bucket used by the durable daily ledger. */
+export function budgetDayBucket(at: Date, window: DailyWindow): string {
+  if (window === "utc") return at.toISOString().slice(0, 10);
+  const year = at.getFullYear();
+  const month = String(at.getMonth() + 1).padStart(2, "0");
+  const day = String(at.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 export const DEFAULT_BREAKERS: CircuitBreakerConfig = {
   maxConsecutiveFailures: 3,
   maxQuarantines: 1,
@@ -42,6 +53,7 @@ export class CircuitBreakers {
   #escalations = 0;
   #completed = 0;
   #spendUsd = 0;
+  #dailyBucket: string | undefined;
   #tripped: BreakerState | undefined;
 
   constructor(config: CircuitBreakerConfig = DEFAULT_BREAKERS) {
@@ -59,6 +71,15 @@ export class CircuitBreakers {
     if (escalated) this.#escalations += 1;
     if (outcome.finalState === "QUARANTINED") this.#quarantines += 1;
     this.#consecutiveFailures = failed ? this.#consecutiveFailures + 1 : 0;
+  }
+
+  /** Synchronize spend from SQLite and reset only the daily breaker at a new day. */
+  setDailySpend(dayBucket: string, costUsd: number): void {
+    if (this.#dailyBucket !== dayBucket) {
+      this.#dailyBucket = dayBucket;
+      if (this.#tripped?.name === "daily-cost") this.#tripped = undefined;
+    }
+    this.#spendUsd = costUsd;
   }
 
   /** Non-destructive: returns the first tripped breaker, or undefined. */
@@ -133,6 +154,9 @@ export interface DaemonOptions {
   readonly pollIntervalMs?: number | undefined;
   readonly onIdle?: (() => void) | undefined;
   readonly onEvent?: ((message: string) => void) | undefined;
+  readonly dailyBudgetLedger?:
+    | { readonly repo: string; readonly window: DailyWindow }
+    | undefined;
 }
 
 export interface DaemonResult {
@@ -181,6 +205,14 @@ export class Daemon {
     });
   }
 
+  #refreshDailyBudget(): void {
+    const ledger = this.#opts.dailyBudgetLedger;
+    if (ledger === undefined) return;
+    const bucket = budgetDayBucket(this.#opts.clock.now(), ledger.window);
+    const usage = this.#opts.store.budgetUsage(bucket, ledger.repo);
+    this.#breakers.setDailySpend(bucket, usage.costUsd);
+  }
+
   /**
    * @param runOnce performs exactly one run, or returns undefined when there
    *                is nothing eligible.
@@ -194,6 +226,7 @@ export class Daemon {
         return { outcomes, stoppedBecause: "signal" };
       }
 
+      this.#refreshDailyBudget();
       const breaker = this.#breakers.evaluate(this.#opts.clock);
       if (breaker !== undefined) {
         this.#opts.onEvent?.(`circuit breaker "${breaker.name}" opened: ${breaker.reason ?? ""}`);
@@ -221,6 +254,15 @@ export class Daemon {
       idle = false;
       outcomes.push(outcome);
       this.#breakers.record(outcome);
+      const ledger = this.#opts.dailyBudgetLedger;
+      if (ledger !== undefined) {
+        this.#opts.store.recordBudgetUsage({
+          dayBucket: budgetDayBucket(this.#opts.clock.now(), ledger.window),
+          repo: ledger.repo,
+          costUsd: outcome.costUsd,
+          invocations: outcome.agentInvocations ?? 0,
+        });
+      }
       this.#opts.onEvent?.(
         `${outcome.issueId} → ${outcome.finalState} ($${outcome.costUsd.toFixed(2)})`,
       );

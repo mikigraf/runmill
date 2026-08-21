@@ -63,13 +63,29 @@ export const ERROR_CATALOG = {
     recoverable: false,
   },
 
+  // -- backlog -----------------------------------------------------------
+  "RM-BACKLOG-003": {
+    title: "Backlog discovery is incomplete",
+    why:
+      "Runmill must evaluate the complete bounded candidate set. A missing or non-progressing " +
+      "cursor, malformed pagination metadata, or a result beyond the safety ceiling could hide " +
+      "eligible work and must never be reported as an empty or complete queue.",
+    fixes: [
+      { description: "Reduce the number of issues in the configured eligible workflow states" },
+      { description: "Retry after confirming Linear pagination is returning progressing cursors" },
+    ],
+    recoverable: false,
+  },
+
   // -- credentials -------------------------------------------------------
   "RM-AUTH-003": {
-    title: "Backlog credential expired",
-    why: "runmill cannot read or transition issues without a valid backlog credential.",
+    title: "Required credential unavailable",
+    why:
+      "runmill cannot use the configured backlog, forge, or provider when its exact resolved " +
+      "credential is missing, expired, or rejected inside the required boundary.",
     fixes: [
-      { description: "Re-authenticate", command: "runmill auth login linear" },
-      { description: "Verify", command: "runmill doctor --check linear" },
+      { description: "Inspect every credential source and API probe", command: "runmill doctor" },
+      { description: "Re-authenticate the failing service" },
     ],
     recoverable: true,
   },
@@ -142,13 +158,14 @@ export const ERROR_CATALOG = {
     recoverable: true,
   },
   "RM-VERIFY-003": {
-    title: "Undeclared test skip",
+    title: "Test inventory unproven or changed",
     why:
-      "A test that passed at the base commit is skipped or absent at the " +
-      "candidate, and the skip is not declared in the manifest. Silently losing " +
-      "a test is indistinguishable from breaking it.",
+      "Runmill could not establish an exact base test inventory, or a test that " +
+      "passed at base is skipped or absent at the candidate without an exact " +
+      "per-check declaration. Counts never identify which test was lost.",
     fixes: [
-      { description: "Restore the test, or declare the skip with a cause and expiry" },
+      { description: "Produce valid unique-id reports at base and candidate" },
+      { description: "Restore the test, or declare its exact test_id with a cause under this check" },
       { description: "See the diff against the baseline inventory", command: "runmill inspect <run-id>" },
     ],
     recoverable: true,
@@ -165,6 +182,22 @@ export const ERROR_CATALOG = {
       { description: "Write a fresh manifest alongside the existing one", command: "runmill init" },
     ],
     recoverable: false,
+  },
+
+  "RM-VERIFY-005": {
+    title: "Verification dependencies are not trusted",
+    why:
+      "A clean exact-commit checkout does not contain ignored dependency directories. " +
+      "Runmill only reuses an npm install when package.json, package-lock.json, the installed " +
+      "package inventory, platform, architecture, and Node ABI match the commit being checked.",
+    fixes: [
+      {
+        description: "Update the source checkout to the configured base and install its exact dependencies",
+        command: "npm ci",
+      },
+      { description: "Start Runmill again so it can prepare a fresh read-only dependency cache" },
+    ],
+    recoverable: true,
   },
 
   "RM-EVAL-001": {
@@ -222,8 +255,9 @@ export const ERROR_CATALOG = {
     title: "Provider budget exhausted",
     why: "The run reached its turn, time, invocation, or cost ceiling.",
     fixes: [
-      { description: "Raise the budget in runmill.yaml" },
-      { description: "Resume with approval", command: "runmill resume <run-id>" },
+      { description: "Raise the budget in the operator policy" },
+      { description: "Inspect the stopped run", command: "runmill inspect <run-id>" },
+      { description: "Return the issue to an eligible state and start a fresh attempt" },
     ],
     recoverable: true,
   },
@@ -245,7 +279,8 @@ export const ERROR_CATALOG = {
     why: "The reviewer found an ambiguity that policy cannot resolve deterministically.",
     fixes: [
       { description: "List what is waiting", command: "runmill list --needs-attention" },
-      { description: "Answer and continue", command: "runmill resume <run-id> --answer <choice>" },
+      { description: "Inspect the evidence and named decision", command: "runmill inspect <run-id>" },
+      { description: "Return the issue to an eligible state and start a fresh attempt" },
     ],
     recoverable: true,
   },
@@ -253,7 +288,7 @@ export const ERROR_CATALOG = {
   // -- config / state ----------------------------------------------------
   "RM-CONFIG-001": {
     title: "Configuration is invalid",
-    why: "runmill.yaml does not satisfy the published schema, so behavior would be undefined.",
+    why: "The operator policy does not satisfy the published schema, so behavior would be undefined.",
     fixes: [
       { description: "Show the specific violations", command: "runmill config validate" },
       { description: "Add the schema header for editor validation" },
@@ -263,7 +298,7 @@ export const ERROR_CATALOG = {
   "RM-CONFIG-002": {
     title: "Referenced file does not exist",
     why:
-      "A path in runmill.yaml points at a file that is not present. This is " +
+      "A path in the operator policy points at a file that is not present. This is " +
       "checked before any agent is dispatched so it cannot fail after spend.",
     fixes: [
       { description: "Write the built-in review skills", command: "runmill skills eject" },
@@ -274,13 +309,40 @@ export const ERROR_CATALOG = {
   "RM-CONFIG-003": {
     title: "No configuration file",
     why:
-      "runmill needs a runmill.yaml to know which backlog to read, which " +
+      "runmill needs an operator policy to know which backlog to read, which " +
       "repositories issues map to, and how much autonomy it has.",
     fixes: [
       { description: "Create one, with the repository inferred from git", command: "runmill init" },
       {
         description: "Or point at one that lives somewhere else",
         command: "runmill --config <path> next",
+      },
+    ],
+    recoverable: false,
+  },
+  "RM-WORKSPACE-003": {
+    title: "Repository identity does not match",
+    why:
+      "A daemon may only push work cloned from the GitHub repository named by the selected " +
+      "issue route. Allowing those identities to differ could send one repository's code to another.",
+    fixes: [
+      { description: "Run the daemon from the repository configured for this issue" },
+      { description: "Inspect repository routing", command: "runmill next --dry-run" },
+    ],
+    recoverable: false,
+  },
+  "RM-WORKSPACE-004": {
+    title: "Candidate commit provenance is unavailable",
+    why:
+      "Runmill, rather than the coding agent, authors the candidate commit. It needs an explicit " +
+      "verified Git identity and must be able to use any signer required by the source checkout " +
+      "before it claims backlog work.",
+    fixes: [
+      { description: "Configure user.name and a verified user.email in the source checkout" },
+      { description: "Make the configured signing key or signing agent available without a prompt" },
+      {
+        description: "Repeat the exact candidate-commit probe",
+        command: "runmill doctor --check git:provenance",
       },
     ],
     recoverable: false,
@@ -295,6 +357,20 @@ export const ERROR_CATALOG = {
       { description: "Check versions", command: "runmill --version" },
     ],
     recoverable: false,
+  },
+  "RM-STATE-002": {
+    title: "External effect outcome is unresolved",
+    why:
+      "A prior request may have changed GitHub or the backlog even though Runmill did not receive " +
+      "a definitive response. Starting more work could repeat or contradict that mutation.",
+    fixes: [
+      { description: "List the exact pending effects", command: "runmill effects list" },
+      {
+        description: "Check the named remote system, then record the observed outcome",
+        command: "runmill effects resolve <key> --outcome applied",
+      },
+    ],
+    recoverable: true,
   },
 } as const satisfies Record<string, ErrorCatalogEntry>;
 

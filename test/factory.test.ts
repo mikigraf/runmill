@@ -180,6 +180,48 @@ describe("scoping which boundaries resolve", () => {
     expect(adapters.provider).toBeDefined();
     expect(adapters.forge).toBeDefined();
   });
+
+  it("forces backlog and forge in-memory when external effects are denied", async () => {
+    const requestedCredentials: string[] = [];
+    const credentials = new (class extends CredentialStore {
+      override async get(name: Parameters<CredentialStore["get"]>[0]): Promise<string> {
+        requestedCredentials.push(name);
+        return "credential-that-must-not-be-read";
+      }
+    })();
+    const automatic = {
+      ...CONFIG,
+      autonomy: "continuous" as const,
+      experimental: { automaticMerge: true },
+    };
+
+    const adapters = await buildAdapters(automatic, {
+      credentials,
+      need: ["backlog", "forge"],
+      externalEffects: "deny",
+    });
+
+    expect(adapters.backlog.name).toBe("fake");
+    expect(adapters.forge.name).toBe("fake");
+    expect(adapters.live.backlog).toBe(false);
+    expect(adapters.live.forge).toBe(false);
+    expect(requestedCredentials).toEqual([]);
+  });
+
+  it("returns host Git auth backed by the same credential as a live forge", async () => {
+    const credentials = new (class extends CredentialStore {
+      override async get(name: Parameters<CredentialStore["get"]>[0]): Promise<string | undefined> {
+        return name === "github" ? "github_pat_exact_resolved_token" : undefined;
+      }
+    })();
+
+    const adapters = await buildAdapters(CONFIG, { credentials, need: ["forge"] });
+
+    expect(adapters.live.forge).toBe(true);
+    expect(adapters.gitCredential?.repositoryUrl("acme/platform")).toBe(
+      "https://github.com/acme/platform.git",
+    );
+  });
 });
 
 describe("RUNMILL_DEMO as an explicit signal", () => {

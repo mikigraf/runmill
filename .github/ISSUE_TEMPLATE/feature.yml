@@ -1,0 +1,45 @@
+name: Feature request
+description: Propose a product capability or workflow improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is blocked or unnecessarily manual today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the observable behavior, not only a proposed implementation.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Backlog selection and leases
+        - Agent provider
+        - Workspace and sandbox
+        - Verification and review
+        - Pull request and CI delivery
+        - Daemon and TUI
+        - Configuration and CLI
+        - Evaluation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: authority
+    attributes:
+      label: Authority and failure behavior
+      description: Could this add an external effect or widen autonomy? What should happen when evidence is unavailable?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

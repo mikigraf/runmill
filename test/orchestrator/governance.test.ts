@@ -42,10 +42,10 @@ const ISSUE: BacklogIssue = {
 
 const CHECK: CheckSpec = {
   id: "readme",
-  run: "/bin/cat README.md",
+  run: "/bin/cp verification-report-source.tap r.tap",
   required: true,
   source: "repository-policy",
-  report: { path: "r.json", format: "json" },
+  report: { path: "r.tap", format: "tap" },
 };
 
 function git(cwd: string, ...args: string[]): string {
@@ -56,6 +56,7 @@ function config(autonomy: string): ReturnType<typeof parseConfig> {
   return parseConfig(`
 version: 1
 autonomy: ${autonomy}
+experimental: { automatic_merge: true }
 providers: { implementer: { implementation: codex } }
 backlog:
   provider: linear
@@ -70,6 +71,7 @@ github:
       repo: acme/platform
       base_branch: main
 workspace: { git_isolation: clone }
+risk: { default: low }
 `);
 }
 
@@ -82,6 +84,10 @@ beforeEach(() => {
   git(source, "config", "user.email", "s@t");
   git(source, "config", "user.name", "S");
   writeFileSync(join(source, "README.md"), "seed\n");
+  writeFileSync(
+    join(source, "verification-report-source.tap"),
+    "TAP version 13\n1..1\nok 1 - readme\n",
+  );
   git(source, "add", "-A");
   git(source, "commit", "-q", "-m", "seed");
   git(source, "push", "-q", "origin", "main");
@@ -94,22 +100,47 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-function build(autonomy: string, forge: FakeForgeAdapter) {
+function build(
+  autonomy: string,
+  forge: FakeForgeAdapter,
+  cfg: ReturnType<typeof parseConfig> = config(autonomy),
+  checks: readonly CheckSpec[] = [CHECK],
+) {
   const backlog = new FakeBacklogAdapter([ISSUE]);
+  const provider = new FakeProviderAdapter();
   return {
     backlog,
+    provider,
     forge,
     orchestrator: new Orchestrator({
       backlog,
-      provider: new FakeProviderAdapter(),
+      provider,
       forge,
       store,
       clock,
-      config: config(autonomy),
+      config: cfg,
       sourceRepoPath: source,
+      sourceRepository: "acme/platform",
       workspaceRoot: join(root, "runs"),
-      checks: [CHECK],
+      checks,
     }),
+  };
+}
+
+function withRisk(
+  overrides: Partial<ReturnType<typeof parseConfig>["risk"]>,
+): ReturnType<typeof parseConfig> {
+  const cfg = config("guarded-merge");
+  return {
+    ...cfg,
+    risk: {
+      ...cfg.risk,
+      ...overrides,
+      manualApproval: {
+        ...cfg.risk.manualApproval,
+        ...overrides.manualApproval,
+      },
+    },
   };
 }
 
@@ -118,6 +149,33 @@ function lease(runId: string): GitRefLease {
 }
 
 const TARGET = { repo: "acme/platform", baseBranch: "main" };
+
+describe("verification policy runtime guard", () => {
+  it("refuses an empty effective union before claiming or invoking an agent", async () => {
+    const forge = new FakeForgeAdapter();
+    const { orchestrator, backlog, provider } = build(
+      "pr-only",
+      forge,
+      config("pr-only"),
+      [],
+    );
+
+    const outcome = await orchestrator.run({
+      runId: "run_empty_checks",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_empty_checks"),
+    });
+
+    expect(outcome).toMatchObject({ finalState: "QUARANTINED" });
+    expect(outcome.reason).toMatch(/RM-VERIFY-001.*union is empty/i);
+    expect(backlog.calls).toHaveLength(0);
+    expect(provider.startedRequests).toHaveLength(0);
+    expect(forge.calls).toHaveLength(0);
+    expect(store.getRun("run_empty_checks")).toBeUndefined();
+    expect(await lease("observer").read(ISSUE.identifier)).toBeUndefined();
+  });
+});
 
 describe("unreadable branch protection", () => {
   it("refuses rather than treating unknown rules as no rules", async () => {
@@ -158,7 +216,7 @@ describe("required check reconciliation", () => {
     const forge = new FakeForgeAdapter({
       requiredChecks: ["build"],
       checks: [
-        { name: "build", conclusion: "success", headSha: "head-1", completedAt: "2026-08-06T10:00:00Z" },
+        { name: "build", conclusion: "success", headSha: "$ref", completedAt: "2026-08-06T10:00:00Z" },
       ],
     });
     const { orchestrator } = build("pr-only", forge);
@@ -175,7 +233,7 @@ describe("required check reconciliation", () => {
     const forge = new FakeForgeAdapter({
       requiredChecks: ["build"],
       checks: [
-        { name: "build", conclusion: "failure", headSha: "head-1", completedAt: "2026-08-06T10:00:00Z" },
+        { name: "build", conclusion: "failure", headSha: "$ref", completedAt: "2026-08-06T10:00:00Z" },
       ],
     });
     const { orchestrator } = build("pr-only", forge);
@@ -195,7 +253,7 @@ describe("required check reconciliation", () => {
     const forge = new FakeForgeAdapter({
       requiredChecks: ["build"],
       checks: [
-        { name: "build", conclusion: "skipped", headSha: "head-1", completedAt: "2026-08-06T10:00:00Z" },
+        { name: "build", conclusion: "skipped", headSha: "$ref", completedAt: "2026-08-06T10:00:00Z" },
       ],
     });
     const { orchestrator } = build("pr-only", forge);
@@ -206,6 +264,103 @@ describe("required check reconciliation", () => {
       lease: lease("run_cs"),
     });
     expect(outcome.finalState).toBe("NEEDS_HUMAN");
+  }, 90_000);
+});
+
+describe("automatic-merge risk policy", () => {
+  it("stops at manual approval when a changed path matches policy", async () => {
+    const forge = new FakeForgeAdapter({ credentialCanWriteProtection: false });
+    const cfg = withRisk({
+      manualApproval: { paths: ["RUNMILL_DEMO.md"], labels: [], conditions: [] },
+    });
+    const { orchestrator } = build("guarded-merge", forge, cfg);
+
+    const outcome = await orchestrator.run({
+      runId: "run_risk_path",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_risk_path"),
+    });
+
+    expect(outcome.finalState).toBe("AWAITING_APPROVAL");
+    expect(outcome.reason).toMatch(/RUNMILL_DEMO\.md/);
+    expect(forge.calls.some((call) => call.op === "merge")).toBe(false);
+  }, 90_000);
+
+  it("stops at manual approval when the issue has a configured label", async () => {
+    const forge = new FakeForgeAdapter({ credentialCanWriteProtection: false });
+    const cfg = withRisk({
+      manualApproval: { paths: [], labels: ["agent-ready"], conditions: [] },
+    });
+    const { orchestrator } = build("guarded-merge", forge, cfg);
+
+    const outcome = await orchestrator.run({
+      runId: "run_risk_label",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_risk_label"),
+    });
+
+    expect(outcome.finalState).toBe("AWAITING_APPROVAL");
+    expect(outcome.reason).toMatch(/agent-ready/);
+    expect(forge.calls.some((call) => call.op === "merge")).toBe(false);
+  }, 90_000);
+
+  it("requires approval when the default risk tier is not low", async () => {
+    const forge = new FakeForgeAdapter({ credentialCanWriteProtection: false });
+    const { orchestrator } = build("guarded-merge", forge, withRisk({ default: "medium" }));
+
+    const outcome = await orchestrator.run({
+      runId: "run_risk_default",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_risk_default"),
+    });
+
+    expect(outcome.finalState).toBe("AWAITING_APPROVAL");
+    expect(outcome.reason).toMatch(/risk\.default is medium/);
+    expect(forge.calls.some((call) => call.op === "merge")).toBe(false);
+  }, 90_000);
+
+  it("fails closed when a configured condition cannot be evaluated", async () => {
+    const forge = new FakeForgeAdapter({ credentialCanWriteProtection: false });
+    const cfg = withRisk({
+      manualApproval: { paths: [], labels: [], conditions: ["public_api_change"] },
+    });
+    const { orchestrator } = build("guarded-merge", forge, cfg);
+
+    const outcome = await orchestrator.run({
+      runId: "run_risk_unknown",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_risk_unknown"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/could not be evaluated.*public_api_change/i);
+    expect(forge.calls.some((call) => call.op === "merge")).toBe(false);
+  }, 90_000);
+
+  it("still delivers pr-only work when a manual-approval rule matches", async () => {
+    const forge = new FakeForgeAdapter();
+    const cfg = {
+      ...withRisk({
+        default: "critical",
+        manualApproval: { paths: ["**"], labels: ["agent-ready"], conditions: [] },
+      }),
+      autonomy: "pr-only" as const,
+    };
+    const { orchestrator } = build("pr-only", forge, cfg);
+
+    const outcome = await orchestrator.run({
+      runId: "run_risk_pr_only",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_risk_pr_only"),
+    });
+
+    expect(outcome.finalState).toBe("PR_DELIVERED");
+    expect(forge.calls.some((call) => call.op === "merge")).toBe(false);
   }, 90_000);
 });
 
@@ -234,6 +389,27 @@ describe("observe mode", () => {
     expect(forge.calls).toHaveLength(0);
     expect(backlog.peek("ENG-1")?.state).toBe("Todo");
   }, 60_000);
+});
+
+describe("repository identity", () => {
+  it("refuses a cross-repository route before any backlog, lease, or forge mutation", async () => {
+    const forge = new FakeForgeAdapter();
+    const { orchestrator, backlog } = build("pr-only", forge);
+    const mismatched = { repo: "acme/other", baseBranch: "main" };
+
+    const outcome = await orchestrator.run({
+      runId: "run_wrong_repo",
+      issue: ISSUE,
+      target: mismatched,
+      lease: lease("run_wrong_repo"),
+    });
+
+    expect(outcome.finalState).toBe("QUARANTINED");
+    expect(outcome.reason).toMatch(/attached to acme\/platform/i);
+    expect(backlog.calls).toHaveLength(0);
+    expect(forge.calls).toHaveLength(0);
+    expect(await lease("run_wrong_repo_probe").read(ISSUE.identifier)).toBeUndefined();
+  });
 });
 
 describe("pull request evidence", () => {

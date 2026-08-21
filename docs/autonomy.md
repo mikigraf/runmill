@@ -21,6 +21,11 @@ deterministic workflow around the task: claims, repository effects, PR delivery,
 `pr-only` is the default because opening a pull request cannot bypass anything. It is the mode
 where a mistake costs a review comment.
 
+> [!IMPORTANT]
+> Runmill is a developer preview. `guarded-merge` and `continuous` are experimental. Selecting
+> either mode is not enough to enable automatic merge; the operator policy must also contain
+> `experimental.automatic_merge: true`.
+
 ## The seven gates
 
 Evaluated in order. Any failure ends the run in a terminal state that names which gate and why.
@@ -49,26 +54,31 @@ Discovery, coverage, freshness, outcome. A green command satisfies only the last
 ### Gate 3 — review, cross-checked
 
 Review runs in a **fresh context** with no implementer narrative, and returns structured findings
-tied to file and line. Findings at or above `review.merge_blocking_severities` (default
-`critical`, `high`) dispatch a fix, up to `review.max_fix_iterations`. Unresolved after that: the
-run escalates.
+tied to file and line. With the default `review.require_all_findings_resolved: true`, every finding
+dispatches a fix. If that flag is deliberately disabled, only findings listed by
+`review.merge_blocking_severities` (default `critical`, `high`) block an approving verdict. An
+explicit `changes_required` verdict always makes every returned finding blocking. The loop is
+bounded by `review.max_fix_iterations`; anything still blocking after that escalates.
 
-The verdict itself is not taken on faith. `crossCheckVerdict` rejects two specific shapes:
+The verdict itself is not taken on faith. `crossCheckVerdict` rejects contradictory combinations,
+including a passing verdict whose scope is not `within_scope`, `no_findings` with a non-empty
+finding list, and `changes_required` without an actionable finding. It also rejects a clean verdict
+on a risk-marked diff:
 
 ```ts
 if (review.verdict === "no_findings" && touchesRisk) {
   // reviewer reported no findings on a diff touching risk-escalating paths;
   // escalating rather than trusting the verdict
 }
-if (review.verdict === "approved" && review.scope_assessment === "out_of_scope") {
-  // reviewer approved a change it also called out of scope
+if (review.verdict !== "changes_required" && review.scope_assessment !== "within_scope") {
+  // a passing review did not establish that the change stayed in scope
 }
 ```
 
-The first is the signature of a prompt-injected — or simply over-agreeable — review: a clean bill
-of health on a diff touching `risk.manual_approval.paths`. The second is internally incoherent:
-a review cannot approve a change while stating it does something it was not asked to do. Both
-escalate to a human rather than resolving in the change's favor.
+The first is the signature of a prompt-injected or simply over-agreeable review: a clean bill of
+health on a diff touching `risk.manual_approval.paths`. The second withholds permission whenever
+scope is unknown. A review cannot approve a change while stating it does something it was not asked
+to do. Both cases escalate to a person instead of resolving in the change's favor.
 
 Configure the paths that trigger this:
 
@@ -95,6 +105,12 @@ unguarded merge, and does it silently, on the repositories most likely to be gov
 Every context branch protection requires must have actually reported success. `neutral` and
 `skipped` do not count. A required check that is never *scheduled* fails after 10 minutes rather
 than waiting forever — see [remote checks](./verification.md#remote-checks).
+
+Immediately before an automatic merge, Runmill also asks GitHub for its authoritative mergeability
+verdict and requires `clean` plus `mergeable: true`. If branch rules require a merge queue, Runmill
+stops: queue enrollment is not implemented in this preview, so it will not substitute a direct
+merge. A `blocked` verdict also withholds merge, including when required conversations are not
+resolved.
 
 ### Gate 6 — the negative capability test
 
@@ -136,16 +152,34 @@ administration on repositories you own, so it fails the negative test — correc
 ### Gate 7 — risk tier vs mode
 
 If branch protection requires an approving human review, the run finishes in `AWAITING_APPROVAL`
-rather than attempting a merge it cannot complete. Changes touching
-`risk.manual_approval.paths` escalate rather than auto-merging.
+rather than attempting a merge it cannot complete. Runmill then evaluates the final diff and the
+claimed issue against operator-owned risk policy immediately before `MERGE_READY`:
+
+- only `risk.default: low` is eligible for automatic merge;
+- a final changed path matching `risk.manual_approval.paths` requires approval;
+- an issue label matching `risk.manual_approval.labels` requires approval; and
+- `missing_acceptance_criteria`, `check_config_changed`, and `lockfile_changed` are evaluated from
+  the task packet and final changed paths.
+
+A known match finishes in `AWAITING_APPROVAL` and names every matching rule. A configured condition
+that Runmill cannot prove from available evidence finishes in `NEEDS_HUMAN`. Today that applies to
+`public_api_change`, `permissions_change`, and `secret_related_change`: treating an unimplemented
+classifier as "false" would be a fail-open merge.
+
+This gate governs automatic merge only. `pr-only` still delivers the verified, reviewed pull
+request so a person can make the final decision.
 
 ## What happens after the gates
 
 **`pr-only`** transitions the issue to `backlog.delivered_state`, comments with the PR URL,
 releases the lease, and finishes at `PR_DELIVERED`. This is a success, not a partial one.
+The delivered state is required and cannot be eligible, so the daemon's next poll cannot select
+the same issue and open a second pull request.
 
-**`guarded-merge` / `continuous`** re-assert the lease, merge with `github.merge.method`,
-transition the issue to `backlog.completed_state`, release, clean up, and finish at `COMPLETED`.
+**`guarded-merge` / `continuous`** re-assert the lease, require GitHub's clean mergeability verdict,
+merge with `github.merge.method`, transition the issue to `backlog.completed_state`, release, clean
+up, and finish at `COMPLETED`. Repositories requiring a merge queue stop for a person in this
+preview.
 
 Note the ordering: `assertHeld` immediately precedes the merge. The gap between "we decided to
 merge" and "we merged" is where a stale worker would do damage, so the fence is checked inside it.
@@ -156,7 +190,7 @@ merge" and "we merged" is where a stale worker would do damage, so the fence is 
 |---|---|
 | `PR_DELIVERED` | Delivered a pull request. `pr-only` never merges by design |
 | `COMPLETED` | Every gate passed and the change was merged |
-| `AWAITING_APPROVAL` | Branch protection requires an approving review |
+| `AWAITING_APPROVAL` | Branch protection or operator risk policy requires a person's approval |
 | `NEEDS_HUMAN` | A gate could not be satisfied deterministically, so it escalated |
 | `QUARANTINED` | Something happened that policy could not classify |
 
@@ -168,8 +202,12 @@ categorize, which is the case where continuing would mean guessing.
 runmill list --needs-attention
 runmill policy explain <run-id>
 runmill inspect <run-id>
-runmill resume <run-id> --answer <decision>
+runmill effects list
 ```
+
+Checkpoint continuation is not available in the developer preview. `runmill resume <run-id>` is an
+honest diagnostic refusal and does not record an answer or advance state. Resolve any ambiguous
+external effect, restore the issue to an eligible state, and start a fresh attempt.
 
 ## Choosing a mode
 
@@ -177,9 +215,10 @@ Start at `pr-only`. It is the default, it needs no special credential, and every
 evidence about whether you would have wanted it merged.
 
 Move to `guarded-merge` once you have a body of runs you would have approved, and once you can
-issue a scoped App token. Use `continuous` when every repeated daemon run should apply that merge
-policy. The daemon loop itself works with `pr-only` too; autonomy controls each run, while
-`runmill daemon` controls repetition, polling, circuit breakers, and session budgets.
+issue a scoped App token and explicitly opt in with `experimental.automatic_merge: true`. Use
+`continuous` when every repeated daemon run should apply that experimental merge policy. The
+daemon loop itself works with `pr-only` too; autonomy controls each run, while `runmill daemon`
+controls repetition, polling, circuit breakers, and session budgets.
 
 Autonomy should be earned with evidence you actually collected, and the PRs from `pr-only` are
 that evidence.

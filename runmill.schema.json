@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/mikigraf/runmill/main/runmill.schema.json",
   "title": "runmill configuration",
-  "description": "Configuration for runmill, a control plane that turns a backlog into governed pull requests. Add `# yaml-language-server: $schema=https://raw.githubusercontent.com/mikigraf/runmill/main/runmill.schema.json` to the top of runmill.yaml for editor autocomplete and inline validation.",
+  "description": "Operator policy for Runmill, the delivery loop for autonomous software factories. Generated policy files reference a schema stored beside them for editor autocomplete and inline validation.",
   "type": "object",
   "required": [
     "version",
@@ -25,7 +25,18 @@
         "continuous"
       ],
       "default": "pr-only",
-      "description": "observe: plan only, no repository mutation. pr-only: implement, verify, review, open a PR, never merge. guarded-merge: may merge low-risk changes after all gates pass. continuous: repeat guarded execution until no eligible work remains, a budget is reached, or a circuit breaker opens. guarded-merge and continuous require a GitHub App token without `administration`."
+      "description": "observe: plan only, no repository mutation. pr-only: implement, verify, review, open a PR, never merge. guarded-merge and continuous are experimental and also require experimental.automatic_merge: true plus a GitHub App token without administration."
+    },
+    "experimental": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "automatic_merge": {
+          "type": "boolean",
+          "default": false,
+          "description": "Required explicit acknowledgement for the experimental guarded-merge and continuous modes. Selecting an autonomy mode alone never enables automatic merge."
+        }
+      }
     },
     "backlog": {
       "type": "object",
@@ -38,10 +49,8 @@
       "additionalProperties": false,
       "properties": {
         "provider": {
-          "enum": [
-            "linear",
-            "github-issues"
-          ]
+          "const": "linear",
+          "description": "Linear is the only live backlog adapter in this preview. Unsupported providers are rejected during configuration validation."
         },
         "team": {
           "type": "string"
@@ -49,21 +58,23 @@
         "eligible_states": {
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
-          "minItems": 1
+          "minItems": 1,
+          "uniqueItems": true
         },
         "claim_state": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "completed_state": {
-          "type": "string"
-        },
-        "blocked_state": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "delivered_state": {
           "type": "string",
+          "minLength": 1,
           "description": "Terminal state for pr-only mode, entered at PR_DELIVERED. Distinct from completed_state, which means merged."
         },
         "include_labels": {
@@ -84,10 +95,13 @@
         },
         "allow_unassigned": {
           "type": "boolean",
-          "default": true
+          "default": true,
+          "description": "When false, claim_assignee is required and only issues already assigned to that exact id are eligible."
         },
         "claim_assignee": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact Linear assignee id Runmill may claim as its automation identity."
         },
         "selection": {
           "type": "object",
@@ -124,7 +138,7 @@
         "repositories": {
           "type": "array",
           "minItems": 1,
-          "description": "Ordered match rules. First match wins. No match, or two matches at the same precedence, makes the issue ineligible with a named reason rather than a guess.",
+          "description": "Ordered match rules. First match wins. Every rule must target the same owner/name as the local origin in this single-repository release. No match, or two matches at the same precedence, makes the issue ineligible with a named reason rather than a guess.",
           "items": {
             "type": "object",
             "required": [
@@ -182,10 +196,6 @@
                 "rebase"
               ],
               "default": "squash"
-            },
-            "delete_branch": {
-              "type": "boolean",
-              "default": true
             }
           },
           "description": "Merge queue usage is discovered from the branch ruleset and is deliberately not configurable here; a local flag would be a stale mirror of a remote control."
@@ -204,16 +214,14 @@
         },
         "git_isolation": {
           "enum": [
-            "separate-git-dir",
             "clone"
           ],
           "default": "clone",
-          "description": "A linked worktree's .git points into the parent repository's shared git directory, sharing the object store, config, and hooks. Both options relocate or duplicate git metadata per run so the sandbox can deny everything outside the run directory."
+          "description": "clone is required because its self-contained Git metadata can be mounted read-only inside the agent sandbox."
         },
         "sandbox": {
           "enum": [
             "native",
-            "container",
             "none"
           ],
           "default": "native",
@@ -224,13 +232,16 @@
             "proxy",
             "none"
           ],
-          "default": "proxy"
+          "default": "proxy",
+          "description": "proxy currently enables unrestricted provider egress. Hostname-filtered proxying is planned but not implemented; doctor reports this limitation. none disables provider network access."
         },
         "network_allowlist": {
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "maxItems": 0,
+          "description": "Reserved for the planned network proxy. Non-empty values are rejected so an unenforced allowlist cannot be mistaken for policy."
         },
         "allow_unenforced": {
           "type": "array",
@@ -241,35 +252,9 @@
               "process_cleanup"
             ]
           },
+          "maxItems": 0,
           "default": [],
-          "description": "Knowing opt-in for controls the host platform cannot enforce. Without an entry here, requesting an unenforceable control is an error rather than a silent no-op."
-        },
-        "clean_untracked_files": {
-          "type": "boolean",
-          "default": true,
-          "description": "Applied at worktree teardown only. Applying it mid-run would delete newly created source files."
-        }
-      }
-    },
-    "context": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "entry_files": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Read into every prompt, so these are hash-pinned and changes alert: a merged change to AGENTS.md is a persistent injection into all future runs."
-        },
-        "max_initial_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "default": 50000
-        },
-        "progressive_disclosure": {
-          "type": "boolean",
-          "default": true
+          "description": "Reserved for a future per-control acknowledgement flow. Non-empty values are rejected because Runmill does not yet consume this policy."
         }
       }
     },
@@ -288,7 +273,7 @@
         "fail_on_skipped_check": {
           "type": "boolean",
           "default": true,
-          "description": "Judged differentially against a baseline test inventory, not by counting. doctor refuses to enable this until every required check declares a machine-readable report."
+          "description": "When true, every required local check must produce a newly generated, parseable declared report. runmill init sets false for pr-only because the portable starter commands have no framework-specific report declaration; guarded-merge and continuous require true. Observed zero-test, focused, and undeclared-skip results always fail."
         },
         "commands": {
           "type": "array",
@@ -321,27 +306,11 @@
                     "enum": [
                       "junit",
                       "tap",
-                      "json",
                       "go-json"
                     ]
                   }
                 },
-                "description": "Without a parseable report the check is coverage: unproven and cannot satisfy a required gate."
-              }
-            }
-          }
-        },
-        "changed_area_rules": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "additional_checks": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
+                "description": "Runmill pre-creates this exact file as the only writable path in otherwise read-only base and candidate verification checkouts; the reporter must overwrite it. JUnit, TAP, and Go JSON are parsed into exact test identities. Missing, stale, malformed, empty, duplicate-id, escaping, and unsupported reports fail the inventory proof."
               }
             }
           }
@@ -403,7 +372,8 @@
             "high",
             "critical"
           ],
-          "default": "medium"
+          "default": "medium",
+          "description": "Baseline risk tier. Only low-risk runs are eligible for automatic merge; all other tiers require manual approval."
         },
         "manual_approval": {
           "type": "object",
@@ -412,14 +382,18 @@
             "paths": {
               "type": "array",
               "items": {
-                "type": "string"
-              }
+                "type": "string",
+                "pattern": "\\S"
+              },
+              "description": "Repository-relative paths or *, **, and ? globs. A match in the final diff requires manual approval before merge."
             },
             "labels": {
               "type": "array",
               "items": {
-                "type": "string"
-              }
+                "type": "string",
+                "pattern": "\\S"
+              },
+              "description": "Issue labels that require manual approval before merge. Matching is case-insensitive."
             },
             "conditions": {
               "type": "array",
@@ -432,7 +406,8 @@
                   "check_config_changed",
                   "lockfile_changed"
                 ]
-              }
+              },
+              "description": "Deterministic conditions with local evidence are evaluated. Conditions Runmill cannot prove fail closed instead of being ignored."
             }
           }
         }
@@ -452,14 +427,16 @@
         },
         "daily_cost_usd": {
           "type": "number",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Durable per-repository spend cap. Requires every configured provider to report dollar cost."
         },
         "daily_window": {
           "enum": [
             "utc",
             "local"
           ],
-          "default": "utc"
+          "default": "utc",
+          "description": "Calendar boundary used by the durable daily spend ledger."
         },
         "max_agent_invocations": {
           "type": "object",
@@ -505,11 +482,10 @@
         "cost_enforcement": {
           "enum": [
             "auto",
-            "tokens-estimated",
             "wall-and-invocations-only"
           ],
           "default": "auto",
-          "description": "Subscription provider plans report no dollar cost, so cost budgets silently become no-ops. doctor reports which dimensions are enforceable and refuses continuous mode when none are."
+          "description": "auto enforces provider-reported dollar cost and refuses when a configured cap is unknown. wall-and-invocations-only is valid only without max_cost_usd_per_issue or daily_cost_usd. Token-price estimation is not implemented."
         }
       }
     },
@@ -520,7 +496,8 @@
       "properties": {
         "max_turns": {
           "type": "integer",
-          "default": 80
+          "default": 80,
+          "description": "Passed to Claude Code for each invocation. Codex CLI has no equivalent turn flag, so Codex is bounded by timeout_minutes and the issue invocation and wall-time budgets instead."
         },
         "timeout_minutes": {
           "type": "integer",

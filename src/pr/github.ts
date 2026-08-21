@@ -9,7 +9,7 @@ import type {
 } from "./adapter.js";
 import { ForgeError } from "./adapter.js";
 import { errorMessage } from "../errors/runmill-error.js";
-import { tryGit } from "../platform/git.js";
+import { GitHubGitCredential } from "../platform/github-git-credential.js";
 
 function splitRepo(repo: string): { owner: string; name: string } {
   const [owner, name] = repo.split("/");
@@ -59,10 +59,10 @@ export interface GitHubAdapterOptions {
 export class GitHubForgeAdapter implements ForgeAdapter {
   readonly name = "github";
   readonly #octokit: Octokit;
-  readonly #token: string;
+  readonly #gitCredential: GitHubGitCredential;
 
   constructor(options: GitHubAdapterOptions) {
-    this.#token = options.token;
+    this.#gitCredential = new GitHubGitCredential(options);
     this.#octokit = new Octokit(
       options.baseUrl === undefined
         ? { auth: options.token }
@@ -71,25 +71,30 @@ export class GitHubForgeAdapter implements ForgeAdapter {
   }
 
   async push(input: { repo: string; branch: string; workspacePath: string }): Promise<void> {
-    // Push happens through git with a credential the worker never sees. The
-    // token is passed via an askpass-free header rather than embedded in the
-    // remote URL, so it never lands in .git/config or the reflog.
-    const result = await tryGit(
-      input.workspacePath,
-      [
-        "-c",
-        `http.extraheader=AUTHORIZATION: basic ${Buffer.from(`x-access-token:${this.#token}`).toString("base64")}`,
-        "push",
-        "--set-upstream",
-        `https://github.com/${input.repo}.git`,
-        `HEAD:refs/heads/${input.branch}`,
-      ],
-    );
-    if (!result.ok) {
-      throw new ForgeError(
-        `push failed: ${result.stderr.trim()}`,
-        /timed out|network|503|502/i.test(result.stderr),
+    // The token is present only in the environment of this short-lived Git
+    // process and its private askpass child. It is never written to the helper,
+    // command arguments, remote URL, repository config, or reflog.
+    try {
+      const result = await this.#gitCredential.tryGit(
+        input.workspacePath,
+        [
+          "push",
+          "--no-verify",
+          this.#gitCredential.repositoryUrl(input.repo),
+          `HEAD:refs/heads/${input.branch}`,
+        ],
       );
+      if (!result.ok) {
+        const detail = result.stderr.trim();
+        throw new ForgeError(
+          `push failed: ${detail}`,
+          /timed out|network|503|502/i.test(detail),
+        );
+      }
+    } catch (err) {
+      if (err instanceof ForgeError) throw err;
+      const detail = this.#gitCredential.redact(errorMessage(err));
+      throw new ForgeError(`push failed: ${detail}`, /timed out|network|503|502/i.test(detail));
     }
   }
 
@@ -355,6 +360,7 @@ export class GitHubForgeAdapter implements ForgeAdapter {
     repo: string;
     number: number;
     method: "squash" | "merge" | "rebase";
+    expectedHeadSha: string;
   }): Promise<{ mergeSha: string }> {
     const { owner, name } = splitRepo(input.repo);
     try {
@@ -363,13 +369,18 @@ export class GitHubForgeAdapter implements ForgeAdapter {
         repo: name,
         pull_number: input.number,
         merge_method: input.method,
+        sha: input.expectedHeadSha,
       });
       return { mergeSha: merged.data.sha };
     } catch (err) {
       // Re-read before concluding. A lost response on a merge is the single
       // worst place to assume nothing happened.
       const after = await this.getPullRequest(input);
-      if (after?.state === "merged" && after.mergeSha !== undefined) {
+      if (
+        after?.state === "merged" &&
+        after.mergeSha !== undefined &&
+        after.headSha === input.expectedHeadSha
+      ) {
         return { mergeSha: after.mergeSha };
       }
       throw new ForgeError(

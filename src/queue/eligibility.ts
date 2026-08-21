@@ -12,6 +12,7 @@ export const RULE_IDS = [
   "mapped-repository",
   "workflow-state",
   "not-terminal",
+  "assignment",
   "not-leased",
   "labels",
   "estimate",
@@ -42,6 +43,10 @@ export interface EligibilityPolicy {
   readonly repositoryRules: readonly RepositoryRule[];
   readonly capacityAvailable: boolean;
   readonly leasedIssueIds: ReadonlySet<string>;
+  /** Whether an issue with no assignee may enter the queue. */
+  readonly allowUnassigned?: boolean | undefined;
+  /** The only already-assigned identity Runmill may adopt. */
+  readonly claimAssignee?: string | undefined;
   readonly maxEstimate?: number | undefined;
   /** Label that bypasses the readiness heuristic, e.g. "agent-ready". */
   readonly readinessOverrideLabel?: string | undefined;
@@ -102,7 +107,34 @@ export function evaluateEligibility(
       : pass("not-terminal", "issue is open"),
   );
 
-  // 4. Not already leased.
+  // 4. Assignment ownership. An already-assigned issue is eligible only when
+  //    its exact id matches the operator-configured automation identity.
+  //    Linear does not expose a dependable human-vs-bot discriminator, so the
+  //    explicit id is authoritative and every other assignee is refused.
+  const unassigned = issue.assigneeId === undefined;
+  if (unassigned) {
+    rules.push(
+      policy.allowUnassigned === false
+        ? fail("assignment", "issue is unassigned and allow_unassigned is false")
+        : pass("assignment", "issue is unassigned and may be claimed"),
+    );
+  } else if (
+    policy.claimAssignee !== undefined &&
+    issue.assigneeId === policy.claimAssignee
+  ) {
+    rules.push(pass("assignment", `already assigned to ${policy.claimAssignee}`));
+  } else {
+    rules.push(
+      fail(
+        "assignment",
+        issue.assigneeIsHuman === true
+          ? "issue is assigned to a human"
+          : "issue is assigned outside the configured automation identity",
+      ),
+    );
+  }
+
+  // 5. Not already leased.
   const leased = policy.leasedIssueIds.has(issue.identifier);
   rules.push(
     leased
@@ -110,7 +142,7 @@ export function evaluateEligibility(
       : pass("not-leased", "no active lease"),
   );
 
-  // 5. Labels.
+  // 6. Labels.
   const missingIncludes = policy.includeLabels.filter((l) => !issue.labels.includes(l));
   const presentExcludes = policy.excludeLabels.filter((l) => issue.labels.includes(l));
   if (missingIncludes.length > 0) {
@@ -121,7 +153,7 @@ export function evaluateEligibility(
     rules.push(pass("labels", "label rules satisfied"));
   }
 
-  // 6. Estimate.
+  // 7. Estimate.
   if (policy.maxEstimate === undefined) {
     rules.push(pass("estimate", "no estimate ceiling configured"));
   } else if (issue.estimate === undefined) {
@@ -132,14 +164,14 @@ export function evaluateEligibility(
     rules.push(pass("estimate", `estimate ${issue.estimate} within maximum ${policy.maxEstimate}`));
   }
 
-  // 7. Dependencies.
+  // 8. Dependencies.
   rules.push(
     issue.blockedBy.length > 0
       ? fail("dependencies", `blocked by ${issue.blockedBy.join(", ")}`)
       : pass("dependencies", "no known blockers"),
   );
 
-  // 8. Readiness. An explicit override label bypasses the heuristic; note that
+  // 9. Readiness. An explicit override label bypasses the heuristic; note that
   //    this makes label-add authority into code-execution authority, which is
   //    surfaced at setup rather than hidden here.
   const minChars = policy.minDescriptionChars ?? DEFAULT_MIN_DESCRIPTION_CHARS;

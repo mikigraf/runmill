@@ -11,8 +11,16 @@ body:
     id: bundle
     attributes:
       label: Support bundle
-      description: Output of `runmill doctor --report`
+      description: Output of `runmill doctor --report`. If Runmill cannot start, explain that here.
       render: text
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the Runmill and Node versions, operating system, and sandbox mechanism.
+      placeholder: runmill <version> / Node 22 / macOS 15 / Seatbelt
     validations:
       required: true
   - type: input
@@ -23,8 +31,22 @@ body:
     validations:
       required: true
   - type: textarea
-    id: expected
+    id: behavior
     attributes:
-      label: What you expected, and what happened instead
+      label: Expected and observed behavior
     validations:
       required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: List the smallest sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed tokens, provider keys, private source, and unredacted agent output.
+          required: true

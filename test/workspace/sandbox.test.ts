@@ -119,6 +119,28 @@ describe("buildEnvironment", () => {
     expect(env["NODE_EXTRA_CA_CERTS"]).toBeUndefined();
   });
 
+  it("drops credential-bearing proxy URLs but keeps credential-free proxies", () => {
+    const env = buildEnvironment(
+      {},
+      {
+        PATH: "/usr/bin",
+        HTTPS_PROXY: "http://operator:secret@proxy.internal:3128",
+        HTTP_PROXY: "http://proxy.internal:3128",
+      },
+    );
+
+    expect(env["HTTPS_PROXY"]).toBeUndefined();
+    expect(env["HTTP_PROXY"]).toBe("http://proxy.internal:3128");
+  });
+
+  it("also strips a credential-bearing proxy passed as an explicit extra", () => {
+    const env = buildEnvironment(
+      { ALL_PROXY: "socks5://name:password@proxy.internal:1080" },
+      { PATH: "/usr/bin" },
+    );
+    expect(env["ALL_PROXY"]).toBeUndefined();
+  });
+
   it("refuses an explicitly passed denylisted variable", () => {
     const env = buildEnvironment({ NODE_OPTIONS: "--require /tmp/evil.js" }, { PATH: "/usr/bin" });
     expect(env["NODE_OPTIONS"]).toBeUndefined();
@@ -141,6 +163,27 @@ describe("buildSeatbeltProfile", () => {
     expect(p).toContain('file-write* (subpath "/w")');
   });
 
+  it("can grant one pre-created output file without granting its parent", () => {
+    const p = buildSeatbeltProfile(
+      { writablePaths: [], writableFiles: ["/w/review.json"], allowNetwork: false },
+      "/Users/x",
+    );
+    expect(p).toContain('(allow file-read* file-write* (literal "/w/review.json"))');
+    expect(p).not.toContain('(allow file-read* file-write* (subpath "/w"))');
+  });
+
+  it("denies writes to protected metadata after granting its writable parent", () => {
+    const p = buildSeatbeltProfile(
+      { writablePaths: ["/w"], protectedPaths: ["/w/.git"], allowNetwork: false },
+      "/Users/x",
+    );
+    const grant = p.indexOf('(allow file-read* file-write* (subpath "/w"))');
+    const protect = p.indexOf(
+      '(deny file-write* (literal "/w/.git") (subpath "/w/.git"))',
+    );
+    expect(protect).toBeGreaterThan(grant);
+  });
+
   it("denies credential directories after any broader grant", () => {
     const p = buildSeatbeltProfile({ writablePaths: ["/w"], allowNetwork: false }, "/Users/x");
     const denySsh = p.indexOf('(deny file-read* file-write* (subpath "/Users/x/.ssh")');
@@ -148,6 +191,9 @@ describe("buildSeatbeltProfile", () => {
     expect(denySsh).toBeGreaterThan(allowW);
     expect(p).toContain('/Users/x/.aws');
     expect(p).toContain('/Users/x/.config/gh');
+    expect(p).toContain('/Users/x/.codex');
+    expect(p).toContain('/Users/x/.claude');
+    expect(p).toContain('/Users/x/.config/claude');
   });
 
   it("grants the real path of the symlinked system directories", () => {
@@ -191,8 +237,14 @@ describe("buildBubblewrapArgs", () => {
 
   it("binds declared writable paths and masks credential directories", () => {
     const args = buildBubblewrapArgs({ writablePaths: ["/w"], allowNetwork: false }, "/home/x");
-    expect(args.join(" ")).toContain("--bind /w /w");
-    expect(args.join(" ")).toContain("--tmpfs /home/x/.ssh");
+    const joined = args.join(" ");
+    expect(joined).toContain("--bind /w /w");
+    expect(joined).toContain("--tmpfs /home/x/.ssh --remount-ro /home/x/.ssh");
+    expect(joined).toContain("--tmpfs /home/x/.codex --remount-ro /home/x/.codex");
+    expect(joined).toContain("--tmpfs /home/x/.claude --remount-ro /home/x/.claude");
+    expect(joined).toContain(
+      "--tmpfs /home/x/.config/claude --remount-ro /home/x/.config/claude",
+    );
   });
 
   it("dies with the parent so an orphaned agent cannot outlive the run", () => {
@@ -234,11 +286,41 @@ describe("buildBubblewrapArgs", () => {
     );
   });
 
+  it("remounts protected metadata read-only after its writable parent", () => {
+    const args = buildBubblewrapArgs(
+      { writablePaths: ["/w"], protectedPaths: ["/w/.git"], allowNetwork: false },
+      "/home/x",
+    );
+    const joined = args.join(" ");
+    expect(joined).toContain("--ro-bind /w/.git /w/.git");
+    expect(joined).not.toContain("--ro-bind-try /w/.git /w/.git");
+    expect(joined.indexOf("--ro-bind /w/.git /w/.git")).toBeGreaterThan(
+      joined.indexOf("--bind /w /w"),
+    );
+  });
+
+  it("binds one writable output file after its read-only workspace", () => {
+    const args = buildBubblewrapArgs(
+      {
+        writablePaths: [],
+        writableFiles: ["/w/review.json"],
+        readablePaths: ["/w"],
+        allowNetwork: false,
+      },
+      "/home/x",
+    );
+    const joined = args.join(" ");
+    expect(joined).toContain("--bind /w/review.json /w/review.json");
+    expect(joined.indexOf("--bind /w/review.json /w/review.json")).toBeGreaterThan(
+      joined.indexOf("--ro-bind-try /w /w"),
+    );
+    expect(joined).not.toContain("--bind /w /w");
+  });
+
   it("tolerates a provider config directory that is not installed", () => {
-    // readablePaths carries ~/.codex and ~/.config/claude. A developer running
-    // only one of the two providers does not have the other's directory, and a
-    // hard --ro-bind on a missing source makes bwrap exit 1 before the agent
-    // starts — which reads as "the agent failed", not "that path is absent".
+    // An optional read-only tool path can be absent. A hard --ro-bind would
+    // make bwrap exit before the agent starts, turning a harmless missing path
+    // into an opaque provider failure.
     const args = buildBubblewrapArgs(
       { writablePaths: ["/w"], readablePaths: ["/home/x/.codex"], allowNetwork: false },
       "/home/x",
@@ -378,10 +460,21 @@ describe("Sandbox.run", () => {
     ).rejects.toThrow(/RM-SANDBOX-001|No sandbox mechanism/);
   });
 
-  it.runIf(hasSandbox)("hands the provider its own credential, which the denylist strips", async () => {
-    // The denylist keeps an agent away from credentials that are not its
-    // business. Its own API key is the one that is: without it the documented
-    // "or API keys" path cannot work at all.
+  it("refuses a missing writable file instead of granting its parent directory", () => {
+    const sandbox = new Sandbox(platform() === "linux" ? "bubblewrap" : "seatbelt");
+    expect(() => sandbox.wrap({
+      command: "/usr/bin/true",
+      args: [],
+      cwd: tmpdir(),
+      policy: {
+        writablePaths: [],
+        writableFiles: [join(dir, "missing", "review.json")],
+        allowNetwork: false,
+      },
+    })).toThrow(/Required writable sandbox file|RM-SANDBOX-001/);
+  });
+
+  it.runIf(hasSandbox)("does not expose a provider API key to tool subprocesses", async () => {
     const ws = mkdtempSync(join(tmpdir(), "runmill-cred-"));
     try {
       const result = await new Sandbox(detectMechanism()).run({
@@ -390,9 +483,9 @@ describe("Sandbox.run", () => {
         cwd: ws,
         policy: { writablePaths: [ws], allowNetwork: false },
         timeoutMs: 20_000,
-        credentialEnv: { ANTHROPIC_API_KEY: "sk-test-value" },
+        env: { ANTHROPIC_API_KEY: "sk-test-value" },
       });
-      expect(result.stdout.trim()).toBe("sk-test-value");
+      expect(result.stdout.trim()).toBe("absent");
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
@@ -544,6 +637,108 @@ describe("Sandbox.run", () => {
     expect(result.outcome).toBe("exited");
     expect(existsSync(target)).toBe(true);
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.runIf(hasSandbox)(
+    "permits normal edits but DENIES writes to planted Git config and hooks",
+    async () => {
+      const workspace = mkdtempSync(join(tmpdir(), "runmill-git-boundary-"));
+      const gitDir = join(workspace, ".git");
+      const config = join(gitDir, "config");
+      const hook = join(gitDir, "hooks", "pre-commit");
+      mkdirSync(join(gitDir, "hooks"), { recursive: true });
+      writeFileSync(config, "[core]\n\trepositoryformatversion = 0\n");
+      writeFileSync(hook, "#!/bin/sh\nexit 0\n");
+
+      try {
+        // Non-vacuity: these are ordinary writable files outside the sandbox.
+        const originalConfig = readFileSync(config, "utf8");
+        writeFileSync(config, `${originalConfig}# outside-write-worked\n`);
+        expect(readFileSync(config, "utf8")).toContain("outside-write-worked");
+        writeFileSync(config, originalConfig);
+
+        const result = await new Sandbox(detectMechanism()).run({
+          command: "/bin/sh",
+          args: [
+            "-c",
+            "printf normal > normal.txt; " +
+              "printf pwn >> .git/config; printf '# pwn' >> .git/hooks/pre-commit",
+          ],
+          cwd: workspace,
+          policy: {
+            writablePaths: [workspace],
+            protectedPaths: [gitDir],
+            allowNetwork: false,
+          },
+          timeoutMs: 20_000,
+        });
+
+        expect(readFileSync(join(workspace, "normal.txt"), "utf8")).toBe("normal");
+        expect(readFileSync(config, "utf8")).toBe(originalConfig);
+        expect(readFileSync(hook, "utf8")).toBe("#!/bin/sh\nexit 0\n");
+        expect(result.exitCode).not.toBe(0);
+      } finally {
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  it.runIf(hasSandbox)("DENIES rewriting a linked-checkout .git pointer file", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "runmill-git-pointer-"));
+    const dotGit = join(workspace, ".git");
+    const original = "gitdir: /outside/worktrees/check\n";
+    writeFileSync(dotGit, original);
+    try {
+      // Non-vacuity: the pointer is writable without the sandbox.
+      writeFileSync(dotGit, `${original}# outside-write-worked\n`);
+      expect(readFileSync(dotGit, "utf8")).toContain("outside-write-worked");
+      writeFileSync(dotGit, original);
+
+      const result = await new Sandbox(detectMechanism()).run({
+        command: "/bin/sh",
+        args: ["-c", "printf normal > normal.txt; printf pwn >> .git"],
+        cwd: workspace,
+        policy: {
+          writablePaths: [workspace],
+          protectedPaths: [dotGit],
+          allowNetwork: false,
+        },
+        timeoutMs: 20_000,
+      });
+
+      expect(readFileSync(join(workspace, "normal.txt"), "utf8")).toBe("normal");
+      expect(readFileSync(dotGit, "utf8")).toBe(original);
+      expect(result.exitCode).not.toBe(0);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it.runIf(hasSandbox)("refuses a missing protective mount instead of silently dropping it", () => {
+    const workspace = mkdtempSync(join(tmpdir(), "runmill-missing-protection-"));
+    try {
+      let thrown: unknown;
+      try {
+        new Sandbox(detectMechanism()).wrap({
+          command: "/bin/true",
+          args: [],
+          cwd: workspace,
+          policy: {
+            writablePaths: [workspace],
+            protectedPaths: [join(workspace, ".git")],
+            allowNetwork: false,
+          },
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toMatchObject({
+        whatHappened: expect.stringMatching(/missing protective mount|does not exist/i),
+      });
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
   });
 
   it.runIf(hasSandbox)("DENIES reading a credential path", async () => {

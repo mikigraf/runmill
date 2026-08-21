@@ -52,6 +52,8 @@ export async function selectNext(input: SelectNextInput): Promise<SelectionResul
     repositoryRules: config.github.repositories,
     capacityAvailable: input.capacityAvailable ?? true,
     leasedIssueIds: input.leasedIssueIds,
+    allowUnassigned: config.backlog.allowUnassigned,
+    claimAssignee: config.backlog.claimAssignee,
     maxEstimate: config.backlog.maxEstimate,
     readinessOverrideLabel: config.backlog.includeLabels.includes("agent-ready")
       ? "agent-ready"
@@ -63,7 +65,7 @@ export async function selectNext(input: SelectNextInput): Promise<SelectionResul
 
   // Order first, then evaluate, so the eligible list is already in priority
   // order and the first entry is the selection.
-  for (const issue of orderIssues(candidates)) {
+  for (const issue of orderIssues(candidates, config.backlog.selection)) {
     const decision = evaluateEligibility(issue, policy);
     if (decision.eligible && decision.target !== undefined) {
       eligible.push({ issue, target: decision.target, decision });

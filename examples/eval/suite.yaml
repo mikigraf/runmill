@@ -25,7 +25,7 @@ tasks:
       identifier: EV-1
       title: Crash when the config has no repositories block
       description: |
-        Loading a runmill.yaml with no `github.repositories` throws a
+        Loading an operator policy with no `github.repositories` throws a
         TypeError instead of a validation error.
 
         Acceptance criteria:

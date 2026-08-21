@@ -1,4 +1,5 @@
 import type { EvalTask, ExpectedOutcome, TaskSplit } from "./suite.js";
+import { evaluateChangedPathScope } from "../workspace/path-scope.js";
 
 /** Terminal run states, mapped onto what the suite asked for. */
 const OUTCOME_OF_STATE: Readonly<Record<string, ExpectedOutcome>> = {
@@ -86,16 +87,17 @@ export function scoreDiffScope(
   if (allowed === undefined || allowed.length === 0) {
     return { evaluator: "diff-scope", passed: true, detail: "no path constraint declared" };
   }
-  const outside = changedPaths.filter(
-    (p) => !allowed.some((a) => p === a || p.startsWith(a.replace(/\*+$/, ""))),
-  );
+  const result = evaluateChangedPathScope(changedPaths, {
+    allowedPaths: allowed,
+    forbiddenPaths: [],
+  });
   return {
     evaluator: "diff-scope",
-    passed: outside.length === 0,
+    passed: result.accepted,
     detail:
-      outside.length === 0
+      result.accepted
         ? `all ${changedPaths.length} changed path(s) within scope`
-        : `changed outside declared scope: ${outside.join(", ")}`,
+        : `changed outside declared scope: ${result.violations.map((v) => v.detail).join("; ")}`,
   };
 }
 
