@@ -9,7 +9,10 @@ import {
   loadChecksManifest,
   mergeCheckSources,
 } from "../../src/verification/manifest.js";
-import { DEFAULT_CHECKS_MANIFEST } from "../../src/review/default-skills.js";
+import {
+  DEFAULT_CHECKS_MANIFEST,
+  starterChecksForRepository,
+} from "../../src/review/default-skills.js";
 import type { CheckSpec } from "../../src/verification/engine.js";
 
 let dir: string;
@@ -50,30 +53,62 @@ checks:
     expect(m.checks[0]?.source).toBe("repository-policy");
   });
 
-  it("applies top-level declared_skips to every check", () => {
-    // A skip is a statement about a test. The same test does not become
-    // acceptable to lose because a different command happened to run it.
+  it("scopes declared_skips to the exact report-producing check", () => {
     const m = parseChecksManifest(`
 checks:
   - id: unit
     run: npm test
+    report:
+      path: unit.tap
+      format: tap
+    declared_skips:
+      - test_id: flaky network integration
+        cause: needs a live staging endpoint; tracked in ENG-88
   - id: e2e
     run: npm run e2e
-declared_skips:
-  - test_id: flaky network integration
-    cause: needs a live staging endpoint; tracked in ENG-88
 `);
-    expect(m.declaredSkips).toHaveLength(1);
-    for (const check of m.checks) {
-      expect(check.declaredSkips?.[0]?.cause).toContain("ENG-88");
-    }
+    expect(m.checks[0]?.declaredSkips?.[0]?.cause).toContain("ENG-88");
+    expect(m.checks[1]?.declaredSkips).toBeUndefined();
   });
 
-  it("parses the manifest that `runmill init` writes", () => {
+  it("infers only npm scripts that actually exist when `runmill init` writes a manifest", () => {
     // init writing a file the loader rejects would be the worst possible
     // first-run experience.
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ scripts: { typecheck: "tsc --noEmit", test: "vitest", deploy: "nope" } }),
+    );
+    writeFileSync(join(dir, "package-lock.json"), '{"lockfileVersion":3,"packages":{}}\n');
+    const starter = starterChecksForRepository(dir);
+    const m = parseChecksManifest(starter.content);
+    expect(starter.inferred).toEqual(["typecheck", "test"]);
+    expect(m.checks.map((check) => check.id)).toEqual(["typecheck", "test"]);
+    expect(validateChecksManifest(m)).toEqual([]);
+  });
+
+  it("writes an explicit empty manifest instead of guessing commands for another ecosystem", () => {
+    writeFileSync(join(dir, "pyproject.toml"), "[project]\nname='fixture'\n");
+    const starter = starterChecksForRepository(dir);
+    const m = parseChecksManifest(starter.content);
+
+    expect(starter.inferred).toEqual([]);
+    expect(m.checks).toEqual([]);
+    expect(starter.content).toMatch(/No safe project check was inferred/i);
+    expect(validateChecksManifest(m)).toEqual([]);
+  });
+
+  it("does not accept npm's placeholder test script as verification", () => {
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ scripts: { test: 'echo "Error: no test specified" && exit 1' } }),
+    );
+    writeFileSync(join(dir, "package-lock.json"), '{"lockfileVersion":3,"packages":{}}\n');
+    expect(starterChecksForRepository(dir).inferred).toEqual([]);
+  });
+
+  it("keeps the context-free fallback syntactically valid and fail-closed", () => {
     const m = parseChecksManifest(DEFAULT_CHECKS_MANIFEST);
-    expect(m.checks.length).toBeGreaterThan(0);
+    expect(m.checks).toEqual([]);
     expect(validateChecksManifest(m)).toEqual([]);
   });
 });
@@ -95,9 +130,56 @@ describe("validateChecksManifest", () => {
     // A skip with no stated cause is exactly the undocumented skip this file
     // exists to prevent.
     const errors = validateChecksManifest(
-      parseChecksManifest("checks:\n  - id: a\n    run: x\ndeclared_skips:\n  - test_id: t\n"),
+      parseChecksManifest(
+        "checks:\n  - id: a\n    run: x\n    report:\n      path: a.tap\n      format: tap\n    declared_skips:\n      - test_id: t\n",
+      ),
     );
     expect(errors.join(" ")).toMatch(/missing cause/);
+  });
+
+  it("rejects unscoped top-level skip declarations", () => {
+    const errors = validateChecksManifest(
+      parseChecksManifest(
+        "checks:\n  - id: a\n    run: x\ndeclared_skips:\n  - test_id: t\n    cause: old shape\n",
+      ),
+    );
+    expect(errors.join(" ")).toMatch(/top-level.*unscoped/i);
+  });
+
+  it("rejects duplicate and empty test ids within a check", () => {
+    const errors = validateChecksManifest(
+      parseChecksManifest(`
+checks:
+  - id: a
+    run: x
+    report:
+      path: a.tap
+      format: tap
+    declared_skips:
+      - test_id: ""
+        cause: missing
+      - test_id: same
+        cause: one
+      - test_id: same
+        cause: two
+`),
+    );
+    expect(errors.join(" ")).toMatch(/missing test_id/i);
+    expect(errors.join(" ")).toMatch(/duplicate test_id/i);
+  });
+
+  it("rejects exact skip declarations on a check with no report", () => {
+    const errors = validateChecksManifest(
+      parseChecksManifest(`
+checks:
+  - id: a
+    run: x
+    declared_skips:
+      - test_id: A
+        cause: tracked
+`),
+    );
+    expect(errors.join(" ")).toMatch(/require a report/i);
   });
 
   it("reports every problem at once", () => {
@@ -105,6 +187,24 @@ describe("validateChecksManifest", () => {
       parseChecksManifest("checks:\n  - id: a\n  - id: a\n"),
     );
     expect(errors.length).toBeGreaterThan(1);
+  });
+
+  it("rejects report paths that escape the verification checkout", () => {
+    const errors = validateChecksManifest(
+      parseChecksManifest(
+        "checks:\n  - id: a\n    run: x\n    report:\n      path: ../report.json\n      format: json\n",
+      ),
+    );
+    expect(errors.join(" ")).toMatch(/stay inside/i);
+  });
+
+  it("rejects report formats the engine cannot parse", () => {
+    const errors = validateChecksManifest(
+      parseChecksManifest(
+        "checks:\n  - id: a\n    run: x\n    report:\n      path: report.txt\n      format: text\n",
+      ),
+    );
+    expect(errors.join(" ")).toMatch(/junit, tap, go-json/);
   });
 });
 
@@ -179,6 +279,17 @@ describe("loadChecksManifest", () => {
       expect(added?.readFrom).toBe("working-tree");
       expect(added?.checks[0]?.id).toBe("new");
     });
+
+    it("refuses an invalid base ref instead of trusting mutable working-tree policy", () => {
+      writeManifest("checks: []\n");
+      expect(() =>
+        loadChecksManifest({
+          repoRoot: dir,
+          manifestPath: ".runmill/checks.yaml",
+          baseRef: "missing-base",
+        }),
+      ).toThrow(/RM-VERIFY-004/);
+    });
   });
 });
 
@@ -195,10 +306,12 @@ describe("mergeCheckSources", () => {
     expect(merged.map((c) => c.id).sort()).toEqual(["a", "b"]);
   });
 
-  it("lets the repository win a conflict", () => {
-    // The repository is the thing that knows how to build itself.
-    const merged = mergeCheckSources([spec("a", "repo-cmd")], [spec("a", "config-cmd")]);
+  it("preserves the operator definition when repository policy reuses its id", () => {
+    // Repository-controlled input may add a requirement but cannot replace an
+    // operator-owned command with one that runs under orchestrator authority.
+    const operator = spec("a", "config-cmd");
+    const merged = mergeCheckSources([spec("a", "repo-cmd")], [operator]);
     expect(merged).toHaveLength(1);
-    expect(merged[0]?.run).toBe("repo-cmd");
+    expect(merged[0]).toBe(operator);
   });
 });

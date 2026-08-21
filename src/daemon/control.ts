@@ -99,7 +99,7 @@ export function readDaemonRegistry(path = daemonRuntimePaths().registry): Daemon
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    throw new Error("No Runmill daemon is registered. Start one with `runmill daemon --detach`.");
+    throw new Error("No Runmill daemon is registered. Start one with `runmill start`.");
   }
   const value = parsed as Partial<DaemonRegistry>;
   if (

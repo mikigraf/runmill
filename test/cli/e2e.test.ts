@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { run } from "../../src/platform/process.js";
-import { mkdtempSync, rmSync, writeFileSync, cpSync } from "node:fs";
+import { run, runWithInput } from "../../src/platform/process.js";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, cpSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 
 const CLI = resolve(process.cwd(), "src/cli/main.ts");
 const QUICKSTART = resolve(process.cwd(), "examples/quickstart");
@@ -12,6 +12,10 @@ const QUICKSTART = resolve(process.cwd(), "examples/quickstart");
 // cannot see this project's node_modules and would try to DOWNLOAD tsx —
 // making the suite depend on the network and on a shared mutable npm cache.
 const TSX = resolve(process.cwd(), "node_modules/.bin/tsx");
+// Doctor now proves execution with a real, potentially billable model turn.
+// E2E tests exercise its CLI rendering with providers absent; unit tests inject
+// local provider fakes for both pass and refusal paths.
+const TEST_PATH = [dirname(process.execPath), "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(delimiter);
 
 let dir: string;
 
@@ -27,11 +31,17 @@ afterEach(() => {
 async function cli(
   args: string[],
   env: Record<string, string> = {},
+  stdin?: string,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  const result = await run(TSX, [CLI, ...args], {
-    cwd: dir,
-    env: { ...process.env, ...env },
-  });
+  // The quickstart fixture intentionally keeps policy in the repository for
+  // inspection. Real discovery defaults outside the repository, so E2E tests
+  // opt into this fixture explicitly instead of weakening the production
+  // boundary with a legacy cwd fallback.
+  const commandArgs = [CLI, "--config", join(dir, "runmill.yaml"), ...args];
+  const options = { cwd: dir, env: { ...process.env, PATH: TEST_PATH, ...env } };
+  const result = stdin === undefined
+    ? await run(TSX, commandArgs, options)
+    : await runWithInput(TSX, commandArgs, stdin, options);
   return { code: result.code ?? 1, stdout: result.stdout, stderr: result.stderr };
 }
 
@@ -40,7 +50,7 @@ describe("runmill next --dry-run", () => {
     const r = await cli(["next", "--dry-run"], { RUNMILL_FAKE_BACKLOG: "issues.json" });
     expect(r.code).toBe(0);
     expect(r.stdout).toContain("ENG-102");
-    expect(r.stdout).toContain("acme/ios");
+    expect(r.stdout).toContain("acme/platform");
   });
 
   it("sorts an unprioritized issue last even when it is by far the oldest", async () => {
@@ -61,13 +71,17 @@ describe("runmill next --dry-run", () => {
     const r = await cli(["--json", "next"], { RUNMILL_FAKE_BACKLOG: "issues.json" });
     const parsed = JSON.parse(r.stdout) as {
       selected: { identifier: string; repo: string } | null;
-      rejected: { identifier: string; rules: unknown[] }[];
+      rejected: { identifier: string; rules: { rule: string }[] }[];
     };
     expect(parsed.selected?.identifier).toBe("ENG-102");
-    expect(parsed.selected?.repo).toBe("acme/ios");
+    expect(parsed.selected?.repo).toBe("acme/platform");
     expect(parsed.rejected).toHaveLength(2);
-    // Every rule is present for a rejected candidate, not only failures.
-    expect(parsed.rejected[0]?.rules).toHaveLength(9);
+    // Every policy class is present for a rejected candidate, not only the
+    // rules that happened to fail. Avoid a brittle total when a new
+    // fail-closed rule is added.
+    expect(parsed.rejected[0]?.rules.map((result) => result.rule)).toEqual(
+      expect.arrayContaining(["workflow-state", "labels", "assignment", "dependencies"]),
+    );
   });
 
   it("prints nothing extra under --quiet", async () => {
@@ -81,6 +95,33 @@ describe("runmill config validate", () => {
     const r = await cli(["config", "validate"]);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain("is valid");
+  });
+
+  it("refuses an empty check union before the first live run", async () => {
+    mkdirSync(join(dir, ".runmill"), { recursive: true });
+    writeFileSync(join(dir, ".runmill/checks.yaml"), "checks: []\n");
+    const policy = join(dir, "runmill.yaml");
+    writeFileSync(
+      policy,
+      readFileSync(policy, "utf8").replace(
+        /\n# This fixture has no application[\s\S]*$/u,
+        "\nverification:\n  commands: []\n",
+      ),
+    );
+
+    const r = await cli(["config", "validate"]);
+
+    expect(r.code).toBe(2);
+    expect(`${r.stdout}\n${r.stderr}`).toMatch(/declares no checks/i);
+  });
+
+  it("accepts an operator-owned command when the repository manifest is empty", async () => {
+    mkdirSync(join(dir, ".runmill"), { recursive: true });
+    writeFileSync(join(dir, ".runmill/checks.yaml"), "checks: []\n");
+
+    const r = await cli(["config", "validate"]);
+
+    expect(r.code).toBe(0);
   });
 
   it("exits 2 and lists every violation for a bad config", async () => {
@@ -98,9 +139,48 @@ describe("runmill config validate", () => {
     );
     const r = await cli(["config", "validate"]);
     expect(r.code).toBe(2);
-    expect(r.stdout).toMatch(/autonomy/);
-    expect(r.stdout).toMatch(/at least one mapping rule/);
-    expect(r.stdout).toMatch(/\{attempt\}/);
+    const diagnostic = `${r.stdout}\n${r.stderr}`;
+    expect(diagnostic).toMatch(/autonomy/);
+    expect(diagnostic).toMatch(/at least one mapping rule|repositories.*item/i);
+    expect(diagnostic).toMatch(/\{attempt\}|branch_template.*pattern/i);
+  });
+
+  it("resolves repository-owned paths from the git root when invoked in a subdirectory", async () => {
+    mkdirSync(join(dir, ".git"));
+    const nested = join(dir, "packages", "app");
+    mkdirSync(nested, { recursive: true });
+    const result = await run(
+      TSX,
+      [CLI, "--config", join(dir, "runmill.yaml"), "config", "validate"],
+      { cwd: nested, env: process.env },
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("is valid");
+  });
+});
+
+describe("runmill auth login", () => {
+  it.each([
+    ["a separate value", ["--token", "lin_api_must_not_reach_diagnostics"]],
+    ["an equals value", ["--token=lin_api_must_not_reach_diagnostics"]],
+  ])("rejects the removed --token argv path with %s without reflecting it", async (_name, args) => {
+    const secret = "lin_api_must_not_reach_diagnostics";
+
+    const result = await cli(["auth", "login", "linear", ...args]);
+
+    expect(result.code).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain(secret);
+    expect(result.stderr).toMatch(/--token credential option is not accepted/);
+  });
+
+  it("refuses empty stdin with a pipe-only command that contains no secret", async () => {
+    const result = await cli(["auth", "login", "linear"], {}, "");
+
+    expect(result.code).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "printenv LINEAR_API_KEY | runmill auth login linear",
+    );
+    expect(`${result.stdout}\n${result.stderr}`).not.toMatch(/lin_api_[A-Za-z0-9]/u);
   });
 });
 
@@ -131,6 +211,20 @@ describe("runmill doctor", () => {
     const out = JSON.parse(r.stdout) as { checks: { id: string }[] };
     expect(out.checks.length).toBeGreaterThan(0);
     expect(out.checks.every((c) => c.id.startsWith("sandbox"))).toBe(true);
+  });
+
+  it("scopes dependency readiness and refuses a fixture with no trusted remote", async () => {
+    const r = await cli(["--json", "doctor", "--check", "verification:dependencies"]);
+    const out = JSON.parse(r.stdout) as {
+      checks: { id: string; status: string; code?: string }[];
+    };
+
+    expect(out.checks).toHaveLength(1);
+    expect(out.checks[0]).toMatchObject({
+      id: "verification:dependencies",
+      status: "fail",
+      code: "RM-VERIFY-005",
+    });
   });
 
   it("proves the sandbox denies a credential read rather than assuming it", async () => {

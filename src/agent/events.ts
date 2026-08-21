@@ -113,17 +113,28 @@ export interface UsageTotals {
   inputTokens: number;
   outputTokens: number;
   costUsd: number;
+  /** Distinguishes a real zero from a provider that supplied no dollar data. */
+  costReported: boolean;
   model: string | undefined;
 }
 
 export function accumulateUsage(events: readonly AgentEvent[]): UsageTotals {
-  const totals: UsageTotals = { inputTokens: 0, outputTokens: 0, costUsd: 0, model: undefined };
+  const totals: UsageTotals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    costUsd: 0,
+    costReported: false,
+    model: undefined,
+  };
   for (const event of events) {
     if (event.type !== "usage.updated") continue;
     // Cumulative: take the latest reading rather than summing deltas.
     totals.inputTokens = event.inputTokens;
     totals.outputTokens = event.outputTokens;
-    totals.costUsd = event.costUsd ?? totals.costUsd;
+    if (event.costUsd !== undefined) {
+      totals.costUsd = event.costUsd;
+      totals.costReported = true;
+    }
     totals.model = event.model;
   }
   return totals;

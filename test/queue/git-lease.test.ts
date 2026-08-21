@@ -116,6 +116,13 @@ describe("GitRefLease.acquire", () => {
     expect(held.expiresAt).toBe("2026-08-06T10:20:00.000Z");
   });
 
+  it("keeps the placeholder identity and epoch date confined to internal lease objects", async () => {
+    const held = await lease(workA, "run_a").acquire("ENG-1");
+    expect(git(workA, "show", "-s", "--format=%an%x00%ae%x00%at", held.objectId)).toBe(
+      ["runmill", "runmill@localhost", "0"].join("\0"),
+    );
+  });
+
   it("EXCLUDES a second claimant: this is the mutual exclusion FR-04 requires", async () => {
     // Two independent clones, both believing the issue is free. Only one may win.
     await lease(workA, "run_a").acquire("ENG-1");

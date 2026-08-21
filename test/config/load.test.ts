@@ -18,6 +18,7 @@ backlog:
   team: ENG
   eligible_states: [Todo, Ready]
   claim_state: In Progress
+  delivered_state: In Review
 github:
   repositories:
     - match: { team: ENG }
@@ -69,15 +70,167 @@ describe("parseConfig", () => {
     expect(fromConfig, "config default must match WorkspaceManager's").toBe(managerDefault);
   });
 
+  it("rejects linked-worktree isolation because its Git metadata is outside the sandbox", () => {
+    expect(() =>
+      parseConfig(`${MINIMAL}\nworkspace:\n  git_isolation: separate-git-dir\n`),
+    ).toThrow(/Configuration is invalid/);
+  });
+
+  it("rejects the unimplemented container sandbox backend", () => {
+    expect(() => parseConfig(`${MINIMAL}\nworkspace:\n  sandbox: container\n`)).toThrow(
+      /Configuration is invalid/,
+    );
+  });
+
+  it("rejects backlog providers without a live adapter", () => {
+    expect(() =>
+      parseConfig(MINIMAL.replace("provider: linear", "provider: github-issues")),
+    ).toThrow(/Configuration is invalid/);
+  });
+
+  it("requires pr-only delivery to move the issue out of the eligible queue", () => {
+    const config = parseConfig(MINIMAL.replace("  delivered_state: In Review\n", ""));
+    expect(validateConfig(config).errors.join("\n")).toMatch(
+      /pr-only requires backlog\.delivered_state/i,
+    );
+  });
+
+  it.each([
+    ["claim_state", "  claim_state: In Progress", "  claim_state: Todo"],
+    ["delivered_state", "  delivered_state: In Review", "  delivered_state: Ready"],
+    ["completed_state", "  delivered_state: In Review", "  delivered_state: In Review\n  completed_state: todo"],
+  ])("rejects %s when it overlaps an eligible state", (_key, before, after) => {
+    const config = parseConfig(MINIMAL.replace(before, after));
+    expect(validateConfig(config).errors.join("\n")).toMatch(/must not overlap.*eligible_states/i);
+  });
+
+  it("rejects duplicate eligible state names without relying on case", () => {
+    const config = parseConfig(MINIMAL.replace("[Todo, Ready]", "[Todo, todo]"));
+    expect(validateConfig(config).errors.join("\n")).toMatch(/same Linear state more than once/i);
+  });
+
+  it("rejects dollar caps that a configured provider cannot report", () => {
+    const cfg = parseConfig(`${MINIMAL}\nbudgets:\n  max_cost_usd_per_issue: 1\n`);
+    expect(validateConfig(cfg).errors.join("\n")).toMatch(/Codex adapter does not/i);
+  });
+
+  it("rejects a dollar cap explicitly paired with wall-only enforcement", () => {
+    const source = MINIMAL.replace("implementation: codex", "implementation: claude") +
+      "\nbudgets:\n  max_cost_usd_per_issue: 1\n  cost_enforcement: wall-and-invocations-only\n";
+    expect(validateConfig(parseConfig(source)).errors.join("\n")).toMatch(/cannot be combined/i);
+  });
+
+  it("rejects a daily dollar cap when a configured provider cannot report cost", () => {
+    const cfg = parseConfig(`${MINIMAL}\nbudgets:\n  daily_cost_usd: 1\n`);
+    expect(validateConfig(cfg).errors.join("\n")).toMatch(/Codex adapter does not/i);
+  });
+
+  it("rejects a daily dollar cap paired with wall-only enforcement", () => {
+    const source = MINIMAL.replace("implementation: codex", "implementation: claude") +
+      "\nbudgets:\n  daily_cost_usd: 1\n  cost_enforcement: wall-and-invocations-only\n";
+    expect(validateConfig(parseConfig(source)).errors.join("\n")).toMatch(/cannot be combined/i);
+  });
+
   it("tolerates a yaml-language-server schema header", () => {
     const cfg = parseConfig(
       `# yaml-language-server: $schema=https://raw.githubusercontent.com/mikigraf/runmill/main/runmill.schema.json\n${MINIMAL}`,
     );
     expect(cfg.version).toBe(1);
   });
+
+  it("rejects misspelled authority and risk keys instead of defaulting them away", () => {
+    const source = MINIMAL
+      .replace("  claim_state: In Progress", "  claim_state: In Progress\n  include_label: [agent-ready]") +
+      "\nrisk:\n  manual_approval:\n    path: [src/auth/**]\n";
+    try {
+      parseConfig(source);
+      expect.unreachable("unknown policy keys must fail closed");
+    } catch (error) {
+      expect(error).toBeInstanceOf(RunmillError);
+      const detail = (error as RunmillError).whatHappened;
+      expect(detail).toContain("backlog.include_label");
+      expect(detail).toContain("risk.manual_approval.path");
+    }
+  });
+
+  it("rejects the wrong type rather than coercing it to a permissive default", () => {
+    try {
+      parseConfig(
+        MINIMAL.replace(
+          "  claim_state: In Progress",
+          "  claim_state: In Progress\n  include_labels: agent-ready",
+        ),
+      );
+      expect.unreachable("a scalar include_labels value must be rejected");
+    } catch (error) {
+      expect(error).toBeInstanceOf(RunmillError);
+      expect((error as RunmillError).whatHappened).toMatch(/include_labels.*array/i);
+    }
+  });
+
+  it.each([
+    {
+      key: "context",
+      source: `${MINIMAL}\ncontext:\n  entry_files: [AGENTS.md]\n`,
+    },
+    {
+      key: "blocked_state",
+      source: MINIMAL.replace(
+        "  claim_state: In Progress",
+        "  claim_state: In Progress\n  blocked_state: Blocked",
+      ),
+    },
+    {
+      key: "delete_branch",
+      source: MINIMAL.replace(
+        "      base_branch: main",
+        "      base_branch: main\n  merge:\n    delete_branch: true",
+      ),
+    },
+    {
+      key: "clean_untracked_files",
+      source: `${MINIMAL}\nworkspace:\n  clean_untracked_files: true\n`,
+    },
+    {
+      key: "changed_area_rules",
+      source:
+        `${MINIMAL}\nverification:\n  changed_area_rules:\n` +
+        "    src/**:\n      additional_checks: [integration]\n",
+    },
+    {
+      key: "stack_dependency_chains",
+      source: MINIMAL.replace(
+        "  repositories:",
+        "  stack_dependency_chains: true\n  repositories:",
+      ),
+    },
+    {
+      key: "stack_max_depth",
+      source: MINIMAL.replace(
+        "  repositories:",
+        "  stack_max_depth: 4\n  repositories:",
+      ),
+    },
+  ])("rejects the unsupported $key setting instead of pretending to enforce it", ({ key, source }) => {
+    try {
+      parseConfig(source);
+      expect.unreachable(`${key} must fail strict schema validation`);
+    } catch (error) {
+      expect(error).toBeInstanceOf(RunmillError);
+      expect((error as RunmillError).whatHappened).toContain(key);
+    }
+  });
 });
 
 describe("validateConfig", () => {
+  it("requires an automation identity when unassigned issues are excluded", () => {
+    const cfg = parseConfig(
+      MINIMAL.replace("  claim_state: In Progress", "  claim_state: In Progress\n  allow_unassigned: false"),
+    );
+    expect(validateConfig(cfg)).toMatchObject({ valid: false });
+    expect(validateConfig(cfg).errors.join("\n")).toMatch(/claim_assignee/);
+  });
+
   it("accepts a valid configuration", () => {
     expect(validateConfig(parseConfig(MINIMAL)).valid).toBe(true);
   });
@@ -86,6 +239,77 @@ describe("validateConfig", () => {
     const result = validateConfig({ ...parseConfig(MINIMAL), autonomy: "yolo" } as never);
     expect(result.valid).toBe(false);
     expect(result.errors.join(" ")).toMatch(/autonomy/);
+  });
+
+  it("requires a second explicit gate for automatic merge modes", () => {
+    const cfg = parseConfig(MINIMAL);
+    const closed = validateConfig({ ...cfg, autonomy: "guarded-merge" });
+    expect(closed.valid).toBe(false);
+    expect(closed.errors.join(" ")).toMatch(/experimental\.automatic_merge/);
+
+    const optedIn = validateConfig({
+      ...cfg,
+      autonomy: "guarded-merge",
+      experimental: { automaticMerge: true },
+    });
+    expect(optedIn.valid).toBe(true);
+  });
+
+  it("requires proven local coverage in automatic-merge modes", () => {
+    const cfg = parseConfig(MINIMAL);
+    const result = validateConfig({
+      ...cfg,
+      autonomy: "guarded-merge",
+      experimental: { automaticMerge: true },
+      verification: { ...cfg.verification, failOnSkippedCheck: false },
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.errors.join(" ")).toMatch(/fail_on_skipped_check.*unproven/i);
+  });
+
+  it("rejects a network allowlist until hostname filtering is enforceable", () => {
+    const cfg = parseConfig(MINIMAL);
+    const result = validateConfig({
+      ...cfg,
+      workspace: { ...cfg.workspace, networkAllowlist: ["api.openai.com"] },
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors.join(" ")).toMatch(/network_allowlist.*not enforceable/);
+  });
+
+  it("rejects network:none for a live delivery mode", () => {
+    const cfg = parseConfig(`${MINIMAL}\nworkspace:\n  network: none\n`);
+    const result = validateConfig(cfg);
+    expect(result.valid).toBe(false);
+    expect(result.errors.join(" ")).toMatch(/network.*none.*observe/i);
+  });
+
+  it("accepts network:none only when observe means no provider runs", () => {
+    const cfg = parseConfig(
+      `${MINIMAL.replace("autonomy: pr-only", "autonomy: observe")}\nworkspace:\n  network: none\n`,
+    );
+    expect(validateConfig(cfg).valid).toBe(true);
+  });
+
+  it("rejects unknown or empty risk policy values before a run starts", () => {
+    const cfg = parseConfig(MINIMAL);
+    const result = validateConfig({
+      ...cfg,
+      risk: {
+        default: "unknown" as never,
+        manualApproval: {
+          paths: [""],
+          labels: [""],
+          conditions: ["future_condition"],
+        },
+      },
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors.join(" ")).toMatch(/risk\.default/);
+    expect(result.errors.join(" ")).toMatch(/manual_approval\.conditions/);
+    expect(result.errors.join(" ")).toMatch(/manual_approval\.paths/);
+    expect(result.errors.join(" ")).toMatch(/manual_approval\.labels/);
   });
 
   it("rejects a branch template without {attempt}", () => {
@@ -99,6 +323,26 @@ describe("validateConfig", () => {
     const result = validateConfig(broken);
     expect(result.valid).toBe(false);
     expect(result.errors.join(" ")).toMatch(/attempt/);
+  });
+
+  it("rejects operator report declarations the verification engine cannot consume", () => {
+    const cfg = parseConfig(MINIMAL);
+    const result = validateConfig({
+      ...cfg,
+      verification: {
+        ...cfg.verification,
+        commands: [
+          {
+            id: "unit",
+            run: "npm test",
+            report: { path: "../outside.json", format: "made-up" },
+          },
+        ],
+      },
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors.join(" ")).toMatch(/report\.path.*inside/i);
+    expect(result.errors.join(" ")).toMatch(/report\.format.*junit, tap, go-json/i);
   });
 
   it("rejects an empty repository rule list", () => {
@@ -133,6 +377,16 @@ describe("validateConfig", () => {
     });
     expect(result.valid).toBe(false);
     expect(result.errors.join(" ")).toMatch(/identical match/i);
+  });
+
+  it("rejects routes to more than one repository from a single local checkout", () => {
+    const cfg = parseConfig(
+      MINIMAL.replace(
+        "      base_branch: main",
+        "      base_branch: main\n    - match: { project: mobile }\n      repo: acme/mobile\n      base_branch: main",
+      ),
+    );
+    expect(validateConfig(cfg).errors.join("\n")).toMatch(/same owner\/name/i);
   });
 
   it("reports every violation, not just the first", () => {

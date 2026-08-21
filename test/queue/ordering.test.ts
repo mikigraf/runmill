@@ -91,6 +91,33 @@ describe("orderIssues", () => {
     expect(ordered.map((i) => i.identifier)).toEqual(["ENG-2", "ENG-9"]);
   });
 
+  it("honors configured selection keys instead of silently using defaults", () => {
+    const ordered = orderIssues(
+      [
+        issue({
+          identifier: "Z-OLD-URGENT",
+          priority: 1,
+          dueDate: "2026-01-01",
+          createdAt: "2020-01-01T00:00:00Z",
+        }),
+        issue({
+          identifier: "A-NEW-LOW",
+          priority: 4,
+          dueDate: "2027-01-01",
+          createdAt: "2026-01-01T00:00:00Z",
+        }),
+      ],
+      {
+        priorityFirst: false,
+        unprioritizedLast: false,
+        dueDateTiebreaker: false,
+        oldestFirst: false,
+      },
+    );
+
+    expect(ordered.map((i) => i.identifier)).toEqual(["A-NEW-LOW", "Z-OLD-URGENT"]);
+  });
+
   it("is a total order: every input permutation yields the same result", () => {
     const issues = [
       issue({ identifier: "ENG-1", priority: 0 }),

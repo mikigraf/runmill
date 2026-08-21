@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { selectNext } from "../../src/queue/selector.js";
+import { RULE_IDS } from "../../src/queue/eligibility.js";
 import { FakeBacklogAdapter } from "../../src/testing/fake-backlog.js";
 import { parseConfig } from "../../src/config/load.js";
 import type { BacklogIssue } from "../../src/domain/types.js";
@@ -84,7 +85,7 @@ describe("selectNext", () => {
     const blocked = result.rejected.find((r) => r.issue.identifier === "ENG-BLOCKED");
     expect(blocked?.decision.rules.find((r) => r.rule === "dependencies")?.passed).toBe(false);
     // Every rule is reported for every rejected candidate, not just the failing one.
-    expect(blocked?.decision.rules).toHaveLength(9);
+    expect(blocked?.decision.rules).toHaveLength(RULE_IDS.length);
   });
 
   it("skips issues already leased by another run", async () => {

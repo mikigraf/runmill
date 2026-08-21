@@ -42,12 +42,18 @@ describe("background daemon", () => {
       RUNMILL_DAEMON_REGISTRY: registry,
       RUNMILL_DATA_DIR: data,
     };
-    const started = await run(TSX, [CLI, "daemon", "--detach", "--poll-seconds", "1"], {
+    const started = await run(
+      TSX,
+      [CLI, "--config", join(repository, "runmill.yaml"), "start", "--poll-seconds", "1"],
+      {
       cwd: repository,
       env: environment,
-    });
+      },
+    );
     expect(started.code).toBe(0);
     expect(started.stdout).toContain("runmill tui");
+    expect(started.stdout).toContain("runmill status");
+    expect(started.stdout).toContain("runmill stop");
 
     // The client is intentionally in another directory and receives only the
     // global registry path, never the config or repository path.
@@ -56,7 +62,19 @@ describe("background daemon", () => {
     expect(snapshot.daemon.repoRoot).toBe(realpathSync(repository));
     expect(snapshot.daemon.phase).toBe("idle");
 
-    await requestDaemon({ type: "stop" }, registry);
+    const status = await run(TSX, [CLI, "--json", "status"], {
+      cwd: directory,
+      env: environment,
+    });
+    expect(status.code).toBe(0);
+    expect(JSON.parse(status.stdout)).toMatchObject({
+      running: true,
+      daemon: { repoRoot: realpathSync(repository) },
+    });
+
+    const stopped = await run(TSX, [CLI, "stop"], { cwd: directory, env: environment });
+    expect(stopped.code).toBe(0);
+    expect(stopped.stdout).toContain("stopping after the current safe boundary");
     const deadline = Date.now() + 3_000;
     while (existsSync(registry) && Date.now() < deadline) {
       await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 25));
@@ -64,6 +82,27 @@ describe("background daemon", () => {
     expect(existsSync(registry)).toBe(false);
     daemonPid = undefined;
   }, 20_000);
+
+  it("reports a stopped daemon without creating project state", async () => {
+    directory = mkdtempSync(join(tmpdir(), "runmill-status-client-"));
+    const registry = join(directory, "runtime", "daemon.json");
+    const state = join(directory, "state");
+    const result = await run(TSX, [CLI, "--json", "status"], {
+      cwd: directory,
+      env: { ...process.env, RUNMILL_DAEMON_REGISTRY: registry, RUNMILL_DATA_DIR: state },
+    });
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.stdout)).toEqual({ running: false });
+    expect(existsSync(state)).toBe(false);
+
+    const stopped = await run(TSX, [CLI, "--json", "stop"], {
+      cwd: directory,
+      env: { ...process.env, RUNMILL_DAEMON_REGISTRY: registry, RUNMILL_DATA_DIR: state },
+    });
+    expect(stopped.code).toBe(0);
+    expect(JSON.parse(stopped.stdout)).toEqual({ stopping: false, running: false });
+    expect(existsSync(state)).toBe(false);
+  });
 
   it("does not create repository state when the TUI is launched elsewhere", async () => {
     directory = mkdtempSync(join(tmpdir(), "runmill-tui-client-"));

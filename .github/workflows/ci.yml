@@ -5,35 +5,58 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm install --global npm@11.15.0
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: Generated documentation is current
+        run: npm run docs:check
+
   test:
-    # Both are first-class execution targets and their sandbox mechanisms
-    # differ, so a green macOS run says nothing about Linux.
+    name: test (Node ${{ matrix.node }}, ${{ matrix.os }})
+    # Both platforms are first-class execution targets and their sandbox
+    # mechanisms differ. Both supported LTS lines exercise the full suite.
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        node: [22, 24]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
-
+      - run: npm install --global npm@11.15.0
       - run: npm ci
 
       - name: Install bubblewrap
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
-      # Ubuntu 23.10 and later block unprivileged user namespaces with an
-      # AppArmor profile, and bubblewrap needs one for every sandbox it builds.
-      # Without this the runner has a bwrap binary that cannot create a
-      # namespace, so `Sandbox.run` exits 1 and the Linux half of the matrix
-      # fails on the mechanism rather than on anything runmill did. Proven
-      # rather than assumed, because a runner that silently could not sandbox
-      # would make every enforcement test below pass for the wrong reason.
+      # Ubuntu runners restrict unprivileged user namespaces by default, while
+      # bubblewrap needs one for every sandbox. Prove the mechanism is usable
+      # before running tests so containment cannot silently degrade.
       - name: Allow unprivileged user namespaces
         if: runner.os == 'Linux'
         run: |
@@ -42,17 +65,46 @@ jobs:
           bwrap --dev-bind / / true \
             || { echo "::error::bubblewrap cannot create a user namespace on this runner"; exit 1; }
 
-      - run: npm run typecheck
-      # Coverage thresholds live in vitest.config.ts. Without this step they
-      # were configured but never enforced, so they could drift downward
-      # indefinitely without anything failing.
       - run: npm run test:coverage
 
-      - name: Error reference is current
-        run: npm run docs:check
-
-      - name: Package contains the binary it declares
+  node-current-canary:
+    name: Node 26 canary (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm install --global npm@11.15.0
+      - run: npm ci
+      - name: Install and prove bubblewrap
         run: |
-          npm pack --pack-destination /tmp >/dev/null
-          tar tzf /tmp/runmill-*.tgz | grep -q 'package/dist/cli/main.js' \
-            || { echo "::error::bin target missing from the published package"; exit 1; }
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
+          bwrap --dev-bind / / true
+      - run: npm run test:coverage
+
+  package:
+    name: package smoke (${{ matrix.os }})
+    needs: [quality, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm install --global npm@11.15.0
+      - run: npm ci
+      - name: Pack, install, and execute the published CLI
+        run: npm run package:check

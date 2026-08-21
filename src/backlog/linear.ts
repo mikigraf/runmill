@@ -1,11 +1,22 @@
-import { LinearClient } from "@linear/sdk";
+import { LinearClient, LinearDocument } from "@linear/sdk";
 import type { BacklogAdapter } from "./adapter.js";
-import { AmbiguousMutationError, BacklogRateLimitError } from "./adapter.js";
+import {
+  AmbiguousMutationError,
+  BacklogMutationNotStartedError,
+  BacklogRateLimitError,
+} from "./adapter.js";
 import type { BacklogIssue, BacklogPriority } from "../domain/types.js";
-import { errorMessage } from "../errors/runmill-error.js";
+import { errorMessage, RunmillError } from "../errors/runmill-error.js";
 
 /** Issues hydrated at once. Each fans out to ~6 relation queries. */
 const HYDRATE_CONCURRENCY = 6;
+
+/** Linear rejects larger pages, and smaller requests reduce rate-limit bursts. */
+const MAX_PAGE_SIZE = 100;
+/** Never present an arbitrarily large or changing backlog snapshot as complete. */
+const MAX_CANDIDATES = 1_000;
+/** A changing remote must not keep discovery following cursors forever. */
+const MAX_DISCOVERY_PAGES = 100;
 
 /**
  * Map with a ceiling on in-flight work.
@@ -39,6 +50,8 @@ export interface LinearAdapterOptions {
   readonly apiKey: string;
   /** Bounded page size; selection and ordering happen locally. */
   readonly pageSize?: number | undefined;
+  /** Test/embedding seam that may only narrow the production safety ceiling. */
+  readonly candidateLimit?: number | undefined;
 }
 
 interface RawIssueShape {
@@ -54,6 +67,12 @@ interface RawIssueShape {
   completedAt?: Date | string | null;
 }
 
+interface RawIssueReference {
+  readonly id: string;
+  readonly identifier: string;
+  readonly team: Promise<{ key: string } | undefined>;
+}
+
 function toIsoString(value: Date | string | null | undefined): string | undefined {
   if (value === null || value === undefined) return undefined;
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
@@ -62,6 +81,14 @@ function toIsoString(value: Date | string | null | undefined): string | undefine
 function isRateLimit(err: unknown): boolean {
   const message = errorMessage(err);
   return /rate limit|429|too many requests/i.test(message);
+}
+
+function parseIdentifier(identifier: string): { teamKey: string; number: number } | undefined {
+  const match = identifier.match(/^([A-Za-z][A-Za-z0-9_-]*)-([1-9][0-9]*)$/u);
+  if (match?.[1] === undefined || match[2] === undefined) return undefined;
+  const number = Number(match[2]);
+  if (!Number.isSafeInteger(number)) return undefined;
+  return { teamKey: match[1], number };
 }
 
 /**
@@ -77,12 +104,28 @@ export class LinearBacklogAdapter implements BacklogAdapter {
   readonly name = "linear";
   readonly #client: LinearClient;
   readonly #pageSize: number;
+  readonly #candidateLimit: number;
   /** Workflow states are stable for a run; re-querying them per transition is waste. */
   readonly #stateIds = new Map<string, string>();
 
   constructor(options: LinearAdapterOptions) {
     this.#client = new LinearClient({ apiKey: options.apiKey });
-    this.#pageSize = options.pageSize ?? 100;
+    const pageSize = options.pageSize ?? MAX_PAGE_SIZE;
+    const candidateLimit = options.candidateLimit ?? MAX_CANDIDATES;
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > MAX_PAGE_SIZE) {
+      throw new RangeError(`Linear pageSize must be an integer from 1 to ${MAX_PAGE_SIZE}`);
+    }
+    if (
+      !Number.isSafeInteger(candidateLimit) ||
+      candidateLimit < 1 ||
+      candidateLimit > MAX_CANDIDATES
+    ) {
+      throw new RangeError(
+        `Linear candidateLimit must be an integer from 1 to ${MAX_CANDIDATES}`,
+      );
+    }
+    this.#pageSize = pageSize;
+    this.#candidateLimit = candidateLimit;
   }
 
   async #wrap<T>(fn: () => Promise<T>): Promise<T> {
@@ -99,33 +142,111 @@ export class LinearBacklogAdapter implements BacklogAdapter {
     states: readonly string[];
   }): Promise<BacklogIssue[]> {
     return this.#wrap(async () => {
-      const connection = await this.#client.issues({
-        first: this.#pageSize,
-        filter: {
-          team: { key: { eq: input.team } },
-          state: { name: { in: [...input.states] } },
-        },
-      });
+      const nodes: Array<{
+        raw: RawIssueShape;
+        node: unknown;
+      }> = [];
+      const seenCursors = new Set<string>();
+      let after: string | undefined;
 
-      // Bounded concurrency, not unbounded. Each issue fans out to ~6 lazy
-      // relation queries, so an unbounded Promise.all over a full page fires
-      // ~500 simultaneous requests against a budget of ~1500/hour — one call
-      // burning a third of the hour, and a 429 on any one of them discarding
-      // every other in-flight response.
-      return mapWithConcurrency(connection.nodes, HYDRATE_CONCURRENCY, (node) =>
-        this.#hydrate(node as unknown as RawIssueShape, node),
-      );
+      for (let page = 1; page <= MAX_DISCOVERY_PAGES; page += 1) {
+        const remaining = this.#candidateLimit - nodes.length;
+        const first = Math.min(this.#pageSize, remaining);
+        const connection = await this.#client.issues({
+          first,
+          ...(after === undefined ? {} : { after }),
+          orderBy: LinearDocument.PaginationOrderBy.CreatedAt,
+          filter: {
+            team: { key: { eq: input.team } },
+            state: { name: { in: [...input.states] } },
+          },
+        });
+
+        if (connection.nodes.length > first) {
+          throw RunmillError.fromCatalog("RM-BACKLOG-003", {
+            whatHappened:
+              `Linear returned ${connection.nodes.length} issues after Runmill requested at most ` +
+              `${first}; refusing to use an unbounded candidate response`,
+          });
+        }
+        nodes.push(
+          ...connection.nodes.map((node) => ({
+            raw: node,
+            node,
+          })),
+        );
+
+        const pageInfo = connection.pageInfo as
+          | { hasNextPage?: unknown; endCursor?: unknown }
+          | undefined;
+        if (typeof pageInfo?.hasNextPage !== "boolean") {
+          throw RunmillError.fromCatalog("RM-BACKLOG-003", {
+            whatHappened:
+              `Linear page ${page} did not include a valid hasNextPage value; ` +
+              "Runmill cannot prove candidate discovery is complete",
+          });
+        }
+        if (!pageInfo.hasNextPage) {
+          // Bounded concurrency, not unbounded. Each issue fans out to ~6 lazy
+          // relation queries, so an unbounded Promise.all over a full backlog
+          // can exhaust Linear's hourly request budget.
+          return mapWithConcurrency(nodes, HYDRATE_CONCURRENCY, ({ raw, node }) =>
+            this.#hydrate(raw, node),
+          );
+        }
+
+        if (nodes.length >= this.#candidateLimit) {
+          throw RunmillError.fromCatalog("RM-BACKLOG-003", {
+            whatHappened:
+              `Linear still has another page after ${nodes.length} candidates, which reached ` +
+              `Runmill's ${this.#candidateLimit}-issue discovery ceiling`,
+          });
+        }
+
+        const nextCursor = pageInfo.endCursor;
+        if (
+          typeof nextCursor !== "string" ||
+          nextCursor.trim() === "" ||
+          nextCursor !== nextCursor.trim()
+        ) {
+          throw RunmillError.fromCatalog("RM-BACKLOG-003", {
+            whatHappened:
+              `Linear page ${page} reported hasNextPage without a valid endCursor; ` +
+              "Runmill cannot continue discovery safely",
+          });
+        }
+        if (seenCursors.has(nextCursor)) {
+          throw RunmillError.fromCatalog("RM-BACKLOG-003", {
+            whatHappened:
+              `Linear repeated cursor ${JSON.stringify(nextCursor)} on page ${page}; ` +
+              "Runmill cannot prove pagination is making progress",
+          });
+        }
+        seenCursors.add(nextCursor);
+        after = nextCursor;
+      }
+
+      throw RunmillError.fromCatalog("RM-BACKLOG-003", {
+        whatHappened:
+          `Linear still reported another candidate page after ${MAX_DISCOVERY_PAGES} pages; ` +
+          "Runmill stopped rather than using a potentially changing or incomplete queue snapshot",
+      });
     });
   }
 
   async getIssue(identifier: string): Promise<BacklogIssue | undefined> {
     return this.#wrap(async () => {
+      const parsed = parseIdentifier(identifier);
+      if (parsed === undefined) return undefined;
       const connection = await this.#client.issues({
         first: 1,
-        filter: { number: { eq: Number(identifier.split("-")[1] ?? "0") } },
+        filter: {
+          team: { key: { eq: parsed.teamKey } },
+          number: { eq: parsed.number },
+        },
       });
       const node = connection.nodes[0];
-      if (node === undefined) return undefined;
+      if (node === undefined || node.identifier !== identifier) return undefined;
       return this.#hydrate(node, node);
     });
   }
@@ -203,9 +324,18 @@ export class LinearBacklogAdapter implements BacklogAdapter {
   }
 
   async transitionState(input: { identifier: string; toState: string }): Promise<void> {
-    const issue = await this.#rawIssue(input.identifier);
-    const team = await issue.team;
-    const stateId = await this.#findStateId(team?.key ?? "", input.toState);
+    const issue = await this.#issueBeforeMutation(input.identifier, "transitionState");
+    let stateId: string;
+    try {
+      const team = await issue.team;
+      stateId = await this.#findStateId(team?.key ?? "", input.toState);
+    } catch (err) {
+      throw new BacklogMutationNotStartedError(
+        "transitionState",
+        `Linear did not start transitionState: ${errorMessage(err)}`,
+        err,
+      );
+    }
 
     try {
       await this.#client.updateIssue(issue.id, { stateId });
@@ -226,24 +356,46 @@ export class LinearBacklogAdapter implements BacklogAdapter {
   }
 
   async assign(input: { identifier: string; assignee: string | null }): Promise<void> {
-    const issue = await this.#rawIssue(input.identifier);
+    const issue = await this.#issueBeforeMutation(input.identifier, "assign");
     await this.#client.updateIssue(issue.id, { assigneeId: input.assignee ?? null });
   }
 
   async comment(input: { identifier: string; body: string }): Promise<{ commentId: string }> {
-    const issue = await this.#rawIssue(input.identifier);
+    const issue = await this.#issueBeforeMutation(input.identifier, "comment");
     const payload = await this.#client.createComment({ issueId: issue.id, body: input.body });
     const comment = await payload.comment;
     return { commentId: comment?.id ?? "" };
   }
 
-  async #rawIssue(identifier: string): Promise<{ id: string; team: Promise<{ key: string } | undefined> }> {
+  async #issueBeforeMutation(
+    identifier: string,
+    operation: "transitionState" | "assign" | "comment",
+  ): Promise<RawIssueReference> {
+    try {
+      return await this.#rawIssue(identifier);
+    } catch (err) {
+      throw new BacklogMutationNotStartedError(
+        operation,
+        `Linear did not start ${operation}: ${errorMessage(err)}`,
+        err,
+      );
+    }
+  }
+
+  async #rawIssue(identifier: string): Promise<RawIssueReference> {
+    const parsed = parseIdentifier(identifier);
+    if (parsed === undefined) throw new Error(`invalid Linear issue identifier ${identifier}`);
     const connection = await this.#client.issues({
       first: 1,
-      filter: { number: { eq: Number(identifier.split("-")[1] ?? "0") } },
+      filter: {
+        team: { key: { eq: parsed.teamKey } },
+        number: { eq: parsed.number },
+      },
     });
     const node = connection.nodes[0];
-    if (node === undefined) throw new Error(`issue ${identifier} not found`);
-    return node as unknown as { id: string; team: Promise<{ key: string } | undefined> };
+    if (node === undefined || node.identifier !== identifier) {
+      throw new Error(`issue ${identifier} not found`);
+    }
+    return node as unknown as RawIssueReference;
   }
 }

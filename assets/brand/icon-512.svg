@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">Runmill gated loop mark</title>
+  <rect width="512" height="512" fill="#F3EFE4"/>
+  <path fill="#111310" d="M64 64h384v136h-64v-72H128v256h256v-72h64v136H64V64Z"/>
+  <path fill="#FF4D1F" d="M288 216h96v80h-96z"/>
+</svg>

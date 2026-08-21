@@ -130,7 +130,17 @@ describe("CLI surface", () => {
   });
 
   it("exposes the commands the getting-started path depends on", () => {
-    for (const required of ["init", "doctor", "next", "run", "config validate"]) {
+    for (const required of [
+      "demo",
+      "init",
+      "doctor",
+      "next",
+      "run",
+      "start",
+      "status",
+      "stop",
+      "config validate",
+    ]) {
       expect(COMMANDS.has(required), `missing: runmill ${required}`).toBe(true);
     }
   });

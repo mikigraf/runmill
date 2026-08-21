@@ -1,5 +1,6 @@
 import type { Clock } from "../platform/clock.js";
 import { git } from "../platform/git.js";
+import type { GitHubGitCredential } from "../platform/github-git-credential.js";
 import { errorMessage } from "../errors/runmill-error.js";
 
 /**
@@ -60,6 +61,8 @@ export interface GitRefLeaseOptions {
   readonly pid: number;
   readonly bootId?: string | undefined;
   readonly remote?: string | undefined;
+  /** Exact resolved GitHub credential used for every remote lease operation. */
+  readonly credential?: GitHubGitCredential | undefined;
   /** How far past expiry a lease must be before takeover is permitted. */
   readonly takeoverGraceMinutes?: number | undefined;
 }
@@ -82,7 +85,14 @@ export class GitRefLease {
   }
 
   async #git(...args: string[]): Promise<string> {
-    return git(this.#opts.cwd, args, { runmillIdentity: true });
+    return git(this.#opts.cwd, args, { deterministicLeaseIdentity: true });
+  }
+
+  async #remoteGit(...args: string[]): Promise<string> {
+    if (this.#opts.credential === undefined) return this.#git(...args);
+    return this.#opts.credential.git(this.#opts.cwd, args, {
+      deterministicLeaseIdentity: true,
+    });
   }
 
   /** Build the orphan commit whose message carries the lease record. */
@@ -91,7 +101,7 @@ export class GitRefLease {
   }
 
   async #remoteObjectId(issueId: string): Promise<string | undefined> {
-    const out = await this.#git("ls-remote", this.#remote, leaseRefName(issueId));
+    const out = await this.#remoteGit("ls-remote", this.#remote, leaseRefName(issueId));
     if (out === "") return undefined;
     const first = out.split("\n")[0];
     return first?.split(/\s+/)[0];
@@ -105,7 +115,7 @@ export class GitRefLease {
     // Bring the object local so it can be read. A forced fetch into a local
     // mirror ref keeps this side-effect-free for the working tree.
     const localRef = `refs/runmill/remote-leases/${issueId}`;
-    await this.#git("fetch", "--quiet", this.#remote, `+${leaseRefName(issueId)}:${localRef}`);
+    await this.#remoteGit("fetch", "--quiet", this.#remote, `+${leaseRefName(issueId)}:${localRef}`);
     const message = await this.#git("log", "-1", "--format=%B", objectId);
     const record = JSON.parse(message) as LeaseRecord;
     return { ...record, refName: leaseRefName(issueId), objectId };
@@ -151,7 +161,12 @@ export class GitRefLease {
     const objectId = await this.#writeRecord(record);
 
     try {
-      await this.#git("push", this.#remote, `${objectId}:${leaseRefName(issueId)}`);
+      await this.#remoteGit(
+        "push",
+        "--no-verify",
+        this.#remote,
+        `${objectId}:${leaseRefName(issueId)}`,
+      );
     } catch (cause) {
       // A rejected push is only evidence of contention if the ref is actually
       // there. It is equally the shape of a read-only credential, a remote that
@@ -181,8 +196,9 @@ export class GitRefLease {
     const objectId = await this.#writeRecord(next);
     const ref = leaseRefName(next.issueId);
     try {
-      await this.#git(
+      await this.#remoteGit(
         "push",
+        "--no-verify",
         `--force-with-lease=${ref}:${held.objectId}`,
         this.#remote,
         `${objectId}:${ref}`,
@@ -202,9 +218,9 @@ export class GitRefLease {
   /**
    * Extend expiry without changing ownership.
    *
-   * Driven by a timer, not by state transitions: the two longest states
-   * (IMPLEMENTING and CI_WAIT) contain no transitions, so checkpoint-only
-   * renewal guarantees expiry while the run is still legitimately working.
+   * This is a tested recovery primitive. The preview daemon currently derives
+   * TTL from the whole-run wall budget instead of scheduling a timer; callers
+   * that add renewal must serialize it with release/takeover CAS operations.
    */
   async heartbeat(held: HeldLease): Promise<HeldLease> {
     const next = this.#buildRecord(
@@ -269,6 +285,12 @@ export class GitRefLease {
   async release(held: HeldLease): Promise<void> {
     await this.assertHeld(held);
     const ref = leaseRefName(held.issueId);
-    await this.#git("push", `--force-with-lease=${ref}:${held.objectId}`, this.#remote, `:${ref}`);
+    await this.#remoteGit(
+      "push",
+      "--no-verify",
+      `--force-with-lease=${ref}:${held.objectId}`,
+      this.#remote,
+      `:${ref}`,
+    );
   }
 }

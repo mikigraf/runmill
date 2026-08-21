@@ -1,5 +1,13 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, realpathSync, accessSync, constants } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  realpathSync,
+  accessSync,
+  constants,
+  existsSync,
+} from "node:fs";
 import { tmpdir, platform } from "node:os";
 import { delimiter, dirname, join, sep } from "node:path";
 import { RunmillError, errorMessage } from "../errors/runmill-error.js";
@@ -10,8 +18,17 @@ export type SandboxMechanism = "seatbelt" | "bubblewrap" | "none";
 export interface SandboxPolicy {
   /** Directories the child may write to. Everything else is read-only or denied. */
   readonly writablePaths: readonly string[];
+  /** Existing individual files the child may update without owning their parent directory. */
+  readonly writableFiles?: readonly string[];
   /** Additional read-only paths beyond the platform baseline. */
   readonly readablePaths?: readonly string[];
+  /**
+   * Existing paths nested inside a writable path that must remain read-only.
+   *
+   * Unlike `readablePaths`, these mounts/rules are emitted after broad write
+   * grants and are mandatory: a missing source refuses to start the sandbox.
+   */
+  readonly protectedPaths?: readonly string[];
   readonly allowNetwork: boolean;
   /** Controls the operator has knowingly accepted as unenforceable here. */
   readonly allowUnenforced?: readonly string[];
@@ -34,17 +51,6 @@ export interface SandboxRunInput {
   readonly timeoutMs: number;
   /** Extra variables to add on top of the allowlist. */
   readonly env?: Readonly<Record<string, string>> | undefined;
-  /**
-   * The child's OWN credential, exempt from the denylist.
-   *
-   * The denylist exists so an agent cannot read credentials that are not its
-   * business. A provider's own API key is the one credential that is: without
-   * it the provider cannot authenticate, and stripping it made the documented
-   * "or API keys" path silently impossible. Passed only by the caller that
-   * owns the boundary -- check runs never set it -- and never inherited from
-   * the parent environment, which is still filtered as before.
-   */
-  readonly credentialEnv?: Readonly<Record<string, string>> | undefined;
 }
 
 /**
@@ -115,6 +121,15 @@ const ENV_DENYLIST = [
   "SSH_ASKPASS",
 ];
 
+const PROXY_ENV_KEYS = new Set([
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "ALL_PROXY",
+  "https_proxy",
+  "http_proxy",
+  "all_proxy",
+]);
+
 /**
  * Output retained per stream.
  *
@@ -134,6 +149,11 @@ const CREDENTIAL_PATHS = [
   ".pypirc",
   ".docker",
   ".config/gh",
+  // Provider sessions use a disposable HOME. These denials protect the real
+  // provider state if a HOME-based toolchain grant would otherwise expose it.
+  ".codex",
+  ".claude",
+  ".config/claude",
 ];
 
 export function buildEnvironment(
@@ -150,6 +170,14 @@ export function buildEnvironment(
   }
   for (const key of ENV_DENYLIST) {
     delete env[key];
+  }
+  // A proxy URL can itself be a credential. Passing
+  // http://user:password@proxy to the provider hands that secret to every tool
+  // process even though the usual API-key variables are stripped. Credential-
+  // free proxy addresses remain supported; authenticated proxies need the
+  // future host-side network broker.
+  for (const key of PROXY_ENV_KEYS) {
+    if (env[key]?.includes("@") === true) delete env[key];
   }
   return env;
 }
@@ -313,8 +341,20 @@ export function buildSeatbeltProfile(policy: SandboxPolicy, home: string): strin
   for (const p of policy.writablePaths) {
     lines.push(`(allow file-read* file-write* (subpath ${JSON.stringify(p)}))`);
   }
+  for (const p of policy.writableFiles ?? []) {
+    lines.push(`(allow file-read* file-write* (literal ${JSON.stringify(p)}))`);
+  }
   for (const p of policy.readablePaths ?? []) {
     lines.push(`(allow file-read* (subpath ${JSON.stringify(p)}))`);
+  }
+
+  // A broad writable workspace contains `.git`, but the worker must not own
+  // the ref, index, config, or hooks that define the candidate. Denials are
+  // deliberately after grants so the narrow read-only boundary wins.
+  for (const p of policy.protectedPaths ?? []) {
+    lines.push(
+      `(deny file-write* (literal ${JSON.stringify(p)}) (subpath ${JSON.stringify(p)}))`,
+    );
   }
 
   // Credential paths are denied last so they win over any broader grant.
@@ -371,8 +411,22 @@ export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string
   // provider is not installed", not "refuse to start the sandbox".
   for (const p of policy.readablePaths ?? []) args.push("--ro-bind-try", p, p);
   for (const p of policy.writablePaths) args.push("--bind", p, p);
-  // Mask credential directories so even a broad bind cannot reach them.
-  for (const rel of CREDENTIAL_PATHS) args.push("--tmpfs", join(home, rel));
+  // A reviewer receives the source tree read-only and one pre-created output
+  // file writable. A nested file bind lets that file remain writable without
+  // granting its parent directory (and therefore task/evidence files) writes.
+  for (const p of policy.writableFiles ?? []) args.push("--bind", p, p);
+  // These are not `-try` mounts. Silently omitting a missing `.git` overlay
+  // would turn the whole workspace bind back into writable Git metadata.
+  for (const p of policy.protectedPaths ?? []) args.push("--ro-bind", p, p);
+  // Mask credential paths so even a broad bind cannot reach them, then make
+  // each empty mask read-only. A writable tmpfs would still protect the host
+  // bytes, but it would make an absolute write appear to succeed inside the
+  // sandbox. Refusing the write is both clearer to tools and consistent with
+  // the Seatbelt boundary.
+  for (const rel of CREDENTIAL_PATHS) {
+    const path = join(home, rel);
+    args.push("--tmpfs", path, "--remount-ro", path);
+  }
   return args;
 }
 
@@ -406,7 +460,6 @@ export class Sandbox {
     cwd: string;
     policy: SandboxPolicy;
     env?: Readonly<Record<string, string>> | undefined;
-    credentialEnv?: Readonly<Record<string, string>> | undefined;
   }): {
     command: string;
     args: string[];
@@ -420,20 +473,46 @@ export class Sandbox {
       });
     }
 
+    const protectedPaths = (input.policy.protectedPaths ?? []).map(realPath);
+    for (const path of protectedPaths) {
+      if (!existsSync(path)) {
+        throw RunmillError.fromCatalog("RM-SANDBOX-001", {
+          whatHappened:
+            `Required read-only sandbox path ${path} does not exist. ` +
+            "Refusing to run with a missing protective mount.",
+        });
+      }
+    }
+
+    const writableFiles = (input.policy.writableFiles ?? []).map(realPath);
+    for (const path of writableFiles) {
+      if (!existsSync(path)) {
+        throw RunmillError.fromCatalog("RM-SANDBOX-001", {
+          whatHappened:
+            `Required writable sandbox file ${path} does not exist. ` +
+            "Refusing to widen the grant to its parent directory.",
+        });
+      }
+    }
+
     const home = process.env["HOME"] ?? tmpdir();
     const childTmp = createPrivateTempDir();
     // The child is told to use it, so the grant and the environment agree.
-    // The credential is applied after buildEnvironment, which is what makes it
-    // an exemption rather than a hole: the parent environment is still
-    // filtered, and only what the caller explicitly hands over survives.
+    // API keys are never accepted here. Anything in the provider process
+    // environment is inherited by the shell and tool processes it launches,
+    // which would hand untrusted repository content the credential.
     const env = {
       ...buildEnvironment(input.env),
-      ...(input.credentialEnv ?? {}),
       TMPDIR: childTmp,
+      // Read-only Git metadata still supports status/diff/log. This tells Git
+      // not to attempt optional index refresh locks for those read operations.
+      GIT_OPTIONAL_LOCKS: "0",
     };
     const policy: SandboxPolicy = {
       ...input.policy,
       writablePaths: [...input.policy.writablePaths.map(realPath), childTmp],
+      writableFiles,
+      protectedPaths,
       readablePaths: [
         ...(input.policy.readablePaths ?? []).map(realPath),
         // Resolved against the PATH the child will actually see, not this

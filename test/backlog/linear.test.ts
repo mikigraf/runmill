@@ -17,6 +17,7 @@ const updateIssueMock = vi.fn();
 const createCommentMock = vi.fn();
 
 vi.mock("@linear/sdk", () => ({
+  LinearDocument: { PaginationOrderBy: { CreatedAt: "createdAt" } },
   LinearClient: class {
     issues = issuesMock;
     workflowStates = workflowStatesMock;
@@ -26,7 +27,7 @@ vi.mock("@linear/sdk", () => ({
 }));
 
 const { LinearBacklogAdapter } = await import("../../src/backlog/linear.js");
-const { AmbiguousMutationError, BacklogRateLimitError } = await import(
+const { AmbiguousMutationError, BacklogMutationNotStartedError, BacklogRateLimitError } = await import(
   "../../src/backlog/adapter.js"
 );
 
@@ -51,10 +52,19 @@ function node(overrides: Record<string, unknown> = {}): Record<string, unknown> 
   };
 }
 
-function adapter(pageSize?: number) {
-  return new LinearBacklogAdapter(
-    pageSize === undefined ? { apiKey: "lin_api_test" } : { apiKey: "lin_api_test", pageSize },
-  );
+function page(
+  nodes: Record<string, unknown>[],
+  pageInfo: { hasNextPage: boolean; endCursor?: string | null } = { hasNextPage: false },
+) {
+  return { nodes, pageInfo };
+}
+
+function adapter(pageSize?: number, candidateLimit?: number) {
+  return new LinearBacklogAdapter({
+    apiKey: "lin_api_test",
+    ...(pageSize === undefined ? {} : { pageSize }),
+    ...(candidateLimit === undefined ? {} : { candidateLimit }),
+  });
 }
 
 beforeEach(() => {
@@ -63,7 +73,7 @@ beforeEach(() => {
 
 describe("listCandidates", () => {
   it("maps a Linear issue onto the domain shape", async () => {
-    issuesMock.mockResolvedValue({ nodes: [node()] });
+    issuesMock.mockResolvedValue(page([node()]));
     const [issue] = await adapter().listCandidates({ team: "ENG", states: ["Todo"] });
 
     expect(issue?.identifier).toBe("ENG-101");
@@ -77,7 +87,7 @@ describe("listCandidates", () => {
   });
 
   it("filters by team key and the requested states", async () => {
-    issuesMock.mockResolvedValue({ nodes: [] });
+    issuesMock.mockResolvedValue(page([]));
     await adapter().listCandidates({ team: "ENG", states: ["Todo", "Ready"] });
 
     const filter = issuesMock.mock.calls[0]?.[0]?.filter;
@@ -86,23 +96,116 @@ describe("listCandidates", () => {
   });
 
   it("bounds the page size rather than fetching the whole backlog", async () => {
-    issuesMock.mockResolvedValue({ nodes: [] });
+    issuesMock.mockResolvedValue(page([]));
     await adapter(25).listCandidates({ team: "ENG", states: ["Todo"] });
     expect(issuesMock.mock.calls[0]?.[0]?.first).toBe(25);
+  });
+
+  it("discovers an eligible issue beyond the first page and advances the cursor", async () => {
+    issuesMock
+      .mockResolvedValueOnce(
+        page(
+          [
+            node({
+              identifier: "ENG-101",
+              labels: () => Promise.resolve({ nodes: [{ name: "triage" }] }),
+            }),
+          ],
+          { hasNextPage: true, endCursor: "cursor-page-1" },
+        ),
+      )
+      .mockResolvedValueOnce(
+        page([
+          node({
+            identifier: "ENG-102",
+            labels: () => Promise.resolve({ nodes: [{ name: "agent-ready" }] }),
+          }),
+        ]),
+      );
+
+    const issues = await adapter(1).listCandidates({ team: "ENG", states: ["Todo"] });
+
+    expect(issues.map((issue) => issue.identifier)).toEqual(["ENG-101", "ENG-102"]);
+    expect(issues.find((issue) => issue.labels.includes("agent-ready"))?.identifier).toBe(
+      "ENG-102",
+    );
+    expect(issuesMock).toHaveBeenCalledTimes(2);
+    expect(issuesMock.mock.calls[0]?.[0]).not.toHaveProperty("after");
+    expect(issuesMock.mock.calls[1]?.[0]?.after).toBe("cursor-page-1");
+    expect(issuesMock.mock.calls.map((call) => call[0]?.orderBy)).toEqual([
+      "createdAt",
+      "createdAt",
+    ]);
+  });
+
+  it.each([
+    { pageInfo: { hasNextPage: true, endCursor: null }, problem: /valid endCursor/u },
+    { pageInfo: { hasNextPage: true, endCursor: "" }, problem: /valid endCursor/u },
+    { pageInfo: { hasNextPage: true, endCursor: " cursor " }, problem: /valid endCursor/u },
+    { pageInfo: undefined, problem: /valid hasNextPage/u },
+  ])("refuses invalid pagination metadata: $pageInfo", async ({ pageInfo, problem }) => {
+    issuesMock.mockResolvedValue({ nodes: [], pageInfo });
+
+    const failure = adapter(1).listCandidates({ team: "ENG", states: ["Todo"] });
+    await expect(failure).rejects.toMatchObject({
+      code: "RM-BACKLOG-003",
+      recoverable: false,
+      whatHappened: expect.stringMatching(problem),
+    });
+  });
+
+  it("refuses a repeated cursor instead of looping or returning a partial queue", async () => {
+    issuesMock
+      .mockResolvedValueOnce(page([node()], { hasNextPage: true, endCursor: "cursor-1" }))
+      .mockResolvedValueOnce(
+        page([node({ identifier: "ENG-102" })], {
+          hasNextPage: true,
+          endCursor: "cursor-1",
+        }),
+      );
+
+    await expect(
+      adapter(1).listCandidates({ team: "ENG", states: ["Todo"] }),
+    ).rejects.toMatchObject({
+      code: "RM-BACKLOG-003",
+      recoverable: false,
+      whatHappened: expect.stringMatching(/repeated cursor/u),
+    });
+    expect(issuesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses truncation when the candidate safety ceiling is reached", async () => {
+    issuesMock
+      .mockResolvedValueOnce(page([node()], { hasNextPage: true, endCursor: "cursor-1" }))
+      .mockResolvedValueOnce(
+        page([node({ identifier: "ENG-102" })], {
+          hasNextPage: true,
+          endCursor: "cursor-2",
+        }),
+      );
+
+    await expect(
+      adapter(1, 2).listCandidates({ team: "ENG", states: ["Todo"] }),
+    ).rejects.toMatchObject({
+      code: "RM-BACKLOG-003",
+      recoverable: false,
+      whatHappened: expect.stringMatching(/2-issue discovery ceiling/u),
+    });
+    expect(issuesMock).toHaveBeenCalledTimes(2);
   });
 
   it("returns priority RAW, including Linear's 0 = no priority", async () => {
     // Translating here would hide the trap from the ordering rules that exist
     // precisely to handle it: sorting on the raw value ascending puts
     // unprioritized work first.
-    issuesMock.mockResolvedValue({ nodes: [node({ priority: 0 })] });
+    issuesMock.mockResolvedValue(page([node({ priority: 0 })]));
     const [issue] = await adapter().listCandidates({ team: "ENG", states: ["Todo"] });
     expect(issue?.priority).toBe(0);
   });
 
   it("collects blocking relations into blockedBy", async () => {
-    issuesMock.mockResolvedValue({
-      nodes: [
+    issuesMock.mockResolvedValue(
+      page([
         node({
           inverseRelations: () =>
             Promise.resolve({
@@ -112,8 +215,8 @@ describe("listCandidates", () => {
               ],
             }),
         }),
-      ],
-    });
+      ]),
+    );
     const [issue] = await adapter().listCandidates({ team: "ENG", states: ["Todo"] });
     expect(issue?.blockedBy).toEqual(["ENG-99"]);
   });
@@ -121,30 +224,30 @@ describe("listCandidates", () => {
   it("propagates a relation failure instead of reporting nothing blocks the issue", async () => {
     // The consequential case: swallowing this would let a blocked issue pass
     // eligibility and be worked on.
-    issuesMock.mockResolvedValue({
-      nodes: [
+    issuesMock.mockResolvedValue(
+      page([
         node({
           inverseRelations: () => Promise.reject(new Error("relations unavailable")),
         }),
-      ],
-    });
+      ]),
+    );
     await expect(adapter().listCandidates({ team: "ENG", states: ["Todo"] })).rejects.toThrow(
       /relations unavailable/,
     );
   });
 
   it("marks an assigned issue as human-held", async () => {
-    issuesMock.mockResolvedValue({
-      nodes: [node({ assignee: Promise.resolve({ id: "user-7" }) })],
-    });
+    issuesMock.mockResolvedValue(
+      page([node({ assignee: Promise.resolve({ id: "user-7" }) })]),
+    );
     const [issue] = await adapter().listCandidates({ team: "ENG", states: ["Todo"] });
     expect(issue?.assigneeId).toBe("user-7");
     expect(issue?.assigneeIsHuman).toBe(true);
   });
 
   it("tolerates absent optional fields without inventing values", async () => {
-    issuesMock.mockResolvedValue({
-      nodes: [
+    issuesMock.mockResolvedValue(
+      page([
         node({
           description: null,
           estimate: null,
@@ -152,8 +255,8 @@ describe("listCandidates", () => {
           project: Promise.resolve(undefined),
           labels: undefined,
         }),
-      ],
-    });
+      ]),
+    );
     const [issue] = await adapter().listCandidates({ team: "ENG", states: ["Todo"] });
     expect(issue?.description).toBe("");
     expect(issue?.estimate).toBeUndefined();
@@ -180,7 +283,7 @@ describe("listCandidates", () => {
         },
       }),
     );
-    issuesMock.mockResolvedValue({ nodes });
+    issuesMock.mockResolvedValue(page(nodes));
 
     const issues = await adapter().listCandidates({ team: "ENG", states: ["Todo"] });
     expect(issues).toHaveLength(40);
@@ -189,7 +292,7 @@ describe("listCandidates", () => {
 
   it("preserves order despite bounded concurrency", async () => {
     const nodes = Array.from({ length: 12 }, (_, i) => node({ identifier: `ENG-${100 + i}` }));
-    issuesMock.mockResolvedValue({ nodes });
+    issuesMock.mockResolvedValue(page(nodes));
     const issues = await adapter().listCandidates({ team: "ENG", states: ["Todo"] });
     expect(issues.map((i) => i.identifier)).toEqual(nodes.map((n) => n["identifier"]));
   });
@@ -201,6 +304,17 @@ describe("listCandidates", () => {
     );
   });
 
+  it("maps a rate limit from a later page without returning the first page", async () => {
+    issuesMock
+      .mockResolvedValueOnce(page([node()], { hasNextPage: true, endCursor: "cursor-1" }))
+      .mockRejectedValueOnce(new Error("429 Too Many Requests"));
+
+    await expect(
+      adapter(1).listCandidates({ team: "ENG", states: ["Todo"] }),
+    ).rejects.toBeInstanceOf(BacklogRateLimitError);
+    expect(issuesMock).toHaveBeenCalledTimes(2);
+  });
+
   it("does not disguise an ordinary failure as a rate limit", async () => {
     issuesMock.mockRejectedValue(new Error("schema error"));
     await expect(adapter().listCandidates({ team: "ENG", states: ["Todo"] })).rejects.toThrow(
@@ -210,11 +324,24 @@ describe("listCandidates", () => {
 });
 
 describe("getIssue", () => {
-  it("looks an issue up by its numeric part", async () => {
+  it("looks an issue up by both team key and number", async () => {
     issuesMock.mockResolvedValue({ nodes: [node()] });
     const issue = await adapter().getIssue("ENG-101");
     expect(issue?.identifier).toBe("ENG-101");
     expect(issuesMock.mock.calls[0]?.[0]?.filter.number.eq).toBe(101);
+    expect(issuesMock.mock.calls[0]?.[0]?.filter.team.key.eq).toBe("ENG");
+  });
+
+  it("refuses a same-number issue returned from a different team", async () => {
+    issuesMock.mockResolvedValue({
+      nodes: [node({ identifier: "OPS-101", team: Promise.resolve({ key: "OPS" }) })],
+    });
+
+    expect(await adapter().getIssue("ENG-101")).toBeUndefined();
+    expect(issuesMock.mock.calls[0]?.[0]?.filter).toMatchObject({
+      team: { key: { eq: "ENG" } },
+      number: { eq: 101 },
+    });
   });
 
   it("returns undefined for an issue that does not exist", async () => {
@@ -223,12 +350,24 @@ describe("getIssue", () => {
   });
 
   it("does not throw on a malformed identifier", async () => {
-    issuesMock.mockResolvedValue({ nodes: [] });
     expect(await adapter().getIssue("nonsense")).toBeUndefined();
+    expect(issuesMock).not.toHaveBeenCalled();
   });
 });
 
 describe("transitionState", () => {
+  it("never mutates a same-number issue from another team", async () => {
+    issuesMock.mockResolvedValue({
+      nodes: [node({ identifier: "OPS-101", team: Promise.resolve({ key: "OPS" }) })],
+    });
+
+    await expect(
+      adapter().transitionState({ identifier: "ENG-101", toState: "In Progress" }),
+    ).rejects.toThrow(/ENG-101 not found/);
+    expect(updateIssueMock).not.toHaveBeenCalled();
+    expect(workflowStatesMock).not.toHaveBeenCalled();
+  });
+
   it("resolves the workflow state id for the issue's team", async () => {
     issuesMock.mockResolvedValue({ nodes: [node()] });
     workflowStatesMock.mockResolvedValue({ nodes: [{ id: "state-uuid" }] });
@@ -258,7 +397,12 @@ describe("transitionState", () => {
     workflowStatesMock.mockResolvedValue({ nodes: [] });
     await expect(
       adapter().transitionState({ identifier: "ENG-101", toState: "Nonexistent" }),
-    ).rejects.toThrow(/workflow state "Nonexistent" not found/);
+    ).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof BacklogMutationNotStartedError &&
+        /workflow state "Nonexistent" not found/.test(error.message),
+    );
+    expect(updateIssueMock).not.toHaveBeenCalled();
   });
 
   it("reports an AMBIGUOUS mutation when the response was lost but the change landed", async () => {
@@ -316,9 +460,24 @@ describe("assign", () => {
     await adapter().assign({ identifier: "ENG-101", assignee: null });
     expect(updateIssueMock).toHaveBeenCalledWith("uuid-1", { assigneeId: null });
   });
+
+  it("classifies an issue lookup failure before assignment as not started", async () => {
+    issuesMock.mockResolvedValue({ nodes: [] });
+    await expect(
+      adapter().assign({ identifier: "ENG-404", assignee: "user-7" }),
+    ).rejects.toBeInstanceOf(BacklogMutationNotStartedError);
+    expect(updateIssueMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("comment", () => {
+  it("classifies an issue lookup failure before commenting as not started", async () => {
+    issuesMock.mockResolvedValue({ nodes: [] });
+    await expect(
+      adapter().comment({ identifier: "ENG-404", body: "status" }),
+    ).rejects.toBeInstanceOf(BacklogMutationNotStartedError);
+    expect(createCommentMock).not.toHaveBeenCalled();
+  });
   it("posts a comment and returns its id", async () => {
     issuesMock.mockResolvedValue({ nodes: [node()] });
     createCommentMock.mockResolvedValue({ comment: Promise.resolve({ id: "comment-1" }) });

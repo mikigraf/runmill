@@ -81,21 +81,15 @@ Succeeds only if the ref did not exist. On rejection, runmill reads the existing
 `LeaseConflictError` naming the current holder — a contended issue reports *who* has it, not just
 that the claim failed.
 
-### heartbeat — extending without re-claiming
+### heartbeat — available primitive, not a daemon timer
 
 Renewal is a compare-and-swap that keeps the same `generation`.
 
-Critically, **it is driven by a timer, not by state transitions**:
-
-```
-Driven by a timer, not by state transitions: the two longest states
-(IMPLEMENTING and CI_WAIT) contain no transitions, so checkpoint-only
-renewal guarantees expiry while the run is still legitimately working.
-```
-
-An agent implementing a change and a pull request waiting on CI are the two longest phases of a
-run, and neither emits transitions. Renewing only at checkpoints would guarantee that every
-long-running run loses its lease precisely while doing the thing it was told to do.
+The compare-and-swap heartbeat primitive is implemented and tested, but this developer preview does
+not run a background renewal timer. Live lease TTL is instead derived from
+`budgets.max_wall_minutes_per_issue` and set beyond the whole-run deadline. The budget stops further
+delivery effects before a legitimate run can become eligible for takeover. Do not infer automatic
+crash recovery from the presence of the heartbeat method.
 
 ### assertHeld — the fence
 
@@ -124,7 +118,7 @@ current. It cannot act on stale ownership no matter how long it was gone or how 
 > This is the standard fencing-token result: leases without fencing tokens are not safe under
 > arbitrary process pauses, and no timeout value makes them safe.
 
-### takeover — reclaiming abandoned work
+### takeover — tested primitive, manual recovery in the preview
 
 ```ts
 if (!this.#isStale(current)) {
@@ -133,12 +127,17 @@ if (!this.#isStale(current)) {
 const next = this.#buildRecord(issueId, current.generation + 1, { ... });
 ```
 
-Never silent, and never merely "expired":
+The primitive is never silent, and never merely "expired":
 
 - Staleness must exceed `expiresAt` **plus a grace window** (default 10 minutes).
 - The generation is **incremented**, which fences the previous holder out permanently.
 - `priorStateId` / `priorAssigneeId` are carried forward, so the takeover inherits the obligation
   to restore the issue.
+
+The daemon does not invoke takeover or restore a crash-abandoned issue automatically yet. Doing
+half of that protocol is worse than stopping: deleting a ref without restoring the backlog can make
+the issue appear owned forever, while restoring without fencing can race a worker that is merely
+paused. Use the explicit manual procedure under Operating notes.
 
 ### release — CAS-guarded deletion
 
@@ -147,13 +146,13 @@ lost its lease cannot delete the lease its successor now holds.
 
 ## What this does and does not protect
 
-**Does:** two workers cannot both start the same issue; a partitioned worker cannot mutate
-anything after ownership moves; an abandoned issue becomes available without a human; the backlog
-is restored to its prior state even if the original worker never comes back.
+**Does:** two workers cannot both start the same issue; every orchestrator-owned external mutation
+is fenced; a worker cannot mutate anything after ownership moves; an ordinary failed attempt before
+PR creation restores its prior backlog state and assignee while it still holds the lease.
 
-**Does not:** it is not a general-purpose lock service, and it says nothing about two workers
-touching the same *files* from different issues. Overlapping changes are a merge-conflict problem,
-handled by git, CI, and review.
+**Does not:** the preview does not automatically recover a lease after process death. It is not a
+general-purpose lock service, and it says nothing about two workers touching the same *files* from
+different issues. Overlapping changes are a merge-conflict problem handled by git, CI, and review.
 
 ## Operating notes
 
@@ -166,12 +165,19 @@ runmill inspect <run-id>                        # the lease this run holds
 runmill list --needs-attention                  # runs blocked on a human
 ```
 
-A lease ref that outlives its run is cleaned up by the next `takeover` after the grace window. To
-clear one by hand — only when you are certain no worker is live:
+A lease ref that outlives its process requires a person in this preview. Only when you are certain
+the worker is dead:
 
 ```bash
+runmill leases list
+# Restore the issue's prior workflow state and assignee in the backlog first.
 git push origin :refs/runmill/leases/ENG-123
+runmill leases resolve ENG-123 --confirm-remote-cleared
 ```
+
+The final command refuses unless `git ls-remote` proves that exact remote ref is absent. Until both
+remote and local records are reconciled, issue selection remains blocked. This is intentionally
+slower than silently stealing work and racing a paused process.
 
 ## See also
 

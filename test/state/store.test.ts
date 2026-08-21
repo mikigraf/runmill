@@ -207,6 +207,30 @@ describe("side-effect outbox", () => {
     store.close();
   });
 
+  it("records an operator-verified outcome and removes it from pending", () => {
+    const store = open();
+    store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
+    const key = store.intendSideEffect({
+      runId: "run_1",
+      system: "github",
+      operation: "merge",
+      target: "acme/platform#7",
+    });
+    store.markSideEffectInFlight(key);
+    store.failSideEffect(key, "timeout, outcome unknown");
+
+    store.resolveSideEffect(key, "applied");
+
+    expect(store.pendingSideEffects()).toHaveLength(0);
+    expect(store.getSideEffect(key)).toMatchObject({
+      status: "confirmed",
+      remoteId: "operator:applied",
+      lastError: "operator resolved outcome as applied",
+    });
+    expect(() => store.resolveSideEffect(key, "not-applied")).toThrow(/already resolved/);
+    store.close();
+  });
+
   it("survives a crash: intent written before the call is visible on reopen", () => {
     const a = open();
     a.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
@@ -218,6 +242,35 @@ describe("side-effect outbox", () => {
     expect(pending).toHaveLength(1);
     expect(pending[0]).toMatchObject({ operation: "claim-issue", status: "intended" });
     b.close();
+  });
+});
+
+describe("durable budget ledger", () => {
+  it("accumulates spend and invocations across store reopen", () => {
+    const first = open();
+    first.recordBudgetUsage({
+      dayBucket: "2026-08-06",
+      repo: "acme/platform",
+      costUsd: 0.4,
+      invocations: 2,
+    });
+    first.close();
+
+    const second = open();
+    second.recordBudgetUsage({
+      dayBucket: "2026-08-06",
+      repo: "acme/platform",
+      costUsd: 0.6,
+      invocations: 3,
+    });
+    expect(second.budgetUsage("2026-08-06", "acme/platform")).toEqual({
+      dayBucket: "2026-08-06",
+      repo: "acme/platform",
+      costUsd: 1,
+      invocations: 5,
+    });
+    expect(second.budgetUsage("2026-08-07", "acme/platform").costUsd).toBe(0);
+    second.close();
   });
 });
 

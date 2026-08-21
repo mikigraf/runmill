@@ -53,7 +53,9 @@ export function registerEvalCommands(program: Command, ctx: CommandContext): voi
     .option("--repeat <n>", "runs per task; agent execution is stochastic", "1")
     .option("--split <split>", `restrict to one of: ${SPLITS.join(", ")}`)
     .option("--dry-run", "score without dispatching an agent")
-    .description("Replay a suite and report pass rates with confidence intervals")
+    .description(
+      "Replay with the configured agent and in-memory forge/backlog; never mutate production",
+    )
     .action(async (suitePath: string, opts: { repeat?: string; split?: string; dryRun?: boolean }) => {
       try {
         const suite = loadSuite(suitePath, ctx.repoRoot());
@@ -82,9 +84,15 @@ export function registerEvalCommands(program: Command, ctx: CommandContext): voi
           },
         });
 
+        // `mode` is part of the JSON contract. Keep its existing values while
+        // making the human rendering explicit about which boundaries are live.
         const mode = opts.dryRun === true ? "dry-run (no agent dispatched)" : "live";
+        const shownMode =
+          opts.dryRun === true
+            ? mode
+            : "live provider eligible; forge/backlog simulated; no production mutations";
         ctx.emit(
-          `${renderReport(report)}\n  mode   ${mode}`,
+          `${renderReport(report)}\n  mode   ${shownMode}`,
           { ...reportToJson(report), mode },
         );
 
@@ -122,4 +130,3 @@ const STATE_FOR_EXPECTED: Record<string, string> = {
   escalate: "NEEDS_HUMAN",
   refuse: "QUARANTINED",
 };
-

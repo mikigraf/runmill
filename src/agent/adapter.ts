@@ -42,6 +42,16 @@ export interface AgentRunRequest {
   readonly network: "proxy" | "none";
   readonly maxTurns: number;
   readonly timeoutMs: number;
+  /**
+   * Repository-provided review guidance captured before implementation starts.
+   *
+   * The live provider always places this after Runmill's immutable rubric and
+   * labels it untrusted, narrowing-only data. It is never a replacement for
+   * the built-in review contract.
+   */
+  readonly supplementalReviewGuidance?:
+    | { readonly source: string; readonly content: string }
+    | undefined;
   /** Cancels the session even before `session.started` arrives. */
   readonly signal?: AbortSignal | undefined;
 }

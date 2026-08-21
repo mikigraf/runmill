@@ -52,17 +52,40 @@ function cmp(x: number | string, y: number | string): number {
   return x === y ? 0 : x < y ? -1 : 1;
 }
 
-export function compareIssues(a: BacklogIssue, b: BacklogIssue): number {
+export interface IssueOrderingOptions {
+  readonly priorityFirst: boolean;
+  readonly unprioritizedLast: boolean;
+  readonly dueDateTiebreaker: boolean;
+  readonly oldestFirst: boolean;
+}
+
+const DEFAULT_ORDERING: IssueOrderingOptions = {
+  priorityFirst: true,
+  unprioritizedLast: true,
+  dueDateTiebreaker: true,
+  oldestFirst: true,
+};
+
+export function compareIssues(
+  a: BacklogIssue,
+  b: BacklogIssue,
+  options: IssueOrderingOptions = DEFAULT_ORDERING,
+): number {
+  const aPriority = options.unprioritizedLast ? prioritySortKey(a.priority) : a.priority;
+  const bPriority = options.unprioritizedLast ? prioritySortKey(b.priority) : b.priority;
   return (
-    cmp(prioritySortKey(a.priority), prioritySortKey(b.priority)) ||
-    cmp(dueDateSortKey(a), dueDateSortKey(b)) ||
+    (options.priorityFirst ? cmp(aPriority, bPriority) : 0) ||
+    (options.dueDateTiebreaker ? cmp(dueDateSortKey(a), dueDateSortKey(b)) : 0) ||
     cmp(manualRankSortKey(a), manualRankSortKey(b)) ||
-    cmp(createdAtSortKey(a), createdAtSortKey(b)) ||
+    (options.oldestFirst ? cmp(createdAtSortKey(a), createdAtSortKey(b)) : 0) ||
     cmp(a.identifier, b.identifier)
   );
 }
 
 /** Returns a new ordered array. Never mutates the input. */
-export function orderIssues(issues: readonly BacklogIssue[]): BacklogIssue[] {
-  return [...issues].sort(compareIssues);
+export function orderIssues(
+  issues: readonly BacklogIssue[],
+  options: IssueOrderingOptions = DEFAULT_ORDERING,
+): BacklogIssue[] {
+  return [...issues].sort((a, b) => compareIssues(a, b, options));
 }

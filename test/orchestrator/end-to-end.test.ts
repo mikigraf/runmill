@@ -1,6 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
@@ -13,6 +20,8 @@ import { GitRefLease } from "../../src/queue/git-lease.js";
 import { parseConfig } from "../../src/config/load.js";
 import type { CheckSpec } from "../../src/verification/engine.js";
 import type { BacklogIssue } from "../../src/domain/types.js";
+import { BacklogMutationNotStartedError } from "../../src/backlog/adapter.js";
+import { selectNext } from "../../src/queue/selector.js";
 
 let root: string;
 let origin: string;
@@ -43,6 +52,7 @@ function config(overrides = ""): ReturnType<typeof parseConfig> {
   return parseConfig(`
 version: 1
 autonomy: pr-only
+experimental: { automatic_merge: true }
 providers:
   implementer:
     implementation: codex
@@ -60,6 +70,8 @@ github:
       base_branch: main
 workspace:
   git_isolation: clone
+risk:
+  default: low
 ${overrides}
 `);
 }
@@ -67,10 +79,10 @@ ${overrides}
 /** A check that genuinely runs in the sandbox and inspects the tree. */
 const PASSING_CHECK: CheckSpec = {
   id: "unit",
-  run: "/bin/cat greeting.ts",
+  run: "/bin/cp verification-report-source.tap report.tap",
   required: true,
   source: "repository-policy",
-  report: { path: "report.json", format: "json" },
+  report: { path: "report.tap", format: "tap" },
 };
 
 const GOOD_REVIEW = {
@@ -93,6 +105,10 @@ beforeEach(() => {
   git(source, "config", "user.email", "s@test");
   git(source, "config", "user.name", "S");
   writeFileSync(join(source, "README.md"), "seed\n");
+  writeFileSync(
+    join(source, "verification-report-source.tap"),
+    "TAP version 13\n1..1\nok 1 - unit\n",
+  );
   git(source, "add", "-A");
   git(source, "commit", "-q", "-m", "seed");
   git(source, "push", "-q", "origin", "main");
@@ -145,6 +161,7 @@ function makeOrchestrator(opts: {
       clock,
       config: opts.cfg ?? config(),
       sourceRepoPath: source,
+      sourceRepository: "acme/platform",
       workspaceRoot: join(root, "runs"),
       checks: opts.checks ?? [PASSING_CHECK],
       onEvent: (m) => opts.log?.push(m),
@@ -168,9 +185,10 @@ function lease(runId: string): GitRefLease {
 const TARGET = { repo: "acme/platform", baseBranch: "main" };
 
 describe("end-to-end: issue to governed pull request", () => {
-  it("completes the whole loop and delivers a pull request", async () => {
+  it("delivers once and cannot reselect the issue on the next poll", async () => {
     const log: string[] = [];
     const { orchestrator, forge, backlog } = makeOrchestrator({ log });
+    const cfg = config();
 
     const outcome = await orchestrator.run({
       runId: "run_1",
@@ -184,6 +202,13 @@ describe("end-to-end: issue to governed pull request", () => {
     expect(outcome.costUsd).toBeGreaterThan(0);
     expect(forge.wasPushed("acme/platform", "runmill/ENG-101-add-a-greeting-helper-1")).toBe(true);
     expect(backlog.peek("ENG-101")?.state).toBe("In Review");
+    const nextPoll = await selectNext({
+      backlog,
+      config: cfg,
+      leasedIssueIds: store.activeLeaseIssueIds(),
+    });
+    expect(nextPoll.selected).toBeUndefined();
+    expect(forge.calls.filter((call) => call.op === "openPullRequest")).toHaveLength(1);
   }, 60_000);
 
   it("walks the specified state machine in order", async () => {
@@ -219,20 +244,48 @@ describe("end-to-end: issue to governed pull request", () => {
     expect(store.getSideEffect(key)?.status).toBe("confirmed");
   }, 60_000);
 
+  it("closes an outbox intent when a Linear lookup proves no mutation started", async () => {
+    class MissingWorkflowStateBacklog extends FakeBacklogAdapter {
+      override async transitionState(input: { identifier: string; toState: string }): Promise<void> {
+        this.calls.push({ op: "transitionState", args: input });
+        throw new BacklogMutationNotStartedError(
+          "transitionState",
+          `workflow state "${input.toState}" does not exist`,
+        );
+      }
+    }
+    const backlog = new MissingWorkflowStateBacklog([ISSUE]);
+    const { orchestrator } = makeOrchestrator({ backlog });
+
+    const outcome = await orchestrator.run({
+      runId: "run_missing_state",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_missing_state"),
+    });
+
+    expect(outcome.finalState).toBe("QUARANTINED");
+    expect(store.pendingSideEffects()).toHaveLength(0);
+    const key = StateStore.sideEffectKey(
+      "run_missing_state",
+      "transition-claim",
+      ISSUE.identifier,
+    );
+    expect(store.getSideEffect(key)).toMatchObject({
+      status: "confirmed",
+      remoteId: "orchestrator:not-applied",
+    });
+  });
+
   it("leaves a failed external mutation PENDING for the recovery sweep", async () => {
     // Failure does not prove the effect did not land.
     const forge = new FakeForgeAdapter({
       applyThenTimeout: new Set(["merge"]),
       credentialCanWriteProtection: false,
     });
-    const { orchestrator } = makeOrchestrator({
-      forge,
-      cfg: config("  merge:\n    method: squash\n"),
-    });
     const cfg = config();
     const guarded = { ...cfg, autonomy: "guarded-merge" as const };
     const { orchestrator: guardedOrch } = makeOrchestrator({ forge, cfg: guarded });
-    void orchestrator;
 
     const outcome = await guardedOrch.run({
       runId: "run_m",
@@ -244,6 +297,73 @@ describe("end-to-end: issue to governed pull request", () => {
     expect(outcome.finalState).toBe("QUARANTINED");
     const pending = store.pendingSideEffects();
     expect(pending.some((p) => p.operation === "merge" && p.status === "failed")).toBe(true);
+  }, 60_000);
+
+  it("refuses all new work until an ambiguous external effect is reconciled", async () => {
+    store.createRun({
+      runId: "run_ambiguous",
+      issueId: "ENG-9",
+      repo: "acme/platform",
+      provider: "codex",
+    });
+    const key = store.intendSideEffect({
+      runId: "run_ambiguous",
+      system: "github",
+      operation: "merge",
+      target: "acme/platform#9",
+    });
+    store.markSideEffectInFlight(key);
+    store.failSideEffect(key, "response lost");
+
+    const { orchestrator, forge, backlog } = makeOrchestrator({});
+    const outcome = await orchestrator.run({
+      runId: "run_blocked",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_blocked"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toContain("RM-STATE-002");
+    expect(store.getRun("run_blocked")).toBeUndefined();
+    expect(forge.calls).toHaveLength(0);
+    expect(backlog.calls).toHaveLength(0);
+    expect(await lease("observer").read(ISSUE.identifier)).toBeUndefined();
+  });
+
+  it("fences a stale worker before its next external mutation", async () => {
+    class LeaseStealingForge extends FakeForgeAdapter {
+      override async openPullRequest(
+        input: Parameters<FakeForgeAdapter["openPullRequest"]>[0],
+      ): ReturnType<FakeForgeAdapter["openPullRequest"]> {
+        const pr = await super.openPullRequest(input);
+        clock.advanceMinutes(31);
+        await lease("run_takeover").takeover(ISSUE.identifier);
+        return pr;
+      }
+    }
+
+    const forge = new LeaseStealingForge();
+    const { orchestrator } = makeOrchestrator({ forge });
+    const outcome = await orchestrator.run({
+      runId: "run_stale",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_stale"),
+    });
+
+    expect(outcome.finalState).toBe("QUARANTINED");
+    expect(outcome.reason).toMatch(/fenced out|lease.*moved/i);
+    expect(forge.calls.some((call) => call.op === "markReadyForReview")).toBe(false);
+    const markReadyKey = StateStore.sideEffectKey(
+      "run_stale",
+      "mark-ready",
+      "acme/platform#1",
+    );
+    expect(store.getSideEffect(markReadyKey)).toMatchObject({
+      status: "confirmed",
+      remoteId: "orchestrator:not-applied",
+    });
   }, 60_000);
 
   it("gives a retry its own branch instead of the one it already pushed", async () => {
@@ -292,7 +412,7 @@ describe("end-to-end: issue to governed pull request", () => {
       required: true,
       source: "repository-policy",
     };
-    const { orchestrator: o } = makeOrchestrator({ checks: [failing] });
+    const { orchestrator: o, backlog } = makeOrchestrator({ checks: [failing] });
     const outcome = await o.run({
       runId: "run_store_lease_fail",
       issue: ISSUE,
@@ -302,6 +422,37 @@ describe("end-to-end: issue to governed pull request", () => {
 
     expect(outcome.finalState).toBe("NEEDS_HUMAN");
     expect(store.activeLeaseIssueIds().has(ISSUE.identifier)).toBe(false);
+    expect(backlog.peek(ISSUE.identifier)?.state).toBe("Todo");
+  }, 90_000);
+
+  it("claims with the configured automation assignee and restores ownership on failure", async () => {
+    const failing: CheckSpec = {
+      id: "unit",
+      run: "/bin/false",
+      required: true,
+      source: "repository-policy",
+    };
+    const base = config();
+    const cfg = {
+      ...base,
+      backlog: { ...base.backlog, claimAssignee: "runmill-bot" },
+    };
+    const { orchestrator, backlog } = makeOrchestrator({ checks: [failing], cfg });
+
+    const outcome = await orchestrator.run({
+      runId: "run_assignment_restore",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_assignment_restore"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(backlog.peek(ISSUE.identifier)).toMatchObject({ state: "Todo" });
+    expect(backlog.peek(ISSUE.identifier)?.assigneeId).toBeUndefined();
+    const assignments = backlog.calls
+      .filter((call) => call.op === "assign")
+      .map((call) => (call.args as { assignee: string | null }).assignee);
+    expect(assignments).toEqual(["runmill-bot", null]);
   }, 90_000);
 
   it("releases the lease so the issue can be claimed again", async () => {
@@ -334,10 +485,11 @@ describe("end-to-end: issue to governed pull request", () => {
   it("records a delivered issue once in the markdown activity log", async () => {
     const { orchestrator } = makeOrchestrator({});
     await orchestrator.run({ runId: "run_log", issue: ISSUE, target: TARGET, lease: lease("run_log") });
-    const body = readFileSync(join(source, ".runmill", "log.md"), "utf8");
+    const body = readFileSync(join(root, "log.md"), "utf8");
     expect(body).toMatch(/\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}/);
     expect(body).toContain("**ENG-101** Add a greeting helper");
     expect(body.match(/run `run_log`/g)).toHaveLength(1);
+    expect(existsSync(join(source, ".runmill", "log.md"))).toBe(false);
   }, 60_000);
 
   it("fences the issue body as untrusted data", async () => {
@@ -351,6 +503,31 @@ describe("end-to-end: issue to governed pull request", () => {
 });
 
 describe("end-to-end: the loop refuses to proceed when it should", () => {
+  it("quarantines an always-forbidden diff before checkpointing or calling the forge", async () => {
+    const provider = new FakeProviderAdapter({
+      byRole: {
+        implementer: [
+          {
+            kind: "write",
+            path: ".github/workflows/agent.yml",
+            content: "permissions: write-all\n",
+          },
+        ],
+      },
+    });
+    const { orchestrator, forge } = makeOrchestrator({ provider });
+    const outcome = await orchestrator.run({
+      runId: "run_forbidden_diff",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_forbidden_diff"),
+    });
+
+    expect(outcome.finalState).toBe("QUARANTINED");
+    expect(outcome.reason).toMatch(/forbidden_paths.*\.github/i);
+    expect(forge.calls).toHaveLength(0);
+  }, 60_000);
+
   it("escalates rather than delivering when a check fails", async () => {
     const failing: CheckSpec = {
       id: "unit",
@@ -518,6 +695,94 @@ describe("end-to-end: the loop refuses to proceed when it should", () => {
     expect(outcome.finalState).toBe("QUARANTINED");
     expect(outcome.reason).toMatch(/already leased/i);
   }, 90_000);
+
+  it("stops before delivery when the whole-run invocation budget is exhausted", async () => {
+    const base = config();
+    const cfg = {
+      ...base,
+      budgets: {
+        ...base.budgets,
+        maxAgentInvocations: { ...base.budgets.maxAgentInvocations, total: 2 },
+      },
+    };
+    const { orchestrator, provider, forge } = makeOrchestrator({ cfg });
+
+    const outcome = await orchestrator.run({
+      runId: "run_invocation_budget",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_invocation_budget"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/invocation total exhausted/i);
+    expect(provider.startedRequests.map((request) => request.role)).toEqual([
+      "implementer",
+      "local-reviewer",
+    ]);
+    expect(forge.calls.some((call) => call.op === "merge")).toBe(false);
+  }, 90_000);
+
+  it("records spend and stops when a provider call crosses the issue cost cap", async () => {
+    const base = config();
+    const cfg = {
+      ...base,
+      budgets: {
+        ...base.budgets,
+        maxCostUsdPerIssue: 0.2,
+        costEnforcement: "auto" as const,
+      },
+    };
+    const { orchestrator, forge } = makeOrchestrator({ cfg });
+
+    const outcome = await orchestrator.run({
+      runId: "run_cost_budget",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_cost_budget"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/cost cap exceeded/i);
+    expect(outcome.costUsd).toBe(0.25);
+    expect(forge.calls).toHaveLength(0);
+  }, 60_000);
+
+  it("clamps provider timeouts and stops when the issue wall-time cap expires", async () => {
+    class SlowProvider extends FakeProviderAdapter {
+      override async start(request: Parameters<FakeProviderAdapter["start"]>[0]) {
+        const session = await super.start(request);
+        clock.advanceMinutes(1);
+        return session;
+      }
+    }
+    const base = config();
+    const cfg = {
+      ...base,
+      budgets: { ...base.budgets, maxWallMinutesPerIssue: 1 },
+    };
+    const provider = new SlowProvider({
+      byRole: {
+        implementer: [
+          { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
+        ],
+      },
+      costUsdPerCall: 0.25,
+    });
+    const { orchestrator, forge } = makeOrchestrator({ cfg, provider });
+
+    const outcome = await orchestrator.run({
+      runId: "run_wall_budget",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_wall_budget"),
+    });
+
+    expect(provider.startedRequests[0]?.timeoutMs).toBe(60_000);
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/wall-time cap reached/i);
+    expect(forge.calls).toHaveLength(0);
+  }, 60_000);
 });
 
 describe("guarded merge", () => {
@@ -527,7 +792,7 @@ describe("guarded merge", () => {
     // answer when it cannot determine the credential's power.
     const forge = new FakeForgeAdapter({ credentialCanWriteProtection: false });
     const cfg = { ...config(), autonomy: "guarded-merge" as const };
-    const { orchestrator, backlog } = makeOrchestrator({ forge, cfg });
+    const { orchestrator, backlog, provider } = makeOrchestrator({ forge, cfg });
 
     const outcome = await orchestrator.run({
       runId: "run_g",
@@ -539,6 +804,79 @@ describe("guarded merge", () => {
     expect(outcome.finalState).toBe("COMPLETED");
     expect(outcome.mergeSha).toBe("merge-1");
     expect(backlog.peek("ENG-101")?.state).toBe("Done");
+    const evidence = provider.capturedPrEvidence[0] as { candidate: { sha: string } };
+    const merge = forge.calls.find((call) => call.op === "merge")?.args as {
+      expectedHeadSha: string;
+    };
+    expect(merge.expectedHeadSha).toBe(evidence.candidate.sha);
+  }, 90_000);
+
+  it("refuses GitHub's blocked mergeability verdict, including unresolved conversations", async () => {
+    const forge = new FakeForgeAdapter({
+      credentialCanWriteProtection: false,
+      requiresConversationResolution: true,
+      mergeability: { state: "blocked", mergeable: false },
+    });
+    const cfg = { ...config(), autonomy: "guarded-merge" as const };
+    const { orchestrator } = makeOrchestrator({ forge, cfg });
+
+    const outcome = await orchestrator.run({
+      runId: "run_blocked_mergeability",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_blocked_mergeability"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/blocked.*conversation resolution/i);
+    expect(forge.calls.some((call) => call.op === "merge")).toBe(false);
+  }, 90_000);
+
+  it("refuses a direct merge when branch protection requires a merge queue", async () => {
+    const forge = new FakeForgeAdapter({
+      credentialCanWriteProtection: false,
+      usesMergeQueue: true,
+    });
+    const cfg = { ...config(), autonomy: "guarded-merge" as const };
+    const { orchestrator } = makeOrchestrator({ forge, cfg });
+
+    const outcome = await orchestrator.run({
+      runId: "run_merge_queue",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_merge_queue"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/merge queue.*not implemented/i);
+    expect(forge.calls.some((call) => call.op === "merge")).toBe(false);
+  }, 90_000);
+
+  it("refuses to merge if the remote PR head changes after review", async () => {
+    class ChangedAfterReviewForge extends FakeForgeAdapter {
+      reads = 0;
+      override async getPullRequest(input: { repo: string; number: number }) {
+        this.reads += 1;
+        const current = await super.getPullRequest(input);
+        return current === undefined || this.reads < 3
+          ? current
+          : { ...current, headSha: "unreviewed-external-commit" };
+      }
+    }
+
+    const forge = new ChangedAfterReviewForge({ credentialCanWriteProtection: false });
+    const cfg = { ...config(), autonomy: "guarded-merge" as const };
+    const { orchestrator } = makeOrchestrator({ forge, cfg });
+    const outcome = await orchestrator.run({
+      runId: "run_head_changed",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_head_changed"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/does not match the exact candidate/i);
+    expect(forge.calls.some((call) => call.op === "merge")).toBe(false);
   }, 90_000);
 
   it("waits for approval when branch protection requires it", async () => {
@@ -607,6 +945,137 @@ describe("PR review", () => {
     expect(roles.indexOf("pr-reviewer")).toBeGreaterThan(roles.indexOf("local-reviewer"));
   }, 90_000);
 
+  it("hands PR reviewers orchestrator-owned evidence for the exact candidate", async () => {
+    const provider = defaultProvider();
+    const forge = new FakeForgeAdapter({
+      requiredChecks: ["build"],
+      checks: [
+        {
+          name: "build",
+          conclusion: "success",
+          headSha: "$ref",
+          completedAt: "2026-08-06T10:00:00Z",
+        },
+      ],
+    });
+    const { orchestrator } = makeOrchestrator({ provider, forge });
+    const outcome = await orchestrator.run({
+      runId: "run_pr_evidence",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_pr_evidence"),
+    });
+
+    expect(outcome.finalState).toBe("PR_DELIVERED");
+    const evidence = provider.capturedPrEvidence[0] as {
+      candidate: { sha: string; matches_pull_request_head: boolean };
+      pull_request: { number: number; head_sha: string };
+      ci: { required_contexts: string[]; verdicts: unknown[] };
+      unavailable: string[];
+    };
+    expect(evidence.pull_request.number).toBe(1);
+    expect(evidence.pull_request.head_sha).toBe(evidence.candidate.sha);
+    expect(evidence.candidate.matches_pull_request_head).toBe(true);
+    expect(evidence.ci).toEqual({
+      required_contexts: ["build"],
+      verdicts: [
+        { context: "build", state: "satisfied", detail: '"build" passed' },
+      ],
+    });
+    expect(evidence.unavailable.join(" ")).toMatch(/comments were not collected/i);
+  }, 90_000);
+
+  it("passes repository review guidance as captured untrusted additions", async () => {
+    mkdirSync(join(source, ".runmill", "skills"), { recursive: true });
+    writeFileSync(join(source, ".runmill", "skills", "local.md"), "Inspect tenant boundaries.\n");
+    writeFileSync(join(source, ".runmill", "skills", "pr.md"), "Inspect migration rollback.\n");
+    git(source, "add", ".runmill/skills");
+    git(source, "commit", "-q", "-m", "add review guidance");
+    git(source, "push", "-q", "origin", "main");
+
+    const base = config();
+    const cfg = {
+      ...base,
+      review: {
+        ...base.review,
+        localReviewSkill: ".runmill/skills/local.md",
+        prReviewSkill: ".runmill/skills/pr.md",
+      },
+    };
+    const provider = defaultProvider();
+    const { orchestrator } = makeOrchestrator({ provider, cfg });
+    const outcome = await orchestrator.run({
+      runId: "run_review_guidance",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_review_guidance"),
+    });
+
+    expect(outcome.finalState).toBe("PR_DELIVERED");
+    const local = provider.startedRequests.find((request) => request.role === "local-reviewer");
+    const pr = provider.startedRequests.find((request) => request.role === "pr-reviewer");
+    expect(local?.supplementalReviewGuidance).toMatchObject({
+      source: ".runmill/skills/local.md",
+      content: "Inspect tenant boundaries.\n",
+    });
+    expect(pr?.supplementalReviewGuidance).toMatchObject({
+      source: ".runmill/skills/pr.md",
+      content: "Inspect migration rollback.\n",
+    });
+    expect(
+      provider.startedRequests.find((request) => request.role === "implementer")
+        ?.supplementalReviewGuidance,
+    ).toBeUndefined();
+  }, 90_000);
+
+  it("refuses PR evidence when the remote head is not the local candidate", async () => {
+    class MismatchedHeadForge extends FakeForgeAdapter {
+      override async getPullRequest(input: { repo: string; number: number }) {
+        const current = await super.getPullRequest(input);
+        return current === undefined ? undefined : { ...current, headSha: "external-commit" };
+      }
+    }
+    const provider = defaultProvider();
+    const forge = new MismatchedHeadForge();
+    const { orchestrator } = makeOrchestrator({ provider, forge });
+    const outcome = await orchestrator.run({
+      runId: "run_wrong_head",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_wrong_head"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/does not match the exact candidate/i);
+    expect(provider.startedRequests.some((request) => request.role === "pr-reviewer")).toBe(false);
+  }, 90_000);
+
+  it("refuses a review that tampers with orchestrator-owned PR evidence", async () => {
+    const provider = new FakeProviderAdapter({
+      byRole: {
+        implementer: [
+          { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
+        ],
+        "local-reviewer": [{ kind: "say", text: "reviewing" }],
+        "pr-reviewer": [
+          { kind: "write", path: ".runmill/run/pr-evidence.json", content: "{}\n" },
+        ],
+      },
+      outputByRole: { "local-reviewer": GOOD_REVIEW, "pr-reviewer": GOOD_REVIEW },
+    });
+    const { orchestrator, forge } = makeOrchestrator({ provider });
+    const outcome = await orchestrator.run({
+      runId: "run_tampered_evidence",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_tampered_evidence"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/modified.*orchestrator-owned evidence/i);
+    expect(forge.calls.some((call) => call.op === "merge")).toBe(false);
+  }, 90_000);
+
   it("never grants the reviewer a writable path", async () => {
     // Something whose only job is to form an opinion has no business editing
     // the thing it judges.
@@ -651,8 +1120,15 @@ describe("PR review", () => {
       lease: lease("run_pf"),
     });
 
-    expect(outcome.finalState).toBe("PR_DELIVERED");
+    expect(outcome.finalState, outcome.reason).toBe("PR_DELIVERED");
     expect(provider.startedRequests.filter((r) => r.role === "pr-reviewer").length).toBe(2);
+    const evidence = provider.capturedPrEvidence as {
+      candidate: { sha: string };
+      pull_request: { head_sha: string };
+    }[];
+    expect(evidence).toHaveLength(2);
+    expect(evidence[0]?.candidate.sha).not.toBe(evidence[1]?.candidate.sha);
+    for (const item of evidence) expect(item.pull_request.head_sha).toBe(item.candidate.sha);
     // Once for the original branch, once for the fix.
     const pushCalls = forge.calls.filter((c) => c.op === "push");
     expect(pushCalls.length).toBeGreaterThan(1);
@@ -678,7 +1154,7 @@ describe("PR review", () => {
       lease: lease("run_pu"),
     });
 
-    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.finalState, outcome.reason).toBe("NEEDS_HUMAN");
     // A fixer that changes nothing means the next review reaches the same
     // verdict, so looping again would only spend money.
     expect(outcome.reason).toMatch(/no change|unresolved/i);

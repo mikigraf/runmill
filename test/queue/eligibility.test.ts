@@ -92,6 +92,29 @@ describe("evaluateEligibility", () => {
     expect(d.rules.find((r) => r.rule === "not-leased")?.passed).toBe(false);
   });
 
+  it("never adopts work assigned to a human", () => {
+    const d = evaluateEligibility(
+      issue({ assigneeId: "user-1", assigneeIsHuman: true }),
+      policy({ allowUnassigned: true, claimAssignee: "runmill-bot" }),
+    );
+    expect(d.rules.find((r) => r.rule === "assignment")).toMatchObject({ passed: false });
+  });
+
+  it("honors allow_unassigned", () => {
+    const d = evaluateEligibility(issue(), policy({ allowUnassigned: false }));
+    expect(d.rules.find((r) => r.rule === "assignment")).toMatchObject({ passed: false });
+  });
+
+  it("accepts work already owned by the exact configured automation identity", () => {
+    const d = evaluateEligibility(
+      // Linear cannot classify account type and marks every assignee human.
+      // Exact operator-owned identity is the authority-bearing comparison.
+      issue({ assigneeId: "runmill-bot", assigneeIsHuman: true }),
+      policy({ allowUnassigned: false, claimAssignee: "runmill-bot" }),
+    );
+    expect(d.rules.find((r) => r.rule === "assignment")).toMatchObject({ passed: true });
+  });
+
   it("requires every include label to be present", () => {
     const p = policy({ includeLabels: ["agent-ready", "backend"] });
     expect(

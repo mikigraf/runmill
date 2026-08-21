@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BoundedCapture, run, runOrThrow } from "../../src/platform/process.js";
+import { BoundedCapture, run, runOrThrow, runWithInput } from "../../src/platform/process.js";
 
 describe("BoundedCapture", () => {
   it("returns everything when under the cap", () => {
@@ -87,5 +87,43 @@ describe("runOrThrow", () => {
 
   it("throws with the stderr attached on failure", async () => {
     await expect(runOrThrow("/bin/sh", ["-c", "echo bad >&2; exit 1"])).rejects.toThrow(/bad/);
+  });
+});
+
+describe("runWithInput", () => {
+  it("delivers sensitive input on stdin without adding it to argv", async () => {
+    const secret = "private-value-not-for-argv";
+    const result = await runWithInput(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        "let data=''; process.stdin.on('data', c => data += c); " +
+          "process.stdin.on('end', () => process.stdout.write(JSON.stringify({argv:process.argv,data})));",
+      ],
+      secret,
+    );
+
+    expect(result.ok).toBe(true);
+    const observed = JSON.parse(result.stdout) as { argv: string[]; data: string };
+    expect(observed.data).toBe(secret);
+    expect(observed.argv.join("\0")).not.toContain(secret);
+  });
+
+  it("never copies stdin into a failed command diagnostic", async () => {
+    const secret = "diagnostic-secret";
+    const result = await runWithInput(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        "process.stdin.resume(); process.stdin.on('end', () => { console.error('refused'); process.exit(2); });",
+      ],
+      secret,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.stderr).toContain("refused");
+    expect(result.stderr).not.toContain(secret);
   });
 });

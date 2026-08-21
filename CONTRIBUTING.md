@@ -4,19 +4,22 @@
 
 ```bash
 git clone https://github.com/mikigraf/runmill.git
-cd runmill && npm install
-npm test
+cd runmill
+npm ci
+npm run check
 ```
 
-Node 20.11+, git, and macOS or Linux. Sandbox tests need Seatbelt (built into macOS) or
-bubblewrap (`apt-get install bubblewrap`).
+Node 22 or 24, git, and macOS or Linux. Sandbox tests need Seatbelt (built into macOS) or
+bubblewrap (`apt-get install bubblewrap`). The repository pins npm 11.15.0 in `package.json`; use
+that version when regenerating `package-lock.json`.
 
 ## The loop you will be working in
 
 ```bash
-npm test              # 240+ tests, no network, no credentials
-npm run typecheck     # strict, and strict about it
-npm run docs:errors   # regenerate docs/errors.md after touching the catalog
+npm run check           # lint, types, coverage-gated tests, generated docs
+npm test                # offline tests without coverage, network, or credentials
+npm run package:check   # pack, clean-install, and execute the release artifact
+npm run docs:errors     # regenerate docs/errors.md after touching the catalog
 ```
 
 `npm test` deliberately excludes `test/live/`, which talks to real credentials and real remotes.
@@ -109,29 +112,24 @@ denial inside.
 
 ## Releasing
 
-The package is not published yet. When it is:
+The package is not published yet. Do not publish it from a development machine. Before a release
+PR is approved, run the same gates used by CI:
 
 ```bash
-npm run typecheck && npm run test:coverage && npm run verify:linux
-npm version <patch|minor|major>          # tags the commit
-npm publish                              # prepublishOnly re-runs the gates
-git push --follow-tags
+npm ci
+npm run check
+npm run package:check
+npm run verify:linux
 ```
 
-`prepublishOnly` runs typecheck, the coverage-gated suite, and the docs check.
-It exists because npm only allows unpublishing within 72 hours, after which a
-broken release is permanent and has to be superseded — a gate is cheaper than
-that.
+`prepublishOnly` repeats `check` and the package smoke test. The smoke test builds the tarball,
+enforces its size budget, installs it in an empty prefix, and executes `runmill --version`. It is
+the release artifact—not the working tree—that must pass.
 
-Check the install actually works before announcing it, from a tarball rather
-than the working copy:
+Release publication uses a reviewed GitHub release and npm trusted publishing with provenance once
+the npm package and repository environments are configured. Maintainers must follow the complete
+[release checklist](./docs/releasing.md); until its one-time external setup is finished, the
+workflow will not be authorized to publish.
 
-```bash
-npm pack --pack-destination /tmp/rel
-npm install -g --prefix /tmp/rel/prefix /tmp/rel/runmill-*.tgz
-PATH=/tmp/rel/prefix/bin:$PATH runmill --version
-```
-
-`npm link` is not a substitute: it symlinks the working copy, so it passes even
-when `files` omits something the tarball needs. That is exactly how a release
-once shipped with no code in it.
+`npm link` is not a substitute for `npm run package:check`: it symlinks the working copy, so it can
+pass when `files` omits something the tarball needs.

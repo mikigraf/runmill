@@ -21,7 +21,8 @@ import {
   summarize,
   wilsonInterval,
 } from "../../src/eval/score.js";
-import { replaySuite, renderReport, reportToJson } from "../../src/eval/replay.js";
+import { makeTaskWorkspace, replaySuite, renderReport, reportToJson } from "../../src/eval/replay.js";
+import { RunmillError } from "../../src/errors/runmill-error.js";
 
 const SUITE = `
 name: t
@@ -30,12 +31,18 @@ tasks:
     kind: bug-fix
     split: development
     expected: deliver
+    repo_path: /fixtures/current
+    base_commit: abc123
+    dependency_path: /fixtures/abc123-installed
     allowed_paths: [src/]
     issue:
       identifier: EV-1
       title: Fix the thing
       description: with criteria
       labels: [agent-ready]
+      team: PLATFORM
+      state: Ready
+      project: Runtime
   - id: b
     kind: underspecified
     split: held-out
@@ -67,6 +74,12 @@ describe("parseSuite", () => {
     expect(suite.tasks[0]?.expected).toBe("deliver");
     expect(suite.tasks[1]?.split).toBe("held-out");
     expect(suite.tasks[0]?.allowedPaths).toEqual(["src/"]);
+    expect(suite.tasks[0]).toMatchObject({
+      repoPath: "/fixtures/current",
+      baseCommit: "abc123",
+      dependencyPath: "/fixtures/abc123-installed",
+      issue: { team: "PLATFORM", state: "Ready", project: "Runtime" },
+    });
   });
 });
 
@@ -110,6 +123,23 @@ tasks:
     expect(errors.join(" ")).toMatch(/duplicate id/);
   });
 
+  it("rejects task ids that can escape a temporary path or form an unsafe run id", () => {
+    const errors = validateSuite(
+      parseSuite(`
+name: t
+tasks:
+  - id: ../../outside
+    expected: deliver
+    issue: { title: one }
+  - id: safe-stop
+    expected: refuse
+    issue: { title: two }
+`),
+    );
+    expect(errors.join(" ")).toMatch(/id must be 1-80 ASCII/);
+    expect(() => makeTaskWorkspace("../../outside")).toThrow(/unsafe evaluation task id/);
+  });
+
   it("rejects an unknown expected outcome and an unknown split", () => {
     const errors = validateSuite(
       parseSuite(`
@@ -130,6 +160,34 @@ tasks:
 
   it("rejects an empty suite, which would otherwise pass trivially", () => {
     expect(validateSuite({ name: "t", tasks: [] }).join(" ")).toMatch(/no tasks/);
+  });
+
+  it("rejects empty optional replay and routing values", () => {
+    const errors = validateSuite(
+      parseSuite(`
+name: t
+tasks:
+  - id: a
+    expected: deliver
+    repo_path: ""
+    base_commit: " "
+    dependency_path: ""
+    issue: { title: one, team: "", state: " ", project: "" }
+  - id: b
+    expected: refuse
+    issue: { title: two }
+`),
+    );
+    expect(errors).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("repo_path must not be empty"),
+        expect.stringContaining("base_commit must not be empty"),
+        expect.stringContaining("dependency_path must not be empty"),
+        expect.stringContaining("issue.team must not be empty"),
+        expect.stringContaining("issue.state must not be empty"),
+        expect.stringContaining("issue.project must not be empty"),
+      ]),
+    );
   });
 });
 
@@ -221,6 +279,21 @@ describe("scoreDiffScope", () => {
     expect(result.passed).toBe(false);
     expect(result.detail).toContain(".github/workflows/ci.yml");
   });
+
+  it("does not widen a literal path into a string prefix", () => {
+    const result = scoreDiffScope(task({ allowedPaths: ["src"] }), ["src-secret.txt"]);
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("src-secret.txt");
+  });
+
+  it("uses the same directory and glob semantics as the delivery path gate", () => {
+    expect(
+      scoreDiffScope(task({ allowedPaths: ["src/", "test/**/*.test.ts"] }), [
+        "src/a.ts",
+        "test/unit/a.test.ts",
+      ]).passed,
+    ).toBe(true);
+  });
 });
 
 describe("scoreTask", () => {
@@ -300,6 +373,24 @@ describe("replaySuite", () => {
     expect(report.scores).toHaveLength(2);
     expect(report.scores[0]?.passRate).toBe(0);
     expect(report.scores[1]?.passRate).toBe(1);
+  });
+
+  it("retains actionable Runmill error evidence without leaking held-out details", async () => {
+    const report = await replaySuite({
+      suite,
+      runner: async (t) => {
+        throw RunmillError.fromCatalog("RM-VERIFY-005", {
+          whatHappened: `exact base evidence for ${t.id} is missing; set dependency_path`,
+        });
+      },
+    });
+
+    expect(report.scores[0]?.attempts[0]?.reason).toContain(
+      "exact base evidence for a is missing; set dependency_path",
+    );
+    expect(report.scores[1]?.attempts[0]?.reason).toBe(
+      "RM-VERIFY-005 Verification dependencies are not trusted",
+    );
   });
 });
 

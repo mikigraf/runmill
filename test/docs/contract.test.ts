@@ -182,8 +182,39 @@ describe("configuration reference", () => {
   it("states the git_isolation default the code actually uses", () => {
     // These drifted once already, in the direction that silently weakened
     // isolation for every real run.
-    const actual = parseConfig("version: 1\n").workspace.gitIsolation;
+    const actual = parseConfig(`
+version: 1
+autonomy: pr-only
+providers:
+  implementer: { implementation: codex }
+backlog:
+  provider: linear
+  team: ENG
+  eligible_states: [Todo]
+  claim_state: In Progress
+github:
+  repositories:
+    - match: { team: ENG }
+      repo: acme/platform
+`).workspace.gitIsolation;
     const body = readFileSync("docs/configuration.md", "utf8");
     expect(body).toMatch(new RegExp(`\\| \`git_isolation\` \\| \`${actual}\``));
+  });
+
+  it("does not advertise configuration controls the runtime does not consume", () => {
+    const schema = readFileSync("runmill.schema.json", "utf8");
+    const docs = readFileSync("docs/configuration.md", "utf8");
+    for (const key of [
+      "blocked_state",
+      "delete_branch",
+      "clean_untracked_files",
+      "changed_area_rules",
+      "entry_files",
+      "max_initial_bytes",
+      "progressive_disclosure",
+    ]) {
+      expect(schema, `schema still advertises ${key}`).not.toContain(`\"${key}\"`);
+      expect(docs, `configuration docs still advertise ${key}`).not.toContain(`\`${key}\``);
+    }
   });
 });

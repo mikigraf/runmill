@@ -1,0 +1,5 @@
+# runmill runtime state. Machine-local, changes every run.
+state/
+workspaces/
+
+# Everything else here is project configuration, and is tracked on purpose.

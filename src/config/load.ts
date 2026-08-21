@@ -1,13 +1,27 @@
 import { parse as parseYaml } from "yaml";
+import Ajv2020, { type ErrorObject } from "ajv/dist/2020.js";
 import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { RunmillError } from "../errors/runmill-error.js";
 import { findConflictingRules, type RepositoryRule } from "../queue/repository-mapping.js";
 import type { RunmillConfig, ValidationResult } from "./types.js";
+import configSchema from "../../runmill.schema.json" with { type: "json" };
+import { SUPPORTED_REPORT_FORMATS } from "../verification/report.js";
 
 export type { RunmillConfig } from "./types.js";
 
 const DEFAULT_BRANCH_TEMPLATE = "runmill/{issue_identifier}-{slug}-{attempt}";
+
+const validateSchema = new Ajv2020({ allErrors: true, strict: false }).compile(configSchema);
+
+function schemaError(error: ErrorObject): string {
+  const path = error.instancePath === "" ? "<root>" : error.instancePath.slice(1).replaceAll("/", ".");
+  if (error.keyword === "additionalProperties") {
+    const extra = String(error.params["additionalProperty"] ?? "unknown");
+    return `${path === "<root>" ? extra : `${path}.${extra}`} is not a recognized policy key`;
+  }
+  return `${path} ${error.message ?? "is invalid"}`;
+}
 
 function asArray<T>(value: unknown, fallback: readonly T[] = []): readonly T[] {
   return Array.isArray(value) ? (value as T[]) : fallback;
@@ -26,7 +40,15 @@ function asRecord(value: unknown): Record<string, unknown> {
  * readable and a missing key never means "undefined behavior".
  */
 export function parseConfig(source: string): RunmillConfig {
-  const raw = asRecord(parseYaml(source));
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(source);
+  } catch (cause) {
+    throw RunmillError.fromCatalog("RM-CONFIG-001", {
+      whatHappened: `The operator policy is not valid YAML.\n  ${cause instanceof Error ? cause.message : String(cause)}`,
+    });
+  }
+  const raw = asRecord(parsed);
 
   // A file written against the old shape parses to all-defaults and silently
   // runs codex on everything, which is the worst possible migration: it looks
@@ -47,7 +69,17 @@ export function parseConfig(source: string): RunmillConfig {
     });
   }
 
+  if (!validateSchema(raw)) {
+    const errors = (validateSchema.errors ?? []).map(schemaError);
+    throw RunmillError.fromCatalog("RM-CONFIG-001", {
+      whatHappened:
+        "The operator policy does not match runmill.schema.json:\n" +
+        errors.map((error) => `  - ${error}`).join("\n"),
+    });
+  }
+
   const providers = asRecord(raw["providers"]);
+  const experimental = asRecord(raw["experimental"]);
   const implementer = asRecord(providers["implementer"]);
   const reviewer = asRecord(providers["reviewer"]);
   const backlog = asRecord(raw["backlog"]);
@@ -55,7 +87,6 @@ export function parseConfig(source: string): RunmillConfig {
   const github = asRecord(raw["github"]);
   const merge = asRecord(github["merge"]);
   const workspace = asRecord(raw["workspace"]);
-  const context = asRecord(raw["context"]);
   const verification = asRecord(raw["verification"]);
   const review = asRecord(raw["review"]);
   const risk = asRecord(raw["risk"]);
@@ -82,6 +113,9 @@ export function parseConfig(source: string): RunmillConfig {
   return {
     version: (raw["version"] ?? 1) as 1,
     autonomy: (raw["autonomy"] ?? "pr-only") as RunmillConfig["autonomy"],
+    experimental: {
+      automaticMerge: experimental["automatic_merge"] === true,
+    },
     providers: {
       execution: "local",
       maxTurns: Number(providers["max_turns"] ?? 80),
@@ -99,12 +133,11 @@ export function parseConfig(source: string): RunmillConfig {
       },
     },
     backlog: {
-      provider: (backlog["provider"] ?? "linear") as "linear" | "github-issues",
+      provider: (backlog["provider"] ?? "linear") as "linear",
       team: String(backlog["team"] ?? ""),
       eligibleStates: asArray<string>(backlog["eligible_states"]),
       claimState: String(backlog["claim_state"] ?? ""),
       completedState: backlog["completed_state"] as string | undefined,
-      blockedState: backlog["blocked_state"] as string | undefined,
       deliveredState: backlog["delivered_state"] as string | undefined,
       includeLabels: asArray<string>(backlog["include_labels"]),
       excludeLabels: asArray<string>(backlog["exclude_labels"]),
@@ -121,12 +154,9 @@ export function parseConfig(source: string): RunmillConfig {
     github: {
       repositories,
       branchTemplate: String(github["branch_template"] ?? DEFAULT_BRANCH_TEMPLATE),
-      stackDependencyChains: github["stack_dependency_chains"] === true,
-      stackMaxDepth: Number(github["stack_max_depth"] ?? 4),
       draftPr: github["draft_pr"] !== false,
       merge: {
         method: (merge["method"] ?? "squash") as "squash" | "merge" | "rebase",
-        deleteBranch: merge["delete_branch"] !== false,
       },
     },
     workspace: {
@@ -138,17 +168,11 @@ export function parseConfig(source: string): RunmillConfig {
       // code execution in the orchestrator's context; denying it breaks git.
       // Only `clone` makes "writable: the run worktree, and nothing else" both
       // true and workable.
-      gitIsolation: (workspace["git_isolation"] ?? "clone") as "separate-git-dir" | "clone",
-      sandbox: (workspace["sandbox"] ?? "native") as "native" | "container" | "none",
+      gitIsolation: "clone",
+      sandbox: (workspace["sandbox"] ?? "native") as "native" | "none",
       network: (workspace["network"] ?? "proxy") as "proxy" | "none",
       networkAllowlist: asArray<string>(workspace["network_allowlist"]),
       allowUnenforced: asArray<string>(workspace["allow_unenforced"]),
-      cleanUntrackedFiles: workspace["clean_untracked_files"] !== false,
-    },
-    context: {
-      entryFiles: asArray<string>(context["entry_files"]),
-      maxInitialBytes: Number(context["max_initial_bytes"] ?? 50_000),
-      progressiveDisclosure: context["progressive_disclosure"] !== false,
     },
     verification: {
       manifest: String(verification["manifest"] ?? ".runmill/checks.yaml"),
@@ -202,7 +226,6 @@ export function parseConfig(source: string): RunmillConfig {
       clampInvocationTimeoutToRemaining: budgets["clamp_invocation_timeout_to_remaining"] !== false,
       costEnforcement: (budgets["cost_enforcement"] ?? "auto") as
         | "auto"
-        | "tokens-estimated"
         | "wall-and-invocations-only",
     },
   };
@@ -210,6 +233,15 @@ export function parseConfig(source: string): RunmillConfig {
 
 const AUTONOMY_MODES = new Set(["observe", "pr-only", "guarded-merge", "continuous"]);
 const PROVIDER_IMPLEMENTATIONS = new Set(["codex", "claude"]);
+const RISK_TIERS = new Set(["low", "medium", "high", "critical"]);
+const MANUAL_APPROVAL_CONDITIONS = new Set([
+  "public_api_change",
+  "permissions_change",
+  "secret_related_change",
+  "missing_acceptance_criteria",
+  "check_config_changed",
+  "lockfile_changed",
+]);
 
 /**
  * Structural and cross-field validation.
@@ -227,6 +259,48 @@ export function validateConfig(config: RunmillConfig): ValidationResult {
   if (!AUTONOMY_MODES.has(config.autonomy)) {
     errors.push(
       `autonomy must be one of ${[...AUTONOMY_MODES].join(", ")}, got "${String(config.autonomy)}"`,
+    );
+  }
+  if (!RISK_TIERS.has(config.risk.default)) {
+    errors.push(
+      `risk.default must be one of ${[...RISK_TIERS].join(", ")}, ` +
+        `got "${String(config.risk.default)}"`,
+    );
+  }
+  for (const [index, condition] of config.risk.manualApproval.conditions.entries()) {
+    if (!MANUAL_APPROVAL_CONDITIONS.has(condition)) {
+      errors.push(
+        `risk.manual_approval.conditions[${index}] must be one of ` +
+          `${[...MANUAL_APPROVAL_CONDITIONS].join(", ")}, got "${condition}"`,
+      );
+    }
+  }
+  for (const [index, path] of config.risk.manualApproval.paths.entries()) {
+    if (path.trim() === "") {
+      errors.push(`risk.manual_approval.paths[${index}] must not be empty`);
+    }
+  }
+  for (const [index, label] of config.risk.manualApproval.labels.entries()) {
+    if (label.trim() === "") {
+      errors.push(`risk.manual_approval.labels[${index}] must not be empty`);
+    }
+  }
+  if (
+    (config.autonomy === "guarded-merge" || config.autonomy === "continuous") &&
+    !config.experimental.automaticMerge
+  ) {
+    errors.push(
+      `autonomy "${config.autonomy}" is experimental; set ` +
+        "experimental.automatic_merge: true to acknowledge the automatic-merge risk",
+    );
+  }
+  if (
+    (config.autonomy === "guarded-merge" || config.autonomy === "continuous") &&
+    !config.verification.failOnSkippedCheck
+  ) {
+    errors.push(
+      `autonomy "${config.autonomy}" requires verification.fail_on_skipped_check: true; ` +
+        "automatic merge cannot rely on checks whose coverage is unproven",
     );
   }
   if (!PROVIDER_IMPLEMENTATIONS.has(config.providers.implementer.implementation)) {
@@ -261,9 +335,76 @@ export function validateConfig(config: RunmillConfig): ValidationResult {
   if (config.backlog.claimState === "") {
     errors.push("backlog.claim_state is required");
   }
+  const normalizedEligibleStates = new Map<string, string>();
+  for (const [index, state] of config.backlog.eligibleStates.entries()) {
+    if (state.trim() === "") {
+      errors.push(`backlog.eligible_states[${index}] must not be empty`);
+      continue;
+    }
+    if (state !== state.trim()) {
+      errors.push(`backlog.eligible_states[${index}] must not have surrounding whitespace`);
+    }
+    const normalized = state.trim().toLowerCase();
+    const duplicate = normalizedEligibleStates.get(normalized);
+    if (duplicate !== undefined) {
+      errors.push(
+        `backlog.eligible_states contains the same Linear state more than once: ` +
+          `"${duplicate}" and "${state}"`,
+      );
+    } else {
+      normalizedEligibleStates.set(normalized, state);
+    }
+  }
+
+  const lifecycleStates = [
+    ["claim_state", config.backlog.claimState],
+    ["delivered_state", config.backlog.deliveredState],
+    ["completed_state", config.backlog.completedState],
+  ] as const;
+  for (const [key, state] of lifecycleStates) {
+    if (state === undefined) continue;
+    if (state.trim() === "") {
+      errors.push(`backlog.${key} must not be empty`);
+      continue;
+    }
+    if (state !== state.trim()) {
+      errors.push(`backlog.${key} must not have surrounding whitespace`);
+    }
+    const eligible = normalizedEligibleStates.get(state.trim().toLowerCase());
+    if (eligible !== undefined) {
+      errors.push(
+        `backlog.${key} "${state}" must not overlap backlog.eligible_states ` +
+          `("${eligible}"); otherwise Runmill can select the same issue again`,
+      );
+    }
+  }
+  if (config.autonomy === "pr-only" && config.backlog.deliveredState === undefined) {
+    errors.push(
+      "autonomy pr-only requires backlog.delivered_state; a delivered pull request must leave " +
+        "the eligible queue before the daemon polls again",
+    );
+  }
+  if (!config.backlog.allowUnassigned && config.backlog.claimAssignee === undefined) {
+    errors.push(
+      "backlog.allow_unassigned: false requires backlog.claim_assignee; otherwise no issue can " +
+        "satisfy the assignment ownership rule",
+    );
+  }
+  if (config.backlog.claimAssignee !== undefined && config.backlog.claimAssignee.trim() === "") {
+    errors.push("backlog.claim_assignee must not be empty");
+  }
 
   if (config.github.repositories.length === 0) {
     errors.push("github.repositories must contain at least one mapping rule");
+  }
+  const configuredRepositories = new Set(
+    config.github.repositories.map((rule) => rule.repo.toLowerCase()),
+  );
+  if (configuredRepositories.size > 1) {
+    errors.push(
+      "github.repositories may contain several routing rules, but every rule must target the " +
+        "same owner/name in this release; run one daemon per local repository",
+    );
   }
   for (const [i, rule] of config.github.repositories.entries()) {
     if (!/^[^/\s]+\/[^/\s]+$/.test(rule.repo)) {
@@ -289,6 +430,41 @@ export function validateConfig(config: RunmillConfig): ValidationResult {
     );
   }
 
+  for (const [index, command] of config.verification.commands.entries()) {
+    if (command.id.trim() === "") {
+      errors.push(`verification.commands[${index}].id is required`);
+    }
+    if (command.run.trim() === "") {
+      errors.push(`verification.commands[${index}].run is required`);
+    }
+    if (command.report !== undefined) {
+      const reportRoot = "/verification-checkout";
+      const reportPath = resolve(reportRoot, command.report.path);
+      const rel = relative(reportRoot, reportPath);
+      if (
+        command.report.path.trim() === "" ||
+        isAbsolute(command.report.path) ||
+        rel === "" ||
+        rel === ".." ||
+        rel.startsWith("../")
+      ) {
+        errors.push(
+          `verification.commands[${index}].report.path must stay inside the verification checkout`,
+        );
+      }
+      if (
+        !SUPPORTED_REPORT_FORMATS.includes(
+          command.report.format as (typeof SUPPORTED_REPORT_FORMATS)[number],
+        )
+      ) {
+        errors.push(
+          `verification.commands[${index}].report.format must be one of ` +
+            SUPPORTED_REPORT_FORMATS.join(", "),
+        );
+      }
+    }
+  }
+
   if (config.review.maxFixIterations > config.budgets.maxAgentInvocations.fixer) {
     errors.push(
       `review.max_fix_iterations (${config.review.maxFixIterations}) exceeds ` +
@@ -310,8 +486,49 @@ export function validateConfig(config: RunmillConfig): ValidationResult {
     );
   }
 
+  const hasDollarCap =
+    config.budgets.maxCostUsdPerIssue !== undefined ||
+    config.budgets.dailyCostUsd !== undefined;
+  if (hasDollarCap && config.budgets.costEnforcement === "wall-and-invocations-only") {
+    errors.push(
+      "dollar-denominated budgets cannot be combined with " +
+        'cost_enforcement: "wall-and-invocations-only" because that mode has no dollar signal',
+    );
+  }
+  const reviewerImplementation =
+    config.providers.reviewer.implementation === "inherit"
+      ? config.providers.implementer.implementation
+      : config.providers.reviewer.implementation;
+  if (
+    hasDollarCap &&
+    (config.providers.implementer.implementation === "codex" || reviewerImplementation === "codex")
+  ) {
+    errors.push(
+      "dollar-denominated budgets require every configured provider to report dollar cost; " +
+        "the current Codex adapter does not, and token-price estimation is not implemented",
+    );
+  }
+
   if (config.workspace.sandbox === "none" && config.autonomy !== "observe") {
     errors.push('workspace.sandbox "none" is only permitted in observe mode');
+  }
+  if (config.workspace.network === "none" && config.autonomy !== "observe") {
+    errors.push(
+      'workspace.network "none" is only permitted in observe mode; configured coding-agent ' +
+        "CLIs require network access for every live implementation or review request",
+    );
+  }
+  if (config.workspace.networkAllowlist.length > 0) {
+    errors.push(
+      "workspace.network_allowlist is not enforceable in this developer preview; " +
+        "leave it empty rather than relying on a host restriction that does not exist",
+    );
+  }
+  if (config.workspace.allowUnenforced.length > 0) {
+    errors.push(
+      "workspace.allow_unenforced is reserved and has no runtime enforcement semantics; " +
+        "leave it empty rather than recording an acknowledgement Runmill does not consume",
+    );
   }
 
   return { valid: errors.length === 0, errors };
@@ -339,8 +556,8 @@ export function loadConfig(
     // fixes that could not possibly apply.
     throw RunmillError.fromCatalog("RM-CONFIG-003", {
       whatHappened:
-        `No runmill.yaml at ${path}\n\n` +
-        `  runmill init creates one, inferring the repository and base branch\n` +
+        `No operator policy at ${path}\n\n` +
+        `  runmill init creates one outside the repository, inferring the repository and base branch\n` +
         `  from git. Everything it cannot infer is left as an editable placeholder.`,
     });
   }
@@ -361,10 +578,6 @@ export function loadConfig(
   if (config.review.prReviewSkill !== undefined) {
     referenced.push({ key: "review.pr_review_skill", value: config.review.prReviewSkill });
   }
-  for (const entry of config.context.entryFiles) {
-    referenced.push({ key: "context.entry_files", value: entry });
-  }
-
   const missing = referenced.filter(({ value }) => {
     const abs = isAbsolute(value) ? value : resolve(options.repoRoot, value);
     return !existsSync(abs);

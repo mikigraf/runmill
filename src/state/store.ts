@@ -34,7 +34,11 @@ export interface LeaseRow {
   releasedAt: string | null;
 }
 
-export type SideEffectStatus = "intended" | "in_flight" | "confirmed" | "failed";
+export type SideEffectStatus =
+  | "intended"
+  | "in_flight"
+  | "confirmed"
+  | "failed";
 
 export interface SideEffectRow {
   key: string;
@@ -45,6 +49,13 @@ export interface SideEffectRow {
   status: SideEffectStatus;
   remoteId: string | null;
   lastError: string | null;
+}
+
+export interface BudgetLedgerRow {
+  readonly dayBucket: string;
+  readonly repo: string;
+  readonly costUsd: number;
+  readonly invocations: number;
 }
 
 export interface StateStoreOptions {
@@ -312,9 +323,8 @@ export class StateStore {
    * Record the intent to perform an external mutation.
    *
    * Called BEFORE the remote call. A crash between this row and the remote
-   * response leaves a durable record naming the run and the operation, so
-   * startup reconciliation can query the remote and decide whether the effect
-   * landed rather than assuming it did not.
+   * response leaves a durable record naming the run and the operation. New
+   * runs block until an operator verifies the remote outcome and resolves it.
    */
   intendSideEffect(input: {
     runId: string;
@@ -368,6 +378,26 @@ export class StateStore {
     this.#setSideEffectStatus(key, "failed", { lastError });
   }
 
+  /** Record an operator/reconciler conclusion for an ambiguous prior effect. */
+  resolveSideEffect(
+    key: string,
+    outcome: "applied" | "not-applied",
+    resolver: "operator" | "orchestrator" = "operator",
+  ): void {
+    const existing = this.getSideEffect(key);
+    if (existing === undefined) throw new Error(`side effect ${key} does not exist`);
+    if (!this.pendingSideEffects().some((effect) => effect.key === key)) {
+      throw new Error(`side effect ${key} is already resolved as ${existing.status}`);
+    }
+    // `confirmed` is the terminal outbox status. Preserve how that conclusion
+    // was reached in the audit fields instead of extending the persisted enum
+    // (and making older databases unreadable without a table rebuild).
+    this.#setSideEffectStatus(key, "confirmed", {
+      remoteId: `${resolver}:${outcome}`,
+      lastError: `${resolver} resolved outcome as ${outcome}`,
+    });
+  }
+
   getSideEffect(key: string): SideEffectRow | undefined {
     return this.#db
       .prepare(
@@ -378,15 +408,48 @@ export class StateStore {
       .get(key) as SideEffectRow | undefined;
   }
 
-  /** Everything the startup recovery sweep must reconcile. */
+  /** Everything that blocks new work until explicitly reconciled. */
   pendingSideEffects(): SideEffectRow[] {
     return this.#db
       .prepare(
         `SELECT key, run_id AS runId, system, operation, target, status,
                 remote_id AS remoteId, last_error AS lastError
-         FROM side_effects WHERE status <> 'confirmed' ORDER BY intended_at`,
+         FROM side_effects
+         WHERE status IN ('intended','in_flight','failed')
+         ORDER BY intended_at`,
       )
       .all() as SideEffectRow[];
+  }
+
+  // -- durable budgets ---------------------------------------------------
+
+  budgetUsage(dayBucket: string, repo: string): BudgetLedgerRow {
+    const row = this.#db
+      .prepare(
+        `SELECT day_bucket AS dayBucket, repo, cost_usd AS costUsd, invocations
+         FROM budget_ledger WHERE day_bucket = ? AND repo = ?`,
+      )
+      .get(dayBucket, repo) as BudgetLedgerRow | undefined;
+    return row ?? { dayBucket, repo, costUsd: 0, invocations: 0 };
+  }
+
+  /** Add one completed run's observed usage atomically across daemon restarts. */
+  recordBudgetUsage(input: {
+    dayBucket: string;
+    repo: string;
+    costUsd: number;
+    invocations: number;
+  }): BudgetLedgerRow {
+    this.#db
+      .prepare(
+        `INSERT INTO budget_ledger(day_bucket, repo, cost_usd, invocations)
+         VALUES (?,?,?,?)
+         ON CONFLICT(day_bucket, repo) DO UPDATE SET
+           cost_usd = cost_usd + excluded.cost_usd,
+           invocations = invocations + excluded.invocations`,
+      )
+      .run(input.dayBucket, input.repo, input.costUsd, input.invocations);
+    return this.budgetUsage(input.dayBucket, input.repo);
   }
 
   // -- leases ------------------------------------------------------------
