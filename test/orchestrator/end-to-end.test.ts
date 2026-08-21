@@ -246,6 +246,64 @@ describe("end-to-end: issue to governed pull request", () => {
     expect(pending.some((p) => p.operation === "merge" && p.status === "failed")).toBe(true);
   }, 60_000);
 
+  it("gives a retry its own branch instead of the one it already pushed", async () => {
+    // The branch template is validated to contain {attempt} for exactly this
+    // reason, and the attempt was hardcoded to 1. A retry of an escalated issue
+    // pushed to its own previous branch and quarantined: "! [rejected] ...
+    // (fetch first)".
+    const { orchestrator: first, forge } = makeOrchestrator({});
+    await first.run({ runId: "run_a1", issue: ISSUE, target: TARGET, lease: lease("run_a1") });
+
+    const { orchestrator: second } = makeOrchestrator({ forge });
+    await second.run({ runId: "run_a2", issue: ISSUE, target: TARGET, lease: lease("run_a2") });
+
+    const pushed = forge.calls
+      .filter((c) => c.op === "push")
+      .map((c) => (c.args as { branch: string }).branch);
+    expect(pushed.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(pushed).size).toBe(pushed.length);
+  }, 120_000);
+
+  it("clears the lease in the state store, not only the git ref", async () => {
+    // The ref and the store are two records of the same fact, and selection
+    // reads the store. recordLease was called on claim and releaseLease was
+    // called nowhere, so every issue that was ever claimed stayed "actively
+    // leased" forever: a run that escalated could never be retried, and
+    // `runmill resume` reported success while the next run answered
+    // "not-leased: issue is actively leased by another run".
+    const { orchestrator: o1 } = makeOrchestrator({});
+    await o1.run({
+      runId: "run_store_lease",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_store_lease"),
+    });
+
+    expect(store.activeLeaseIssueIds().has(ISSUE.identifier)).toBe(false);
+  }, 90_000);
+
+  it("clears the lease in the store even when the run escalates", async () => {
+    // The case that matters: a clean delivery is not the one that needs
+    // retrying. NEEDS_HUMAN keeps the workspace for inspection, and it must
+    // still hand the issue back.
+    const failing: CheckSpec = {
+      id: "unit",
+      run: "/bin/cat does-not-exist.ts",
+      required: true,
+      source: "repository-policy",
+    };
+    const { orchestrator: o } = makeOrchestrator({ checks: [failing] });
+    const outcome = await o.run({
+      runId: "run_store_lease_fail",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_store_lease_fail"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(store.activeLeaseIssueIds().has(ISSUE.identifier)).toBe(false);
+  }, 90_000);
+
   it("releases the lease so the issue can be claimed again", async () => {
     const { orchestrator } = makeOrchestrator({});
     await orchestrator.run({ runId: "run_1", issue: ISSUE, target: TARGET, lease: lease("run_1") });

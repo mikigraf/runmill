@@ -265,3 +265,37 @@ describe("leases", () => {
     store.close();
   });
 });
+
+describe("attemptsFor", () => {
+  /**
+   * The branch template is validated to contain {attempt} precisely so a retry
+   * does not reuse a branch. The orchestrator hardcoded "1", so a retry of an
+   * escalated issue pushed to the branch its own previous attempt had already
+   * created and the run quarantined on a rejected push.
+   */
+  it("counts no prior runs for an issue that has never been seen", () => {
+    const store = open();
+    expect(store.attemptsFor("ENG-404")).toBe(0);
+    store.close();
+  });
+
+  it("counts each run recorded for the issue", () => {
+    const store = open();
+    store.createRun({ runId: "r1", issueId: "ENG-9", repo: "o/r", provider: "codex" });
+    expect(store.attemptsFor("ENG-9")).toBe(1);
+
+    store.createRun({ runId: "r2", issueId: "ENG-9", repo: "o/r", provider: "codex" });
+    expect(store.attemptsFor("ENG-9")).toBe(2);
+    store.close();
+  });
+
+  it("counts per issue, not across the whole store", () => {
+    const store = open();
+    store.createRun({ runId: "r3", issueId: "ENG-10", repo: "o/r", provider: "codex" });
+    store.createRun({ runId: "r4", issueId: "ENG-11", repo: "o/r", provider: "codex" });
+
+    expect(store.attemptsFor("ENG-10")).toBe(1);
+    expect(store.attemptsFor("ENG-11")).toBe(1);
+    store.close();
+  });
+});

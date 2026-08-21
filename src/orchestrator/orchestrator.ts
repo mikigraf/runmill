@@ -132,6 +132,23 @@ export class Orchestrator {
     this.#log(`→ ${to}`);
   }
 
+
+  /**
+   * Hand the issue back, in both places that record who holds it.
+   *
+   * The git ref is the distributed lock and the store row is what selection
+   * reads. Releasing only the ref left every claimed issue "actively leased"
+   * for good: a run that escalated could never be retried, and `runmill
+   * resume` reported success while the next run refused the issue.
+   */
+  async #releaseLease(lease: GitRefLease, held: HeldLease, issueId: string, runId: string): Promise<void> {
+    try {
+      await lease.release(held);
+    } finally {
+      this.#d.store.releaseLease(issueId, runId);
+    }
+  }
+
   /** Intent, then act, then confirm. Never act first. */
   async #withOutbox<T>(
     runId: string,
@@ -216,11 +233,18 @@ export class Orchestrator {
     };
 
     try {
+      // Counted BEFORE this run is recorded, so the first attempt is 1.
+      // github.branch_template is validated to contain {attempt} precisely so a
+      // retry does not reuse a branch; hardcoding it to "1" meant every retry
+      // pushed to the branch its own previous attempt had already created and
+      // quarantined on a rejected push.
+      const attempt = this.#d.store.attemptsFor(issue.identifier) + 1;
       this.#d.store.createRun({
         runId,
         issueId: issue.identifier,
         repo: target.repo,
         provider: cfg.providers.implementer.implementation,
+        attempt,
       });
       this.#advance(runId, "ELIGIBILITY_CHECKED");
 
@@ -257,7 +281,7 @@ export class Orchestrator {
       branch = cfg.github.branchTemplate
         .replace("{issue_identifier}", issue.identifier)
         .replace("{slug}", slugify(issue.title))
-        .replace("{attempt}", "1");
+        .replace("{attempt}", String(attempt));
 
       workspace = await this.#workspaces.create({
         runId,
@@ -580,7 +604,7 @@ export class Orchestrator {
             body: `runmill opened ${pr.url} for this issue.\n\nRun: ${runId}`,
           }),
         );
-        await input.lease.release(held);
+        await this.#releaseLease(input.lease, held, issue.identifier, runId);
         held = undefined;
         return finish("PR_DELIVERED", { prNumber: pr.number, prUrl: pr.url });
       }
@@ -627,7 +651,7 @@ export class Orchestrator {
       }
       this.#advance(runId, "BACKLOG_UPDATED");
 
-      await input.lease.release(held);
+      await this.#releaseLease(input.lease, held, issue.identifier, runId);
       held = undefined;
       this.#advance(runId, "CLEANUP");
       return finish("COMPLETED", {
@@ -657,9 +681,10 @@ export class Orchestrator {
       }
       if (held !== undefined) {
         try {
-          await input.lease.release(held);
+          await this.#releaseLease(input.lease, held, issue.identifier, runId);
         } catch {
-          // A lost lease is already someone else's; nothing to release.
+          // A lost lease is already someone else's; the store row is cleared
+          // regardless, because a run that is over must not keep the issue.
         }
       }
     }

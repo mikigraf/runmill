@@ -481,6 +481,21 @@ export class StateStore {
     return Object.fromEntries(rows.map((r) => [r.key, r.value]));
   }
 
+  /**
+   * How many runs this issue has already had.
+   *
+   * The branch template is validated to contain {attempt} so that a retry does
+   * not reuse a branch, which only works if something actually counts. Derived
+   * from the runs table rather than tracked separately, so it stays true across
+   * restarts and cannot drift from the runs it describes.
+   */
+  attemptsFor(issueId: string): number {
+    const row = this.#db
+      .prepare("SELECT COUNT(*) AS n FROM runs WHERE issue_id = ?")
+      .get(issueId) as { n: number };
+    return row.n;
+  }
+
   activeLeaseIssueIds(): Set<string> {
     const rows = this.#db
       .prepare("SELECT issue_id AS issueId FROM leases WHERE released_at IS NULL")
