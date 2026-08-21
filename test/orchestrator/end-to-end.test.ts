@@ -148,6 +148,8 @@ function makeOrchestrator(opts: {
       workspaceRoot: join(root, "runs"),
       checks: opts.checks ?? [PASSING_CHECK],
       onEvent: (m) => opts.log?.push(m),
+      ciPollIntervalMs: 1,
+      sleep: async () => undefined,
     }),
   };
 }
@@ -622,4 +624,74 @@ describe("PR review", () => {
     expect(outcome.finalState).toBe("NEEDS_HUMAN");
     expect(forge.calls.filter((c) => c.op === "merge")).toEqual([]);
   }, 120_000);
+});
+
+describe("CI_WAIT", () => {
+  /**
+   * A required check does not exist the instant a pull request opens. Reading
+   * the checks once meant every protected repository escalated on every run
+   * with `"ci" has not reported yet`, and made the schedule deadline
+   * unreachable, because the elapsed time could never grow past one glance.
+   */
+  class SlowCiForge extends FakeForgeAdapter {
+    reads = 0;
+    constructor(private readonly readsBeforeSuccess: number) {
+      super({ requiredChecks: ["ci"] });
+    }
+    override async listChecks(input: {
+      repo: string;
+      ref: string;
+    }): Promise<{ name: string; headSha: string; conclusion: "pending" | "success" }[]> {
+      this.reads += 1;
+      const headSha = (await super.listChecks(input), input.ref);
+      return [
+        {
+          name: "ci",
+          headSha,
+          conclusion: this.reads >= this.readsBeforeSuccess ? "success" : "pending",
+        },
+      ];
+    }
+  }
+
+  it("waits for a required check that has not reported yet", async () => {
+    const forge = new SlowCiForge(3);
+    const { orchestrator } = makeOrchestrator({ forge });
+
+    const outcome = await orchestrator.run({
+      runId: "run_ciwait",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_ciwait"),
+    });
+
+    expect(outcome.finalState).toBe("PR_DELIVERED");
+    expect(forge.reads).toBeGreaterThanOrEqual(3);
+  }, 90_000);
+
+  it("stops on a failing check instead of waiting out the deadline", async () => {
+    // A conclusion is an answer. Only "still running" is worth waiting on.
+    class FailingCiForge extends FakeForgeAdapter {
+      constructor() {
+        super({ requiredChecks: ["ci"] });
+      }
+      override async listChecks(input: { repo: string; ref: string }): Promise<
+        { name: string; headSha: string; conclusion: "failure" }[]
+      > {
+        return [{ name: "ci", headSha: input.ref, conclusion: "failure" }];
+      }
+    }
+    const forge = new FailingCiForge();
+    const { orchestrator } = makeOrchestrator({ forge });
+
+    const outcome = await orchestrator.run({
+      runId: "run_cifail",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_cifail"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/CI not satisfied/);
+  }, 90_000);
 });

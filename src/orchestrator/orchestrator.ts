@@ -11,7 +11,7 @@ import { WorkspaceManager, type Workspace } from "../workspace/manager.js";
 import { VerificationEngine, resolveManifest, type CheckSpec } from "../verification/engine.js";
 import { buildTaskPacket, renderIssueDocument } from "../agent/task-packet.js";
 import { parseReviewJson, blockingFindings, crossCheckVerdict, type Review } from "../review/schema.js";
-import { reconcileChecks, type CheckMapping } from "../pr/reconcile.js";
+import { reconcileChecks, type CheckMapping, type ReconcileVerdict } from "../pr/reconcile.js";
 import { GitRefLease, type HeldLease } from "../queue/git-lease.js";
 import { accumulateUsage } from "../agent/events.js";
 import { RunmillError , errorMessage } from "../errors/runmill-error.js";
@@ -68,6 +68,10 @@ export interface OrchestratorDeps {
   readonly checks: readonly CheckSpec[];
   readonly checkMappings?: readonly CheckMapping[] | undefined;
   readonly onEvent?: ((message: string) => void) | undefined;
+  /** How often CI_WAIT re-reads the checks. Lowered by tests. */
+  readonly ciPollIntervalMs?: number | undefined;
+  /** Injectable so tests do not spend real time in the CI poll loop. */
+  readonly sleep?: ((ms: number) => Promise<void>) | undefined;
 }
 
 export interface RunOutcome {
@@ -472,22 +476,51 @@ export class Orchestrator {
             "unknown; refusing to treat unreadable rules as absent rules",
         });
       }
-      const observed = await this.#d.forge.listChecks({ repo: target.repo, ref: pr.headSha });
-      const verdicts = reconcileChecks({
-        requiredContexts: protection.requiredChecks,
+      // Actually wait, rather than glancing once.
+      //
+      // A required check does not exist the instant a pull request opens:
+      // GitHub needs a moment to create the run. Reading the checks a single
+      // time meant every required context was "has not reported yet", so a
+      // protected repository escalated on every run, and the schedule deadline
+      // below was unreachable -- `waitedMs` could never grow. Terminal states
+      // still stop immediately; only "waiting" costs time.
+      const pollIntervalMs = this.#d.ciPollIntervalMs ?? CI_POLL_INTERVAL_MS;
+      const pause = this.#d.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+      const mappings =
+        this.#d.checkMappings ??
         // Identity by default: the context name IS the check name until an
         // explicit mapping says otherwise. Without this every context is
         // `unmapped` and any protected repository escalates on every run.
-        mappings:
-          this.#d.checkMappings ??
-          protection.requiredChecks.map((c) => ({ localId: c, contextName: c })),
-        observed,
-        headSha: pr.headSha,
-        waitedMs: this.#d.clock.now().getTime() - ciWaitStartedMs,
-        scheduleDeadlineMs: CI_SCHEDULE_DEADLINE_MS,
-        ...(protection.usesMergeQueue ? { event: "merge_group" as const } : {}),
-      });
-      const unsatisfied = [...verdicts].filter(([, v]) => v.state !== "satisfied");
+        protection.requiredChecks.map((c) => ({ localId: c, contextName: c }));
+
+      let verdicts = new Map<string, ReconcileVerdict>();
+      let unsatisfied: [string, ReconcileVerdict][] = [];
+      // Bounded by attempts as well as by elapsed time. The deadline alone
+      // relies on the clock advancing, and a stopped or injected clock would
+      // otherwise spin here forever rather than giving up.
+      const maxAttempts = Math.max(1, Math.ceil(CI_SCHEDULE_DEADLINE_MS / pollIntervalMs)) + 1;
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        const observed = await this.#d.forge.listChecks({ repo: target.repo, ref: pr.headSha });
+        verdicts = reconcileChecks({
+          requiredContexts: protection.requiredChecks,
+          mappings,
+          observed,
+          headSha: pr.headSha,
+          waitedMs: this.#d.clock.now().getTime() - ciWaitStartedMs,
+          scheduleDeadlineMs: CI_SCHEDULE_DEADLINE_MS,
+          ...(protection.usesMergeQueue ? { event: "merge_group" as const } : {}),
+        });
+        unsatisfied = [...verdicts].filter(([, v]) => v.state !== "satisfied");
+        if (unsatisfied.length === 0) break;
+        // Anything other than "still running" is an answer, not a delay.
+        if (unsatisfied.some(([, v]) => v.state !== "waiting")) break;
+        if (this.#d.clock.now().getTime() - ciWaitStartedMs >= CI_SCHEDULE_DEADLINE_MS) break;
+
+        // The lease has to still be ours while we sit here, or a takeover
+        // could be pushing to the same branch behind us.
+        await input.lease.assertHeld(held);
+        await pause(pollIntervalMs);
+      }
       if (unsatisfied.length > 0) {
         return finish("NEEDS_HUMAN", {
           prNumber: pr.number,
@@ -808,6 +841,9 @@ interface PrReviewOutcome {
 
 /** Bound on how long a required check may go unscheduled before escalating. */
 const CI_SCHEDULE_DEADLINE_MS = 10 * 60_000;
+
+/** How often CI_WAIT re-reads the required checks while they are still running. */
+const CI_POLL_INTERVAL_MS = 15_000;
 
 /**
  * Terminal states after which the workspace holds nothing a human needs.
