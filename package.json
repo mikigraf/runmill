@@ -38,7 +38,7 @@
   },
   "dependencies": {
     "@linear/sdk": "39.2.1",
-    "@octokit/rest": "21.1.1",
+    "@octokit/rest": "22.0.1",
     "@opentui/core": "0.5.1",
     "ajv": "8.20.0",
     "better-sqlite3": "13.0.3",
