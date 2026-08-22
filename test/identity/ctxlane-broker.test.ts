@@ -1,852 +1,957 @@
-import { chmodSync, mkdtempSync, rmSync } from "node:fs";
-import { createServer, type Server, type Socket } from "node:net";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { sha256Digest } from "../../src/asf/canonical-json.js";
-import { RunmillError } from "../../src/errors/runmill-error.js";
 import type {
   IdentityLease,
   IdentityLeaseRequest,
   IdentityOwnershipFence,
   IdentityOwnershipFenceValidator,
 } from "../../src/identity/broker.js";
+import { identityBrokerFailureDisposition } from "../../src/identity/broker.js";
+import type { CtxlaneAcquisitionAuthority } from "../../src/identity/ctxlane-authority.js";
 import {
-  CTXLANE_AUTOMATION_REQUEST_SCHEMA,
-  CTXLANE_AUTOMATION_RESPONSE_SCHEMA,
-  CTXLANE_IDENTITY_LEASE_SCHEMA,
   CtxlaneIdentityProtocolError,
   CtxlaneProviderIdentityBroker,
-  CtxlaneUnixAutomationClient,
-  ctxlaneAutomationRequestId,
-  type CtxlaneAutomationIdentityClient,
-  type CtxlaneAutomationRequest,
+  strictJsonDecode,
+  type CtxlaneIdentityLeaseAcquisitionClient,
+  type CtxlaneLeaseCloseRequest,
+  type CtxlaneLeaseLifecycleClient,
+  type CtxlaneLeaseRenewalRequest,
+  type CtxlaneLeaseRevocationRequest,
+  type CtxlaneProviderIdentityLease,
 } from "../../src/identity/ctxlane-broker.js";
+import type {
+  CtxlaneAutomationError,
+  CtxlaneIdentityLease,
+  CtxlaneIdentityLeaseRequest,
+} from "../../src/identity/ctxlane-contracts.js";
 import { FakeClock } from "../../src/testing/fake-clock.js";
 
+const FIXTURE_DIRECTORY = join(
+  __dirname,
+  "..",
+  "fixtures",
+  "ctxlane",
+  "examples",
+);
+
+function fixture<T>(name: string): T {
+  return JSON.parse(readFileSync(join(FIXTURE_DIRECTORY, name), "utf8")) as T;
+}
+
+function clone<T>(value: T): T {
+  return structuredClone(value);
+}
+
+const REQUEST_FIXTURE = fixture<CtxlaneIdentityLeaseRequest>(
+  "identity-lease-request.v1.json",
+);
+const ACTIVE_FIXTURE = fixture<CtxlaneIdentityLease>(
+  "identity-lease-active.v1.json",
+);
+const REFUSED_FIXTURE = fixture<CtxlaneIdentityLease>(
+  "identity-lease-refused.v1.json",
+);
+const ERROR_FIXTURE = fixture<CtxlaneAutomationError>(
+  "automation-error.v1.json",
+);
 const NOW = "2026-08-21T10:00:00.000Z";
-const POLICY_DIGEST = `sha256:${"a".repeat(64)}`;
-const LEASE_ID = "protected-ctxlane-lease-0001";
-const EXECUTION_HANDLE = "protected-ctxlane-execution-handle-0001";
+const RUNMILL_POLICY_DIGEST = `sha256:${"c".repeat(64)}`;
 
-function leaseRequest(overrides: Partial<IdentityLeaseRequest> = {}): IdentityLeaseRequest {
+function identityRequest(
+  overrides: Partial<IdentityLeaseRequest> = {},
+): IdentityLeaseRequest {
   return {
-    runId: "run-01",
-    workOrderId: "wo-01",
-    attemptId: "attempt-01",
-    role: "implementer",
-    requestedProfile: "codex:asf-production",
-    policyDigest: POLICY_DIGEST,
-    fencingGeneration: 7,
-    requestedDurationMs: 60_000,
+    runId: REQUEST_FIXTURE.run_id,
+    workOrderId: REQUEST_FIXTURE.work_order_id,
+    attemptId: REQUEST_FIXTURE.attempt_id,
+    role: REQUEST_FIXTURE.role,
+    requestedProfile: REQUEST_FIXTURE.profile_ref,
+    policyDigest: RUNMILL_POLICY_DIGEST,
+    fencingGeneration: 41,
+    requestedDurationMs: REQUEST_FIXTURE.requested_ttl_seconds * 1_000,
     ...overrides,
   };
 }
 
-function directAcquireRequest(
-  payloadOverrides: Record<string, unknown> = {},
-): CtxlaneAutomationRequest {
-  const payload = {
-    schema: "ctxlane.identity-lease-request/v1",
-    run_id: "run-01",
-    work_order_id: "wo-01",
-    attempt_id: "attempt-01",
-    role: "implementer",
-    requested_profile: "codex:asf-production",
-    policy_digest: POLICY_DIGEST,
-    fencing_generation: 7,
-    requested_duration_ms: 60_000,
-    ...payloadOverrides,
-  } as const;
+function acquisitionAuthority(
+  overrides: Partial<CtxlaneAcquisitionAuthority> = {},
+): CtxlaneAcquisitionAuthority {
   return {
-    schema: CTXLANE_AUTOMATION_REQUEST_SCHEMA,
-    request_id: ctxlaneAutomationRequestId("acquire", payload),
-    operation: "acquire",
-    payload,
-  };
-}
-
-function directRevokeRequest(
-  payloadOverrides: Record<string, unknown> = {},
-): CtxlaneAutomationRequest {
-  const payload = {
-    schema: "ctxlane.identity-lease-revocation/v1",
-    lease_id: LEASE_ID,
-    lease_id_digest: sha256Digest({ lease_id: LEASE_ID }),
-    run_id: "run-01",
-    work_order_id: "wo-01",
-    attempt_id: "attempt-01",
-    role: "implementer",
-    policy_digest: POLICY_DIGEST,
-    provider: "openai",
-    principal: "ctxlane-principal-01",
-    profile: "codex:asf-production",
-    fencing_generation: 7,
-    reason: "test cancellation",
-    ...payloadOverrides,
-  } as const;
-  return {
-    schema: CTXLANE_AUTOMATION_REQUEST_SCHEMA,
-    request_id: ctxlaneAutomationRequestId("revoke", payload),
-    operation: "revoke",
-    payload,
-  };
-}
-
-function wireLease(
-  request: IdentityLeaseRequest = leaseRequest(),
-  overrides: Record<string, unknown> = {},
-): Record<string, unknown> {
-  return {
-    schema: CTXLANE_IDENTITY_LEASE_SCHEMA,
-    lease_id: LEASE_ID,
-    execution_handle: EXECUTION_HANDLE,
-    run_id: request.runId,
-    work_order_id: request.workOrderId,
-    attempt_id: request.attemptId,
-    role: request.role,
-    policy_digest: request.policyDigest,
-    provider: "openai",
-    principal: "ctxlane-principal-01",
-    profile: request.requestedProfile,
-    issued_at: NOW,
-    expires_at: "2026-08-21T10:01:00.000Z",
-    fencing_generation: request.fencingGeneration,
+    intent: {
+      clientRequestId: REQUEST_FIXTURE.client_request_id,
+      acquisitionRequest: clone(REQUEST_FIXTURE),
+      expectedCallerSubject: ACTIVE_FIXTURE.caller_subject,
+      expectedHostIdentity: ACTIVE_FIXTURE.host_identity,
+    },
+    clientRequestId: REQUEST_FIXTURE.client_request_id,
+    tenantId: REQUEST_FIXTURE.tenant_id,
+    workOrderDigest: REQUEST_FIXTURE.work_order_digest,
+    workOrderAuthorization: clone(REQUEST_FIXTURE.work_order_authorization),
+    provider: REQUEST_FIXTURE.provider,
+    profileUid: REQUEST_FIXTURE.profile_uid,
+    profileRef: REQUEST_FIXTURE.profile_ref,
+    repository: REQUEST_FIXTURE.repository,
+    workspaceId: REQUEST_FIXTURE.workspace_id,
+    environment: REQUEST_FIXTURE.environment,
+    expectedCallerSubject: ACTIVE_FIXTURE.caller_subject,
+    expectedHostIdentity: ACTIVE_FIXTURE.host_identity,
+    ctxlanePolicyDigest: REQUEST_FIXTURE.policy_digest,
     ...overrides,
   };
 }
 
-function success(request: CtxlaneAutomationRequest, result: unknown): unknown {
-  return {
-    schema: CTXLANE_AUTOMATION_RESPONSE_SCHEMA,
-    request_id: request.request_id,
-    ok: true,
-    result,
-  };
-}
-
-class RecordingClient implements CtxlaneAutomationIdentityClient {
-  readonly requests: CtxlaneAutomationRequest[] = [];
+class RecordingAcquisitionClient
+  implements CtxlaneIdentityLeaseAcquisitionClient
+{
+  readonly requests: CtxlaneIdentityLeaseRequest[] = [];
+  readonly signals: AbortSignal[] = [];
 
   constructor(
-    readonly respond: (request: CtxlaneAutomationRequest) => unknown | Promise<unknown>,
+    readonly respond: (
+      request: CtxlaneIdentityLeaseRequest,
+      signal: AbortSignal | undefined,
+    ) => unknown | Promise<unknown>,
   ) {}
 
-  async request(request: CtxlaneAutomationRequest): Promise<unknown> {
-    this.requests.push(structuredClone(request));
-    return this.respond(request);
+  async acquire(
+    request: CtxlaneIdentityLeaseRequest,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    this.requests.push(clone(request));
+    if (signal !== undefined) this.signals.push(signal);
+    return await this.respond(request, signal);
   }
 }
 
-class Fence implements IdentityOwnershipFenceValidator {
-  readonly observations: IdentityOwnershipFence[] = [];
-  values: boolean[] = [true];
+class RecordingLifecycleClient implements CtxlaneLeaseLifecycleClient {
+  readonly renewRequests: CtxlaneLeaseRenewalRequest[] = [];
+  readonly closeRequests: CtxlaneLeaseCloseRequest[] = [];
+  readonly revokeRequests: CtxlaneLeaseRevocationRequest[] = [];
+  renewResponse: (
+    request: CtxlaneLeaseRenewalRequest,
+  ) => unknown | Promise<unknown> = () => {
+    throw new Error("unexpected renewal");
+  };
+  closeResponse: (
+    request: CtxlaneLeaseCloseRequest,
+  ) => unknown | Promise<unknown> = () => {
+    throw new Error("unexpected close");
+  };
+  revokeResponse: (
+    request: CtxlaneLeaseRevocationRequest,
+  ) => unknown | Promise<unknown> = () => {
+    throw new Error("unexpected revocation");
+  };
 
-  isCurrent(fence: IdentityOwnershipFence): boolean {
+  async renew(request: CtxlaneLeaseRenewalRequest): Promise<unknown> {
+    this.renewRequests.push(request);
+    return await this.renewResponse(request);
+  }
+
+  async close(request: CtxlaneLeaseCloseRequest): Promise<unknown> {
+    this.closeRequests.push(request);
+    return await this.closeResponse(request);
+  }
+
+  async revoke(request: CtxlaneLeaseRevocationRequest): Promise<unknown> {
+    this.revokeRequests.push(request);
+    return await this.revokeResponse(request);
+  }
+}
+
+class RecordingFence implements IdentityOwnershipFenceValidator {
+  readonly observations: IdentityOwnershipFence[] = [];
+  values: boolean[] = [];
+
+  async isCurrent(fence: IdentityOwnershipFence): Promise<boolean> {
     this.observations.push(fence);
     return this.values.shift() ?? true;
   }
 }
 
-function broker(
-  client: CtxlaneAutomationIdentityClient,
-  fence = new Fence(),
-  clock = new FakeClock(NOW),
-  requestTimeoutMs?: number,
-) {
+function publishedFromInternal(
+  lease: CtxlaneProviderIdentityLease,
+  status: "active" | "closed" | "revoked" | "expired",
+  overrides: Partial<CtxlaneIdentityLease> = {},
+): CtxlaneIdentityLease {
+  const terminal = status !== "active";
   return {
-    fence,
-    broker: new CtxlaneProviderIdentityBroker({
-      client,
-      clock,
-      ownershipFence: fence,
-      ...(requestTimeoutMs === undefined ? {} : { requestTimeoutMs }),
-    }),
+    schema: "ctxlane.identity-lease/v1",
+    lease_id: lease.leaseId,
+    status,
+    tenant_id: lease.ctxlane.tenantId,
+    work_order_id: lease.workOrderId,
+    work_order_digest: lease.ctxlane.workOrderDigest,
+    run_id: lease.runId,
+    attempt_id: lease.attemptId,
+    role: lease.role as CtxlaneIdentityLease["role"],
+    provider: lease.provider as CtxlaneIdentityLease["provider"],
+    profile_uid: lease.ctxlane.profileUid,
+    profile_ref: lease.profile,
+    repository: lease.ctxlane.repository,
+    workspace_id: lease.ctxlane.workspaceId,
+    environment: lease.ctxlane.environment,
+    caller_subject: lease.ctxlane.callerSubject,
+    host_identity: lease.ctxlane.hostIdentity,
+    worker_identity: lease.ctxlane.workerIdentity,
+    principal_ref: lease.principal,
+    workspace_ref: lease.ctxlane.workspaceRef,
+    auth_mode: lease.ctxlane.authMode as CtxlaneIdentityLease["auth_mode"],
+    fencing_generation: lease.ctxlane.fencingGeneration,
+    issued_at: lease.issuedAt,
+    expires_at: lease.expiresAt,
+    maximum_expires_at: lease.ctxlane.maximumExpiresAt,
+    execution_handle: terminal ? null : lease.executionHandle,
+    isolation: lease.ctxlane.isolation as CtxlaneIdentityLease["isolation"],
+    effective_policy_digest: lease.ctxlane.effectivePolicyDigest,
+    refusal_code: null,
+    reason_code:
+      status === "closed"
+        ? "completed"
+        : status === "revoked"
+          ? "operator-revoked"
+          : status === "expired"
+            ? "lease-expired"
+            : null,
+    ...overrides,
   };
 }
 
-function dispositionResult(
-  request: CtxlaneAutomationRequest,
-  disposition: string,
-): unknown {
-  return success(request, {
-    lease_id_digest: request.payload["lease_id_digest"],
-    disposition,
-  });
+interface SetupOptions {
+  readonly response?: unknown;
+  readonly authority?: CtxlaneAcquisitionAuthority;
+  readonly acquisition?: RecordingAcquisitionClient;
+  readonly lifecycle?: RecordingLifecycleClient;
+  readonly fence?: RecordingFence;
+  readonly requestTimeoutMs?: number;
+  readonly clock?: FakeClock;
 }
 
-describe("CtxlaneProviderIdentityBroker", () => {
-  it("acquires a strict, fenced lease through an idempotent trusted request", async () => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) => success(request, wireLease(input)));
-    const { broker: identity, fence } = broker(client);
+function setup(options: SetupOptions = {}) {
+  const acquisition =
+    options.acquisition ??
+    new RecordingAcquisitionClient(() =>
+      clone(options.response ?? ACTIVE_FIXTURE),
+    );
+  const lifecycle = options.lifecycle ?? new RecordingLifecycleClient();
+  const fence = options.fence ?? new RecordingFence();
+  const clock = options.clock ?? new FakeClock(NOW);
+  const authority = options.authority ?? acquisitionAuthority();
+  const broker = new CtxlaneProviderIdentityBroker({
+    client: acquisition,
+    lifecycleClient: lifecycle,
+    clock,
+    ownershipFence: fence,
+    authority: {
+      resolveAcquisitionAuthority: () => authority,
+    },
+    ...(options.requestTimeoutMs === undefined
+      ? {}
+      : { requestTimeoutMs: options.requestTimeoutMs }),
+  });
+  return { acquisition, authority, broker, clock, fence, lifecycle };
+}
 
-    const lease = await identity.acquire(input);
+async function acquireActive(options: SetupOptions = {}) {
+  const context = setup(options);
+  const lease = (await context.broker.acquire(
+    identityRequest(),
+  )) as CtxlaneProviderIdentityLease;
+  return { ...context, lease };
+}
 
-    expect(lease).toMatchObject({
-      leaseId: LEASE_ID,
-      executionHandle: EXECUTION_HANDLE,
-      runId: input.runId,
-      workOrderId: input.workOrderId,
-      attemptId: input.attemptId,
-      role: "implementer",
-      policyDigest: POLICY_DIGEST,
-      profile: "codex:asf-production",
-      fencingGeneration: 7,
+describe("CtxlaneProviderIdentityBroker acquisition", () => {
+  it("sends the byte-faithful published request and preserves separate fences", async () => {
+    const { acquisition, broker } = setup();
+
+    const lease = (await broker.acquire(
+      identityRequest(),
+    )) as CtxlaneProviderIdentityLease;
+
+    expect(acquisition.requests).toEqual([REQUEST_FIXTURE]);
+    expect(
+      Object.hasOwn(acquisition.requests[0] as object, "fencingGeneration"),
+    ).toBe(false);
+    expect(
+      Object.hasOwn(acquisition.requests[0] as object, "policyDigest"),
+    ).toBe(false);
+    expect(
+      Object.hasOwn(acquisition.requests[0] as object, "requestedDurationMs"),
+    ).toBe(false);
+    expect(lease.fencingGeneration).toBe(41);
+    expect(lease.ctxlane.fencingGeneration).toBe(1);
+    expect(lease.policyDigest).toBe(RUNMILL_POLICY_DIGEST);
+    expect(lease.ctxlane.effectivePolicyDigest).toBe(
+      ACTIVE_FIXTURE.effective_policy_digest,
+    );
+    expect(lease.ctxlane).toMatchObject({
+      clientRequestId: REQUEST_FIXTURE.client_request_id,
+      tenantId: REQUEST_FIXTURE.tenant_id,
+      profileUid: REQUEST_FIXTURE.profile_uid,
+      callerSubject: ACTIVE_FIXTURE.caller_subject,
+      hostIdentity: ACTIVE_FIXTURE.host_identity,
+      repository: REQUEST_FIXTURE.repository,
+      status: "active",
     });
     expect(Object.isFrozen(lease)).toBe(true);
-    expect(fence.observations).toEqual([
-      {
-        runId: "run-01",
-        workOrderId: "wo-01",
-        attemptId: "attempt-01",
-        fencingGeneration: 7,
-      },
-      {
-        runId: "run-01",
-        workOrderId: "wo-01",
-        attemptId: "attempt-01",
-        fencingGeneration: 7,
-      },
-    ]);
-    expect(client.requests).toHaveLength(1);
-    expect(client.requests[0]).toMatchObject({
-      operation: "acquire",
-      payload: {
-        run_id: "run-01",
-        requested_profile: "codex:asf-production",
-        requested_duration_ms: 60_000,
-      },
-    });
-    const sent = client.requests[0];
-    if (sent === undefined) throw new Error("ctxlane request was not recorded");
-    expect(sent.request_id).toBe(
-      ctxlaneAutomationRequestId("acquire", sent.payload),
-    );
-    expect(JSON.stringify(sent.payload)).not.toContain(EXECUTION_HANDLE);
-  });
-
-  it("does not contact ctxlane when the durable ownership fence is missing or unknown", async () => {
-    const client = new RecordingClient((request) => success(request, wireLease()));
-    const fence = new Fence();
-    fence.values = [false];
-    const identity = broker(client, fence).broker;
-
-    await expect(identity.acquire(leaseRequest())).rejects.toMatchObject({
-      code: "RM-AUTH-003",
-    });
-    expect(client.requests).toHaveLength(0);
+    expect(Object.isFrozen(lease.ctxlane)).toBe(true);
   });
 
   it.each([
-    ["run", { run_id: "run-other" }],
-    ["work order", { work_order_id: "wo-other" }],
-    ["attempt", { attempt_id: "attempt-other" }],
-    ["role", { role: "local-reviewer" }],
-    ["policy", { policy_digest: `sha256:${"b".repeat(64)}` }],
-    ["profile", { profile: "claude:asf-review" }],
-    ["generation", { fencing_generation: 8 }],
-    ["expired", { expires_at: "2026-08-21T09:59:59.000Z" }],
-    ["overlong", { expires_at: "2026-08-21T10:02:00.000Z" }],
-  ] as const)("refuses a %s mismatch without exposing protected values", async (_label, mutation) => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) =>
-      success(request, wireLease(input, mutation)),
-    );
-    const identity = broker(client).broker;
-
-    let error: unknown;
-    try {
-      await identity.acquire(input);
-    } catch (caught) {
-      error = caught;
-    }
-
-    expect(error).toBeInstanceOf(RunmillError);
-    expect((error as RunmillError).code).toBe("RM-AUTH-003");
-    expect((error as Error).message).not.toContain(LEASE_ID);
-    expect((error as Error).message).not.toContain(EXECUTION_HANDLE);
-  });
-
-  it("revokes the returned lease if ownership changes during acquisition", async () => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) => {
-      if (request.operation === "acquire") return success(request, wireLease(input));
-      if (request.operation === "revoke") return dispositionResult(request, "revoked");
-      throw new Error("unexpected operation");
-    });
-    const fence = new Fence();
-    fence.values = [true, false];
-    const identity = broker(client, fence).broker;
-
-    await expect(identity.acquire(input)).rejects.toMatchObject({ code: "RM-AUTH-003" });
-    expect(client.requests.map((request) => request.operation)).toEqual(["acquire", "revoke"]);
-    expect(client.requests[1]?.payload).toMatchObject({
-      lease_id: LEASE_ID,
-      reason: "fencing generation changed during identity acquisition",
-    });
-  });
-
-  it("revokes a well-formed lease whose authority bindings do not match", async () => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) => {
-      if (request.operation === "acquire") {
-        return success(request, wireLease(input, { profile: "unexpected-profile" }));
+    ["refused lease", REFUSED_FIXTURE, "unchanged"],
+    ["automation error", ERROR_FIXTURE, undefined],
+  ] as const)(
+    "fails closed for the official %s fixture",
+    async (_label, response, disposition) => {
+      const { broker } = setup({ response });
+      let error: unknown;
+      try {
+        await broker.acquire(identityRequest());
+      } catch (caught) {
+        error = caught;
       }
-      if (request.operation === "revoke") return dispositionResult(request, "revoked");
-      throw new Error("unexpected operation");
-    });
-    const identity = broker(client).broker;
-
-    await expect(identity.acquire(input)).rejects.toMatchObject({ code: "RM-AUTH-003" });
-    expect(client.requests.map((request) => request.operation)).toEqual(["acquire", "revoke"]);
-    expect(client.requests[1]?.payload["reason"]).toBe(
-      "ctxlane returned an invalid identity acquisition binding",
-    );
-  });
-
-  it("renews only the same principal/profile and a bounded lease duration", async () => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) => {
-      if (request.operation === "acquire") return success(request, wireLease(input));
-      if (request.operation === "renew") {
-        return success(
-          request,
-          wireLease(input, {
-            lease_id: "protected-ctxlane-lease-0002",
-            execution_handle: "protected-ctxlane-execution-handle-0002",
-            issued_at: "2026-08-21T10:00:30.000Z",
-            expires_at: "2026-08-21T10:01:30.000Z",
-          }),
-        );
-      }
-      throw new Error("unexpected operation");
-    });
-    const identity = broker(client).broker;
-    const original = await identity.acquire(input);
-    const renewed = await identity.renew(original);
-
-    expect(renewed.leaseId).not.toBe(original.leaseId);
-    expect(renewed.principal).toBe(original.principal);
-    expect(client.requests[1]).toMatchObject({
-      operation: "renew",
-      payload: {
-        lease_id: LEASE_ID,
-        run_id: "run-01",
-        work_order_id: "wo-01",
-        attempt_id: "attempt-01",
-        role: "implementer",
-        policy_digest: POLICY_DIGEST,
-        provider: "openai",
-        principal: "ctxlane-principal-01",
-        profile: "codex:asf-production",
-        requested_duration_ms: 60_000,
-        fencing_generation: 7,
-      },
-    });
-  });
-
-  it("closes and revokes exact leases idempotently without requiring stale ownership", async () => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) => {
-      if (request.operation === "acquire") return success(request, wireLease(input));
-      if (request.operation === "close") return dispositionResult(request, "completed");
-      if (request.operation === "revoke") return dispositionResult(request, "revoked");
-      throw new Error("unexpected operation");
-    });
-    const fence = new Fence();
-    const identity = broker(client, fence).broker;
-    const lease = await identity.acquire(input);
-    fence.values = [false];
-
-    await identity.close(lease, "completed");
-    await identity.revoke(lease, "forced cancellation");
-
-    expect(client.requests.map((request) => request.operation)).toEqual([
-      "acquire",
-      "close",
-      "revoke",
-    ]);
-    expect(client.requests[1]?.payload["lease_id_digest"]).toBe(
-      sha256Digest({ lease_id: LEASE_ID }),
-    );
-    expect(client.requests[1]?.payload).toMatchObject({
-      run_id: "run-01",
-      work_order_id: "wo-01",
-      attempt_id: "attempt-01",
-      role: "implementer",
-      policy_digest: POLICY_DIGEST,
-      provider: "openai",
-      principal: "ctxlane-principal-01",
-      profile: "codex:asf-production",
-      fencing_generation: 7,
-    });
-    expect(client.requests[2]?.payload).toMatchObject({
-      run_id: "run-01",
-      work_order_id: "wo-01",
-      attempt_id: "attempt-01",
-      role: "implementer",
-      policy_digest: POLICY_DIGEST,
-      provider: "openai",
-      principal: "ctxlane-principal-01",
-      profile: "codex:asf-production",
-      fencing_generation: 7,
-    });
-    expect(fence.observations).toHaveLength(2);
-  });
-
-  it("runtime-validates caller objects before observing authority or contacting ctxlane", async () => {
-    const client = new RecordingClient((request) => success(request, wireLease()));
-    const { broker: identity, fence } = broker(client);
-
-    await expect(
-      identity.acquire(null as unknown as IdentityLeaseRequest),
-    ).rejects.toMatchObject({ code: "RM-AUTH-003" });
-    await expect(
-      identity.acquire({ ...leaseRequest(), extra: true } as IdentityLeaseRequest),
-    ).rejects.toMatchObject({ code: "RM-AUTH-003" });
-    await expect(identity.renew(null as unknown as IdentityLease)).rejects.toMatchObject({
-      code: "RM-AUTH-003",
-    });
-    await expect(
-      identity.revoke(wireLease() as unknown as IdentityLease, null as unknown as string),
-    ).rejects.toMatchObject({ code: "RM-AUTH-003" });
-
-    expect(fence.observations).toHaveLength(0);
-    expect(client.requests).toHaveLength(0);
-  });
-
-  it("refuses expired and overlong forged leases before observing the fence", async () => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) => success(request, wireLease(input)));
-    const clock = new FakeClock(NOW);
-    const { broker: identity, fence } = broker(client, new Fence(), clock);
-    const lease = await identity.acquire(input);
-    const observationsAfterAcquire = fence.observations.length;
-
-    const overlong = {
-      ...lease,
-      expiresAt: "2026-08-23T10:00:00.000Z",
-    } as IdentityLease;
-    await expect(identity.renew(overlong)).rejects.toMatchObject({ code: "RM-AUTH-003" });
-    clock.advanceMinutes(2);
-    await expect(identity.renew(lease)).rejects.toMatchObject({ code: "RM-AUTH-003" });
-
-    expect(fence.observations).toHaveLength(observationsAfterAcquire);
-    expect(client.requests.map((request) => request.operation)).toEqual(["acquire"]);
-  });
-
-  it("fails renewal on a stale fence before contacting ctxlane", async () => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) => success(request, wireLease(input)));
-    const fence = new Fence();
-    const identity = broker(client, fence).broker;
-    const lease = await identity.acquire(input);
-    fence.values = [false];
-
-    await expect(identity.renew(lease)).rejects.toMatchObject({ code: "RM-AUTH-003" });
-    expect(client.requests.map((request) => request.operation)).toEqual(["acquire"]);
-  });
-
-  it("revokes a renewed lease if the fence changes during renewal", async () => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) => {
-      if (request.operation === "acquire") return success(request, wireLease(input));
-      if (request.operation === "renew") {
-        return success(
-          request,
-          wireLease(input, {
-            lease_id: "protected-ctxlane-lease-0002",
-            execution_handle: "protected-ctxlane-execution-handle-0002",
-          }),
-        );
-      }
-      if (request.operation === "revoke") return dispositionResult(request, "revoked");
-      throw new Error("unexpected operation");
-    });
-    const fence = new Fence();
-    const identity = broker(client, fence).broker;
-    const lease = await identity.acquire(input);
-    fence.values = [true, false];
-
-    await expect(identity.renew(lease)).rejects.toMatchObject({ code: "RM-AUTH-003" });
-    expect(client.requests.map((request) => request.operation)).toEqual([
-      "acquire",
-      "renew",
-      "revoke",
-    ]);
-  });
-
-  it("revokes a renewal that regresses the lease expiry", async () => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) => {
-      if (request.operation === "acquire") return success(request, wireLease(input));
-      if (request.operation === "renew") {
-        return success(
-          request,
-          wireLease(input, {
-            lease_id: "protected-ctxlane-lease-0002",
-            execution_handle: "protected-ctxlane-execution-handle-0002",
-            expires_at: "2026-08-21T10:00:45.000Z",
-          }),
-        );
-      }
-      if (request.operation === "revoke") return dispositionResult(request, "revoked");
-      throw new Error("unexpected operation");
-    });
-    const identity = broker(client).broker;
-    const lease = await identity.acquire(input);
-
-    await expect(identity.renew(lease)).rejects.toMatchObject({ code: "RM-AUTH-003" });
-    expect(client.requests.map((request) => request.operation)).toEqual([
-      "acquire",
-      "renew",
-      "revoke",
-    ]);
-  });
-
-  it("revokes a strict-invalid returned capability only within the requested work attempt", async () => {
-    const input = leaseRequest();
-    const protectedRemoteDetail = "protected-remote-extra-0001";
-    const client = new RecordingClient((request) => {
-      if (request.operation === "acquire") {
-        return success(request, wireLease(input, { unexpected: protectedRemoteDetail }));
-      }
-      if (request.operation === "revoke") return dispositionResult(request, "revoked");
-      throw new Error("unexpected operation");
-    });
-    const identity = broker(client).broker;
-
-    let error: unknown;
-    try {
-      await identity.acquire(input);
-    } catch (caught) {
-      error = caught;
-    }
-
-    expect(client.requests.map((request) => request.operation)).toEqual(["acquire", "revoke"]);
-    expect(client.requests[1]?.payload).toMatchObject({
-      lease_id: LEASE_ID,
-      run_id: input.runId,
-      work_order_id: input.workOrderId,
-      attempt_id: input.attemptId,
-    });
-    expect(error).toBeInstanceOf(RunmillError);
-    expect((error as Error).message).not.toContain(protectedRemoteDetail);
-    expect((error as Error).message).not.toContain(LEASE_ID);
-  });
+      expect(error).toMatchObject({ code: "RM-AUTH-003" });
+      expect((error as Error).message).not.toContain(ACTIVE_FIXTURE.lease_id);
+      expect((error as Error).message).not.toContain(
+        ACTIVE_FIXTURE.execution_handle,
+      );
+      expect(identityBrokerFailureDisposition(error)).toBe(disposition);
+    },
+  );
 
   it.each([
-    ["capability namespace collision", { execution_handle: LEASE_ID }],
-    ["capability in public attribution", { principal: EXECUTION_HANDLE }],
-  ])("revokes a lease with a %s before exposing it", async (_label, mutation) => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) => {
-      if (request.operation === "acquire") {
-        return success(request, wireLease(input, mutation));
-      }
-      if (request.operation === "revoke") return dispositionResult(request, "revoked");
-      throw new Error("unexpected operation");
-    });
-    const identity = broker(client).broker;
-
+    [
+      "cross-operation automation error",
+      {
+        ...clone(ERROR_FIXTURE),
+        operation: "service-health",
+        code: "service-recovering",
+        client_request_id: REQUEST_FIXTURE.client_request_id,
+      },
+    ],
+    [
+      "foreign client request error",
+      {
+        ...clone(ERROR_FIXTURE),
+        client_request_id: "request_other",
+      },
+    ],
+    [
+      "foreign terminal lease",
+      { ...clone(REFUSED_FIXTURE), tenant_id: "tenant-other" },
+    ],
+    [
+      "transitional error lease",
+      {
+        ...clone(ACTIVE_FIXTURE),
+        status: "error",
+        execution_handle: null,
+        reason_code: "service-recovery",
+      },
+    ],
+  ] as const)("keeps %s outcome ambiguous", async (_label, response) => {
+    const { broker } = setup({ response });
     let error: unknown;
     try {
-      await identity.acquire(input);
+      await broker.acquire(identityRequest());
     } catch (caught) {
       error = caught;
     }
-
-    expect(client.requests.map((request) => request.operation)).toEqual(["acquire", "revoke"]);
-    expect(error).toBeInstanceOf(RunmillError);
-    expect((error as Error).message).not.toContain(LEASE_ID);
-    expect((error as Error).message).not.toContain(EXECUTION_HANDLE);
+    expect(error).toMatchObject({ code: "RM-AUTH-003" });
+    expect(identityBrokerFailureDisposition(error)).toBeUndefined();
   });
 
-  it("does not revoke a malformed capability attributed to another run", async () => {
-    const client = new RecordingClient((request) =>
-      success(request, wireLease(leaseRequest(), { run_id: "run-other", unexpected: true })),
-    );
-    const identity = broker(client).broker;
-
-    await expect(identity.acquire(leaseRequest())).rejects.toMatchObject({
-      code: "RM-AUTH-003",
-      runId: "run-01",
-    });
-    expect(client.requests.map((request) => request.operation)).toEqual(["acquire"]);
-  });
-
-  it("bounds a hanging injected client and actively aborts it", async () => {
-    vi.useFakeTimers();
-    let observedSignal: AbortSignal | undefined;
-    const client: CtxlaneAutomationIdentityClient = {
-      request: async (_request, signal) => {
-        observedSignal = signal;
-        return await new Promise<never>(() => undefined);
-      },
+  it("marks an exactly correlated acquisition error as unchanged", async () => {
+    const response = {
+      ...clone(ERROR_FIXTURE),
+      code: "idempotency-conflict",
+      client_request_id: REQUEST_FIXTURE.client_request_id,
     };
-    const identity = broker(client, new Fence(), new FakeClock(NOW), 25).broker;
+    const { broker } = setup({ response });
+    let error: unknown;
+    try {
+      await broker.acquire(identityRequest());
+    } catch (caught) {
+      error = caught;
+    }
+    expect(identityBrokerFailureDisposition(error)).toBe("unchanged");
+  });
 
-    const pending = identity.acquire(leaseRequest());
-    const refusal = expect(pending).rejects.toMatchObject({ code: "RM-AUTH-003" });
+  it.each(["fixer", "retrospective"] as const)(
+    "rejects unsupported role %s before authority contact",
+    async (role) => {
+      const acquisition = new RecordingAcquisitionClient(() =>
+        clone(ACTIVE_FIXTURE),
+      );
+      const { broker } = setup({ acquisition });
+      await expect(
+        broker.acquire(identityRequest({ role })),
+      ).rejects.toMatchObject({
+        code: "RM-AUTH-003",
+      });
+      expect(acquisition.requests).toHaveLength(0);
+    },
+  );
+
+  it("rejects a non-integral-second TTL before contact", async () => {
+    const acquisition = new RecordingAcquisitionClient(() =>
+      clone(ACTIVE_FIXTURE),
+    );
+    const { broker } = setup({ acquisition });
+    await expect(
+      broker.acquire(identityRequest({ requestedDurationMs: 1_500 })),
+    ).rejects.toMatchObject({ code: "RM-AUTH-003" });
+    expect(acquisition.requests).toHaveLength(0);
+  });
+
+  it("refuses a mismatched durable acquisition intent before contact", async () => {
+    const authority = acquisitionAuthority({
+      intent: {
+        ...acquisitionAuthority().intent,
+        acquisitionRequest: {
+          ...clone(REQUEST_FIXTURE),
+          attempt_id: "attempt_other",
+        },
+      },
+    });
+    const { acquisition, broker } = setup({ authority });
+    await expect(broker.acquire(identityRequest())).rejects.toMatchObject({
+      code: "RM-AUTH-003",
+    });
+    expect(acquisition.requests).toHaveLength(0);
+  });
+
+  it("binds replay intent to non-coordinate request fields", async () => {
+    const authority = acquisitionAuthority({
+      intent: {
+        ...acquisitionAuthority().intent,
+        acquisitionRequest: {
+          ...clone(REQUEST_FIXTURE),
+          policy_digest: `sha256:${"f".repeat(64)}`,
+        },
+      },
+    });
+    const { acquisition, broker } = setup({ authority });
+
+    await expect(broker.acquire(identityRequest())).rejects.toMatchObject({
+      code: "RM-AUTH-003",
+    });
+    expect(acquisition.requests).toHaveLength(0);
+  });
+
+  it("snapshots mutable caller and authority inputs before adapter awaits", async () => {
+    const mutableRequest = identityRequest() as {
+      -readonly [Key in keyof IdentityLeaseRequest]: IdentityLeaseRequest[Key];
+    };
+    const mutableAuthority = acquisitionAuthority() as {
+      -readonly [Key in keyof CtxlaneAcquisitionAuthority]: CtxlaneAcquisitionAuthority[Key];
+    };
+    const acquisition = new RecordingAcquisitionClient((wire) => {
+      expect(Object.isFrozen(wire)).toBe(true);
+      expect(Object.isFrozen(wire.work_order_authorization)).toBe(true);
+      expect(() => {
+        (wire as { tenant_id: string }).tenant_id = "tenant-other";
+      }).toThrow(TypeError);
+      mutableAuthority.expectedCallerSubject = "caller:other";
+      return clone(ACTIVE_FIXTURE);
+    });
+    const lifecycle = new RecordingLifecycleClient();
+    const broker = new CtxlaneProviderIdentityBroker({
+      client: acquisition,
+      lifecycleClient: lifecycle,
+      clock: new FakeClock(NOW),
+      ownershipFence: new RecordingFence(),
+      authority: {
+        resolveAcquisitionAuthority: (snapshot) => {
+          expect(Object.isFrozen(snapshot)).toBe(true);
+          mutableRequest.runId = "run_other";
+          return mutableAuthority;
+        },
+      },
+    });
+
+    const lease = await broker.acquire(mutableRequest);
+
+    expect(lease.runId).toBe(REQUEST_FIXTURE.run_id);
+    expect(lease.ctxlane?.callerSubject).toBe(ACTIVE_FIXTURE.caller_subject);
+  });
+
+  it.each([
+    ["profile", { profileRef: "codex:other" }],
+    ["signed coordinate", { tenantId: "tenant-other" }],
+  ] as const)(
+    "refuses an authority %s mismatch before contact",
+    async (_label, mutation) => {
+      const { acquisition, broker } = setup({
+        authority: acquisitionAuthority(mutation),
+      });
+      await expect(broker.acquire(identityRequest())).rejects.toMatchObject({
+        code: "RM-AUTH-003",
+      });
+      expect(acquisition.requests).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["caller", { caller_subject: "caller:other" }],
+    ["host", { host_identity: "host:other" }],
+  ] as const)(
+    "rejects a returned %s mismatch without revoking foreign authority",
+    async (_label, mutation) => {
+      const lifecycle = new RecordingLifecycleClient();
+      lifecycle.revokeResponse = ({ lease }) =>
+        publishedFromInternal(lease, "revoked");
+      const response = {
+        ...clone(ACTIVE_FIXTURE),
+        ...mutation,
+      } as CtxlaneIdentityLease;
+      const { broker } = setup({
+        lifecycle,
+        response,
+      });
+
+      await expect(broker.acquire(identityRequest())).rejects.toMatchObject({
+        code: "RM-AUTH-003",
+      });
+      expect(lifecycle.revokeRequests).toHaveLength(0);
+    },
+  );
+
+  it("rejects a returned policy mismatch and retires matching authority", async () => {
+    const expectedPolicyDigest = `sha256:${"e".repeat(64)}`;
+    const lifecycle = new RecordingLifecycleClient();
+    lifecycle.revokeResponse = ({ lease }) =>
+      publishedFromInternal(lease, "revoked");
+    const response = {
+      ...clone(ACTIVE_FIXTURE),
+      effective_policy_digest: `sha256:${"d".repeat(64)}`,
+    } as CtxlaneIdentityLease;
+    const { broker } = setup({
+      authority: acquisitionAuthority({
+        intent: {
+          ...acquisitionAuthority().intent,
+          acquisitionRequest: {
+            ...clone(REQUEST_FIXTURE),
+            policy_digest: expectedPolicyDigest,
+          },
+        },
+        ctxlanePolicyDigest: expectedPolicyDigest,
+      }),
+      lifecycle,
+      response,
+    });
+
+    await expect(broker.acquire(identityRequest())).rejects.toMatchObject({
+      code: "RM-AUTH-003",
+    });
+    expect(lifecycle.revokeRequests).toHaveLength(1);
+  });
+
+  it("requires a complete lifecycle retirement boundary at construction", () => {
+    const common = {
+      client: new RecordingAcquisitionClient(() => clone(ACTIVE_FIXTURE)),
+      clock: new FakeClock(NOW),
+      ownershipFence: new RecordingFence(),
+      authority: { resolveAcquisitionAuthority: () => acquisitionAuthority() },
+    };
+    for (const lifecycleClient of [
+      {},
+      { renew: async () => ACTIVE_FIXTURE },
+      { renew: async () => ACTIVE_FIXTURE, close: async () => ACTIVE_FIXTURE },
+    ]) {
+      expect(
+        () =>
+          new CtxlaneProviderIdentityBroker({
+            ...common,
+            lifecycleClient:
+              lifecycleClient as unknown as CtxlaneLeaseLifecycleClient,
+          }),
+      ).toThrow(CtxlaneIdentityProtocolError);
+    }
+  });
+});
+
+describe("CtxlaneProviderIdentityBroker lifecycle", () => {
+  it("renews through the in-process boundary with a greater ctxlane generation", async () => {
+    const { broker, clock, lease, lifecycle } = await acquireActive();
+    clock.advanceMinutes(1);
+    lifecycle.renewResponse = ({ lease: current, requestedTtlSeconds }) => {
+      expect(requestedTtlSeconds).toBe(900);
+      expect(Object.isFrozen(current)).toBe(true);
+      expect(Object.isFrozen(current.ctxlane)).toBe(true);
+      expect(() => {
+        (current.ctxlane as { tenantId: string }).tenantId = "tenant-other";
+      }).toThrow(TypeError);
+      return publishedFromInternal(current, "active", {
+        fencing_generation: 2,
+        expires_at: "2026-08-21T10:16:00Z",
+      });
+    };
+
+    const renewed = (await broker.renew(lease)) as CtxlaneProviderIdentityLease;
+
+    expect(lifecycle.renewRequests).toHaveLength(1);
+    expect(lifecycle.renewRequests[0]?.lease.leaseId).toBe(lease.leaseId);
+    expect(renewed.leaseId).toBe(lease.leaseId);
+    expect(renewed.executionHandle).toBe(lease.executionHandle);
+    expect(renewed.fencingGeneration).toBe(41);
+    expect(renewed.ctxlane.fencingGeneration).toBe(2);
+  });
+
+  it("preserves the original TTL while accepting policy narrowing and a smaller maximum", async () => {
+    const { broker, clock, lease, lifecycle } = await acquireActive();
+    const narrowedPolicy = `sha256:${"d".repeat(64)}`;
+    const furtherNarrowedPolicy = `sha256:${"e".repeat(64)}`;
+    lifecycle.renewResponse = ({ lease: current, requestedTtlSeconds }) => {
+      expect(requestedTtlSeconds).toBe(900);
+      const nextGeneration = (current.ctxlane.fencingGeneration ?? 0) + 1;
+      return publishedFromInternal(current, "active", {
+        fencing_generation: nextGeneration,
+        expires_at:
+          nextGeneration === 2
+            ? "2026-08-21T10:16:00Z"
+            : "2026-08-21T10:17:00Z",
+        maximum_expires_at:
+          nextGeneration === 2
+            ? "2026-08-21T12:00:00Z"
+            : "2026-08-21T11:00:00Z",
+        effective_policy_digest:
+          nextGeneration === 2 ? narrowedPolicy : furtherNarrowedPolicy,
+      });
+    };
+
+    clock.advanceMinutes(1);
+    const first = (await broker.renew(lease)) as CtxlaneProviderIdentityLease;
+    clock.advanceMinutes(1);
+    const second = (await broker.renew(first)) as CtxlaneProviderIdentityLease;
+
+    expect(
+      lifecycle.renewRequests.map((request) => request.requestedTtlSeconds),
+    ).toEqual([900, 900]);
+    expect(first.ctxlane).toMatchObject({
+      requestedTtlSeconds: 900,
+      fencingGeneration: 2,
+      effectivePolicyDigest: narrowedPolicy,
+      maximumExpiresAt: "2026-08-21T12:00:00Z",
+    });
+    expect(second.ctxlane).toMatchObject({
+      requestedTtlSeconds: 900,
+      fencingGeneration: 3,
+      effectivePolicyDigest: furtherNarrowedPolicy,
+      maximumExpiresAt: "2026-08-21T11:00:00Z",
+    });
+  });
+
+  it.each([
+    ["equal generation", { fencing_generation: 1 }],
+    [
+      "regressed expiry",
+      { fencing_generation: 2, expires_at: "2026-08-21T10:14:00Z" },
+    ],
+  ] as const)(
+    "rejects renewal with %s and revokes returned authority",
+    async (_label, mutation) => {
+      const { broker, lease, lifecycle } = await acquireActive();
+      lifecycle.renewResponse = ({ lease: current }) =>
+        publishedFromInternal(current, "active", mutation);
+      lifecycle.revokeResponse = ({ lease: current }) =>
+        publishedFromInternal(current, "revoked");
+
+      await expect(broker.renew(lease)).rejects.toMatchObject({
+        code: "RM-AUTH-003",
+      });
+      expect(lifecycle.revokeRequests).toHaveLength(1);
+      expect(lifecycle.revokeRequests[0]?.lease.leaseId).toBe(lease.leaseId);
+      expect(lifecycle.revokeRequests[0]?.lease.ctxlane.fencingGeneration).toBe(
+        mutation.fencing_generation,
+      );
+    },
+  );
+
+  it("retires an invalid higher-generation renewal at the returned generation", async () => {
+    const { broker, lease, lifecycle } = await acquireActive();
+    lifecycle.renewResponse = ({ lease: current }) =>
+      publishedFromInternal(current, "active", {
+        fencing_generation: 2,
+        expires_at: "2026-08-21T10:14:00Z",
+      });
+    lifecycle.revokeResponse = ({ lease: current }) =>
+      current.ctxlane.fencingGeneration === 2
+        ? publishedFromInternal(current, "revoked")
+        : clone(ERROR_FIXTURE);
+
+    await expect(broker.renew(lease)).rejects.toMatchObject({
+      code: "RM-AUTH-003",
+    });
+    expect(lifecycle.revokeRequests).toHaveLength(1);
+    expect(lifecycle.revokeRequests[0]?.lease.ctxlane.fencingGeneration).toBe(
+      2,
+    );
+  });
+
+  it("never revokes a different lease id returned by renewal", async () => {
+    const { broker, lease, lifecycle } = await acquireActive();
+    const returnedLeaseId = "lease_01ARZ3NDEKTSV4RRFFQ69G5FB9";
+    lifecycle.renewResponse = ({ lease: current }) =>
+      publishedFromInternal(current, "active", {
+        lease_id: returnedLeaseId,
+        fencing_generation: 2,
+        expires_at: "2026-08-21T10:16:00Z",
+      });
+    lifecycle.revokeResponse = ({ lease: current }) =>
+      publishedFromInternal(current, "revoked");
+
+    await expect(broker.renew(lease)).rejects.toMatchObject({
+      code: "RM-AUTH-003",
+    });
+    expect(lifecycle.revokeRequests).toHaveLength(1);
+    expect(lifecycle.revokeRequests[0]?.lease.leaseId).toBe(lease.leaseId);
+    expect(lifecycle.revokeRequests[0]?.lease.leaseId).not.toBe(
+      returnedLeaseId,
+    );
+  });
+
+  it("treats an exactly bound terminal renewal race as definitively retired", async () => {
+    const { broker, lease, lifecycle } = await acquireActive();
+    lifecycle.renewResponse = ({ lease: current }) =>
+      publishedFromInternal(current, "expired");
+
+    let error: unknown;
+    try {
+      await broker.renew(lease);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(identityBrokerFailureDisposition(error)).toBe("retired");
+    expect(lifecycle.revokeRequests).toHaveLength(0);
+  });
+
+  it.each([
+    ["a skipped generation", { fencing_generation: 3 }],
+    [
+      "an overlong TTL",
+      { fencing_generation: 2, expires_at: "2026-08-21T10:17:00Z" },
+    ],
+  ] as const)(
+    "rejects renewal with %s and retires its exact returned generation",
+    async (_label, mutation) => {
+      const { broker, clock, lease, lifecycle } = await acquireActive();
+      clock.advanceMinutes(1);
+      lifecycle.renewResponse = ({ lease: current }) =>
+        publishedFromInternal(current, "active", {
+          expires_at: "2026-08-21T10:16:00Z",
+          ...mutation,
+        });
+      lifecycle.revokeResponse = ({ lease: current }) =>
+        publishedFromInternal(current, "revoked");
+
+      let error: unknown;
+      try {
+        await broker.renew(lease);
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toMatchObject({ code: "RM-AUTH-003" });
+      expect(identityBrokerFailureDisposition(error)).toBe("retired");
+      expect(lifecycle.revokeRequests).toHaveLength(1);
+      expect(lifecycle.revokeRequests[0]?.lease.ctxlane.fencingGeneration).toBe(
+        mutation.fencing_generation,
+      );
+    },
+  );
+
+  it.each([
+    ["lease id", { leaseId: "sensitive-lease-capability-0001" }],
+    [
+      "execution handle",
+      { executionHandle: "sensitive-execution-capability-0001" },
+    ],
+    [
+      "maximum expiry",
+      {
+        ctxlane: {
+          maximumExpiresAt: "2026-08-21T10:14:00Z",
+        },
+      },
+    ],
+  ] as const)(
+    "rejects a corrupt protected %s snapshot before lifecycle contact",
+    async (_label, mutation) => {
+      const { broker, lease, lifecycle } = await acquireActive();
+      const corrupted = structuredClone(lease);
+      const candidate =
+        "ctxlane" in mutation
+          ? {
+              ...corrupted,
+              ctxlane: { ...corrupted.ctxlane, ...mutation.ctxlane },
+            }
+          : { ...corrupted, ...mutation };
+
+      await expect(
+        broker.renew(candidate as unknown as IdentityLease),
+      ).rejects.toMatchObject({
+        code: "RM-AUTH-003",
+      });
+      expect(lifecycle.renewRequests).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["completed", "completed"],
+    ["failed", "worker-failed"],
+  ] as const)(
+    "maps Runmill %s to ctxlane close reason %s",
+    async (disposition, reason) => {
+      const { broker, lease, lifecycle } = await acquireActive();
+      lifecycle.closeResponse = (request) =>
+        publishedFromInternal(request.lease, "closed", { reason_code: reason });
+
+      await broker.close(lease, disposition);
+
+      expect(lifecycle.closeRequests).toHaveLength(1);
+      expect(lifecycle.closeRequests[0]?.disposition).toBe(reason);
+      expect(lifecycle.revokeRequests).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["revoked", "operator-revoked"],
+    ["closed with another reason", "worker-failed"],
+  ] as const)(
+    "treats close race ending %s as definitively retired",
+    async (_label, reason) => {
+      const { broker, lease, lifecycle } = await acquireActive();
+      lifecycle.closeResponse = ({ lease: current }) =>
+        reason === "operator-revoked"
+          ? publishedFromInternal(current, "revoked")
+          : publishedFromInternal(current, "closed", { reason_code: reason });
+
+      let error: unknown;
+      try {
+        await broker.close(lease, "completed");
+      } catch (caught) {
+        error = caught;
+      }
+      expect(identityBrokerFailureDisposition(error)).toBe("retired");
+    },
+  );
+
+  it.each(["cancelled", "refused"] as const)(
+    "routes Runmill %s retirement through revoke",
+    async (disposition) => {
+      const { broker, lease, lifecycle } = await acquireActive();
+      lifecycle.revokeResponse = ({ lease: current }) =>
+        publishedFromInternal(current, "revoked");
+
+      await broker.close(lease, disposition);
+
+      expect(lifecycle.closeRequests).toHaveLength(0);
+      expect(lifecycle.revokeRequests[0]?.reason).toBe(
+        `runmill-${disposition}`,
+      );
+    },
+  );
+
+  it("requires a published revoked lease and keeps capabilities out of reasons", async () => {
+    const { broker, lease, lifecycle } = await acquireActive();
+    for (const capability of [lease.leaseId, lease.executionHandle]) {
+      await expect(
+        broker.revoke(lease, `failure referenced ${capability}`),
+      ).rejects.toMatchObject({ code: "RM-AUTH-003" });
+    }
+    expect(lifecycle.revokeRequests).toHaveLength(0);
+
+    lifecycle.revokeResponse = ({ lease: current }) =>
+      publishedFromInternal(current, "revoked");
+    await broker.revoke(lease, "operator cancellation");
+    expect(lifecycle.revokeRequests).toHaveLength(1);
+  });
+
+  it("revokes a lease when the Runmill ownership fence changes during acquisition", async () => {
+    const fence = new RecordingFence();
+    fence.values = [true, false];
+    const lifecycle = new RecordingLifecycleClient();
+    lifecycle.revokeResponse = ({ lease }) =>
+      publishedFromInternal(lease, "revoked");
+    const { broker } = setup({ fence, lifecycle });
+
+    await expect(broker.acquire(identityRequest())).rejects.toMatchObject({
+      code: "RM-AUTH-003",
+    });
+    expect(lifecycle.revokeRequests).toHaveLength(1);
+    expect(
+      fence.observations.map((observation) => observation.fencingGeneration),
+    ).toEqual([41, 41]);
+  });
+
+  it("reports fence loss with unresolved revocation when cleanup fails", async () => {
+    const fence = new RecordingFence();
+    fence.values = [true, false];
+    const lifecycle = new RecordingLifecycleClient();
+    lifecycle.revokeResponse = () => {
+      throw new Error("protected remote detail");
+    };
+    const { broker } = setup({ fence, lifecycle });
+
+    let error: unknown;
+    try {
+      await broker.acquire(identityRequest());
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ code: "RM-AUTH-003" });
+    expect((error as Error).message).not.toContain("protected remote detail");
+  });
+
+  it("bounds and aborts a hanging acquisition client", async () => {
+    vi.useFakeTimers();
+    const acquisition = new RecordingAcquisitionClient(
+      async () => await new Promise<never>(() => undefined),
+    );
+    const { broker } = setup({ acquisition, requestTimeoutMs: 25 });
+
+    const pending = broker.acquire(identityRequest());
+    const refusal = expect(pending).rejects.toMatchObject({
+      code: "RM-AUTH-003",
+    });
     await vi.advanceTimersByTimeAsync(25);
     await refusal;
-
-    expect(observedSignal?.aborted).toBe(true);
-  });
-
-  it("refuses to put either sensitive capability into a revocation reason", async () => {
-    const input = leaseRequest();
-    const client = new RecordingClient((request) => success(request, wireLease(input)));
-    const identity = broker(client).broker;
-    const lease = await identity.acquire(input);
-
-    for (const capability of [lease.leaseId, lease.executionHandle]) {
-      let error: unknown;
-      try {
-        await identity.revoke(lease, `provider failure referenced ${capability}`);
-      } catch (caught) {
-        error = caught;
-      }
-      expect(error).toBeInstanceOf(RunmillError);
-      expect((error as Error).message).not.toContain(capability);
-    }
-    expect(client.requests.map((request) => request.operation)).toEqual(["acquire"]);
-  });
-
-  it("rejects unsafe timeout and clock-skew configurations", () => {
-    const client = new RecordingClient((request) => success(request, wireLease()));
-    const common = {
-      client,
-      clock: new FakeClock(NOW),
-      ownershipFence: new Fence(),
-    };
-
-    expect(
-      () => new CtxlaneProviderIdentityBroker({ ...common, requestTimeoutMs: 30_001 }),
-    ).toThrow(CtxlaneIdentityProtocolError);
-    expect(
-      () => new CtxlaneProviderIdentityBroker({ ...common, maximumClockSkewMs: 30_001 }),
-    ).toThrow(CtxlaneIdentityProtocolError);
-  });
-
-  it("fails closed without reflecting a remote refusal code or hostile response getter", async () => {
-    const protectedRemoteDetail = "PROTECTED_CTXLANE_EXECUTION_HANDLE_0001";
-    const refusalClient = new RecordingClient((request) => ({
-      schema: CTXLANE_AUTOMATION_RESPONSE_SCHEMA,
-      request_id: request.request_id,
-      ok: false,
-      error: { code: protectedRemoteDetail, retryable: false },
-    }));
-    const hostileClient = new RecordingClient(() => {
-      const response: Record<string, unknown> = {};
-      Object.defineProperty(response, "schema", {
-        enumerable: true,
-        get: () => {
-          throw new Error(EXECUTION_HANDLE);
-        },
-      });
-      return response;
-    });
-
-    for (const client of [refusalClient, hostileClient]) {
-      let error: unknown;
-      try {
-        await broker(client).broker.acquire(leaseRequest());
-      } catch (caught) {
-        error = caught;
-      }
-      expect(error).toBeInstanceOf(RunmillError);
-      expect((error as Error).message).not.toContain(protectedRemoteDetail);
-      expect((error as Error).message).not.toContain(EXECUTION_HANDLE);
-    }
-  });
-
-  it("never retries an ambiguous transport outcome or reflects its error text", async () => {
-    const client = new RecordingClient(() => {
-      throw new Error(`remote said ${EXECUTION_HANDLE}`);
-    });
-    const identity = broker(client).broker;
-
-    let error: unknown;
-    try {
-      await identity.acquire(leaseRequest());
-    } catch (caught) {
-      error = caught;
-    }
-
-    expect(client.requests).toHaveLength(1);
-    expect(error).toBeInstanceOf(RunmillError);
-    expect((error as Error).message).not.toContain(EXECUTION_HANDLE);
-  });
-
-  it("refuses a response correlated to another request", async () => {
-    const client = new RecordingClient((request) => ({
-      ...(success(request, wireLease()) as Record<string, unknown>),
-      request_id: `sha256:${"f".repeat(64)}`,
-    }));
-    const identity = broker(client).broker;
-
-    await expect(identity.acquire(leaseRequest())).rejects.toMatchObject({
-      code: "RM-AUTH-003",
-    });
+    expect(acquisition.signals[0]?.aborted).toBe(true);
   });
 });
 
-const cleanup: Array<{ server: Server; directory: string }> = [];
+describe("strictJsonDecode", () => {
+  afterEach(() => vi.useRealTimers());
 
-afterEach(async () => {
-  vi.useRealTimers();
-  for (const item of cleanup.splice(0)) {
-    await new Promise<void>((resolve) => item.server.close(() => resolve()));
-    rmSync(item.directory, { recursive: true, force: true });
-  }
-});
-
-async function unixFixture(
-  respond: (request: CtxlaneAutomationRequest, socket: Socket) => unknown,
-  timeoutMs = 5_000,
-): Promise<{
-  client: CtxlaneUnixAutomationClient;
-  directory: string;
-  socketPath: string;
-}> {
-  const directory = mkdtempSync(join(tmpdir(), "runmill-ctxlane-"));
-  const socketPath = join(directory, "automation.sock");
-  const server = createServer((socket) => {
-    let body = "";
-    socket.setEncoding("utf8");
-    socket.on("data", (chunk: string) => {
-      body += chunk;
-      const newline = body.indexOf("\n");
-      if (newline < 0) return;
-      const request = JSON.parse(body.slice(0, newline)) as CtxlaneAutomationRequest;
-      const result = respond(request, socket);
-      if (result === undefined) return;
-      if (Buffer.isBuffer(result)) {
-        socket.end(result);
-        return;
-      }
-      socket.end(`${JSON.stringify(result)}\n`);
-    });
+  it.each([
+    '{"a":1,"a":2}',
+    '{"nested":{"a":1,"a":2}}',
+    '{"a":1,"\\u0061":2}',
+    '{"a":',
+    "[1,]",
+  ])("rejects ambiguous or malformed JSON", (text) => {
+    expect(() => strictJsonDecode(text)).toThrow();
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socketPath, () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-  chmodSync(socketPath, 0o600);
-  cleanup.push({ server, directory });
-  return {
-    directory,
-    socketPath,
-    client: new CtxlaneUnixAutomationClient({
-      endpoint: `unix://${socketPath}`,
-      timeoutMs,
-    }),
-  };
-}
 
-describe("CtxlaneUnixAutomationClient", () => {
-  it("uses one bounded request over a privately owned Unix socket", async () => {
-    const fixture = await unixFixture((request) => success(request, { observed: true }));
-    const request = directAcquireRequest();
-
-    await expect(fixture.client.request(request)).resolves.toEqual(
-      success(request, { observed: true }),
+  it("materializes __proto__ as an own key on a null-prototype object", () => {
+    const decoded = strictJsonDecode(
+      '{"__proto__":{"polluted":true},"safe":1}',
     );
+    expect(typeof decoded).toBe("object");
+    expect(decoded).not.toBeNull();
+    const record = decoded as Record<string, unknown>;
+    expect(Object.getPrototypeOf(record)).toBeNull();
+    expect(Object.hasOwn(record, "__proto__")).toBe(true);
+    expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
   });
 
-  it("refuses a group/world-writable control socket before sending authority", async () => {
-    const fixture = await unixFixture((request) => success(request, {}));
-    chmodSync(fixture.socketPath, 0o666);
-
-    await expect(fixture.client.request(directAcquireRequest())).rejects.toBeInstanceOf(
-      CtxlaneIdentityProtocolError,
-    );
-  });
-
-  it("refuses an immediately writable socket directory before sending authority", async () => {
-    let observedRequests = 0;
-    const fixture = await unixFixture((request) => {
-      observedRequests += 1;
-      return success(request, {});
-    });
-    chmodSync(fixture.directory, 0o777);
-
-    await expect(
-      fixture.client.request(directAcquireRequest()),
-    ).rejects.toBeInstanceOf(CtxlaneIdentityProtocolError);
-    expect(observedRequests).toBe(0);
-  });
-
-  it("runtime-validates the exact request and deterministic request id before connecting", async () => {
-    let observedRequests = 0;
-    const fixture = await unixFixture((request) => {
-      observedRequests += 1;
-      return success(request, {});
-    });
-    const valid = directAcquireRequest();
-    const malformed = [
+  it("parses nested arrays without losing an element", () => {
+    expect(strictJsonDecode('[1,true,null,{"value":[2,3]}]')).toEqual([
+      1,
+      true,
       null,
-      { ...valid, request_id: `sha256:${"f".repeat(64)}` },
-      { ...valid, unexpected: true },
-      { ...valid, payload: { ...valid.payload, unexpected: true } },
-      { ...valid, operation: "execute" },
-      { ...valid, payload: { ...valid.payload, requested_duration_ms: 0 } },
-      directRevokeRequest({ lease_id_digest: `sha256:${"f".repeat(64)}` }),
-    ];
-
-    for (const request of malformed) {
-      await expect(
-        fixture.client.request(request as CtxlaneAutomationRequest),
-      ).rejects.toBeInstanceOf(CtxlaneIdentityProtocolError);
-    }
-    expect(observedRequests).toBe(0);
-  });
-
-  it("rejects invalid UTF-8 without reflecting remote bytes", async () => {
-    const fixture = await unixFixture(() => Buffer.from([0x7b, 0x22, 0x80, 0x0a]));
-
-    await expect(
-      fixture.client.request(directAcquireRequest()),
-    ).rejects.toMatchObject({ message: "ctxlane returned invalid UTF-8" });
-  });
-
-  it("enforces an absolute deadline even while the peer trickles data", async () => {
-    const fixture = await unixFixture((_request, socket) => {
-      const interval = setInterval(() => socket.write(" "), 5);
-      // The client intentionally destroys this connection at its absolute
-      // deadline, so a server-side EPIPE is the expected end of the fixture.
-      socket.once("error", () => clearInterval(interval));
-      socket.once("close", () => clearInterval(interval));
-      return undefined;
-    }, 40);
-
-    await expect(
-      fixture.client.request(directAcquireRequest()),
-    ).rejects.toMatchObject({ message: "ctxlane request timed out" });
-  });
-
-  it("rejects non-Unix and credential-bearing endpoint forms", () => {
-    for (const endpoint of [
-      "https://ctxlane.example",
-      "unix://relative.sock",
-      "unix:///run/ctxlane.sock?token=secret",
-      "unix://user@/run/ctxlane.sock",
-    ]) {
-      expect(() => new CtxlaneUnixAutomationClient({ endpoint })).toThrow(
-        CtxlaneIdentityProtocolError,
-      );
-    }
-    expect(
-      () =>
-        new CtxlaneUnixAutomationClient({
-          endpoint: "unix:///run/ctxlane.sock",
-          timeoutMs: 30_001,
-        }),
-    ).toThrow(CtxlaneIdentityProtocolError);
+      { value: [2, 3] },
+    ]);
   });
 });

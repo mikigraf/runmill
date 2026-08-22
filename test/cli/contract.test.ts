@@ -43,7 +43,9 @@ const COMMANDS = commandPaths(program);
 /** Every `runmill ...` string the catalog suggests, with placeholders stripped. */
 function citedRunmillCommands(): { code: string; command: string }[] {
   const cited: { code: string; command: string }[] = [];
-  for (const [code, entry] of Object.entries<ErrorCatalogEntry>(ERROR_CATALOG)) {
+  for (const [code, entry] of Object.entries<ErrorCatalogEntry>(
+    ERROR_CATALOG,
+  )) {
     for (const fix of entry.fixes) {
       if (fix.command?.startsWith("runmill ") !== true) continue;
       cited.push({ code, command: fix.command });
@@ -81,7 +83,10 @@ describe("error catalog remediation commands", () => {
       const path = [tokens.slice(0, 2).join(" "), tokens[0] ?? ""].find((p) =>
         COMMANDS.has(p),
       );
-      expect(path, `no such command: runmill ${tokens.join(" ")}`).toBeDefined();
+      expect(
+        path,
+        `no such command: runmill ${tokens.join(" ")}`,
+      ).toBeDefined();
 
       // Flags in the suggestion must be real flags on that command.
       for (const token of command.split(" ").slice(1)) {
@@ -95,7 +100,9 @@ describe("error catalog remediation commands", () => {
   );
 
   it("gives every entry at least one fix a developer can act on", () => {
-    for (const [code, entry] of Object.entries<ErrorCatalogEntry>(ERROR_CATALOG)) {
+    for (const [code, entry] of Object.entries<ErrorCatalogEntry>(
+      ERROR_CATALOG,
+    )) {
       expect(entry.fixes.length, `${code} has no fixes`).toBeGreaterThan(0);
     }
   });
@@ -114,18 +121,36 @@ describe("CLI surface", () => {
     // Only commands the README presents AS commands: inside backticks or a
     // fenced block. Prose that happens to start with the product name is not
     // an instruction to run anything.
-    const inBackticks = [...readme.matchAll(/`runmill ([a-z][a-z0-9 |-]*?)`/g)].map((m) => m[1] ?? "");
-    const inFences = [...readme.matchAll(/^\s*(?:\$ )?runmill ([a-z][a-z0-9 -]*)$/gm)].map((m) => m[1] ?? "");
+    const inBackticks = [
+      ...readme.matchAll(/`runmill ([a-z][a-z0-9 |-]*?)`/g),
+    ].map((m) => m[1] ?? "");
+    const inFences = [
+      ...readme.matchAll(/^\s*(?:\$ )?runmill ([a-z][a-z0-9 -]*)$/gm),
+    ].map((m) => m[1] ?? "");
     const cited = [...inBackticks, ...inFences]
       .flatMap((c) => c.split("|"))
-      .map((c) => c.trim().split(" ").filter((t) => t !== "" && !t.startsWith("-") && !t.startsWith("<") && !t.startsWith("[")))
+      .map((c) =>
+        c
+          .trim()
+          .split(" ")
+          .filter(
+            (t) =>
+              t !== "" &&
+              !t.startsWith("-") &&
+              !t.startsWith("<") &&
+              !t.startsWith("["),
+          ),
+      )
       .filter((t) => t.length > 0);
 
     for (const tokens of cited) {
       const path = [tokens.slice(0, 2).join(" "), tokens[0] ?? ""].find((p) =>
         COMMANDS.has(p),
       );
-      expect(path, `README cites \`runmill ${tokens.join(" ")}\` which does not exist`).toBeDefined();
+      expect(
+        path,
+        `README cites \`runmill ${tokens.join(" ")}\` which does not exist`,
+      ).toBeDefined();
     }
   });
 
@@ -146,17 +171,23 @@ describe("CLI surface", () => {
   });
 
   it("keeps standalone start as the default and puts ASF behind an explicit surface", () => {
-    const start = program.commands.find((command) => command.name() === "start");
+    const start = program.commands.find(
+      (command) => command.name() === "start",
+    );
     expect(start).toBeDefined();
-    expect(start?.options.some((option) => option.long === "--mode")).toBe(false);
+    expect(start?.options.some((option) => option.long === "--mode")).toBe(
+      false,
+    );
     expect(COMMANDS.has("mcp serve")).toBe(true);
     expect(optionNames(program, "mcp serve").has("--stdio")).toBe(true);
     expect(COMMANDS.has("service start")).toBe(true);
     expect(optionNames(program, "service start").has("--mode")).toBe(true);
-    expect(optionNames(program, "service start").has("--runtime-module")).toBe(true);
+    expect(optionNames(program, "service start").has("--runtime-module")).toBe(
+      true,
+    );
   });
 
-  it("documents the environment variables that change behavior", async () => {
+  it("documents the standalone environment variables in the README", async () => {
     const readme = await import("node:fs").then((fs) =>
       fs.readFileSync("README.md", "utf8"),
     );
@@ -165,10 +196,76 @@ describe("CLI surface", () => {
       "RUNMILL_FAKE_BACKLOG",
       "RUNMILL_SOURCE_REPO",
       "RUNMILL_DATA_DIR",
-      "RUNMILL_ASF_RUNTIME_MODULE",
-      "RUNMILL_ASF_DAEMON_REGISTRY",
+      "RUNMILL_DAEMON_REGISTRY",
     ]) {
       expect(readme, `README does not document ${v}`).toContain(v);
+    }
+  });
+
+  it("keeps ASF-only environment variables out of the README and in docs/asf-worker.md", async () => {
+    const fs = await import("node:fs");
+    const readme = fs.readFileSync("README.md", "utf8");
+    const asfDoc = fs.readFileSync("docs/asf-worker.md", "utf8");
+    for (const v of [
+      "RUNMILL_ASF_RUNTIME_MODULE",
+      "RUNMILL_ASF_DAEMON_REGISTRY",
+      "RUNMILL_ASF_CONTROL_CONTROLLER_ID",
+      "RUNMILL_ASF_CONTROL_KEY_ID",
+      "RUNMILL_ASF_CONTROL_KEY_FILE",
+      "RUNMILL_ASF_EVIDENCE_SIGNING_KEY_ID",
+      "RUNMILL_ASF_EVIDENCE_SIGNING_KEY_FILE",
+      "RUNMILL_ASF_EVIDENCE_SIGNING_KEY_VALID_FROM",
+      "RUNMILL_ASF_EVIDENCE_SIGNING_KEY_VALID_UNTIL",
+    ]) {
+      expect(asfDoc, `docs/asf-worker.md does not document ${v}`).toContain(v);
+      expect(
+        readme,
+        `README must not document ASF-only variable ${v}`,
+      ).not.toContain(v);
+    }
+  });
+
+  it("keeps ASF service and MCP commands out of the README and in docs/asf-worker.md", async () => {
+    const fs = await import("node:fs");
+    const readme = fs.readFileSync("README.md", "utf8");
+    const asfDoc = fs.readFileSync("docs/asf-worker.md", "utf8");
+    for (const command of [
+      "service start",
+      "service status",
+      "service stop",
+      "mcp serve",
+    ]) {
+      expect(
+        asfDoc,
+        `docs/asf-worker.md does not document \`runmill ${command}\``,
+      ).toContain(`runmill ${command}`);
+      expect(
+        readme,
+        `README must not document ASF-only command \`runmill ${command}\``,
+      ).not.toContain(`runmill ${command}`);
+    }
+  });
+
+  it("keeps the README to exactly one ASF mention and free of ASF implementation details", async () => {
+    const fs = await import("node:fs");
+    const readme = fs.readFileSync("README.md", "utf8");
+    // Strip markdown link destinations (e.g. the docs/asf-worker.md URL) so the
+    // filename itself is not counted as a prose mention of ASF.
+    const prose = readme.replace(/\]\([^)]*\)/g, "]");
+    const mentions = prose.match(/asf/giu) ?? [];
+    expect(mentions.length, "README must mention ASF exactly once").toBe(1);
+
+    for (const detail of [
+      "ctxlane",
+      "createAsfWorkerHostOptions",
+      "runtime-module",
+      "asf-worker.sock",
+      "asf-worker.json",
+    ]) {
+      expect(
+        readme,
+        `README must not carry ASF implementation detail: ${detail}`,
+      ).not.toContain(detail);
     }
   });
 });
@@ -200,8 +297,13 @@ describe("commands cited anywhere in the source", () => {
         .split(" ")
         .filter((t) => t !== "" && !t.startsWith("-"));
       if (tokens.length === 0) continue;
-      const path = [tokens.slice(0, 2).join(" "), tokens[0] ?? ""].find((p) => COMMANDS.has(p));
-      expect(path, `${file} cites \`runmill ${tokens.join(" ")}\` which does not exist`).toBeDefined();
+      const path = [tokens.slice(0, 2).join(" "), tokens[0] ?? ""].find((p) =>
+        COMMANDS.has(p),
+      );
+      expect(
+        path,
+        `${file} cites \`runmill ${tokens.join(" ")}\` which does not exist`,
+      ).toBeDefined();
     }
   });
 });
@@ -211,14 +313,22 @@ describe("the advertised quickstart", () => {
   // the headline command printed "No eligible issue." — a first impression of
   // a product that appears to do nothing.
   it("seeds demo mode with issues, so the zero-credential path shows real output", async () => {
-    const { buildAdapters, demoFixturePath } = await import("../../src/factory.js");
+    const { buildAdapters, demoFixturePath } = await import(
+      "../../src/factory.js"
+    );
     const fs = await import("node:fs");
-    expect(fs.existsSync(demoFixturePath()), "bundled demo fixture is missing").toBe(true);
+    expect(
+      fs.existsSync(demoFixturePath()),
+      "bundled demo fixture is missing",
+    ).toBe(true);
 
     const config = (await import("../../src/config/load.js")).parseConfig(
       fs.readFileSync("examples/quickstart/runmill.yaml", "utf8"),
     );
-    const { backlog } = await buildAdapters(config, { demo: true, need: ["backlog"] });
+    const { backlog } = await buildAdapters(config, {
+      demo: true,
+      need: ["backlog"],
+    });
     const issues = await backlog.listCandidates({
       team: config.backlog.team,
       states: config.backlog.eligibleStates,
@@ -228,7 +338,9 @@ describe("the advertised quickstart", () => {
 
   it("ships the demo fixture in the published package", async () => {
     const fs = await import("node:fs");
-    const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")) as { files: string[] };
+    const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")) as {
+      files: string[];
+    };
     expect(pkg.files.some((f) => f.startsWith("examples"))).toBe(true);
   });
 
@@ -236,10 +348,15 @@ describe("the advertised quickstart", () => {
     // The $id is what developers paste into runmill.yaml for editor
     // autocomplete. Pointing it at an unregistered domain broke that silently.
     const fs = await import("node:fs");
-    const schema = JSON.parse(fs.readFileSync("runmill.schema.json", "utf8")) as { $id: string };
+    const schema = JSON.parse(
+      fs.readFileSync("runmill.schema.json", "utf8"),
+    ) as { $id: string };
     expect(schema.$id).toMatch(/^https:\/\/raw\.githubusercontent\.com\//);
     for (const f of ["examples/quickstart/runmill.yaml", "README.md"]) {
-      expect(fs.readFileSync(f, "utf8"), `${f} cites the dead host`).not.toContain("runmill.dev");
+      expect(
+        fs.readFileSync(f, "utf8"),
+        `${f} cites the dead host`,
+      ).not.toContain("runmill.dev");
     }
   });
 });
@@ -267,7 +384,9 @@ describe("published package", () => {
     const fs = await import("node:fs");
     const source = fs.readFileSync("src/cli/main.ts", "utf8");
     expect(source).toContain("realpathSync");
-    expect(source).not.toMatch(/import\.meta\.url === `file:\/\/\$\{process\.argv\[1\]\}`/);
+    expect(source).not.toMatch(
+      /import\.meta\.url === `file:\/\/\$\{process\.argv\[1\]\}`/,
+    );
   });
 });
 
@@ -276,18 +395,40 @@ describe("documentation", () => {
     const fs = await import("node:fs");
     const docs = fs.readFileSync("docs/errors.md", "utf8");
     for (const code of Object.keys(ERROR_CATALOG)) {
-      expect(docs, `docs/errors.md is missing ${code} — run npm run docs:errors`).toContain(code);
+      expect(
+        docs,
+        `docs/errors.md is missing ${code} — run npm run docs:errors`,
+      ).toContain(code);
     }
   });
 
-  it("documents every command in the README", () => {
+  const ASF_ONLY_COMMANDS = new Set([
+    "service start",
+    "service status",
+    "service stop",
+    "mcp serve",
+  ]);
+
+  it("documents every leaf command across the README and docs/asf-worker.md", () => {
     const fs = require("node:fs") as typeof import("node:fs");
     const readme = fs.readFileSync("README.md", "utf8");
+    const asfDoc = fs.readFileSync("docs/asf-worker.md", "utf8");
     for (const path of COMMANDS) {
       // Subcommand groups appear via their children, e.g. `config validate`.
       const isGroup = [...COMMANDS].some((c) => c.startsWith(`${path} `));
       if (isGroup || path === "help") continue;
-      expect(readme, `README does not document \`runmill ${path}\``).toContain(`runmill ${path}`);
+
+      const cited = `runmill ${path}`;
+      if (ASF_ONLY_COMMANDS.has(path)) {
+        expect(
+          asfDoc,
+          `docs/asf-worker.md does not document \`${cited}\``,
+        ).toContain(cited);
+      } else {
+        expect(readme, `README does not document \`${cited}\``).toContain(
+          cited,
+        );
+      }
     }
   });
 });

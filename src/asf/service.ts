@@ -36,6 +36,14 @@ import type {
   AsfOutcomeAcknowledgementService,
 } from "./outcome.js";
 import type { AsfHealthReport, AsfHealthService } from "./health.js";
+import type {
+  AsfTelemetryAttributeInput,
+  AsfTelemetryCounterName,
+  AsfTelemetryHistogramName,
+  AsfTelemetryRecorder,
+  AsfTelemetrySpanName,
+  AsfTelemetryUnit,
+} from "./telemetry.js";
 
 export type AsfWorkerStore = Pick<
   StateStore,
@@ -180,6 +188,7 @@ export interface AsfWorkerServiceOptions {
     | Pick<AsfOutcomeAcknowledgementService, "acknowledge">
     | undefined;
   readonly health?: Pick<AsfHealthService, "getHealth"> | undefined;
+  readonly telemetry?: AsfTelemetryRecorder | undefined;
   readonly onBackgroundError?:
     | ((error: unknown, runId: string) => void)
     | undefined;
@@ -244,6 +253,8 @@ export class AsfWorkerService {
     | Pick<AsfOutcomeAcknowledgementService, "acknowledge">
     | undefined;
   readonly #health: Pick<AsfHealthService, "getHealth"> | undefined;
+  readonly #telemetry: AsfTelemetryRecorder | undefined;
+  readonly #serviceTelemetryStartedAt: number | undefined;
   readonly #onBackgroundError:
     | ((error: unknown, runId: string) => void)
     | undefined;
@@ -257,6 +268,7 @@ export class AsfWorkerService {
   #pumpRequested = false;
   #retryTask: AsfScheduledTask | undefined;
   #stopping = false;
+  #stopTelemetryEmitted = false;
 
   constructor(options: AsfWorkerServiceOptions) {
     if (options.workerId.trim() === "")
@@ -322,6 +334,8 @@ export class AsfWorkerService {
     this.#reconciliation = options.reconciliation;
     this.#outcome = options.outcome;
     this.#health = options.health;
+    this.#telemetry = options.telemetry;
+    this.#serviceTelemetryStartedAt = this.#telemetryMonotonicMs();
     this.#onBackgroundError = options.onBackgroundError;
     options.reconciliation?.bindDurableContinuationHandler?.((completion) => {
       this.notifyReconciliationContinuation(completion);
@@ -334,21 +348,85 @@ export class AsfWorkerService {
         "ASF worker service is stopping and is not accepting submissions",
       );
     }
-    const admitted = await this.#admission.submit(raw);
+    const startedAt = this.#telemetryMonotonicMs();
+    let admitted: SubmitWorkOrderResult;
+    try {
+      admitted = await this.#admission.submit(raw);
+    } catch (error) {
+      // An arbitrary submit rejection may be a store failure or an ambiguous
+      // post-commit result, not a proven refusal of invalid input. Record only
+      // a failed admission operation; the refusal counter needs typed proof.
+      this.#telemetryOperation(
+        "runmill.asf.work_order.admission",
+        startedAt,
+        "admission",
+        "work-order-admit",
+        "failed",
+        { reason_code: "unknown" },
+      );
+      throw error;
+    }
     this.#schedule(admitted.runId);
+    this.#telemetryOperation(
+      "runmill.asf.work_order.admission",
+      startedAt,
+      "admission",
+      "work-order-admit",
+      "succeeded",
+    );
+    if (admitted.disposition === "accepted") {
+      this.#telemetryCounter("runmill.asf.work_orders.accepted", 1, {
+        component: "admission",
+        operation: "work-order-admit",
+        outcome: "succeeded",
+      });
+    }
     return admitted;
   }
 
   /** Queue every durable, nonterminal ASF run not already active here. */
   recover(): number {
     if (this.#stopping) throw new Error("ASF worker service is stopping");
-    this.#scheduleDurableEventRetentionCandidates();
-    let queued = 0;
-    for (const run of this.#store.listRecoverableAsfRuns()) {
-      if (isTerminalRunEventPhase(run.state)) continue;
-      if (this.#schedule(run.runId)) queued += 1;
+    const startedAt = this.#telemetryMonotonicMs();
+    try {
+      this.#scheduleDurableEventRetentionCandidates();
+      let queued = 0;
+      for (const run of this.#store.listRecoverableAsfRuns()) {
+        if (isTerminalRunEventPhase(run.state)) continue;
+        if (this.#schedule(run.runId)) queued += 1;
+      }
+      const recovered = queued + (this.#reconciliation?.recover() ?? 0);
+      this.#telemetryOperation(
+        "runmill.asf.reconciliation",
+        startedAt,
+        "reconciliation",
+        "reconcile",
+        "recovered",
+        { recovery_mode: "startup" },
+      );
+      if (recovered > 0) {
+        this.#telemetryCounter("runmill.asf.recovery.actions", recovered, {
+          component: "reconciliation",
+          operation: "reconcile",
+          outcome: "recovered",
+          recovery_mode: "startup",
+        });
+      }
+      return recovered;
+    } catch (error) {
+      this.#telemetryOperation(
+        "runmill.asf.reconciliation",
+        startedAt,
+        "reconciliation",
+        "reconcile",
+        "failed",
+        {
+          reason_code: "unknown",
+          recovery_mode: "startup",
+        },
+      );
+      throw error;
     }
-    return queued + (this.#reconciliation?.recover() ?? 0);
   }
 
   getRun(runId: string): AsfRunSnapshot {
@@ -377,7 +455,31 @@ export class AsfWorkerService {
         "ASF cancellation is not configured for this worker service",
       );
     }
-    const result = this.#cancellation.request(raw);
+    const startedAt = this.#telemetryMonotonicMs();
+    let result: CancellationResult;
+    try {
+      result = this.#cancellation.request(raw);
+    } catch (error) {
+      this.#telemetryOperation(
+        "runmill.asf.cancellation",
+        startedAt,
+        "cancellation",
+        "cancel",
+        "failed",
+        { reason_code: "unknown" },
+      );
+      throw error;
+    }
+    this.#telemetryOperation(
+      "runmill.asf.cancellation",
+      startedAt,
+      "cancellation",
+      "cancel",
+      result.disposition === "already-terminal" ? "degraded" : "succeeded",
+      result.disposition === "already-terminal"
+        ? { reason_code: "terminal-state" }
+        : {},
+    );
     if (result.disposition === "already-terminal") return result;
 
     this.#cancelDelayedWake(result.runId);
@@ -462,7 +564,29 @@ export class AsfWorkerService {
         "ASF reconciliation is not configured for this worker service",
       );
     }
-    return this.#reconciliation.request(raw);
+    const startedAt = this.#telemetryMonotonicMs();
+    try {
+      const result = this.#reconciliation.request(raw);
+      this.#telemetryOperation(
+        "runmill.asf.reconciliation",
+        startedAt,
+        "reconciliation",
+        "reconcile",
+        "succeeded",
+        { recovery_mode: "reconcile-only" },
+      );
+      return result;
+    } catch (error) {
+      this.#telemetryOperation(
+        "runmill.asf.reconciliation",
+        startedAt,
+        "reconciliation",
+        "reconcile",
+        "failed",
+        { reason_code: "unknown", recovery_mode: "reconcile-only" },
+      );
+      throw error;
+    }
   }
 
   /**
@@ -559,8 +683,10 @@ export class AsfWorkerService {
       }
       this.#rescheduleAfterActive.clear();
     }
-    if (this.#activeRuns.size === 0) return;
-    await new Promise<void>((resolve) => this.#idleWaiters.add(resolve));
+    if (this.#activeRuns.size > 0) {
+      await new Promise<void>((resolve) => this.#idleWaiters.add(resolve));
+    }
+    this.#emitStopTelemetry();
   }
 
   #wakeRun(runId: string): void {
@@ -710,93 +836,166 @@ export class AsfWorkerService {
     active: ActiveRun,
     takeover: boolean,
   ): Promise<void> {
-    if (active.leaseLost) return;
     const generation = active.generation;
-    try {
-      await this.#runner({
-        runId,
-        generation,
-        takeover,
-        signal: active.abortController.signal,
-        transition: (input) => {
-          if (active.leaseLost || this.#activeRuns.get(runId) !== active) {
-            throw new Error(
-              `ASF runner for ${runId} generation ${generation} lost fenced ownership`,
-            );
-          }
-          return this.#store.transitionAsfRun({
-            ...input,
-            runId,
-            ownerId: this.#workerId,
-            generation,
-          });
+    const startedAt = this.#telemetryMonotonicMs();
+    let telemetryFinished = false;
+    const finishTelemetry = (
+      outcome: NonNullable<AsfTelemetryAttributeInput["outcome"]>,
+      disposition: NonNullable<AsfTelemetryAttributeInput["disposition"]>,
+      reason_code?: NonNullable<AsfTelemetryAttributeInput["reason_code"]>,
+    ): void => {
+      if (telemetryFinished) return;
+      telemetryFinished = true;
+      const attributes: AsfTelemetryAttributeInput = {
+        component: "runner",
+        operation: "run-dispatch",
+        outcome,
+        disposition,
+        ...(reason_code === undefined ? {} : { reason_code }),
+        ...(takeover ? { recovery_mode: "takeover" as const } : {}),
+      };
+      this.#telemetryCounter("runmill.asf.run.invocations", 1, attributes);
+      this.#telemetryOperation(
+        "runmill.asf.run.dispatch",
+        startedAt,
+        "runner",
+        "run-dispatch",
+        outcome,
+        {
+          disposition,
+          ...(reason_code === undefined ? {} : { reason_code }),
+          ...(takeover ? { recovery_mode: "takeover" as const } : {}),
         },
-      });
-    } catch (error) {
-      if (active.leaseLost) return;
-      if (
-        error instanceof AsfPendingTerminalEvidenceRetryError &&
-        error.runId === runId &&
-        this.#store.getAsfTerminalEvidencePlanRecord(runId) !== undefined
-      ) {
-        this.#releaseIfOwned(runId, generation);
-        this.#scheduleDelayedWake(runId);
+      );
+    };
+    try {
+      if (active.leaseLost) {
+        finishTelemetry("degraded", "lease-lost", "stale-fence");
+        return;
+      }
+      if (takeover) {
+        this.#telemetryCounter("runmill.asf.recovery.actions", 1, {
+          component: "runner",
+          operation: "run-dispatch",
+          outcome: "recovered",
+          recovery_mode: "takeover",
+        });
+      }
+      try {
+        await this.#runner({
+          runId,
+          generation,
+          takeover,
+          signal: active.abortController.signal,
+          transition: (input) => {
+            if (active.leaseLost || this.#activeRuns.get(runId) !== active) {
+              throw new Error(
+                `ASF runner for ${runId} generation ${generation} lost fenced ownership`,
+              );
+            }
+            return this.#store.transitionAsfRun({
+              ...input,
+              runId,
+              ownerId: this.#workerId,
+              generation,
+            });
+          },
+        });
+      } catch (error) {
+        if (active.leaseLost) {
+          finishTelemetry("degraded", "lease-lost", "stale-fence");
+          return;
+        }
+        if (
+          error instanceof AsfPendingTerminalEvidenceRetryError &&
+          error.runId === runId &&
+          this.#store.getAsfTerminalEvidencePlanRecord(runId) !== undefined
+        ) {
+          this.#releaseIfOwned(runId, generation);
+          this.#scheduleDelayedWake(runId);
+          this.#reportBackgroundError(error, runId);
+          finishTelemetry("degraded", "retry", "terminal-state");
+          return;
+        }
+        if (
+          error instanceof AsfPendingCiRetryError &&
+          error.runId === runId &&
+          this.#isCurrentPendingCiYield(error, generation)
+        ) {
+          this.#releaseIfOwned(runId, generation);
+          this.#scheduleDelayedWake(runId);
+          finishTelemetry("degraded", "retry", "dependency-unavailable");
+          return;
+        }
+        this.#recordRunnerFailure(
+          runId,
+          generation,
+          "background runner rejected",
+        );
+        this.#releaseFinishedOwnership(runId, generation);
         this.#reportBackgroundError(error, runId);
+        finishTelemetry("failed", "unexpected-error", "unknown");
+        return;
+      }
+
+      if (active.leaseLost) {
+        finishTelemetry("degraded", "lease-lost", "stale-fence");
+        return;
+      }
+
+      let current: AsfRunRow | undefined;
+      try {
+        current = this.#store.getAsfRun(runId);
+      } catch (error) {
+        this.#reportBackgroundError(error, runId);
+        finishTelemetry("failed", "unexpected-error", "dependency-unavailable");
         return;
       }
       if (
-        error instanceof AsfPendingCiRetryError &&
-        error.runId === runId &&
-        this.#isCurrentPendingCiYield(error, generation)
+        current === undefined ||
+        current.ownerId !== this.#workerId ||
+        current.generation !== generation
       ) {
-        this.#releaseIfOwned(runId, generation);
-        this.#scheduleDelayedWake(runId);
+        finishTelemetry("degraded", "lease-lost", "stale-fence");
         return;
       }
+      if (
+        isTerminalRunEventPhase(current.state) ||
+        DURABLE_PAUSE_PHASES.has(current.state)
+      ) {
+        this.#releaseIfOwned(runId, generation);
+        if (current.state === "COMPLETED") {
+          finishTelemetry("succeeded", "terminal");
+        } else if (isTerminalRunEventPhase(current.state)) {
+          finishTelemetry(
+            current.state === "CANCELLED"
+              ? "cancelled"
+              : current.state === "REFUSED"
+                ? "refused"
+                : "failed",
+            "terminal",
+            "terminal-state",
+          );
+        } else {
+          finishTelemetry("succeeded", "durable-pause");
+        }
+        return;
+      }
+
+      const error = new Error(
+        `ASF runner for ${runId} resolved while durable phase ${current.state} remained active`,
+      );
       this.#recordRunnerFailure(
         runId,
         generation,
-        "background runner rejected",
+        "background runner resolved in a nonterminal active phase",
       );
       this.#releaseFinishedOwnership(runId, generation);
       this.#reportBackgroundError(error, runId);
-      return;
+      finishTelemetry("failed", "unexpected-error", "contradictory-state");
+    } finally {
+      finishTelemetry("failed", "unexpected-error", "unknown");
     }
-
-    if (active.leaseLost) return;
-
-    let current: AsfRunRow | undefined;
-    try {
-      current = this.#store.getAsfRun(runId);
-    } catch (error) {
-      this.#reportBackgroundError(error, runId);
-      return;
-    }
-    if (
-      current === undefined ||
-      current.ownerId !== this.#workerId ||
-      current.generation !== generation
-    ) {
-      return;
-    }
-    if (
-      isTerminalRunEventPhase(current.state) ||
-      DURABLE_PAUSE_PHASES.has(current.state)
-    ) {
-      this.#releaseIfOwned(runId, generation);
-      return;
-    }
-
-    const error = new Error(
-      `ASF runner for ${runId} resolved while durable phase ${current.state} remained active`,
-    );
-    this.#recordRunnerFailure(
-      runId,
-      generation,
-      "background runner resolved in a nonterminal active phase",
-    );
-    this.#releaseFinishedOwnership(runId, generation);
-    this.#reportBackgroundError(error, runId);
   }
 
   #recordRunnerFailure(
@@ -1189,11 +1388,121 @@ export class AsfWorkerService {
     this.#idleWaiters.clear();
   }
 
+  #telemetryMonotonicMs(): number | undefined {
+    if (this.#telemetry === undefined) return undefined;
+    try {
+      const value = this.#clock.monotonicMs();
+      return Number.isFinite(value) && value >= 0 ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  #telemetryElapsedMs(startedAt: number | undefined): number | undefined {
+    if (startedAt === undefined) return undefined;
+    const finishedAt = this.#telemetryMonotonicMs();
+    return finishedAt === undefined || finishedAt < startedAt
+      ? undefined
+      : finishedAt - startedAt;
+  }
+
+  #telemetryOperation(
+    name: AsfTelemetrySpanName,
+    startedAt: number | undefined,
+    component: NonNullable<AsfTelemetryAttributeInput["component"]>,
+    operation: NonNullable<AsfTelemetryAttributeInput["operation"]>,
+    outcome: NonNullable<AsfTelemetryAttributeInput["outcome"]>,
+    attributes: Omit<
+      AsfTelemetryAttributeInput,
+      "component" | "operation" | "outcome"
+    > = {},
+  ): void {
+    const durationMs = this.#telemetryElapsedMs(startedAt);
+    if (durationMs === undefined) return;
+    const completeAttributes = {
+      ...attributes,
+      component,
+      operation,
+      outcome,
+    };
+    this.#telemetrySpan(name, durationMs, completeAttributes);
+    this.#telemetryHistogram(
+      "runmill.asf.operation.duration",
+      durationMs,
+      "ms",
+      completeAttributes,
+    );
+  }
+
+  #discardTelemetryResult(result: unknown): void {
+    if (result === undefined) return;
+    try {
+      void Promise.resolve(result).catch(() => undefined);
+    } catch {
+      // A hostile thenable is still non-authoritative telemetry input.
+    }
+  }
+
+  #telemetrySpan(
+    name: AsfTelemetrySpanName,
+    durationMs: number,
+    attributes: AsfTelemetryAttributeInput,
+  ): void {
+    try {
+      this.#discardTelemetryResult(
+        this.#telemetry?.span(name, durationMs, attributes),
+      );
+    } catch {
+      // Even a nonconforming telemetry adapter cannot affect worker authority.
+    }
+  }
+
+  #telemetryCounter(
+    name: AsfTelemetryCounterName,
+    value: number,
+    attributes: AsfTelemetryAttributeInput,
+  ): void {
+    try {
+      this.#discardTelemetryResult(
+        this.#telemetry?.counter(name, value, attributes),
+      );
+    } catch {
+      // Even a nonconforming telemetry adapter cannot affect worker authority.
+    }
+  }
+
+  #telemetryHistogram(
+    name: AsfTelemetryHistogramName,
+    value: number,
+    unit: AsfTelemetryUnit,
+    attributes: AsfTelemetryAttributeInput,
+  ): void {
+    try {
+      this.#discardTelemetryResult(
+        this.#telemetry?.histogram(name, value, unit, attributes),
+      );
+    } catch {
+      // Even a nonconforming telemetry adapter cannot affect worker authority.
+    }
+  }
+
+  #emitStopTelemetry(): void {
+    if (this.#stopTelemetryEmitted) return;
+    this.#stopTelemetryEmitted = true;
+    this.#telemetryOperation(
+      "runmill.asf.service.lifecycle",
+      this.#serviceTelemetryStartedAt,
+      "service",
+      "service-lifecycle",
+      "succeeded",
+    );
+  }
+
   #reportBackgroundError(error: unknown, runId: string): void {
     try {
       this.#onBackgroundError?.(error, runId);
     } catch {
-      // A telemetry callback cannot be allowed to create an unhandled
+      // A diagnostic callback cannot be allowed to create an unhandled
       // rejection in the detached execution path.
     }
   }

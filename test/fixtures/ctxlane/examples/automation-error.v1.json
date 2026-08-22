@@ -1,0 +1,7 @@
+{
+  "schema": "ctxlane.automation-error/v1",
+  "operation": "lease-acquire",
+  "code": "caller-unauthenticated",
+  "client_request_id": null,
+  "lease_id": null
+}

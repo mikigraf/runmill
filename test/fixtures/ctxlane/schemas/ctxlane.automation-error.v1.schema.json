@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.automation-error.v1.schema.json",
+  "title": "ctxlane automation error v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "operation",
+    "code",
+    "client_request_id",
+    "lease_id"
+  ],
+  "properties": {
+    "schema": { "const": "ctxlane.automation-error/v1" },
+    "operation": {
+      "enum": [
+        "profile-list",
+        "profile-readiness",
+        "profile-resolve",
+        "lease-acquire",
+        "lease-inspect",
+        "lease-renew",
+        "lease-revoke",
+        "lease-close",
+        "service-health",
+        "execution-start"
+      ]
+    },
+    "code": {
+      "enum": [
+        "invalid-request",
+        "unsupported-schema",
+        "caller-unauthenticated",
+        "caller-unauthorized",
+        "rate-limited",
+        "service-recovering",
+        "unsupported-platform",
+        "store-unavailable",
+        "internal-error",
+        "profile-not-found",
+        "provider-mismatch",
+        "profile-not-eligible",
+        "authentication-exception-required",
+        "isolation-exception-required",
+        "environment-not-allowed",
+        "role-not-allowed",
+        "caller-not-allowed",
+        "repository-not-allowed",
+        "profile-not-ready",
+        "identity-token-stale",
+        "harness-untrusted",
+        "principal-unverified",
+        "principal-mismatch",
+        "organization-mismatch",
+        "workspace-mismatch",
+        "isolation-unproven",
+        "idempotency-conflict",
+        "lease-not-found",
+        "lease-not-active",
+        "lease-expired",
+        "lease-revoked",
+        "generation-mismatch",
+        "run-mismatch",
+        "role-mismatch",
+        "tenant-mismatch",
+        "host-mismatch",
+        "session-limit-reached"
+      ]
+    },
+    "client_request_id": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@+-]*$(?![\\s\\S])"
+        },
+        { "type": "null" }
+      ]
+    },
+    "lease_id": {
+      "oneOf": [
+        { "$ref": "#/$defs/leaseId" },
+        { "type": "null" }
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "code": { "$ref": "#/$defs/commonCode" },
+        "lease_id": { "type": "null" }
+      }
+    },
+    {
+      "properties": {
+        "operation": { "const": "profile-readiness" },
+        "code": {
+          "enum": ["profile-not-found", "provider-mismatch"]
+        },
+        "lease_id": { "type": "null" }
+      }
+    },
+    {
+      "properties": {
+        "operation": { "const": "profile-resolve" },
+        "code": { "$ref": "#/$defs/profileResolveCode" },
+        "lease_id": { "type": "null" }
+      }
+    },
+    {
+      "properties": {
+        "operation": { "const": "lease-acquire" },
+        "code": { "const": "idempotency-conflict" },
+        "lease_id": { "type": "null" }
+      }
+    },
+    {
+      "properties": {
+        "operation": { "const": "lease-inspect" },
+        "code": { "const": "lease-not-found" },
+        "lease_id": { "$ref": "#/$defs/leaseId" }
+      }
+    },
+    {
+      "properties": {
+        "operation": { "const": "lease-renew" },
+        "code": { "$ref": "#/$defs/leaseMutationCode" },
+        "lease_id": { "$ref": "#/$defs/leaseId" }
+      }
+    },
+    {
+      "properties": {
+        "operation": { "const": "lease-revoke" },
+        "code": {
+          "enum": ["lease-not-found", "lease-not-active"]
+        },
+        "lease_id": { "$ref": "#/$defs/leaseId" }
+      }
+    },
+    {
+      "properties": {
+        "operation": { "const": "lease-close" },
+        "code": { "$ref": "#/$defs/leaseCloseCode" },
+        "lease_id": { "$ref": "#/$defs/leaseId" }
+      }
+    },
+    {
+      "properties": {
+        "operation": { "const": "execution-start" },
+        "code": { "$ref": "#/$defs/executionStartCode" },
+        "lease_id": { "$ref": "#/$defs/leaseId" }
+      }
+    }
+  ],
+  "$defs": {
+    "leaseId": {
+      "type": "string",
+      "pattern": "^lease_[0-7][0-9A-HJKMNP-TV-Z]{25}$(?![\\s\\S])"
+    },
+    "commonCode": {
+      "enum": [
+        "invalid-request",
+        "unsupported-schema",
+        "caller-unauthenticated",
+        "caller-unauthorized",
+        "rate-limited",
+        "service-recovering",
+        "unsupported-platform",
+        "store-unavailable",
+        "internal-error"
+      ]
+    },
+    "profileResolveCode": {
+      "enum": [
+        "profile-not-found",
+        "provider-mismatch",
+        "profile-not-eligible",
+        "authentication-exception-required",
+        "isolation-exception-required",
+        "environment-not-allowed",
+        "role-not-allowed",
+        "caller-not-allowed",
+        "repository-not-allowed",
+        "profile-not-ready",
+        "identity-token-stale",
+        "harness-untrusted",
+        "principal-unverified",
+        "principal-mismatch",
+        "organization-mismatch",
+        "workspace-mismatch",
+        "isolation-unproven"
+      ]
+    },
+    "leaseMutationCode": {
+      "enum": [
+        "lease-not-found",
+        "lease-not-active",
+        "lease-expired",
+        "lease-revoked",
+        "generation-mismatch",
+        "run-mismatch",
+        "role-mismatch",
+        "tenant-mismatch",
+        "host-mismatch",
+        "session-limit-reached"
+      ]
+    },
+    "leaseCloseCode": {
+      "enum": [
+        "lease-not-found",
+        "lease-not-active",
+        "lease-expired",
+        "lease-revoked",
+        "generation-mismatch",
+        "run-mismatch",
+        "role-mismatch",
+        "tenant-mismatch",
+        "host-mismatch"
+      ]
+    },
+    "executionStartCode": {
+      "enum": [
+        "lease-not-found",
+        "lease-not-active",
+        "lease-expired",
+        "lease-revoked",
+        "generation-mismatch",
+        "run-mismatch",
+        "role-mismatch",
+        "tenant-mismatch",
+        "host-mismatch",
+        "session-limit-reached",
+        "profile-not-ready",
+        "identity-token-stale",
+        "harness-untrusted",
+        "principal-unverified",
+        "principal-mismatch",
+        "organization-mismatch",
+        "workspace-mismatch",
+        "isolation-unproven"
+      ]
+    }
+  }
+}

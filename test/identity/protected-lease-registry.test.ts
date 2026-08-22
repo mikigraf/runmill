@@ -60,11 +60,46 @@ function lease(): IdentityLease {
   });
 }
 
+function ctxlaneLease(): IdentityLease {
+  return Object.freeze({
+    ...lease(),
+    provider: "codex",
+    principal: "service-account:automation-worker",
+    profile: "codex:automation-production",
+    ctxlane: Object.freeze({
+      clientRequestId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      requestedTtlSeconds: 600,
+      tenantId: "tenant-acme",
+      workOrderDigest: `sha256:${"b".repeat(64)}`,
+      profileUid: "profile_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      callerSubject: "caller:local-controller",
+      hostIdentity: "host:runner-01",
+      workerIdentity: "worker:controller-01",
+      workspaceId: "workspace_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      environment: "production",
+      repository: "github:acme/payments",
+      workspaceRef: "chatgpt-workspace:ws_automation_prod",
+      authMode: "wif",
+      isolation: "credential-isolated",
+      fencingGeneration: 3,
+      effectivePolicyDigest: `sha256:${"c".repeat(64)}`,
+      maximumExpiresAt: "2026-08-21T14:00:00.000Z",
+      status: "active",
+    }),
+  });
+}
+
 function update(
   overrides: Partial<
-    Omit<ProtectedIdentityLeaseSnapshot, "revision" | "updatedAt" | "recordDigest">
+    Omit<
+      ProtectedIdentityLeaseSnapshot,
+      "revision" | "updatedAt" | "recordDigest"
+    >
   > = {},
-): Omit<ProtectedIdentityLeaseSnapshot, "revision" | "updatedAt" | "recordDigest"> {
+): Omit<
+  ProtectedIdentityLeaseSnapshot,
+  "revision" | "updatedAt" | "recordDigest"
+> {
   const exactLease = lease();
   return {
     schema: PROTECTED_IDENTITY_LEASE_REGISTRY_SCHEMA,
@@ -75,12 +110,14 @@ function update(
       prReviewer: "pr-review-profile",
     },
     phase: "acquiring",
-    leases: [{
-      leaseDigest: protectedIdentityLeaseDigest(exactLease),
-      lease: exactLease,
-      currentRole: "implementer",
-      retired: false,
-    }],
+    leases: [
+      {
+        leaseDigest: protectedIdentityLeaseDigest(exactLease),
+        lease: exactLease,
+        currentRole: "implementer",
+        retired: false,
+      },
+    ],
     pendingOperations: [],
     acquisitionObservation: null,
     ...overrides,
@@ -143,16 +180,53 @@ describe("EncryptedFileIdentityLeaseRegistry", () => {
     }
   });
 
+  it("round-trips and deep-freezes complete ctxlane attribution", async () => {
+    const test = fixture();
+    try {
+      const exactLease = ctxlaneLease();
+      const saved = await test.registry.save(
+        update({
+          leases: [
+            {
+              leaseDigest: protectedIdentityLeaseDigest(exactLease),
+              lease: exactLease,
+              currentRole: "implementer",
+              retired: false,
+            },
+          ],
+        }),
+        null,
+      );
+
+      const loaded = await test.registry.load(binding());
+      expect(loaded).toEqual(saved);
+      const loadedLease = loaded?.leases[0]?.lease;
+      expect(loadedLease?.ctxlane).toEqual(exactLease.ctxlane);
+      expect(Object.isFrozen(loadedLease)).toBe(true);
+      expect(Object.isFrozen(loadedLease?.ctxlane)).toBe(true);
+
+      const [name] = readdirSync(test.directory);
+      const sealed = readFileSync(
+        join(test.directory, name ?? "missing"),
+        "utf8",
+      );
+      expect(sealed).not.toContain("caller:local-controller");
+      expect(sealed).not.toContain("profile_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    } finally {
+      test.remove();
+    }
+  });
+
   it("refuses stale compare-and-swap writers and leaves the current record intact", async () => {
     const test = fixture();
     try {
       const first = await test.registry.save(update(), null);
-      await expect(test.registry.save(update({ phase: "failed" }), null)).rejects.toThrow(
-        /unavailable or contradictory/u,
-      );
-      await expect(test.registry.save(update({ phase: "failed" }), 99)).rejects.toThrow(
-        /unavailable or contradictory/u,
-      );
+      await expect(
+        test.registry.save(update({ phase: "failed" }), null),
+      ).rejects.toThrow(/unavailable or contradictory/u);
+      await expect(
+        test.registry.save(update({ phase: "failed" }), 99),
+      ).rejects.toThrow(/unavailable or contradictory/u);
       await expect(test.registry.load(binding())).resolves.toEqual(first);
     } finally {
       test.remove();
@@ -185,12 +259,15 @@ describe("EncryptedFileIdentityLeaseRegistry", () => {
     const test = fixture();
     try {
       chmodSync(test.directory, 0o755);
-      expect(() => new EncryptedFileIdentityLeaseRegistry({
-        directory: test.directory,
-        keyId: "identity-registry-test-key",
-        key: Buffer.alloc(32, 0x37),
-        clock: test.clock,
-      })).toThrow(/unavailable or contradictory/u);
+      expect(
+        () =>
+          new EncryptedFileIdentityLeaseRegistry({
+            directory: test.directory,
+            keyId: "identity-registry-test-key",
+            key: Buffer.alloc(32, 0x37),
+            clock: test.clock,
+          }),
+      ).toThrow(/unavailable or contradictory/u);
 
       chmodSync(test.directory, 0o700);
       const registry = new EncryptedFileIdentityLeaseRegistry({
@@ -202,7 +279,9 @@ describe("EncryptedFileIdentityLeaseRegistry", () => {
       await registry.save(update(), null);
       const [name] = readdirSync(test.directory);
       chmodSync(join(test.directory, name ?? "missing"), 0o644);
-      await expect(registry.load(binding())).rejects.toThrow(/unavailable or contradictory/u);
+      await expect(registry.load(binding())).rejects.toThrow(
+        /unavailable or contradictory/u,
+      );
     } finally {
       test.remove();
     }

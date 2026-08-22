@@ -1,0 +1,9 @@
+{
+  "warning": "PUBLIC TEST KEY ONLY - NEVER USE THIS KEY OUTSIDE CONTRACT TESTS",
+  "public_key_hex": "3e7ac95170ac322c7cbd342e12e5e0af36f21375ed128c33372e73810d05bff9",
+  "domain_separator_utf8": "ctxlane.work-order-authorization/v1\u0000",
+  "canonical_authorization_without_signature": "{\"algorithm\":\"ed25519\",\"attempt_id\":\"attempt_01\",\"client_request_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"environment\":\"production\",\"expires_at\":\"2026-08-21T14:00:00Z\",\"key_id\":\"key-controller-2026-08\",\"maximum_session_seconds\":14400,\"maximum_ttl_seconds\":900,\"not_before\":\"2026-08-21T10:00:00Z\",\"profile_ref\":\"codex:automation-production\",\"profile_uid\":\"profile_01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"provider\":\"codex\",\"repository\":\"github:acme/payments\",\"role\":\"implementer\",\"run_id\":\"run_01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"schema\":\"ctxlane.work-order-authorization/v1\",\"tenant_id\":\"tenant-acme\",\"work_order_digest\":\"sha256:a36dbc1704725260b0896399529c16a86acabb6849bb1c9abeb251d7ffd16e6c\",\"work_order_id\":\"wo_01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"workspace_id\":\"workspace_01ARZ3NDEKTSV4RRFFQ69G5FAV\"}",
+  "signing_payload_sha256_hex": "a2f5e03f11738de0482eaeca477bddeb5abe545275de5d1340ab13a71fc212c6",
+  "signature_base64url_unpadded": "jLtlv6wVNme_sIhGEIcT25hnhY4YrkAwOolb60L22TWa9DRkudNgfEAxrBSrCm3YXjvFIRsujAKizOeO7wjrAw",
+  "canonical_request_digest": "sha256:c2e97e1730562837f58c1a0745026b1a377afa60a8d2d58254d078be6e7dcb4c"
+}

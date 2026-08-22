@@ -1,8 +1,4 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  randomBytes,
-} from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -42,7 +38,11 @@ export const SEALED_IDENTITY_LEASE_FILE_SCHEMA =
 const MAX_SEALED_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_SEALED_FILES = 4_096;
 const SEALED_FILE_NAME_PATTERN = /^([a-f0-9]{64})\.identity-sealed$/u;
-const REQUIRED_ROLES = ["implementer", "local-reviewer", "pr-reviewer"] as const;
+const REQUIRED_ROLES = [
+  "implementer",
+  "local-reviewer",
+  "pr-reviewer",
+] as const;
 const ALL_ROLES = [
   "implementer",
   "local-reviewer",
@@ -129,13 +129,18 @@ export interface ProtectedIdentityLeaseRegistry {
     binding: ProtectedIdentityLeaseBinding,
   ): Promise<readonly ProtectedIdentityLeaseSnapshot[]>;
   save(
-    snapshot: Omit<ProtectedIdentityLeaseSnapshot, "revision" | "updatedAt" | "recordDigest">,
+    snapshot: Omit<
+      ProtectedIdentityLeaseSnapshot,
+      "revision" | "updatedAt" | "recordDigest"
+    >,
     expectedRevision: number | null,
   ): Promise<ProtectedIdentityLeaseSnapshot>;
 }
 
 export class ProtectedIdentityLeaseRegistryError extends Error {
-  constructor(message = "protected identity lease state is unavailable or contradictory") {
+  constructor(
+    message = "protected identity lease state is unavailable or contradictory",
+  ) {
     super(message);
     this.name = "ProtectedIdentityLeaseRegistryError";
   }
@@ -172,6 +177,29 @@ const profilesSchema = z
   })
   .strict();
 
+const ctxlaneAttributionSchema = z
+  .object({
+    clientRequestId: identifierSchema,
+    requestedTtlSeconds: z.number().int().min(1).max(86_400),
+    tenantId: identifierSchema,
+    workOrderDigest: digestSchema,
+    profileUid: identifierSchema,
+    callerSubject: identifierSchema,
+    hostIdentity: identifierSchema,
+    workerIdentity: identifierSchema.nullable(),
+    workspaceId: identifierSchema,
+    environment: identifierSchema,
+    repository: identifierSchema,
+    workspaceRef: identifierSchema.nullable(),
+    authMode: identifierSchema.nullable(),
+    isolation: identifierSchema.nullable(),
+    fencingGeneration: z.number().int().positive().safe().nullable(),
+    effectivePolicyDigest: digestSchema.nullable(),
+    maximumExpiresAt: timestampSchema.nullable(),
+    status: identifierSchema,
+  })
+  .strict();
+
 const leaseSchema = z
   .object({
     leaseId: identifierSchema,
@@ -187,6 +215,7 @@ const leaseSchema = z
     issuedAt: timestampSchema,
     expiresAt: timestampSchema,
     fencingGeneration: z.number().int().positive().safe(),
+    ctxlane: ctxlaneAttributionSchema.optional(),
   })
   .strict();
 
@@ -228,7 +257,11 @@ const sealedFileSchema = z
     key_id: identifierSchema,
     binding_digest: digestSchema,
     nonce: z.string().regex(/^[A-Za-z0-9_-]{16}$/u),
-    ciphertext: z.string().min(1).max(MAX_SEALED_FILE_BYTES * 2).regex(/^[A-Za-z0-9_-]+$/u),
+    ciphertext: z
+      .string()
+      .min(1)
+      .max(MAX_SEALED_FILE_BYTES * 2)
+      .regex(/^[A-Za-z0-9_-]+$/u),
     authentication_tag: z.string().regex(/^[A-Za-z0-9_-]{22}$/u),
   })
   .strict();
@@ -253,17 +286,21 @@ function sameBinding(
 export function protectedIdentityLeaseBindingDigest(
   binding: ProtectedIdentityLeaseBinding,
 ): string {
-  return sha256Digest(asJson({
-    schema: "runmill.protected-identity-lease-binding/v1",
-    binding,
-  }));
+  return sha256Digest(
+    asJson({
+      schema: "runmill.protected-identity-lease-binding/v1",
+      binding,
+    }),
+  );
 }
 
 export function protectedIdentityLeaseDigest(lease: IdentityLease): string {
-  return sha256Digest(asJson({
-    schema: "runmill.protected-identity-lease-snapshot/v1",
-    lease,
-  }));
+  return sha256Digest(
+    asJson({
+      schema: "runmill.protected-identity-lease-snapshot/v1",
+      lease,
+    }),
+  );
 }
 
 function unsignedSnapshot(
@@ -279,19 +316,25 @@ function snapshotRecordDigest(
 }
 
 function freezeLease(raw: z.infer<typeof leaseSchema>): IdentityLease {
+  const { ctxlane, ...lease } = raw;
   return Object.freeze({
-    ...raw,
+    ...lease,
     leaseId: raw.leaseId as IdentityLeaseId,
     executionHandle: raw.executionHandle as IdentityExecutionHandle,
+    ...(ctxlane === undefined
+      ? {}
+      : { ctxlane: Object.freeze({ ...ctxlane }) }),
   });
 }
 
 function parseSnapshot(raw: unknown): ProtectedIdentityLeaseSnapshot {
   const parsed = snapshotSchema.parse(raw);
-  const leases = parsed.leases.map((entry) => Object.freeze({
-    ...entry,
-    lease: freezeLease(entry.lease),
-  }));
+  const leases = parsed.leases.map((entry) =>
+    Object.freeze({
+      ...entry,
+      lease: freezeLease(entry.lease),
+    }),
+  );
   const snapshotWithoutDigest = {
     schema: parsed.schema,
     binding: Object.freeze({ ...parsed.binding }),
@@ -299,7 +342,9 @@ function parseSnapshot(raw: unknown): ProtectedIdentityLeaseSnapshot {
     phase: parsed.phase,
     leases: Object.freeze(leases),
     pendingOperations: Object.freeze(
-      parsed.pendingOperations.map((operation) => Object.freeze({ ...operation })),
+      parsed.pendingOperations.map((operation) =>
+        Object.freeze({ ...operation }),
+      ),
     ),
     acquisitionObservation: parsed.acquisitionObservation as JsonValue | null,
     revision: parsed.revision,
@@ -332,7 +377,10 @@ function parseSnapshot(raw: unknown): ProtectedIdentityLeaseSnapshot {
       throw new ProtectedIdentityLeaseRegistryError();
     }
     if (operation.kind !== "acquire") {
-      if (operation.leaseDigest === null || !leaseDigests.has(operation.leaseDigest)) {
+      if (
+        operation.leaseDigest === null ||
+        !leaseDigests.has(operation.leaseDigest)
+      ) {
         throw new ProtectedIdentityLeaseRegistryError();
       }
     }
@@ -406,7 +454,8 @@ export interface EncryptedFileIdentityLeaseRegistryOptions {
  * malformed ciphertext, key mismatches, and compare-and-swap contradictions.
  */
 export class EncryptedFileIdentityLeaseRegistry
-implements ProtectedIdentityLeaseRegistry {
+  implements ProtectedIdentityLeaseRegistry
+{
   readonly #directory: string;
   readonly #keyId: string;
   readonly #key: Buffer;
@@ -435,7 +484,9 @@ implements ProtectedIdentityLeaseRegistry {
     const parsedBinding = bindingSchema.safeParse(binding);
     if (!parsedBinding.success) throw safeError();
     this.#assertSafeDirectory(this.#directory);
-    const bindingDigest = protectedIdentityLeaseBindingDigest(parsedBinding.data);
+    const bindingDigest = protectedIdentityLeaseBindingDigest(
+      parsedBinding.data,
+    );
     const path = this.#path(bindingDigest);
     let descriptor: number | undefined;
     let sealedBytes: Buffer | undefined;
@@ -452,25 +503,38 @@ implements ProtectedIdentityLeaseRegistry {
       if (!unchanged(before, after) || sealedBytes.byteLength !== before.size) {
         throw safeError();
       }
-      const sealed = sealedFileSchema.parse(JSON.parse(sealedBytes.toString("utf8")));
-      if (sealed.key_id !== this.#keyId || sealed.binding_digest !== bindingDigest) {
+      const sealed = sealedFileSchema.parse(
+        JSON.parse(sealedBytes.toString("utf8")),
+      );
+      if (
+        sealed.key_id !== this.#keyId ||
+        sealed.binding_digest !== bindingDigest
+      ) {
         throw safeError();
       }
       const nonce = decodeBase64Url(sealed.nonce);
       const ciphertext = decodeBase64Url(sealed.ciphertext);
       const tag = decodeBase64Url(sealed.authentication_tag);
       if (nonce.byteLength !== 12 || tag.byteLength !== 16) throw safeError();
-      const aad = Buffer.from(canonicalJson(asJson({
-        schema: sealed.schema,
-        key_id: sealed.key_id,
-        binding_digest: sealed.binding_digest,
-      })), "utf8");
+      const aad = Buffer.from(
+        canonicalJson(
+          asJson({
+            schema: sealed.schema,
+            key_id: sealed.key_id,
+            binding_digest: sealed.binding_digest,
+          }),
+        ),
+        "utf8",
+      );
       const decipher = createDecipheriv("aes-256-gcm", this.#key, nonce, {
         authTagLength: 16,
       });
       decipher.setAAD(aad);
       decipher.setAuthTag(tag);
-      plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+      plaintext = Buffer.concat([
+        decipher.update(ciphertext),
+        decipher.final(),
+      ]);
       const snapshot = parseSnapshot(JSON.parse(plaintext.toString("utf8")));
       if (!sameBinding(snapshot.binding, parsedBinding.data)) throw safeError();
       return snapshot;
@@ -510,7 +574,8 @@ implements ProtectedIdentityLeaseRegistry {
         const repeated = second[index];
         return (
           repeated === undefined ||
-          entry.binding.fencingGeneration !== repeated.binding.fencingGeneration ||
+          entry.binding.fencingGeneration !==
+            repeated.binding.fencingGeneration ||
           entry.revision !== repeated.revision ||
           entry.recordDigest !== repeated.recordDigest
         );
@@ -522,7 +587,10 @@ implements ProtectedIdentityLeaseRegistry {
   }
 
   async save(
-    snapshot: Omit<ProtectedIdentityLeaseSnapshot, "revision" | "updatedAt" | "recordDigest">,
+    snapshot: Omit<
+      ProtectedIdentityLeaseSnapshot,
+      "revision" | "updatedAt" | "recordDigest"
+    >,
     expectedRevision: number | null,
   ): Promise<ProtectedIdentityLeaseSnapshot> {
     const parsedBinding = bindingSchema.safeParse(snapshot.binding);
@@ -534,7 +602,9 @@ implements ProtectedIdentityLeaseRegistry {
       throw safeError();
     }
     this.#assertSafeDirectory(this.#directory);
-    const bindingDigest = protectedIdentityLeaseBindingDigest(parsedBinding.data);
+    const bindingDigest = protectedIdentityLeaseBindingDigest(
+      parsedBinding.data,
+    );
     const lock = this.#acquireWriteLock(bindingDigest);
     try {
       return await this.#saveWhileLocked(
@@ -549,7 +619,10 @@ implements ProtectedIdentityLeaseRegistry {
   }
 
   async #saveWhileLocked(
-    snapshot: Omit<ProtectedIdentityLeaseSnapshot, "revision" | "updatedAt" | "recordDigest">,
+    snapshot: Omit<
+      ProtectedIdentityLeaseSnapshot,
+      "revision" | "updatedAt" | "recordDigest"
+    >,
     parsedBinding: ProtectedIdentityLeaseBinding,
     bindingDigest: string,
     expectedRevision: number | null,
@@ -566,12 +639,18 @@ implements ProtectedIdentityLeaseRegistry {
       ...snapshot,
       binding: Object.freeze({ ...snapshot.binding }),
       profiles: Object.freeze({ ...snapshot.profiles }),
-      leases: Object.freeze(snapshot.leases.map((entry) => Object.freeze({
-        ...entry,
-        lease: Object.freeze({ ...entry.lease }),
-      }))),
+      leases: Object.freeze(
+        snapshot.leases.map((entry) =>
+          Object.freeze({
+            ...entry,
+            lease: Object.freeze({ ...entry.lease }),
+          }),
+        ),
+      ),
       pendingOperations: Object.freeze(
-        snapshot.pendingOperations.map((operation) => Object.freeze({ ...operation })),
+        snapshot.pendingOperations.map((operation) =>
+          Object.freeze({ ...operation }),
+        ),
       ),
       revision,
       updatedAt: this.#clock.now().toISOString(),
@@ -583,7 +662,9 @@ implements ProtectedIdentityLeaseRegistry {
     if (!sameBinding(complete.binding, parsedBinding)) throw safeError();
 
     this.#assertSafeDirectory(this.#directory);
-    if (protectedIdentityLeaseBindingDigest(complete.binding) !== bindingDigest) {
+    if (
+      protectedIdentityLeaseBindingDigest(complete.binding) !== bindingDigest
+    ) {
       throw safeError();
     }
     const path = this.#path(bindingDigest);
@@ -604,7 +685,10 @@ implements ProtectedIdentityLeaseRegistry {
         authTagLength: 16,
       });
       cipher.setAAD(aad);
-      const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+      const ciphertext = Buffer.concat([
+        cipher.update(plaintext),
+        cipher.final(),
+      ]);
       const sealed = {
         ...aadValue,
         nonce: nonce.toString("base64url"),
@@ -615,7 +699,10 @@ implements ProtectedIdentityLeaseRegistry {
       if (output.byteLength > MAX_SEALED_FILE_BYTES) throw safeError();
       descriptor = openSync(
         temporary,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          constants.O_NOFOLLOW,
         0o600,
       );
       writeFileSync(descriptor, output);
@@ -658,17 +745,16 @@ implements ProtectedIdentityLeaseRegistry {
     try {
       descriptor = openSync(
         path,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          constants.O_NOFOLLOW,
         0o600,
       );
       writeFileSync(descriptor, "locked\n", "utf8");
       fsyncSync(descriptor);
       const stat = fstatSync(descriptor);
-      if (
-        !stat.isFile() ||
-        stat.nlink !== 1 ||
-        (stat.mode & 0o077) !== 0
-      ) {
+      if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0) {
         throw safeError();
       }
       this.#fsyncDirectory();
@@ -725,7 +811,10 @@ implements ProtectedIdentityLeaseRegistry {
   }
 
   #path(bindingDigest: string): string {
-    return join(this.#directory, `${bindingDigest.slice("sha256:".length)}.identity-sealed`);
+    return join(
+      this.#directory,
+      `${bindingDigest.slice("sha256:".length)}.identity-sealed`,
+    );
   }
 
   #readLineagePass(
@@ -760,7 +849,8 @@ implements ProtectedIdentityLeaseRegistry {
       }
     }
     return snapshots.sort(
-      (left, right) => left.binding.fencingGeneration - right.binding.fencingGeneration,
+      (left, right) =>
+        left.binding.fencingGeneration - right.binding.fencingGeneration,
     );
   }
 
@@ -783,7 +873,9 @@ implements ProtectedIdentityLeaseRegistry {
       if (!unchanged(before, after) || sealedBytes.byteLength !== before.size) {
         throw safeError();
       }
-      const sealed = sealedFileSchema.parse(JSON.parse(sealedBytes.toString("utf8")));
+      const sealed = sealedFileSchema.parse(
+        JSON.parse(sealedBytes.toString("utf8")),
+      );
       if (
         sealed.key_id !== this.#keyId ||
         sealed.binding_digest !== expectedBindingDigest
@@ -794,19 +886,30 @@ implements ProtectedIdentityLeaseRegistry {
       const ciphertext = decodeBase64Url(sealed.ciphertext);
       const tag = decodeBase64Url(sealed.authentication_tag);
       if (nonce.byteLength !== 12 || tag.byteLength !== 16) throw safeError();
-      const aad = Buffer.from(canonicalJson(asJson({
-        schema: sealed.schema,
-        key_id: sealed.key_id,
-        binding_digest: sealed.binding_digest,
-      })), "utf8");
+      const aad = Buffer.from(
+        canonicalJson(
+          asJson({
+            schema: sealed.schema,
+            key_id: sealed.key_id,
+            binding_digest: sealed.binding_digest,
+          }),
+        ),
+        "utf8",
+      );
       const decipher = createDecipheriv("aes-256-gcm", this.#key, nonce, {
         authTagLength: 16,
       });
       decipher.setAAD(aad);
       decipher.setAuthTag(tag);
-      plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+      plaintext = Buffer.concat([
+        decipher.update(ciphertext),
+        decipher.final(),
+      ]);
       const snapshot = parseSnapshot(JSON.parse(plaintext.toString("utf8")));
-      if (protectedIdentityLeaseBindingDigest(snapshot.binding) !== expectedBindingDigest) {
+      if (
+        protectedIdentityLeaseBindingDigest(snapshot.binding) !==
+        expectedBindingDigest
+      ) {
         throw safeError();
       }
       return snapshot;
@@ -824,7 +927,8 @@ implements ProtectedIdentityLeaseRegistry {
       const currentUid = process.getuid?.();
       if (currentUid === undefined) throw safeError();
       const requestedStat = lstatSync(requested);
-      if (requestedStat.isSymbolicLink() || !requestedStat.isDirectory()) throw safeError();
+      if (requestedStat.isSymbolicLink() || !requestedStat.isDirectory())
+        throw safeError();
       const canonical = realpathSync(requested);
       const canonicalStat = lstatSync(canonical);
       if (

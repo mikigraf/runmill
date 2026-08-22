@@ -30,6 +30,7 @@ import type {
   LeaseDisposition,
   ProviderIdentityBroker,
 } from "../../src/identity/broker.js";
+import { markDefinitiveIdentityBrokerFailure } from "../../src/identity/broker.js";
 import {
   EncryptedFileIdentityLeaseRegistry,
   PROTECTED_IDENTITY_LEASE_REGISTRY_SCHEMA,
@@ -268,6 +269,35 @@ class LostAcquireResponseBroker implements ProviderIdentityBroker {
   async acquire(request: IdentityLeaseRequest): Promise<IdentityLease> {
     await this.#inner.acquire(request);
     throw new Error("simulated lost acquire response");
+  }
+
+  renew(lease: IdentityLease): Promise<IdentityLease> {
+    return this.#inner.renew(lease);
+  }
+
+  close(lease: IdentityLease, disposition: LeaseDisposition): Promise<void> {
+    return this.#inner.close(lease, disposition);
+  }
+
+  revoke(lease: IdentityLease, reason: string): Promise<void> {
+    return this.#inner.revoke(lease, reason);
+  }
+}
+
+class DefinitiveAcquireFailureBroker implements ProviderIdentityBroker {
+  readonly #inner: ProviderIdentityBroker;
+
+  constructor(inner: ProviderIdentityBroker) {
+    this.#inner = inner;
+  }
+
+  acquire(_request: IdentityLeaseRequest): Promise<IdentityLease> {
+    return Promise.reject(
+      markDefinitiveIdentityBrokerFailure(
+        new Error("simulated correlated refusal"),
+        "unchanged",
+      ),
+    );
   }
 
   renew(lease: IdentityLease): Promise<IdentityLease> {
@@ -1929,6 +1959,53 @@ describe("AsfIdentityLifecycleController", () => {
       });
       expect(inner.calls.filter((call) => call.op === "revoke")).toHaveLength(
         0,
+      );
+    } finally {
+      protectedState.remove();
+    }
+  });
+
+  it("clears a definitively unchanged acquire marker and permits fenced restart recovery", async () => {
+    const clock = new FakeClock(NOW);
+    const fence = new MutableFence();
+    const inner = new FakeProviderIdentityBroker(clock, GRANTS, fence);
+    const protectedState = protectedRegistryFixture(clock);
+    try {
+      const first = restartableController({
+        broker: new DefinitiveAcquireFailureBroker(inner),
+        clock,
+        fence,
+        registry: protectedState.registry,
+      });
+      await expect(
+        first.acquireRequiredRoles(effectInput()),
+      ).rejects.toMatchObject({ reason: "authority-unavailable" });
+
+      const persisted = await protectedState.registry.load({
+        runId: binding().runId,
+        workOrderId: binding().workOrderId,
+        attemptId: binding().attemptId,
+        policyDigest: binding().policyDigest,
+        fencingGeneration: binding().fencingGeneration,
+      });
+      expect(persisted).toMatchObject({
+        phase: "acquiring",
+        leases: [],
+        pendingOperations: [],
+      });
+
+      const restarted = restartableController({
+        broker: inner,
+        clock,
+        fence,
+        registry: protectedState.registry,
+      });
+      const observation = await restarted.acquireRequiredRoles(
+        generationRecoveryEffectInput(7, 8),
+      );
+      expect(observation.binding.fencing_generation).toBe(8);
+      expect(inner.calls.filter((call) => call.op === "acquire")).toHaveLength(
+        3,
       );
     } finally {
       protectedState.remove();
