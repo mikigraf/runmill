@@ -7,7 +7,14 @@
  * platform sailing through.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -96,6 +103,23 @@ function fakeProvider(
         : "one-turn provider request completed inside sandbox (small, potentially billable token usage)",
     }),
   };
+}
+
+async function sandboxProbeLeftovers(): Promise<string[]> {
+  // Other Vitest workers run doctor through the CLI at the same time. Give
+  // this invocation its own temp namespace so an active probe in another
+  // worker cannot look like a leaked directory from this one.
+  const isolatedTmp = join(dir, "sandbox-probe-tmp");
+  mkdirSync(isolatedTmp, { recursive: true });
+  const previousTmp = process.env["TMPDIR"];
+  process.env["TMPDIR"] = isolatedTmp;
+  try {
+    await checkSandbox();
+    return readdirSync(isolatedTmp);
+  } finally {
+    if (previousTmp === undefined) delete process.env["TMPDIR"];
+    else process.env["TMPDIR"] = previousTmp;
+  }
 }
 
 beforeEach(() => {
@@ -845,8 +869,7 @@ describe("checkSandbox", () => {
   }, 30_000);
 
   it("does not leave its probe secret behind", async () => {
-    await checkSandbox();
-    const leftovers = (await import("node:fs")).readdirSync(tmpdir());
+    const leftovers = await sandboxProbeLeftovers();
     expect(leftovers.filter((f) => f.startsWith("runmill-probe-home-"))).toEqual([]);
   }, 30_000);
 
@@ -991,10 +1014,8 @@ describe("worstStatus", () => {
 describe("a check that plants files cleans up after itself", () => {
   it("leaves no runmill-probe directories in tmp", async () => {
     // Guards against the probe leaking a directory per doctor invocation.
-    const before = (await import("node:fs")).readdirSync(tmpdir()).filter((f) => f.startsWith("runmill-probe"));
-    await checkSandbox();
-    const after = (await import("node:fs")).readdirSync(tmpdir()).filter((f) => f.startsWith("runmill-probe"));
-    expect(after.length).toBeLessThanOrEqual(before.length);
+    const leftovers = await sandboxProbeLeftovers();
+    expect(leftovers.filter((f) => f.startsWith("runmill-probe"))).toEqual([]);
   }, 30_000);
 });
 

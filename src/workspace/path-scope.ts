@@ -14,10 +14,6 @@ export interface ChangeScopeViolation {
 /** Used only by callers that deliberately want an unrestricted test fixture. */
 export const ALL_CHANGE_SCOPE: ChangeScope = { allowedPaths: ["**"], forbiddenPaths: [] };
 
-function normalizeSlashes(value: string): string {
-  return value.replaceAll("\\", "/");
-}
-
 /**
  * Normalize a path reported by Git without ever turning an escape into authority.
  *
@@ -26,10 +22,15 @@ function normalizeSlashes(value: string): string {
  * than cleaned up into a path that might accidentally match an allow rule.
  */
 export function normalizeRepositoryPath(value: string): string {
-  const path = normalizeSlashes(value);
+  // Git's repository-relative path format uses '/' on every supported host.
+  // A backslash can therefore be a literal filename character, not a Windows
+  // separator. Rewriting it would let `src\\escape.ts` borrow authority from
+  // an allowed `src/**` path it is not actually under.
+  const path = value;
   if (
     path === "" ||
     path.includes("\0") ||
+    path.includes("\\") ||
     path.startsWith("/") ||
     /^[A-Za-z]:\//.test(path)
   ) {
@@ -55,7 +56,10 @@ function compilePattern(source: string): CompiledPattern {
     throw new Error(`unsupported or empty path pattern: ${JSON.stringify(source)}`);
   }
 
-  let pattern = normalizeSlashes(source);
+  if (source.includes("\\")) {
+    throw new Error(`backslashes are not supported in path patterns: ${JSON.stringify(source)}`);
+  }
+  let pattern = source;
   if (pattern.startsWith("/")) pattern = pattern.slice(1);
   const directory = pattern.endsWith("/");
   if (directory) pattern = pattern.slice(0, -1);

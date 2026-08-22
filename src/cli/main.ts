@@ -67,6 +67,7 @@ import { repositoryIdentity } from "../workspace/repository-identity.js";
 import { fetchTrustedBase } from "../workspace/manager.js";
 import { runDemo } from "./demo.js";
 import {
+  asfDaemonRuntimePaths,
   DaemonControlServer,
   type ControlRequest,
   type DaemonLogLine,
@@ -408,9 +409,13 @@ export function buildProgram(): Command {
 
   // First invocation of anything starts the clock. Local only.
   program.hook("preAction", (_rootCommand, actionCommand) => {
-    // The TUI is a remote client. Running it from an arbitrary directory must
-    // not create a local .runmill directory or attempt config discovery.
-    if (["demo", "status", "stop", "tui"].includes(actionCommand.name()))
+    // Remote clients and the explicitly composed ASF service must not create
+    // standalone project state or attempt standalone config discovery.
+    if (
+      ["demo", "status", "stop", "tui"].includes(actionCommand.name()) ||
+      (actionCommand.name() === "serve" && actionCommand.parent?.name() === "mcp") ||
+      actionCommand.parent?.name() === "service"
+    )
       return;
     recordMilestone(dataDir(), "installed_at", new Date());
   });
@@ -850,6 +855,169 @@ export function buildProgram(): Command {
     });
 
   program
+    .command("mcp")
+    .description("Expose the explicit ASF worker control surface over MCP")
+    .command("serve")
+    .description("Serve the ASF MCP adapter without owning worker execution")
+    .requiredOption("--stdio", "use newline-delimited JSON-RPC over standard input/output")
+    .action(async () => {
+      const opts = program.opts<GlobalOpts>();
+      try {
+        // Keep ASF out of the ordinary standalone startup path. The adapter is
+        // loaded only for this explicit command and merely connects to the
+        // separately durable worker service.
+        const { serveAsfMcpStdio } = await import("../mcp/asf-server.js");
+        const { loadAsfControlRequestSigner } = await import(
+          "../asf/control-auth-config.js"
+        );
+        await serveAsfMcpStdio({
+          controlAuthentication: loadAsfControlRequestSigner(new SystemClock()),
+        });
+        process.exitCode = EXIT.ok;
+      } catch (err) {
+        fail(err, opts);
+      }
+    });
+
+  const serviceCommand = program
+    .command("service")
+    .description("Operate an explicitly configured ASF worker service");
+
+  serviceCommand
+    .command("start")
+    .description("Start a production-gated ASF worker in the foreground")
+    .requiredOption("--mode <mode>", "must be the explicit mode `asf-worker`")
+    .option(
+      "--runtime-module <absolute-path>",
+      "trusted deployment composition (or set RUNMILL_ASF_RUNTIME_MODULE)",
+    )
+    .action(
+      async (cmdOpts: { mode: string; runtimeModule?: string | undefined }) => {
+        const opts = program.opts<GlobalOpts>();
+        try {
+          if (cmdOpts.mode !== "asf-worker") {
+            throw new Error("runmill service start requires --mode asf-worker");
+          }
+          // This import is intentionally confined to the explicit ASF command.
+          // Standalone start/daemon/demo/run paths never load the worker host or
+          // inspect its deployment-composition environment.
+          const { startAsfWorkerFromRuntime } = await import(
+            "../asf/runtime-entrypoint.js"
+          );
+          const startedAt = new Date().toISOString();
+          const host = await startAsfWorkerFromRuntime({
+            mode: "asf-worker",
+            startedAt,
+            ...(cmdOpts.runtimeModule === undefined
+              ? {}
+              : { runtimeModulePath: cmdOpts.runtimeModule }),
+          });
+          const requestStop = (): void => {
+            // waitUntilStopped owns reporting the same failure below.
+            void host.stop().catch(() => undefined);
+          };
+          process.once("SIGINT", requestStop);
+          process.once("SIGTERM", requestStop);
+          try {
+            emit(opts, "ASF worker is ready; press Ctrl-C or run `runmill service stop`.", {
+              running: true,
+              mode: "asf-worker",
+              startedAt,
+            });
+            await host.waitUntilStopped();
+            process.exitCode = EXIT.ok;
+          } finally {
+            process.off("SIGINT", requestStop);
+            process.off("SIGTERM", requestStop);
+            await host.stop();
+          }
+        } catch (err) {
+          fail(err, opts);
+        }
+      },
+    );
+
+  serviceCommand
+    .command("status")
+    .description("Read authenticated ASF worker health")
+    .action(async () => {
+      const opts = program.opts<GlobalOpts>();
+      try {
+        const [{ loadAsfControlRequestSigner }, { asfHealthReportSchema }] =
+          await Promise.all([
+            import("../asf/control-auth-config.js"),
+            import("../asf/health.js"),
+          ]);
+        const controlAuthentication = loadAsfControlRequestSigner(new SystemClock());
+        const raw = await requestDaemon<unknown>(
+          { type: "asf.health" },
+          asfDaemonRuntimePaths().registry,
+          5_000,
+          { controlAuthentication },
+        );
+        const health = asfHealthReportSchema.parse(raw);
+        emit(
+          opts,
+          [
+            `ASF worker is ${health.status}.`,
+            `  ready    ${health.ready ? "yes" : "no"}`,
+            `  checked  ${health.checked_at}`,
+          ].join("\n"),
+          { running: true, health },
+        );
+        process.exitCode = health.ready ? EXIT.ok : EXIT.blocked;
+      } catch (err) {
+        if (daemonIsUnavailable(err)) {
+          emit(opts, "ASF worker service is not running.", { running: false });
+          process.exitCode = EXIT.failed;
+          return;
+        }
+        fail(err, opts);
+      }
+    });
+
+  serviceCommand
+    .command("stop")
+    .description("Authenticate and request a graceful ASF worker stop")
+    .action(async () => {
+      const opts = program.opts<GlobalOpts>();
+      try {
+        const { loadAsfControlRequestSigner } = await import(
+          "../asf/control-auth-config.js"
+        );
+        const response = await requestDaemon<unknown>(
+          { type: "stop" },
+          asfDaemonRuntimePaths().registry,
+          5_000,
+          { controlAuthentication: loadAsfControlRequestSigner(new SystemClock()) },
+        );
+        if (
+          typeof response !== "object" ||
+          response === null ||
+          (response as Readonly<Record<string, unknown>>)["mode"] !== "asf-worker" ||
+          (response as Readonly<Record<string, unknown>>)["stopping"] !== true
+        ) {
+          throw new Error("ASF worker returned an invalid stop acknowledgement");
+        }
+        emit(opts, "ASF worker is stopping after its active safe boundaries.", {
+          stopping: true,
+          mode: "asf-worker",
+        });
+        process.exitCode = EXIT.ok;
+      } catch (err) {
+        if (daemonIsUnavailable(err)) {
+          emit(opts, "ASF worker service is not running.", {
+            stopping: false,
+            running: false,
+          });
+          process.exitCode = EXIT.ok;
+          return;
+        }
+        fail(err, opts);
+      }
+    });
+
+  program
     .command("daemon")
     .description("Watch the backlog and process eligible issues continuously")
     .option("--max-runs <n>", "stop after this many runs", (v: string) =>
@@ -931,12 +1099,15 @@ export function buildProgram(): Command {
           const adapters = await buildAdapters(cfg);
           const store = StateStore.open(join(dataDir(), "runmill.db"));
           const clock = new SystemClock();
-          const breakers = new CircuitBreakers({
-            ...DEFAULT_BREAKERS,
-            ...(cfg.budgets.dailyCostUsd === undefined
-              ? {}
-              : { dailyCostUsd: cfg.budgets.dailyCostUsd }),
-          });
+          const breakers = new CircuitBreakers(
+            {
+              ...DEFAULT_BREAKERS,
+              ...(cfg.budgets.dailyCostUsd === undefined
+                ? {}
+                : { dailyCostUsd: cfg.budgets.dailyCostUsd }),
+            },
+            store,
+          );
           const startedAt = new Date().toISOString();
           let phase: DaemonPhase = "starting";
           let activeIssue: string | undefined;
@@ -1003,6 +1174,11 @@ export function buildProgram(): Command {
               handle: (
                 request: ControlRequest,
               ): DaemonSnapshot | RunDetail | null | { stopping: true } => {
+                if (request.type.startsWith("asf.")) {
+                  throw new Error(
+                    "This is a standalone Runmill daemon; ASF requests require explicit asf-worker mode.",
+                  );
+                }
                 if (request.type === "stop") {
                   phase = "stopping";
                   recordLog("stop requested from TUI");

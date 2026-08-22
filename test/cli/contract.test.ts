@@ -145,6 +145,17 @@ describe("CLI surface", () => {
     }
   });
 
+  it("keeps standalone start as the default and puts ASF behind an explicit surface", () => {
+    const start = program.commands.find((command) => command.name() === "start");
+    expect(start).toBeDefined();
+    expect(start?.options.some((option) => option.long === "--mode")).toBe(false);
+    expect(COMMANDS.has("mcp serve")).toBe(true);
+    expect(optionNames(program, "mcp serve").has("--stdio")).toBe(true);
+    expect(COMMANDS.has("service start")).toBe(true);
+    expect(optionNames(program, "service start").has("--mode")).toBe(true);
+    expect(optionNames(program, "service start").has("--runtime-module")).toBe(true);
+  });
+
   it("documents the environment variables that change behavior", async () => {
     const readme = await import("node:fs").then((fs) =>
       fs.readFileSync("README.md", "utf8"),
@@ -154,6 +165,8 @@ describe("CLI surface", () => {
       "RUNMILL_FAKE_BACKLOG",
       "RUNMILL_SOURCE_REPO",
       "RUNMILL_DATA_DIR",
+      "RUNMILL_ASF_RUNTIME_MODULE",
+      "RUNMILL_ASF_DAEMON_REGISTRY",
     ]) {
       expect(readme, `README does not document ${v}`).toContain(v);
     }

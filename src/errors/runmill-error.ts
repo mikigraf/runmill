@@ -38,6 +38,161 @@ export const DOCS_BASE = "https://github.com/mikigraf/runmill/blob/main/docs/err
  * an entry here is a contract violation, not a shortcut.
  */
 export const ERROR_CATALOG = {
+  // -- ASF Work Orders --------------------------------------------------
+  "RM-WO-001": {
+    title: "Work Order schema version is unsupported",
+    why:
+      "Runmill must understand every authority-bearing field before it creates a run. " +
+      "Guessing at an unknown schema could omit a restriction or reinterpret delivery authority.",
+    fixes: [
+      { description: "Submit an asf.work-order-envelope/v1 containing an asf.work-order/v1 payload" },
+      { description: "Upgrade Runmill only after the newer schema has been reviewed and supported" },
+    ],
+    recoverable: false,
+  },
+  "RM-WO-002": {
+    title: "Work Order is invalid",
+    why:
+      "Origin, freshness, repository identity, and policy lineage must all be proven before " +
+      "a signed request can create durable work or exercise authority.",
+    fixes: [
+      { description: "Correct and re-sign the Work Order with a trusted ASF signing key" },
+      { description: "Submit a new Work Order if its admission window has expired" },
+    ],
+    recoverable: false,
+  },
+  "RM-WO-003": {
+    title: "Work Order idempotency conflict",
+    why:
+      "An idempotency key permanently names one canonical payload. Rebinding it to different " +
+      "work would make a client retry capable of changing an already accepted attempt.",
+    fixes: [
+      { description: "Retry with the original canonical Work Order payload" },
+      { description: "Use a new attempt and idempotency key for changed work" },
+    ],
+    recoverable: false,
+  },
+  "RM-WO-004": {
+    title: "Work Order base commit is stale or unproven",
+    why:
+      "The immutable base must belong to the registered repository and be reachable from its " +
+      "configured base ref before repository policy or candidate evidence can be bound to it.",
+    fixes: [
+      { description: "Issue a new Work Order against a currently reachable base commit" },
+      { description: "Restore repository access if the base could not be observed" },
+    ],
+    recoverable: false,
+  },
+  "RM-WO-005": {
+    title: "Work Order exceeds effective authority",
+    why:
+      "Signed requests may narrow local policy but cannot widen operator, repository, or current " +
+      "forge restrictions. Missing or contradictory authority therefore fails closed.",
+    fixes: [
+      { description: "Request only registered identities, checks, paths, runtime profiles, and delivery authority" },
+      { description: "Have the appropriate owner change the stricter policy before issuing a new Work Order" },
+    ],
+    recoverable: false,
+  },
+  "RM-WO-006": {
+    title: "Work Order closure target is unsupported",
+    why:
+      "Silently downgrading merge, deploy, or observation work to a pull request would report a " +
+      "different accountable outcome from the one ASF requested.",
+    fixes: [
+      { description: "Request the P0 pull-request closure target" },
+      { description: "Wait until the requested delivery adapter and policy are production-qualified" },
+    ],
+    recoverable: false,
+  },
+
+  // -- ASF approvals ----------------------------------------------------
+  "RM-APPROVAL-001": {
+    title: "Approval schema version is unsupported",
+    why:
+      "Approvals carry narrowly scoped authority. Runmill cannot safely interpret an unknown " +
+      "schema version or omit a binding added by a newer producer.",
+    fixes: [
+      { description: "Submit an asf.approval-envelope/v1 containing an asf.approval/v1 payload" },
+      { description: "Upgrade Runmill only after the newer approval schema is supported" },
+    ],
+    recoverable: false,
+  },
+  "RM-APPROVAL-002": {
+    title: "Approval is malformed, unsigned, or stale",
+    why:
+      "An approval can authorize an effect only while its EdDSA signature and explicit validity " +
+      "window are current. Missing or unparseable evidence fails closed.",
+    fixes: [
+      { description: "Correct and re-sign the approval with a trusted approval key" },
+      { description: "Issue a fresh approval if the previous assertion expired" },
+    ],
+    recoverable: false,
+  },
+  "RM-APPROVAL-003": {
+    title: "Approval does not bind the current candidate",
+    why:
+      "Work Order, attempt, candidate, policy, decision, and effect are all authority-bearing. " +
+      "Changing any one invalidates the prior approval.",
+    fixes: [
+      { description: "Issue a new approval for the exact current run, candidate, policy, and effect" },
+    ],
+    recoverable: false,
+  },
+  "RM-APPROVAL-004": {
+    title: "Approval signer lacks authority",
+    why:
+      "A valid signature proves origin but does not grant subjects, decisions, or effects beyond " +
+      "the operator-owned signer registration.",
+    fixes: [
+      { description: "Use a current signer registered for the exact approver authority and effect" },
+      { description: "Have the platform operator update signer trust outside repository control" },
+    ],
+    recoverable: false,
+  },
+
+  // -- ASF cancellation -------------------------------------------------
+  "RM-CANCEL-001": {
+    title: "Cancellation request is invalid or conflicting",
+    why:
+      "Cancellation fences an active worker and may terminate trusted harness and sandbox " +
+      "processes. Its run, requester, mode, reason, grace policy, and idempotency identity must " +
+      "therefore be explicit and immutable.",
+    fixes: [
+      { description: "Retry the original asf.cancellation-request/v1 unchanged" },
+      { description: "Use a new request id for a deliberate forced escalation" },
+    ],
+    recoverable: false,
+  },
+
+  // -- ASF reconciliation -----------------------------------------------
+  "RM-RECON-001": {
+    title: "Reconciliation request is invalid or unresolved",
+    why:
+      "Reconciliation may change whether a recorded external effect is safe to retry. Only a " +
+      "durable, authorized request for deterministic observation can make that decision; missing, " +
+      "stale, or contradictory observations fail closed.",
+    fixes: [
+      { description: "Retry the original reconciliation operation id and request unchanged" },
+      { description: "Inspect the protected effect evidence if deterministic observation is blocked" },
+    ],
+    recoverable: true,
+  },
+
+  // -- ASF evidence/outcome ---------------------------------------------
+  "RM-EVID-008": {
+    title: "ASF evidence binding is invalid",
+    why:
+      "Evidence finalization and ASF acknowledgement are authority-bearing claims. They must bind " +
+      "one exact Work Order, attempt, candidate, policy, delivery observation, and immutable signed " +
+      "bundle digest.",
+    fixes: [
+      { description: "Acknowledge the exact bundle digest returned for the terminal run" },
+      { description: "Retry the original acknowledgement id and payload unchanged" },
+    ],
+    recoverable: false,
+  },
+
   // -- selection ---------------------------------------------------------
   "RM-SELECT-002": {
     title: "Issue does not map to a repository",
@@ -371,6 +526,18 @@ export const ERROR_CATALOG = {
       },
     ],
     recoverable: true,
+  },
+  "RM-STATE-003": {
+    title: "State database migration could not be completed safely",
+    why:
+      "Runmill refused to change the durable audit database because it could not create a " +
+      "consistent backup or acquire a coherent migration state.",
+    fixes: [
+      { description: "Preserve the database and any backup files before retrying" },
+      { description: "Check filesystem permissions and available disk space" },
+      { description: "Stop other Runmill versions that may be using the same state directory" },
+    ],
+    recoverable: false,
   },
 } as const satisfies Record<string, ErrorCatalogEntry>;
 

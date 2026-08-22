@@ -194,6 +194,31 @@ describe("runmill config show", () => {
   });
 });
 
+describe("standalone mode without ASF", () => {
+  it("runs the ordinary one-shot command without ASF keys, ctxlane, or MCP", async () => {
+    const emptyBacklog = join(dir, "empty-issues.json");
+    writeFileSync(emptyBacklog, "[]\n");
+
+    const result = await cli(
+      ["--json", "run"],
+      {
+        RUNMILL_DEMO: "1",
+        RUNMILL_FAKE_BACKLOG: emptyBacklog,
+        RUNMILL_ASF_CONTROL_CONTROLLER_ID: "invalid standalone poison",
+        RUNMILL_ASF_CONTROL_KEY_ID: "invalid standalone poison",
+        RUNMILL_ASF_CONTROL_KEY_FILE: join(dir, "must-not-be-read.key"),
+        RUNMILL_ASF_RUNTIME_MODULE: join(dir, "must-not-be-read.mjs"),
+        RUNMILL_ASF_DAEMON_REGISTRY: join(dir, "must-not-be-read.json"),
+        RUNMILL_CTXLANE_ENDPOINT: "unix:///must/not/be-contacted.sock",
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ ran: false });
+    expect(result.stderr).toBe("");
+  });
+});
+
 describe("runmill doctor", () => {
   it("reports a status for every check and an overall verdict", async () => {
     const r = await cli(["--json", "doctor"]);

@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { run } from "../../src/platform/process.js";
 import { requestDaemon, type DaemonSnapshot } from "../../src/daemon/control.js";
+import { AsfControlRequestSigner } from "../../src/asf/control-auth.js";
+import { SystemClock } from "../../src/platform/clock.js";
 
 const CLI = resolve(process.cwd(), "src/cli/main.ts");
 const TSX = resolve(process.cwd(), "node_modules/.bin/tsx");
@@ -41,6 +43,13 @@ describe("background daemon", () => {
       RUNMILL_FAKE_BACKLOG: issues,
       RUNMILL_DAEMON_REGISTRY: registry,
       RUNMILL_DATA_DIR: data,
+      // These values are deliberately unusable. Ordinary start/daemon/status/stop
+      // must not inspect ASF configuration, much less try to read a key file.
+      RUNMILL_ASF_CONTROL_CONTROLLER_ID: "invalid standalone poison",
+      RUNMILL_ASF_CONTROL_KEY_ID: "invalid standalone poison",
+      RUNMILL_ASF_CONTROL_KEY_FILE: join(directory, "must-not-be-read.key"),
+      RUNMILL_ASF_RUNTIME_MODULE: join(directory, "must-not-be-read.mjs"),
+      RUNMILL_ASF_DAEMON_REGISTRY: join(directory, "must-not-be-read.json"),
     };
     const started = await run(
       TSX,
@@ -61,6 +70,34 @@ describe("background daemon", () => {
     daemonPid = snapshot.daemon.pid;
     expect(snapshot.daemon.repoRoot).toBe(realpathSync(repository));
     expect(snapshot.daemon.phase).toBe("idle");
+
+    // The standalone daemon refuses the ASF protocol even though the shared
+    // local transport knows its bounded message shapes.
+    await expect(
+      requestDaemon({ type: "asf.health" }, registry),
+    ).rejects.toThrow(/standalone Runmill daemon/u);
+
+    // An authenticated ASF wire envelope cannot reinterpret the legacy stop
+    // verb. The ordinary unsigned channel remains live after the refusal.
+    const asfSigner = new AsfControlRequestSigner({
+      key: {
+        controllerId: "asf-controller-test",
+        keyId: "asf-control-test",
+        secret: "standalone-boundary-test-control-secret-0001",
+      },
+      clock: new SystemClock(),
+    });
+    await expect(
+      requestDaemon({ type: "stop" }, registry, 2_000, {
+        controlAuthentication: asfSigner,
+      }),
+    ).rejects.toThrow(/control request/u);
+    const afterRefusal = await requestDaemon<DaemonSnapshot>(
+      { type: "snapshot" },
+      registry,
+    );
+    expect(afterRefusal.daemon.pid).toBe(daemonPid);
+    expect(afterRefusal.daemon.phase).not.toBe("stopping");
 
     const status = await run(TSX, [CLI, "--json", "status"], {
       cwd: directory,

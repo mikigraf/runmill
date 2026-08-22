@@ -1,5 +1,8 @@
 import type { Clock } from "../platform/clock.js";
-import type { StateStore } from "../state/store.js";
+import type {
+  DurableCircuitBreakerState,
+  StateStore,
+} from "../state/store.js";
 import type { RunOutcome } from "./orchestrator.js";
 
 export type BreakerName = "consecutive-failures" | "daily-cost" | "quarantine" | "escalation-rate";
@@ -38,6 +41,11 @@ export const DEFAULT_BREAKERS: CircuitBreakerConfig = {
   maxEscalationRate: 0.8,
 };
 
+export interface CircuitBreakerPersistence {
+  getCircuitBreakerState(): DurableCircuitBreakerState;
+  saveCircuitBreakerState(state: DurableCircuitBreakerState): void;
+}
+
 /**
  * Stop conditions for unattended operation.
  *
@@ -48,6 +56,7 @@ export const DEFAULT_BREAKERS: CircuitBreakerConfig = {
  */
 export class CircuitBreakers {
   readonly #config: CircuitBreakerConfig;
+  readonly #persistence: CircuitBreakerPersistence | undefined;
   #consecutiveFailures = 0;
   #quarantines = 0;
   #escalations = 0;
@@ -56,8 +65,44 @@ export class CircuitBreakers {
   #dailyBucket: string | undefined;
   #tripped: BreakerState | undefined;
 
-  constructor(config: CircuitBreakerConfig = DEFAULT_BREAKERS) {
+  constructor(
+    config: CircuitBreakerConfig = DEFAULT_BREAKERS,
+    persistence?: CircuitBreakerPersistence,
+  ) {
     this.#config = config;
+    this.#persistence = persistence;
+    const durable = persistence?.getCircuitBreakerState();
+    if (durable !== undefined) {
+      this.#consecutiveFailures = durable.consecutiveFailures;
+      this.#quarantines = durable.quarantines;
+      this.#escalations = durable.escalations;
+      this.#completed = durable.completed;
+      if (durable.tripped !== null) {
+        this.#tripped = { ...durable.tripped, open: true };
+      }
+    }
+  }
+
+  #persistNonDailyState(): void {
+    const tripped = this.#tripped;
+    let durableTrip: DurableCircuitBreakerState["tripped"] = null;
+    if (tripped !== undefined && tripped.name !== "daily-cost") {
+      if (tripped.openedAt === undefined || tripped.reason === undefined) {
+        throw new Error("non-daily circuit breaker trip is missing durable metadata");
+      }
+      durableTrip = {
+        name: tripped.name,
+        openedAt: tripped.openedAt,
+        reason: tripped.reason,
+      };
+    }
+    this.#persistence?.saveCircuitBreakerState({
+      consecutiveFailures: this.#consecutiveFailures,
+      quarantines: this.#quarantines,
+      escalations: this.#escalations,
+      completed: this.#completed,
+      tripped: durableTrip,
+    });
   }
 
   record(outcome: RunOutcome): void {
@@ -71,6 +116,7 @@ export class CircuitBreakers {
     if (escalated) this.#escalations += 1;
     if (outcome.finalState === "QUARANTINED") this.#quarantines += 1;
     this.#consecutiveFailures = failed ? this.#consecutiveFailures + 1 : 0;
+    this.#persistNonDailyState();
   }
 
   /** Synchronize spend from SQLite and reset only the daily breaker at a new day. */
@@ -94,6 +140,7 @@ export class CircuitBreakers {
         openedAt: at,
         reason: `${this.#quarantines} quarantined run(s); a quarantine means policy could not classify what happened`,
       };
+      this.#persistNonDailyState();
       return this.#tripped;
     }
 
@@ -104,6 +151,7 @@ export class CircuitBreakers {
         openedAt: at,
         reason: `${this.#consecutiveFailures} consecutive runs did not complete`,
       };
+      this.#persistNonDailyState();
       return this.#tripped;
     }
 
@@ -130,6 +178,7 @@ export class CircuitBreakers {
             `${Math.round(rate * 100)}% of ${this.#completed} runs escalated to a human. ` +
             `The backlog is likely underspecified rather than the worker being broken.`,
         };
+        this.#persistNonDailyState();
         return this.#tripped;
       }
     }

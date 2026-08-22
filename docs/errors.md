@@ -6,6 +6,19 @@ edit that, then run `npm run docs:errors`.
 
 | Code | Title | Recoverable |
 |---|---|---|
+| [`RM-WO-001`](#rm-wo-001) | Work Order schema version is unsupported | no |
+| [`RM-WO-002`](#rm-wo-002) | Work Order is invalid | no |
+| [`RM-WO-003`](#rm-wo-003) | Work Order idempotency conflict | no |
+| [`RM-WO-004`](#rm-wo-004) | Work Order base commit is stale or unproven | no |
+| [`RM-WO-005`](#rm-wo-005) | Work Order exceeds effective authority | no |
+| [`RM-WO-006`](#rm-wo-006) | Work Order closure target is unsupported | no |
+| [`RM-APPROVAL-001`](#rm-approval-001) | Approval schema version is unsupported | no |
+| [`RM-APPROVAL-002`](#rm-approval-002) | Approval is malformed, unsigned, or stale | no |
+| [`RM-APPROVAL-003`](#rm-approval-003) | Approval does not bind the current candidate | no |
+| [`RM-APPROVAL-004`](#rm-approval-004) | Approval signer lacks authority | no |
+| [`RM-CANCEL-001`](#rm-cancel-001) | Cancellation request is invalid or conflicting | no |
+| [`RM-RECON-001`](#rm-recon-001) | Reconciliation request is invalid or unresolved | yes |
+| [`RM-EVID-008`](#rm-evid-008) | ASF evidence binding is invalid | no |
 | [`RM-SELECT-002`](#rm-select-002) | Issue does not map to a repository | no |
 | [`RM-SELECT-003`](#rm-select-003) | Issue is too underspecified to build a task packet | no |
 | [`RM-BACKLOG-003`](#rm-backlog-003) | Backlog discovery is incomplete | no |
@@ -33,6 +46,175 @@ edit that, then run `npm run docs:errors`.
 | [`RM-WORKSPACE-004`](#rm-workspace-004) | Candidate commit provenance is unavailable | no |
 | [`RM-STATE-001`](#rm-state-001) | State database schema is newer than this binary | no |
 | [`RM-STATE-002`](#rm-state-002) | External effect outcome is unresolved | yes |
+| [`RM-STATE-003`](#rm-state-003) | State database migration could not be completed safely | no |
+
+## RM-WO-001
+
+**Work Order schema version is unsupported**
+
+Runmill must understand every authority-bearing field before it creates a run. Guessing at an unknown schema could omit a restriction or reinterpret delivery authority.
+
+**Fix (pick one)**
+
+- Submit an asf.work-order-envelope/v1 containing an asf.work-order/v1 payload
+- Upgrade Runmill only after the newer schema has been reviewed and supported
+
+Not recoverable: the run stops.
+
+## RM-WO-002
+
+**Work Order is invalid**
+
+Origin, freshness, repository identity, and policy lineage must all be proven before a signed request can create durable work or exercise authority.
+
+**Fix (pick one)**
+
+- Correct and re-sign the Work Order with a trusted ASF signing key
+- Submit a new Work Order if its admission window has expired
+
+Not recoverable: the run stops.
+
+## RM-WO-003
+
+**Work Order idempotency conflict**
+
+An idempotency key permanently names one canonical payload. Rebinding it to different work would make a client retry capable of changing an already accepted attempt.
+
+**Fix (pick one)**
+
+- Retry with the original canonical Work Order payload
+- Use a new attempt and idempotency key for changed work
+
+Not recoverable: the run stops.
+
+## RM-WO-004
+
+**Work Order base commit is stale or unproven**
+
+The immutable base must belong to the registered repository and be reachable from its configured base ref before repository policy or candidate evidence can be bound to it.
+
+**Fix (pick one)**
+
+- Issue a new Work Order against a currently reachable base commit
+- Restore repository access if the base could not be observed
+
+Not recoverable: the run stops.
+
+## RM-WO-005
+
+**Work Order exceeds effective authority**
+
+Signed requests may narrow local policy but cannot widen operator, repository, or current forge restrictions. Missing or contradictory authority therefore fails closed.
+
+**Fix (pick one)**
+
+- Request only registered identities, checks, paths, runtime profiles, and delivery authority
+- Have the appropriate owner change the stricter policy before issuing a new Work Order
+
+Not recoverable: the run stops.
+
+## RM-WO-006
+
+**Work Order closure target is unsupported**
+
+Silently downgrading merge, deploy, or observation work to a pull request would report a different accountable outcome from the one ASF requested.
+
+**Fix (pick one)**
+
+- Request the P0 pull-request closure target
+- Wait until the requested delivery adapter and policy are production-qualified
+
+Not recoverable: the run stops.
+
+## RM-APPROVAL-001
+
+**Approval schema version is unsupported**
+
+Approvals carry narrowly scoped authority. Runmill cannot safely interpret an unknown schema version or omit a binding added by a newer producer.
+
+**Fix (pick one)**
+
+- Submit an asf.approval-envelope/v1 containing an asf.approval/v1 payload
+- Upgrade Runmill only after the newer approval schema is supported
+
+Not recoverable: the run stops.
+
+## RM-APPROVAL-002
+
+**Approval is malformed, unsigned, or stale**
+
+An approval can authorize an effect only while its EdDSA signature and explicit validity window are current. Missing or unparseable evidence fails closed.
+
+**Fix (pick one)**
+
+- Correct and re-sign the approval with a trusted approval key
+- Issue a fresh approval if the previous assertion expired
+
+Not recoverable: the run stops.
+
+## RM-APPROVAL-003
+
+**Approval does not bind the current candidate**
+
+Work Order, attempt, candidate, policy, decision, and effect are all authority-bearing. Changing any one invalidates the prior approval.
+
+**Fix**
+
+- Issue a new approval for the exact current run, candidate, policy, and effect
+
+Not recoverable: the run stops.
+
+## RM-APPROVAL-004
+
+**Approval signer lacks authority**
+
+A valid signature proves origin but does not grant subjects, decisions, or effects beyond the operator-owned signer registration.
+
+**Fix (pick one)**
+
+- Use a current signer registered for the exact approver authority and effect
+- Have the platform operator update signer trust outside repository control
+
+Not recoverable: the run stops.
+
+## RM-CANCEL-001
+
+**Cancellation request is invalid or conflicting**
+
+Cancellation fences an active worker and may terminate trusted harness and sandbox processes. Its run, requester, mode, reason, grace policy, and idempotency identity must therefore be explicit and immutable.
+
+**Fix (pick one)**
+
+- Retry the original asf.cancellation-request/v1 unchanged
+- Use a new request id for a deliberate forced escalation
+
+Not recoverable: the run stops.
+
+## RM-RECON-001
+
+**Reconciliation request is invalid or unresolved**
+
+Reconciliation may change whether a recorded external effect is safe to retry. Only a durable, authorized request for deterministic observation can make that decision; missing, stale, or contradictory observations fail closed.
+
+**Fix (pick one)**
+
+- Retry the original reconciliation operation id and request unchanged
+- Inspect the protected effect evidence if deterministic observation is blocked
+
+Recoverable: the run can continue once resolved.
+
+## RM-EVID-008
+
+**ASF evidence binding is invalid**
+
+Evidence finalization and ASF acknowledgement are authority-bearing claims. They must bind one exact Work Order, attempt, candidate, policy, delivery observation, and immutable signed bundle digest.
+
+**Fix (pick one)**
+
+- Acknowledge the exact bundle digest returned for the terminal run
+- Retry the original acknowledgement id and payload unchanged
+
+Not recoverable: the run stops.
 
 ## RM-SELECT-002
 
@@ -387,5 +569,19 @@ A prior request may have changed GitHub or the backlog even though Runmill did n
 - `runmill effects resolve <key> --outcome applied` — Check the named remote system, then record the observed outcome
 
 Recoverable: the run can continue once resolved.
+
+## RM-STATE-003
+
+**State database migration could not be completed safely**
+
+Runmill refused to change the durable audit database because it could not create a consistent backup or acquire a coherent migration state.
+
+**Fix (pick one)**
+
+- Preserve the database and any backup files before retrying
+- Check filesystem permissions and available disk space
+- Stop other Runmill versions that may be using the same state directory
+
+Not recoverable: the run stops.
 
 <!-- Docs base: https://github.com/mikigraf/runmill/blob/main/docs/errors.md -->
