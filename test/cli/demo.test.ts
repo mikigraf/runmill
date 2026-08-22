@@ -30,6 +30,13 @@ describe("runmill demo", () => {
         GH_TOKEN: "",
         OPENAI_API_KEY: "",
         ANTHROPIC_API_KEY: "",
+        // Demo is a standalone product path. A broken ASF setup in the ambient
+        // environment must be irrelevant to it.
+        RUNMILL_ASF_CONTROL_CONTROLLER_ID: "invalid standalone poison",
+        RUNMILL_ASF_CONTROL_KEY_ID: "invalid standalone poison",
+        RUNMILL_ASF_CONTROL_KEY_FILE: join(cwd, "must-not-be-read.key"),
+        RUNMILL_ASF_RUNTIME_MODULE: join(cwd, "must-not-be-read.mjs"),
+        RUNMILL_ASF_DAEMON_REGISTRY: join(cwd, "must-not-be-read.json"),
       },
     });
 

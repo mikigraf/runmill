@@ -6,8 +6,8 @@ import {
 } from "../../src/workspace/path-scope.js";
 
 describe("repository path normalization", () => {
-  it("normalizes platform separators before matching", () => {
-    expect(normalizeRepositoryPath("src\\feature\\index.ts")).toBe("src/feature/index.ts");
+  it("rejects literal backslashes instead of rewriting them into allowed directories", () => {
+    expect(() => normalizeRepositoryPath("src\\feature\\index.ts")).toThrow(/repository-relative/u);
   });
 
   it.each(["", "/etc/passwd", "C:/Windows/system.ini", "../outside", "src/../secret"])(
@@ -76,6 +76,18 @@ describe("candidate diff scope", () => {
     expect(
       evaluateChangedPathScope(["src/a.ts"], {
         allowedPaths: ["src/[broken"],
+        forbiddenPaths: [],
+      }).violations,
+    ).toContainEqual(expect.objectContaining({ reason: "invalid-pattern", path: "<policy>" }));
+    expect(
+      evaluateChangedPathScope(["src\\escape.ts"], {
+        allowedPaths: ["src/**"],
+        forbiddenPaths: [],
+      }).violations,
+    ).toContainEqual(expect.objectContaining({ reason: "invalid-path", path: "src\\escape.ts" }));
+    expect(
+      evaluateChangedPathScope(["src/index.ts"], {
+        allowedPaths: ["src\\**"],
         forbiddenPaths: [],
       }).violations,
     ).toContainEqual(expect.objectContaining({ reason: "invalid-pattern", path: "<policy>" }));

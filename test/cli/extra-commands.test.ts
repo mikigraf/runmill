@@ -239,6 +239,36 @@ function addInstalledNodeProject(): void {
 }
 
 describe("init", () => {
+  it("does not require ASF or ctxlane configuration for standalone setup", async () => {
+    initGitRepo();
+    addInstalledNodeProject();
+    const h = harness();
+    const poison = {
+      RUNMILL_ASF_CONTROL_CONTROLLER_ID: "invalid standalone poison",
+      RUNMILL_ASF_CONTROL_KEY_ID: "invalid standalone poison",
+      RUNMILL_ASF_CONTROL_KEY_FILE: join(data, "must-not-be-read.key"),
+      RUNMILL_ASF_RUNTIME_MODULE: join(data, "must-not-be-read.mjs"),
+      RUNMILL_ASF_DAEMON_REGISTRY: join(data, "must-not-be-read.json"),
+      RUNMILL_CTXLANE_ENDPOINT: "unix:///must/not/be-contacted.sock",
+    } as const;
+    const previous = new Map(
+      Object.keys(poison).map((key) => [key, process.env[key]]),
+    );
+    Object.assign(process.env, poison);
+
+    try {
+      expect(await h.run(["init"])).toBe(0);
+    } finally {
+      for (const [key, value] of previous) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+
+    expect(existsSync(policy)).toBe(true);
+    expect(h.failures).toEqual([]);
+  });
+
   it("writes the operator policy, manifest, and both review skills", async () => {
     initGitRepo();
     addInstalledNodeProject();

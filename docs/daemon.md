@@ -172,5 +172,6 @@ unit generation is not built in yet.
 
 Whichever supervisor you use, give `SIGTERM` enough time for an in-flight issue to reach a safe
 boundary. Do not configure the supervisor to restart a circuit-breaker exit immediately; that
-would defeat the breaker. Daily spend is durable in SQLite; quarantine, consecutive-failure, and
-escalation-rate counters are session-only in this developer preview.
+would defeat the breaker. Daily spend is reconstructed from the durable budget ledger. Quarantine,
+consecutive-failure, and escalation-rate counters and trips are also durable in SQLite, so a daemon
+restart cannot reset an opened breaker.

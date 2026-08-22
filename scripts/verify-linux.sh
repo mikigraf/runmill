@@ -30,7 +30,10 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 case "$TARGET" in
-  sandbox) VITEST_ARGS="test/workspace/sandbox.test.ts" ;;
+  # Exercise both the legacy standalone sandbox and the stricter ASF
+  # bubblewrap profile. They are separate enforcement mechanisms and neither
+  # result is evidence for the other.
+  sandbox) VITEST_ARGS="test/workspace/sandbox.test.ts test/workspace/asf-bubblewrap.test.ts" ;;
   all)     VITEST_ARGS="" ;;
   *)       VITEST_ARGS="$TARGET" ;;
 esac

@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readdirSync, writeFileSync } from "node:fs";
+import Database from "better-sqlite3";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StateStore, CURRENT_SCHEMA_VERSION } from "../../src/state/store.js";
 import { RunmillError } from "../../src/errors/runmill-error.js";
 import { FakeClock } from "../../src/testing/fake-clock.js";
+import { MIGRATIONS } from "../../src/state/migrations.js";
 
 let dir: string;
 let clock: FakeClock;
@@ -71,6 +74,103 @@ describe("StateStore.open", () => {
     store.close();
     const backups = readdirSync(dir).filter((f) => f.includes(".backup-"));
     expect(backups.length).toBe(1);
+  });
+
+  it("includes committed WAL state in the pre-migration backup", () => {
+    const initial = MIGRATIONS.find((migration) => migration.version === 1);
+    if (initial === undefined) throw new Error("initial migration is missing");
+    const path = join(dir, "runmill.db");
+    const legacy = new Database(path);
+    legacy.pragma("journal_mode = WAL");
+    legacy.pragma("wal_autocheckpoint = 0");
+    legacy.exec(initial.up);
+    legacy
+      .prepare("INSERT INTO schema_migrations(version, name, applied_at) VALUES (?,?,?)")
+      .run(1, initial.name, "2026-08-06T09:59:00.000Z");
+    legacy.pragma("user_version = 1");
+    legacy
+      .prepare(
+        `INSERT INTO runs(run_id, issue_id, repo, provider, state, state_version, attempt,
+                          created_at, updated_at)
+         VALUES ('run_in_wal','ENG-WAL','acme/wal','codex','DISCOVERED',1,1,?,?)`,
+      )
+      .run("2026-08-06T09:59:00.000Z", "2026-08-06T09:59:00.000Z");
+    expect(existsSync(`${path}-wal`)).toBe(true);
+
+    const migrated = StateStore.open(path, { clock });
+    migrated.close();
+    legacy.close();
+    const backupName = readdirSync(dir).find((file) => file.includes(".backup-"));
+    if (backupName === undefined) throw new Error("migration backup is missing");
+    const backup = new Database(join(dir, backupName), { readonly: true });
+    expect(backup.prepare("SELECT run_id AS runId FROM runs").all()).toContainEqual({
+      runId: "run_in_wal",
+    });
+    backup.close();
+  });
+
+  it("serializes concurrent migration openers and re-reads the locked version", async () => {
+    const initial = MIGRATIONS.find((migration) => migration.version === 1);
+    if (initial === undefined) throw new Error("initial migration is missing");
+    const path = join(dir, "runmill.db");
+    const legacy = new Database(path);
+    legacy.exec(initial.up);
+    legacy
+      .prepare("INSERT INTO schema_migrations(version, name, applied_at) VALUES (?,?,?)")
+      .run(1, initial.name, "2026-08-06T09:59:00.000Z");
+    legacy.pragma("user_version = 1");
+    legacy.close();
+
+    const barrier = join(dir, "migration.start");
+    const script = [
+      'import { existsSync } from "node:fs";',
+      'import { StateStore } from "./src/state/store.ts";',
+      "const wait = new Int32Array(new SharedArrayBuffer(4));",
+      'while (!existsSync(process.env["RUNMILL_TEST_BARRIER"])) Atomics.wait(wait, 0, 0, 5);',
+      'const store = StateStore.open(process.env["RUNMILL_TEST_DATABASE"]);',
+      "process.stdout.write(String(store.schemaVersion()));",
+      "store.close();",
+    ].join("\n");
+    const launch = () => {
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "-e", script],
+        {
+          cwd: process.cwd(),
+          env: {
+            ...process.env,
+            RUNMILL_TEST_BARRIER: barrier,
+            RUNMILL_TEST_DATABASE: path,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk: Buffer) => {
+          stdout += chunk.toString("utf8");
+        });
+        child.stderr.on("data", (chunk: Buffer) => {
+          stderr += chunk.toString("utf8");
+        });
+        child.on("close", (code) => resolve({ code, stdout, stderr }));
+      });
+    };
+    const openers = [launch(), launch(), launch(), launch()];
+    writeFileSync(barrier, "start\n");
+    const outcomes = await Promise.all(openers);
+
+    expect(outcomes).toEqual(
+      outcomes.map(() => ({
+        code: 0,
+        stdout: String(CURRENT_SCHEMA_VERSION),
+        stderr: "",
+      })),
+    );
+    const migrated = open();
+    expect(migrated.appliedMigrations()).toHaveLength(CURRENT_SCHEMA_VERSION);
+    migrated.close();
   });
 
   it("does not back up a database it is creating for the first time", () => {

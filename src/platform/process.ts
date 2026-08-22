@@ -227,3 +227,183 @@ export function armKillTimer(
   }, timeoutMs);
   return () => clearTimeout(timer);
 }
+
+export type ControlledProcessOutcome =
+  | "exited"
+  | "signaled"
+  | "timeout"
+  | "aborted"
+  | "output-limit"
+  | "spawn-error";
+
+export interface ControlledProcessInput {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: Readonly<Record<string, string>>;
+  readonly stdin?: string | undefined;
+  readonly timeoutMs: number;
+  readonly maxOutputBytes: number;
+  readonly signal: AbortSignal;
+}
+
+export interface ControlledProcessResult {
+  readonly outcome: ControlledProcessOutcome;
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly outputBytesObserved: number;
+}
+
+function utf8Suffix(text: string, maximumBytes: number): string {
+  if (maximumBytes <= 0) return "";
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.length <= maximumBytes) return text;
+  const output: string[] = [];
+  let used = 0;
+  for (const character of [...text].reverse()) {
+    const width = Buffer.byteLength(character, "utf8");
+    if (used + width > maximumBytes) break;
+    output.push(character);
+    used += width;
+  }
+  return output.reverse().join("");
+}
+
+/**
+ * Abortable process execution with an operator-owned aggregate output bound.
+ *
+ * Like every other Runmill subprocess, this lives in the single trusted
+ * platform process boundary and never invokes a shell.
+ */
+export function runControlledProcess(
+  input: ControlledProcessInput,
+): Promise<ControlledProcessResult> {
+  if (
+    !Number.isSafeInteger(input.timeoutMs) ||
+    input.timeoutMs <= 0 ||
+    !Number.isSafeInteger(input.maxOutputBytes) ||
+    input.maxOutputBytes <= 0
+  ) {
+    throw new Error("controlled process limits must be positive safe integers");
+  }
+
+  return new Promise((resolve) => {
+    const stdout = new BoundedCapture(input.maxOutputBytes);
+    const stderr = new BoundedCapture(input.maxOutputBytes);
+    let child: ChildProcess;
+    let settled = false;
+    let timedOut = false;
+    let aborted = input.signal.aborted;
+    let outputLimited = false;
+    let observedBytes = 0;
+    let spawnError: Error | undefined;
+
+    const finish = (result: ControlledProcessResult): void => {
+      if (settled) return;
+      settled = true;
+      input.signal.removeEventListener("abort", onAbort);
+      resolve(result);
+    };
+
+    const onAbort = (): void => {
+      aborted = true;
+      if (child !== undefined) terminateTree(child);
+    };
+
+    if (aborted) {
+      finish({
+        outcome: "aborted",
+        exitCode: null,
+        signal: "ABORT",
+        stdout: "",
+        stderr: "",
+        outputBytesObserved: 0,
+      });
+      return;
+    }
+
+    try {
+      child = spawn(input.command, [...input.args], {
+        cwd: input.cwd,
+        env: { ...input.env },
+        detached: true,
+        stdio: [input.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      finish({
+        outcome: "spawn-error",
+        exitCode: null,
+        signal: null,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+        outputBytesObserved: 0,
+      });
+      return;
+    }
+
+    input.signal.addEventListener("abort", onAbort, { once: true });
+    // EventTarget does not replay an abort that raced addEventListener().
+    if (input.signal.aborted) onAbort();
+
+    const observe = (capture: BoundedCapture, chunk: Buffer): void => {
+      observedBytes += chunk.length;
+      capture.push(chunk);
+      if (observedBytes > input.maxOutputBytes && !outputLimited) {
+        outputLimited = true;
+        terminateTree(child);
+      }
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => observe(stdout, chunk));
+    child.stderr?.on("data", (chunk: Buffer) => observe(stderr, chunk));
+    child.on("error", (error) => {
+      spawnError = error;
+    });
+
+    const cancelTimer = armKillTimer(child, input.timeoutMs, () => {
+      timedOut = true;
+    });
+
+    child.on("close", (code, signal) => {
+      cancelTimer();
+      const outcome: ControlledProcessOutcome = aborted
+        ? "aborted"
+        : timedOut
+          ? "timeout"
+          : outputLimited
+            ? "output-limit"
+            : spawnError !== undefined
+              ? "spawn-error"
+              : signal !== null
+                ? "signaled"
+                : "exited";
+      const rawErrors = [stderr.text(), ...(spawnError === undefined ? [] : [spawnError.message])]
+        .filter((part) => part !== "")
+        .join("\n");
+      const stdoutBudget = Math.floor(input.maxOutputBytes / 2);
+      const safeStdout = utf8Suffix(stdout.text(), stdoutBudget);
+      const stderrBudget = input.maxOutputBytes - Buffer.byteLength(safeStdout, "utf8");
+      const safeStderr = utf8Suffix(rawErrors, stderrBudget);
+      finish({
+        outcome,
+        exitCode: code,
+        signal:
+          outcome === "aborted"
+            ? "ABORT"
+            : outcome === "output-limit"
+              ? "OUTPUT_LIMIT"
+              : signal,
+        stdout: safeStdout,
+        stderr: safeStderr,
+        outputBytesObserved: observedBytes,
+      });
+    });
+
+    if (input.stdin !== undefined) {
+      child.stdin?.on("error", () => undefined);
+      child.stdin?.end(input.stdin);
+    }
+  });
+}
