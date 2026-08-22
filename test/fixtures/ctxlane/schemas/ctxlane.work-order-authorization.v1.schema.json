@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.work-order-authorization.v1.schema.json",
+  "title": "ctxlane work-order authorization v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "algorithm",
+    "key_id",
+    "client_request_id",
+    "tenant_id",
+    "work_order_id",
+    "work_order_digest",
+    "run_id",
+    "attempt_id",
+    "role",
+    "provider",
+    "profile_uid",
+    "profile_ref",
+    "repository",
+    "workspace_id",
+    "environment",
+    "not_before",
+    "expires_at",
+    "maximum_ttl_seconds",
+    "maximum_session_seconds",
+    "signature"
+  ],
+  "properties": {
+    "schema": { "const": "ctxlane.work-order-authorization/v1" },
+    "algorithm": { "const": "ed25519" },
+    "key_id": { "$ref": "#/$defs/logSafeId" },
+    "client_request_id": { "$ref": "#/$defs/logSafeId" },
+    "tenant_id": { "$ref": "#/$defs/logSafeId" },
+    "work_order_id": { "$ref": "#/$defs/logSafeId" },
+    "work_order_digest": { "$ref": "#/$defs/sha256Digest" },
+    "run_id": { "$ref": "#/$defs/logSafeId" },
+    "attempt_id": { "$ref": "#/$defs/logSafeId" },
+    "role": { "enum": ["implementer", "local-reviewer", "pr-reviewer"] },
+    "provider": { "enum": ["claude", "codex"] },
+    "profile_uid": { "$ref": "#/$defs/profileUid" },
+    "profile_ref": {
+      "type": "string",
+      "pattern": "^(claude|codex):[A-Za-z0-9][A-Za-z0-9_-]{0,63}$(?![\\s\\S])"
+    },
+    "repository": { "$ref": "#/$defs/repositoryId" },
+    "workspace_id": { "$ref": "#/$defs/logSafeId" },
+    "environment": { "$ref": "#/$defs/logSafeId" },
+    "not_before": { "$ref": "#/$defs/utcTimestamp" },
+    "expires_at": { "$ref": "#/$defs/utcTimestamp" },
+    "maximum_ttl_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 86400
+    },
+    "maximum_session_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{85}[AQgw]$(?![\\s\\S])"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "provider": { "const": "claude" } } },
+      "then": { "properties": { "profile_ref": { "pattern": "^claude:" } } }
+    },
+    {
+      "if": { "properties": { "provider": { "const": "codex" } } },
+      "then": { "properties": { "profile_ref": { "pattern": "^codex:" } } }
+    }
+  ],
+  "$defs": {
+    "logSafeId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@+-]*$(?![\\s\\S])"
+    },
+    "repositoryId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+\\-]{0,63}:[A-Za-z0-9][A-Za-z0-9._@+\\-]{0,127}(/[A-Za-z0-9][A-Za-z0-9._@+\\-]{0,127})*$(?![\\s\\S])"
+    },
+    "profileUid": {
+      "type": "string",
+      "pattern": "^profile_[0-7][0-9A-HJKMNP-TV-Z]{25}$(?![\\s\\S])"
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$(?![\\s\\S])"
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?!0000-)[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-5][0-9](\\.[0-9]{1,9})?Z$(?![\\s\\S])"
+    }
+  }
+}

@@ -434,6 +434,7 @@ function service(options: {
     | AsfWorkerServiceOptions["reconciliation"]
     | undefined;
   readonly outcome?: AsfWorkerServiceOptions["outcome"] | undefined;
+  readonly telemetry?: AsfWorkerServiceOptions["telemetry"] | undefined;
   readonly onBackgroundError?:
     | ((error: unknown, runId: string) => void)
     | undefined;
@@ -471,6 +472,9 @@ function service(options: {
       ? {}
       : { reconciliation: options.reconciliation }),
     ...(options.outcome === undefined ? {} : { outcome: options.outcome }),
+    ...(options.telemetry === undefined
+      ? {}
+      : { telemetry: options.telemetry }),
     ...(options.onBackgroundError === undefined
       ? {}
       : { onBackgroundError: options.onBackgroundError }),
@@ -499,6 +503,172 @@ function outcomeThatAcknowledges(
 }
 
 describe("AsfWorkerService submission", () => {
+  it("keeps admission, execution, and shutdown unchanged when telemetry throws", async () => {
+    const store = new FakeStore();
+    const admission = new FakeAdmissionService(admissionResult(), () => {
+      store.addRun();
+    });
+    const telemetryCalls: string[] = [];
+    const fail = (method: string): never => {
+      telemetryCalls.push(method);
+      throw new Error("telemetry exporter unavailable");
+    };
+    const backgroundErrors: unknown[] = [];
+    const worker = service({
+      store,
+      admission,
+      runner: async (context) => pauseRun(context),
+      telemetry: {
+        span: () => fail("span"),
+        counter: () => fail("counter"),
+        histogram: () => fail("histogram"),
+      },
+      onBackgroundError: (error) => backgroundErrors.push(error),
+    });
+
+    await expect(worker.submitWorkOrder({})).resolves.toEqual(
+      admissionResult(),
+    );
+    await expect(worker.requestStop()).resolves.toBeUndefined();
+
+    expect(telemetryCalls).toContain("span");
+    expect(telemetryCalls).toContain("counter");
+    expect(telemetryCalls).toContain("histogram");
+    expect(backgroundErrors).toEqual([]);
+    expect(store.getAsfRun("run_01")).toMatchObject({
+      state: "WAITING_APPROVAL",
+      ownerId: null,
+    });
+  });
+
+  it("contains asynchronously rejecting recorder methods", async () => {
+    const store = new FakeStore();
+    const admission = new FakeAdmissionService(admissionResult(), () => {
+      store.addRun();
+    });
+    const calls: string[] = [];
+    const reject = (method: string): Promise<void> => {
+      calls.push(method);
+      return Promise.reject(new Error("async telemetry rejection"));
+    };
+    const backgroundErrors: unknown[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const rejectingTelemetry = {
+        span: () => reject("span"),
+        counter: () => reject("counter"),
+        histogram: () => reject("histogram"),
+      } as unknown as NonNullable<AsfWorkerServiceOptions["telemetry"]>;
+      const worker = service({
+        store,
+        admission,
+        runner: async (context) => pauseRun(context),
+        telemetry: rejectingTelemetry,
+        onBackgroundError: (error) => backgroundErrors.push(error),
+      });
+
+      await expect(worker.submitWorkOrder({})).resolves.toEqual(
+        admissionResult(),
+      );
+      await expect(worker.requestStop()).resolves.toBeUndefined();
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+
+    expect(calls).toEqual(
+      expect.arrayContaining(["span", "counter", "histogram"]),
+    );
+    expect(backgroundErrors).toEqual([]);
+    expect(unhandledRejections).toEqual([]);
+    expect(store.getAsfRun("run_01")).toMatchObject({
+      state: "WAITING_APPROVAL",
+      ownerId: null,
+    });
+  });
+
+  it.each(["accepted", "existing"] as const)(
+    "counts work_orders.accepted only for the %s durable disposition when accepted",
+    async (disposition) => {
+      const store = new FakeStore();
+      const admission = new FakeAdmissionService(
+        admissionResult(disposition),
+        () => {
+          store.addRun();
+        },
+      );
+      const counters: { name: string; attributes: unknown }[] = [];
+      const worker = service({
+        store,
+        admission,
+        runner: async (context) => pauseRun(context),
+        telemetry: {
+          span: () => undefined,
+          counter: (name, _value, attributes) =>
+            counters.push({ name, attributes }),
+          histogram: () => undefined,
+        },
+      });
+
+      await expect(worker.submitWorkOrder({})).resolves.toEqual(
+        admissionResult(disposition),
+      );
+      await worker.requestStop();
+
+      expect(
+        counters.filter(
+          (counter) => counter.name === "runmill.asf.work_orders.accepted",
+        ),
+      ).toHaveLength(disposition === "accepted" ? 1 : 0);
+    },
+  );
+
+  it("records an ambiguous admission failure without claiming a refusal", async () => {
+    const store = new FakeStore();
+    const admission: AsfWorkOrderSubmitter = {
+      async submit() {
+        throw new Error("admission store failed after an ambiguous commit");
+      },
+    };
+    const spans: { name: string; attributes: unknown }[] = [];
+    const counters: string[] = [];
+    const worker = service({
+      store,
+      admission,
+      runner: async (context) => pauseRun(context),
+      telemetry: {
+        span: (name, _durationMs, attributes) =>
+          spans.push({ name, attributes }),
+        counter: (name) => counters.push(name),
+        histogram: () => undefined,
+      },
+    });
+
+    await expect(worker.submitWorkOrder({})).rejects.toThrow(
+      "admission store failed after an ambiguous commit",
+    );
+
+    expect(counters).toEqual([]);
+    expect(
+      spans.filter((span) => span.name === "runmill.asf.work_order.admission"),
+    ).toEqual([
+      {
+        name: "runmill.asf.work_order.admission",
+        attributes: {
+          component: "admission",
+          operation: "work-order-admit",
+          outcome: "failed",
+          reason_code: "unknown",
+        },
+      },
+    ]);
+  });
+
   it("acknowledges durable admission without waiting for the background runner", async () => {
     const store = new FakeStore();
     let persistedBeforeRunner = false;
@@ -773,9 +943,7 @@ describe("AsfWorkerService fencing and recovery", () => {
   it("cancels a pending CI delayed wake before scheduling fenced cancellation", async () => {
     const candidateSha = "c".repeat(40);
     const store = new FakeStore();
-    store.addRun(
-      runRow({ state: "CI_WAIT", stateVersion: 7, candidateSha }),
-    );
+    store.addRun(runRow({ state: "CI_WAIT", stateVersion: 7, candidateSha }));
     store.eventPage = {
       events: [
         parseRunEvent({
@@ -2205,6 +2373,134 @@ describe("AsfWorkerService background failures", () => {
           generation: 99,
         });
       }
+    },
+  );
+});
+
+describe("AsfWorkerService run invocation telemetry", () => {
+  interface RunInvocationScenario {
+    readonly disposition:
+      | "durable-pause"
+      | "terminal"
+      | "retry"
+      | "lease-lost"
+      | "unexpected-error";
+    readonly prepare?: (store: FakeStore) => void;
+    readonly runner: (store: FakeStore) => AsfRunner;
+    readonly attributes: Record<string, string>;
+    readonly finalRun: Partial<AsfRunRow>;
+  }
+
+  const scenarios: readonly RunInvocationScenario[] = [
+    {
+      disposition: "durable-pause",
+      runner: () => async (context) => pauseRun(context),
+      attributes: { outcome: "succeeded", disposition: "durable-pause" },
+      finalRun: { state: "WAITING_APPROVAL", ownerId: null },
+    },
+    {
+      disposition: "terminal",
+      runner: (store) => async (context) => {
+        const row = store.runs.get(context.runId);
+        if (row === undefined) throw new Error("missing terminal run");
+        row.state = "COMPLETED";
+      },
+      attributes: { outcome: "succeeded", disposition: "terminal" },
+      finalRun: { state: "COMPLETED", ownerId: null },
+    },
+    {
+      disposition: "retry",
+      prepare: (store) => store.terminalPlans.add("run_01"),
+      runner: () => async (context) => {
+        throw new AsfPendingTerminalEvidenceRetryError(
+          context.runId,
+          new Error("transient terminal signer failure"),
+        );
+      },
+      attributes: {
+        outcome: "degraded",
+        disposition: "retry",
+        reason_code: "terminal-state",
+      },
+      finalRun: { state: "ADMITTED", ownerId: null },
+    },
+    {
+      disposition: "lease-lost",
+      runner: (store) => async (context) => {
+        const row = store.runs.get(context.runId);
+        if (row === undefined) throw new Error("missing fenced run");
+        row.ownerId = "worker-usurper";
+      },
+      attributes: {
+        outcome: "degraded",
+        disposition: "lease-lost",
+        reason_code: "stale-fence",
+      },
+      finalRun: { state: "ADMITTED", ownerId: "worker-usurper" },
+    },
+    {
+      disposition: "unexpected-error",
+      runner: () => async () => {
+        throw new Error("background runner exploded");
+      },
+      attributes: {
+        outcome: "failed",
+        disposition: "unexpected-error",
+        reason_code: "unknown",
+      },
+      finalRun: { state: "BLOCKED_EXTERNAL", ownerId: null },
+    },
+  ];
+
+  it.each(scenarios)(
+    "emits runmill.asf.run.invocations exactly once for a $disposition execution",
+    async (scenario) => {
+      const store = new FakeStore();
+      store.addRun();
+      scenario.prepare?.(store);
+      const counters: { name: string; value: number; attributes: unknown }[] =
+        [];
+      const firstInvocation = deferred();
+      const worker = service({
+        store,
+        scheduler: new ManualScheduler(),
+        retryDelayMs: 250,
+        runner: scenario.runner(store),
+        telemetry: {
+          span: () => undefined,
+          counter: (name, value, attributes) => {
+            counters.push({ name, value, attributes });
+            if (name === "runmill.asf.run.invocations") {
+              firstInvocation.resolve();
+            }
+          },
+          histogram: () => undefined,
+        },
+        onBackgroundError: () => undefined,
+      });
+
+      await worker.submitWorkOrder({});
+      await firstInvocation.promise;
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(
+        counters.filter(
+          (counter) => counter.name === "runmill.asf.run.invocations",
+        ),
+      ).toEqual([
+        {
+          name: "runmill.asf.run.invocations",
+          value: 1,
+          attributes: {
+            component: "runner",
+            operation: "run-dispatch",
+            ...scenario.attributes,
+          },
+        },
+      ]);
+      expect(store.getAsfRun("run_01")).toMatchObject(scenario.finalRun);
+      expect(store.claims).toHaveLength(1);
     },
   );
 });

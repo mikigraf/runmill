@@ -40,6 +40,45 @@ export interface IdentityLeaseRequest {
 }
 
 /**
+ * Nested, ctxlane-specific attribution carried on an {@link IdentityLease}
+ * issued by the ctxlane provider broker. Generic consumers of `IdentityLease`
+ * (fakes, other providers) may omit this field entirely; only
+ * `CtxlaneProviderIdentityBroker` treats it as required.
+ *
+ * `fencingGeneration` here is ctxlane's own `fencing_generation`; it is a
+ * distinct, unrelated value from `IdentityLease.fencingGeneration`, which is
+ * Runmill's own durable ownership fence and is never derived from or compared
+ * with this field.
+ */
+export interface IdentityLeaseCtxlaneAttribution {
+  readonly clientRequestId: string;
+  /** Exact original requested TTL; stable across every renewal and restart. */
+  readonly requestedTtlSeconds: number;
+  readonly tenantId: string;
+  readonly workOrderDigest: string;
+  readonly profileUid: string;
+  readonly callerSubject: string;
+  readonly hostIdentity: string;
+  readonly workerIdentity: string | null;
+  readonly workspaceId: string;
+  readonly environment: string;
+  /**
+   * Not part of the spec's minimum field list, but included so a full
+   * published `ctxlane.identity-lease/v1` object can be losslessly
+   * reconstructed from a generic `IdentityLease` snapshot for renew/close/
+   * revoke calls against `CtxlaneLeaseLifecycleClient`.
+   */
+  readonly repository: string;
+  readonly workspaceRef: string | null;
+  readonly authMode: string | null;
+  readonly isolation: string | null;
+  readonly fencingGeneration: number | null;
+  readonly effectivePolicyDigest: string | null;
+  readonly maximumExpiresAt: string | null;
+  readonly status: string;
+}
+
+/**
  * Temporary provider execution authority bound to one role and run fence.
  *
  * `provider`, `principal`, and `profile` are non-secret attribution. The two
@@ -60,6 +99,8 @@ export interface IdentityLease {
   readonly issuedAt: string;
   readonly expiresAt: string;
   readonly fencingGeneration: number;
+  /** Present only on leases issued by `CtxlaneProviderIdentityBroker`. */
+  readonly ctxlane?: IdentityLeaseCtxlaneAttribution;
 }
 
 /** Non-sensitive ownership coordinates used to validate the current run fence. */
@@ -90,7 +131,12 @@ export function identityOwnershipFenceFor(
   };
 }
 
-export const LEASE_DISPOSITIONS = ["completed", "cancelled", "failed", "refused"] as const;
+export const LEASE_DISPOSITIONS = [
+  "completed",
+  "cancelled",
+  "failed",
+  "refused",
+] as const;
 export type LeaseDisposition = (typeof LEASE_DISPOSITIONS)[number];
 
 export class IdentityLeaseIndependenceError extends Error {
@@ -101,7 +147,9 @@ export class IdentityLeaseIndependenceError extends Error {
 }
 
 function refuseIndependence(reason: string): never {
-  throw new IdentityLeaseIndependenceError(`reviewer identity independence refused: ${reason}`);
+  throw new IdentityLeaseIndependenceError(
+    `reviewer identity independence refused: ${reason}`,
+  );
 }
 
 function assertLeaseAttribution(lease: IdentityLease, label: string): void {
@@ -124,7 +172,10 @@ function assertLeaseAttribution(lease: IdentityLease, label: string): void {
   if (!POLICY_DIGEST_PATTERN.test(lease.policyDigest)) {
     refuseIndependence(`${label} lease has invalid policyDigest`);
   }
-  if (!Number.isSafeInteger(lease.fencingGeneration) || lease.fencingGeneration <= 0) {
+  if (
+    !Number.isSafeInteger(lease.fencingGeneration) ||
+    lease.fencingGeneration <= 0
+  ) {
     refuseIndependence(`${label} lease has invalid fencingGeneration`);
   }
 }
@@ -144,10 +195,14 @@ export function assertIndependentIdentityLeases(
   assertLeaseAttribution(implementer, "implementer");
   assertLeaseAttribution(reviewer, "reviewer");
   if (implementer.role !== "implementer") {
-    refuseIndependence(`expected implementer lease, received role ${implementer.role}`);
+    refuseIndependence(
+      `expected implementer lease, received role ${implementer.role}`,
+    );
   }
   if (reviewer.role !== "local-reviewer" && reviewer.role !== "pr-reviewer") {
-    refuseIndependence(`expected reviewer lease, received role ${reviewer.role}`);
+    refuseIndependence(
+      `expected reviewer lease, received role ${reviewer.role}`,
+    );
   }
 
   const bindingFields = [
@@ -167,14 +222,18 @@ export function assertIndependentIdentityLeases(
     refuseIndependence("implementer and reviewer received the same lease");
   }
   if (implementer.executionHandle === reviewer.executionHandle) {
-    refuseIndependence("implementer and reviewer received the same execution handle");
+    refuseIndependence(
+      "implementer and reviewer received the same execution handle",
+    );
   }
 
   if (
     implementer.provider === reviewer.provider &&
     implementer.principal === reviewer.principal
   ) {
-    refuseIndependence("reviewer resolved to the implementer provider and principal");
+    refuseIndependence(
+      "reviewer resolved to the implementer provider and principal",
+    );
   }
 }
 
@@ -184,4 +243,33 @@ export interface ProviderIdentityBroker {
   renew(lease: IdentityLease): Promise<IdentityLease>;
   close(lease: IdentityLease, disposition: LeaseDisposition): Promise<void>;
   revoke(lease: IdentityLease, reason: string): Promise<void>;
+}
+
+export type IdentityBrokerFailureDisposition = "unchanged" | "retired";
+
+const definitiveIdentityBrokerFailures = new WeakMap<
+  object,
+  IdentityBrokerFailureDisposition
+>();
+
+/**
+ * Attach provider-adapter status semantics to a thrown failure without
+ * exposing them in logs or JSON error output. Unmarked failures are always
+ * ambiguous. Only trusted broker implementations should call this helper.
+ */
+export function markDefinitiveIdentityBrokerFailure<T extends Error>(
+  error: T,
+  disposition: IdentityBrokerFailureDisposition,
+): T {
+  definitiveIdentityBrokerFailures.set(error, disposition);
+  return error;
+}
+
+/** Return an exact settled disposition, or `undefined` for ambiguity. */
+export function identityBrokerFailureDisposition(
+  error: unknown,
+): IdentityBrokerFailureDisposition | undefined {
+  return error !== null && typeof error === "object"
+    ? definitiveIdentityBrokerFailures.get(error)
+    : undefined;
 }

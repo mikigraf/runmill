@@ -43,25 +43,8 @@
 > [!IMPORTANT]
 > Runmill is a developer preview. Start with `pr-only`. Automatic merge modes are experimental.
 
-Runmill remains fully usable without Autonomous Software Factory (ASF). The normal
-`runmill start` command is the standalone backlog-to-PR product and never requires ASF,
-ctxlane, an ASF signing key, or the MCP adapter. ASF-related control surfaces are
-separate, explicit commands; ordinary startup cannot enter `asf-worker` mode.
-
-ASF worker startup is a deployment integration point, not a built-in set of production
-controllers. `runmill service start --mode asf-worker --runtime-module <absolute-path>`
-loads an operator-owned ESM composition whose named `createAsfWorkerHostOptions(context)`
-factory returns the fully configured worker host dependencies. The entrypoint accepts only
-a private, root/current-user-owned regular module in a safe directory, then the host
-independently requires production-readiness and health evidence before recovery or control
-intake. Its readiness callback must return the complete, versioned canonical evaluator
-output; a custom or partial passing checklist is refused. `RUNMILL_ASF_RUNTIME_MODULE` may
-name the same module instead of the option.
-
-ASF control discovery is also isolated: it uses `RUNMILL_ASF_DAEMON_REGISTRY` or
-`~/.runmill/asf-worker.json` with `asf-worker.sock`. Standalone commands continue to use
-`RUNMILL_DAEMON_REGISTRY` or `daemon.json`/`daemon.sock`, so both services can coexist and
-ASF status, stop, and MCP clients cannot target the standalone daemon by default.
+Runmill works standalone as a backlog-to-PR product and is also part of
+[Autonomous Software Factory (ASF)](./docs/asf-worker.md).
 
 ## Quick start
 
@@ -210,10 +193,6 @@ Runmill is available under the [MIT License](./LICENSE).
 | `runmill stop`                                                   | Request a safe stop at the next run boundary                                                                    |
 | `runmill daemon`                                                 | Run foreground, one-shot, polling, and breaker modes                                                            |
 | `runmill tui`                                                    | Open the terminal interface                                                                                     |
-| `runmill service start --mode asf-worker --runtime-module <absolute-path>` | Start the production-gated ASF host with an operator-owned deployment composition                     |
-| `runmill mcp serve --stdio`                                      | Run the stateless ASF MCP adapter against an explicitly started ASF worker service                              |
-| `runmill service status`                                         | Read authenticated health from an explicitly configured ASF worker service                                      |
-| `runmill service stop`                                           | Request a graceful stop from the ASF worker without affecting standalone mode                                   |
 | `runmill list --needs-attention`                                 | Find runs waiting for a person                                                                                  |
 | `runmill inspect <run-id>`                                       | Show transitions, evidence, and pending effects                                                                 |
 | `runmill resume <run-id>`                                        | Explain why checkpoint continuation is unavailable in the preview; never changes state                          |
@@ -243,12 +222,7 @@ Runmill is available under the [MIT License](./LICENSE).
 | `RUNMILL_FAKE_BACKLOG=<file>`    | Load backlog issues from an explicit JSON fixture                      |
 | `RUNMILL_SOURCE_REPO=<path>`     | Override the source repository used for workspaces                     |
 | `RUNMILL_DATA_DIR=<path>`        | Override the machine-state directory                                   |
-| `RUNMILL_DAEMON_REGISTRY=<path>` | Override standalone daemon discovery; ASF commands never use it         |
-| `RUNMILL_ASF_RUNTIME_MODULE=<absolute-path>` | Select the trusted deployment composition for explicit ASF startup |
-| `RUNMILL_ASF_DAEMON_REGISTRY=<absolute-path>` | Override ASF-only service discovery for start/status/stop/MCP       |
-| `RUNMILL_ASF_CONTROL_CONTROLLER_ID=<id>` | Identify the trusted controller for explicit ASF MCP/service control   |
-| `RUNMILL_ASF_CONTROL_KEY_ID=<id>` | Select the dedicated ASF local-control authentication key              |
-| `RUNMILL_ASF_CONTROL_KEY_FILE=<path>` | Read that key from a private root/current-user-owned `0600` file     |
+| `RUNMILL_DAEMON_REGISTRY=<path>` | Override daemon discovery                                              |
 
 Every command accepts `--json`, `--quiet`, and `--config <path>`.
 

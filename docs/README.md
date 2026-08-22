@@ -95,5 +95,6 @@ The TUI is optional. It needs Bun, or Node 26.4+ with experimental FFI. The daem
 | [Security policy](../SECURITY.md) | Supported versions, private reporting, and threat boundary |
 | [Support](../SUPPORT.md) | Setup help, diagnostic reports, and issue routing |
 | [Releasing](./releasing.md) | Trusted publishing, provenance, signed tags, and the maintainer release gate |
+| [ASF worker](./asf-worker.md) | The explicit, operator-composed Autonomous Software Factory integration surface |
 
 Runtime and development dependencies are pinned. Use `npm ci` when working from source.

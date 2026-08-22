@@ -3,7 +3,10 @@ import type {
   IdentityOwnershipFenceValidator,
   ProviderIdentityBroker,
 } from "../identity/broker.js";
-import { assertIndependentIdentityLeases } from "../identity/broker.js";
+import {
+  assertIndependentIdentityLeases,
+  identityBrokerFailureDisposition,
+} from "../identity/broker.js";
 import {
   PROTECTED_IDENTITY_LEASE_REGISTRY_SCHEMA,
   protectedIdentityLeaseDigest,
@@ -498,7 +501,8 @@ export class AsfIdentityLifecycleController implements AsfIdentityController {
       (candidate) => candidate.binding.fencingGeneration === currentGeneration,
     );
     const requested = lineage.filter(
-      (candidate) => candidate.binding.fencingGeneration === requestedGeneration,
+      (candidate) =>
+        candidate.binding.fencingGeneration === requestedGeneration,
     );
     const currentSnapshot = current[0];
     // A current-generation snapshot wins even while the durable delivery
@@ -1161,16 +1165,24 @@ export class AsfIdentityLifecycleController implements AsfIdentityController {
             leaseDigest: null,
           },
         );
-        const lease = await this.#broker.acquire({
-          runId: binding.runId,
-          workOrderId: binding.workOrderId,
-          attemptId: binding.attemptId,
-          role,
-          requestedProfile: profileFor(profiles, role),
-          policyDigest: binding.policyDigest,
-          fencingGeneration: binding.fencingGeneration,
-          requestedDurationMs: this.#requestedDurationMs,
-        });
+        let lease: IdentityLease;
+        try {
+          lease = await this.#broker.acquire({
+            runId: binding.runId,
+            workOrderId: binding.workOrderId,
+            attemptId: binding.attemptId,
+            role,
+            requestedProfile: profileFor(profiles, role),
+            policyDigest: binding.policyDigest,
+            fencingGeneration: binding.fencingGeneration,
+            requestedDurationMs: this.#requestedDurationMs,
+          });
+        } catch (error) {
+          if (identityBrokerFailureDisposition(error) !== undefined) {
+            await this.#completeProtectedOperation(session, protectedOperation);
+          }
+          throw error;
+        }
         // Retain even a malformed response until revocation has been attempted.
         leases.set(role, lease);
         session.allLeases.add(lease);
@@ -1757,6 +1769,13 @@ export class AsfIdentityLifecycleController implements AsfIdentityController {
       let renewed: IdentityLease;
       try {
         renewed = await renewal;
+      } catch (error) {
+        const disposition = identityBrokerFailureDisposition(error);
+        if (disposition !== undefined) {
+          if (disposition === "retired") session.retiredLeases.add(current);
+          await this.#completeProtectedOperation(session, protectedOperation);
+        }
+        throw error;
       } finally {
         if (session.inFlightRenewal === renewal)
           session.inFlightRenewal = undefined;
@@ -2058,11 +2077,22 @@ export class AsfIdentityLifecycleController implements AsfIdentityController {
         session.retiredLeases.add(lease);
         await this.#completeProtectedOperation(session, protectedOperation);
         outcomes.push(true);
-      } catch {
-        // A rejection has no status semantics in the base broker contract. The
-        // durable marker therefore remains ambiguous until a provider-specific
-        // exact lookup/status API resolves it.
-        outcomes.push(false);
+      } catch (error) {
+        const disposition = identityBrokerFailureDisposition(error);
+        if (disposition === undefined) {
+          // Unknown broker failures remain ambiguous until a provider-specific
+          // exact lookup/status API resolves them.
+          outcomes.push(false);
+          continue;
+        }
+        if (disposition === "retired") session.retiredLeases.add(lease);
+        try {
+          await this.#completeProtectedOperation(session, protectedOperation);
+          outcomes.push(disposition === "retired");
+        } catch {
+          durable = false;
+          outcomes.push(false);
+        }
       }
     }
     const complete =

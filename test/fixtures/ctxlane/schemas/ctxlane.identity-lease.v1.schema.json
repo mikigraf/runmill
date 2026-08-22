@@ -1,0 +1,485 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.identity-lease.v1.schema.json",
+  "title": "ctxlane identity lease v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "lease_id",
+    "status",
+    "tenant_id",
+    "work_order_id",
+    "work_order_digest",
+    "run_id",
+    "attempt_id",
+    "role",
+    "provider",
+    "profile_uid",
+    "profile_ref",
+    "repository",
+    "workspace_id",
+    "environment",
+    "caller_subject",
+    "host_identity",
+    "worker_identity",
+    "principal_ref",
+    "workspace_ref",
+    "auth_mode",
+    "fencing_generation",
+    "issued_at",
+    "expires_at",
+    "maximum_expires_at",
+    "execution_handle",
+    "isolation",
+    "effective_policy_digest",
+    "refusal_code",
+    "reason_code"
+  ],
+  "properties": {
+    "schema": { "const": "ctxlane.identity-lease/v1" },
+    "lease_id": { "$ref": "#/$defs/leaseId" },
+    "status": {
+      "enum": [
+        "requested",
+        "active",
+        "renewing",
+        "closed",
+        "revoked",
+        "expired",
+        "refused",
+        "error"
+      ]
+    },
+    "tenant_id": { "$ref": "#/$defs/logSafeId" },
+    "work_order_id": { "$ref": "#/$defs/logSafeId" },
+    "work_order_digest": { "$ref": "#/$defs/sha256Digest" },
+    "run_id": { "$ref": "#/$defs/logSafeId" },
+    "attempt_id": { "$ref": "#/$defs/logSafeId" },
+    "role": {
+      "enum": ["implementer", "local-reviewer", "pr-reviewer"]
+    },
+    "provider": { "enum": ["claude", "codex"] },
+    "profile_uid": { "$ref": "#/$defs/profileUid" },
+    "profile_ref": {
+      "type": "string",
+      "pattern": "^(claude|codex):[A-Za-z0-9][A-Za-z0-9_-]{0,63}$(?![\\s\\S])"
+    },
+    "repository": { "$ref": "#/$defs/repositoryId" },
+    "workspace_id": { "$ref": "#/$defs/logSafeId" },
+    "environment": { "$ref": "#/$defs/logSafeId" },
+    "caller_subject": { "$ref": "#/$defs/callerSubject" },
+    "host_identity": { "$ref": "#/$defs/hostIdentity" },
+    "worker_identity": {
+      "oneOf": [
+        { "$ref": "#/$defs/workerIdentity" },
+        { "type": "null" }
+      ]
+    },
+    "principal_ref": {
+      "oneOf": [
+        { "$ref": "#/$defs/principalRef" },
+        { "type": "null" }
+      ]
+    },
+    "workspace_ref": {
+      "oneOf": [
+        { "$ref": "#/$defs/workspaceRef" },
+        { "type": "null" }
+      ]
+    },
+    "auth_mode": {
+      "oneOf": [
+        { "$ref": "#/$defs/authMode" },
+        { "type": "null" }
+      ]
+    },
+    "fencing_generation": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        { "type": "null" }
+      ]
+    },
+    "issued_at": { "$ref": "#/$defs/utcTimestamp" },
+    "expires_at": {
+      "oneOf": [
+        { "$ref": "#/$defs/utcTimestamp" },
+        { "type": "null" }
+      ]
+    },
+    "maximum_expires_at": {
+      "oneOf": [
+        { "$ref": "#/$defs/utcTimestamp" },
+        { "type": "null" }
+      ]
+    },
+    "execution_handle": {
+      "oneOf": [
+        { "$ref": "#/$defs/executionHandle" },
+        { "type": "null" }
+      ]
+    },
+    "isolation": {
+      "oneOf": [
+        { "$ref": "#/$defs/isolation" },
+        { "type": "null" }
+      ]
+    },
+    "effective_policy_digest": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256Digest" },
+        { "type": "null" }
+      ]
+    },
+    "refusal_code": {
+      "oneOf": [
+        { "$ref": "#/$defs/refusalCode" },
+        { "type": "null" }
+      ]
+    },
+    "reason_code": {
+      "oneOf": [
+        { "$ref": "#/$defs/reasonCode" },
+        { "type": "null" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "provider": { "const": "claude" } } },
+      "then": {
+        "properties": {
+          "profile_ref": { "pattern": "^claude:" },
+          "auth_mode": {
+            "oneOf": [
+              { "enum": ["wif", "subscription-token", "api-key"] },
+              { "type": "null" }
+            ]
+          },
+          "workspace_ref": {
+            "oneOf": [
+              { "type": "string", "pattern": "^claude-organization:" },
+              { "type": "null" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "provider": { "const": "codex" } } },
+      "then": {
+        "properties": {
+          "profile_ref": { "pattern": "^codex:" },
+          "auth_mode": {
+            "oneOf": [
+              { "enum": ["wif", "chatgpt-oauth", "api-key", "access-token"] },
+              { "type": "null" }
+            ]
+          },
+          "workspace_ref": {
+            "oneOf": [
+              { "type": "string", "pattern": "^chatgpt-workspace:" },
+              { "type": "null" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "refusal_code": { "const": "organization-mismatch" }
+        }
+      },
+      "then": { "properties": { "provider": { "const": "claude" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "refusal_code": { "const": "workspace-mismatch" }
+        }
+      },
+      "then": { "properties": { "provider": { "const": "codex" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "isolation": { "const": "copied-credential-development" }
+        }
+      },
+      "then": {
+        "anyOf": [
+          {
+            "properties": {
+              "environment": { "const": "local-development" }
+            }
+          },
+          {
+            "properties": {
+              "role": { "const": "pr-reviewer" }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "oneOf": [
+    {
+      "properties": {
+        "status": { "const": "requested" },
+        "worker_identity": { "type": "null" },
+        "principal_ref": { "type": "null" },
+        "workspace_ref": { "type": "null" },
+        "auth_mode": { "type": "null" },
+        "fencing_generation": { "type": "null" },
+        "expires_at": { "type": "null" },
+        "maximum_expires_at": { "type": "null" },
+        "execution_handle": { "type": "null" },
+        "isolation": { "type": "null" },
+        "effective_policy_digest": { "type": "null" },
+        "refusal_code": { "type": "null" },
+        "reason_code": { "type": "null" }
+      }
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/resolvedAttribution" },
+        {
+          "properties": {
+            "status": { "enum": ["active", "renewing"] },
+            "execution_handle": { "$ref": "#/$defs/executionHandle" },
+            "refusal_code": { "type": "null" },
+            "reason_code": { "type": "null" }
+          }
+        }
+      ]
+    },
+    {
+      "properties": {
+        "status": { "const": "refused" },
+        "worker_identity": { "type": "null" },
+        "principal_ref": { "type": "null" },
+        "workspace_ref": { "type": "null" },
+        "auth_mode": { "type": "null" },
+        "fencing_generation": { "type": "null" },
+        "expires_at": { "type": "null" },
+        "maximum_expires_at": { "type": "null" },
+        "execution_handle": { "type": "null" },
+        "isolation": { "type": "null" },
+        "effective_policy_digest": { "type": "null" },
+        "refusal_code": { "$ref": "#/$defs/refusalCode" },
+        "reason_code": { "type": "null" }
+      }
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/resolvedAttribution" },
+        {
+          "properties": {
+            "status": { "const": "closed" },
+            "execution_handle": { "type": "null" },
+            "refusal_code": { "type": "null" },
+            "reason_code": { "enum": ["completed", "worker-failed"] }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/resolvedAttribution" },
+        {
+          "properties": {
+            "status": { "const": "expired" },
+            "execution_handle": { "type": "null" },
+            "refusal_code": { "type": "null" },
+            "reason_code": {
+              "enum": ["lease-expired", "maximum-lifetime-reached"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/resolvedAttribution" },
+        {
+          "properties": {
+            "status": { "const": "revoked" },
+            "execution_handle": { "type": "null" },
+            "refusal_code": { "type": "null" },
+            "reason_code": {
+              "enum": [
+                "operator-revoked",
+                "policy-revoked",
+                "principal-mismatch",
+                "heartbeat-lost",
+                "process-unverifiable",
+                "generation-superseded",
+                "renewal-acknowledgement-failed",
+                "service-recovery"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/resolvedAttribution" },
+        {
+          "properties": {
+            "status": { "const": "error" },
+            "execution_handle": { "type": "null" },
+            "refusal_code": { "type": "null" },
+            "reason_code": {
+              "enum": [
+                "process-unverifiable",
+                "service-recovery",
+                "internal-error"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "$defs": {
+    "leaseId": {
+      "type": "string",
+      "pattern": "^lease_[0-7][0-9A-HJKMNP-TV-Z]{25}$(?![\\s\\S])"
+    },
+    "executionHandle": {
+      "type": "string",
+      "pattern": "^exec_[0-7][0-9A-HJKMNP-TV-Z]{25}$(?![\\s\\S])"
+    },
+    "profileUid": {
+      "type": "string",
+      "pattern": "^profile_[0-7][0-9A-HJKMNP-TV-Z]{25}$(?![\\s\\S])"
+    },
+    "logSafeId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@+-]*$(?![\\s\\S])"
+    },
+    "callerSubject": {
+      "type": "string",
+      "pattern": "^caller:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$(?![\\s\\S])"
+    },
+    "hostIdentity": {
+      "type": "string",
+      "pattern": "^host:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$(?![\\s\\S])"
+    },
+    "workerIdentity": {
+      "type": "string",
+      "pattern": "^worker:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$(?![\\s\\S])"
+    },
+    "principalRef": {
+      "type": "string",
+      "pattern": "^(user|service-account):[A-Za-z0-9][A-Za-z0-9._-]{0,127}$(?![\\s\\S])"
+    },
+    "workspaceRef": {
+      "type": "string",
+      "pattern": "^(claude-organization|chatgpt-workspace):[A-Za-z0-9][A-Za-z0-9._-]{0,127}$(?![\\s\\S])"
+    },
+    "repositoryId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+\\-]{0,63}:[A-Za-z0-9][A-Za-z0-9._@+\\-]{0,127}(/[A-Za-z0-9][A-Za-z0-9._@+\\-]{0,127})*$(?![\\s\\S])"
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$(?![\\s\\S])"
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?!0000-)[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-5][0-9](\\.[0-9]{1,9})?Z$(?![\\s\\S])"
+    },
+    "isolation": {
+      "enum": [
+        "credential-isolated",
+        "per-lease-isolated",
+        "copied-credential-development",
+        "unproven"
+      ]
+    },
+    "authMode": {
+      "enum": [
+        "wif",
+        "subscription-token",
+        "api-key",
+        "chatgpt-oauth",
+        "access-token"
+      ]
+    },
+    "refusalCode": {
+      "enum": [
+        "work-order-proof-invalid",
+        "work-order-authorization-mismatch",
+        "requested-ttl-not-allowed",
+        "policy-digest-mismatch",
+        "profile-not-found",
+        "provider-mismatch",
+        "profile-not-eligible",
+        "authentication-exception-required",
+        "isolation-exception-required",
+        "environment-not-allowed",
+        "role-not-allowed",
+        "caller-not-allowed",
+        "repository-not-allowed",
+        "profile-not-ready",
+        "identity-token-stale",
+        "harness-untrusted",
+        "principal-unverified",
+        "principal-mismatch",
+        "organization-mismatch",
+        "workspace-mismatch",
+        "isolation-unproven",
+        "capacity-exceeded"
+      ]
+    },
+    "reasonCode": {
+      "enum": [
+        "completed",
+        "worker-failed",
+        "operator-revoked",
+        "policy-revoked",
+        "principal-mismatch",
+        "lease-expired",
+        "maximum-lifetime-reached",
+        "heartbeat-lost",
+        "process-unverifiable",
+        "generation-superseded",
+        "renewal-acknowledgement-failed",
+        "service-recovery",
+        "internal-error"
+      ]
+    },
+    "resolvedAttribution": {
+      "type": "object",
+      "properties": {
+        "profile_uid": { "$ref": "#/$defs/profileUid" },
+        "principal_ref": { "$ref": "#/$defs/principalRef" },
+        "workspace_ref": { "$ref": "#/$defs/workspaceRef" },
+        "auth_mode": { "$ref": "#/$defs/authMode" },
+        "fencing_generation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "expires_at": { "$ref": "#/$defs/utcTimestamp" },
+        "maximum_expires_at": { "$ref": "#/$defs/utcTimestamp" },
+        "isolation": {
+          "enum": [
+            "credential-isolated",
+            "per-lease-isolated",
+            "copied-credential-development"
+          ]
+        },
+        "effective_policy_digest": { "$ref": "#/$defs/sha256Digest" }
+      }
+    }
+  }
+}
