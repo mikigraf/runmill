@@ -91,6 +91,9 @@ describe.runIf(configured)("live: ctxlane identity lease lifecycle", () => {
     expect(acquired.status).toBe("active");
     expect(acquired.lease_id).toBeTruthy();
     expect(acquired.execution_handle).toBeTruthy();
+    if (acquired.fencing_generation === null) {
+      throw new Error("ctxlane acquisition returned no fencing generation");
+    }
 
     const lifecycle = new CtxlanePrivateLifecycleClient(
       new CtxlaneNativeSeqpacketLifecycleExchange(client),

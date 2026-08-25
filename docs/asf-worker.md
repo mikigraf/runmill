@@ -451,11 +451,15 @@ the runner requires and exercises the native `SOCK_SEQPACKET` boundary fixture:
 npm run build:native
 RUNMILL_CTXLANE_BINARY=/usr/local/bin/ctxlane \
 RUNMILL_CTXLANE_ROOT=/var/lib/ctxlane \
+RUNMILL_CTXLANE_ENDPOINT=unix:///var/lib/ctxlane/automation-controller.sock \
+RUNMILL_CTXLANE_EXPECTED_PEER_EXECUTABLE=/usr/local/bin/ctxlane \
+RUNMILL_CTXLANE_EXPECTED_PEER_CGROUP=0::/system.slice/ctxlane.service \
 RUNMILL_CTXLANE_CLIENT_REQUEST_ID=req_01ARZ3NDEKTSV4RRFFQ69G5FAV \
 RUNMILL_CTXLANE_PROFILE_UID=profile_01ARZ3NDEKTSV4RRFFQ69G5FAV \
 RUNMILL_CTXLANE_PROFILE_REF=codex:automation-production \
 RUNMILL_CTXLANE_ENVIRONMENT=production \
 RUNMILL_CTXLANE_ROLE=implementer \
+RUNMILL_CTXLANE_LIVE_REQUEST_FILE=/etc/runmill/asf/identity-lease-request.json \
 npm run verify:ctxlane-live
 ```
 
