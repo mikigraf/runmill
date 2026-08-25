@@ -318,6 +318,9 @@ describe("CtxlaneNativeSeqpacketAutomationClient", () => {
               "decoded = json.loads(request.decode('utf-8'))",
               "response = {'schema': 'ctxlane.live-fixture-response/v1', 'client_request_id': decoded['client_request_id']} ",
               "connection.send(json.dumps(response, separators=(',', ':')).encode('utf-8'))",
+              // Keep the peer alive until the native client has completed its
+              // post-response attestation and closed the connected socket.
+              "connection.recv(1)",
               "connection.close()",
               "server.close()",
             ].join("\n"),
