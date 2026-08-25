@@ -342,7 +342,7 @@ export function inspectAsfReferenceComposition(
     {
       id: "work-order-admission",
       value: safeValue(controls, "admission"),
-      methods: ["submit"],
+      methods: ["submit", "lookupSubmission"],
     },
     {
       id: "cancellation",
@@ -541,6 +541,9 @@ function referenceService(
   return Object.freeze({
     submitWorkOrder: (raw: unknown) => worker.submitWorkOrder(raw),
     getRun: (runId: string) => worker.getRun(runId),
+    lookupSubmission: (
+      input: Parameters<AsfWorkerService["lookupSubmission"]>[0],
+    ) => worker.lookupSubmission(input),
     listRunEvents: (runId: string, after?: number, limit?: number) =>
       worker.listRunEvents(runId, after, limit),
     getEvidence: (runId: string) => worker.getEvidence(runId),

@@ -1,0 +1,693 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.automation-readiness.v1.schema.json",
+  "title": "ctxlane automation readiness v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "profile_uid",
+    "profile_ref",
+    "provider",
+    "auth_mode",
+    "environment",
+    "role",
+    "ready",
+    "isolation",
+    "authentication_exception_acknowledged",
+    "isolation_exception_acknowledged",
+    "checked_at",
+    "valid_until",
+    "probe_cost",
+    "probe_timeout_milliseconds",
+    "probe_interactive",
+    "checks"
+  ],
+  "properties": {
+    "schema": { "const": "ctxlane.automation-readiness/v1" },
+    "profile_uid": {
+      "type": "string",
+      "pattern": "^profile_[0-7][0-9A-HJKMNP-TV-Z]{25}$(?![\\s\\S])"
+    },
+    "profile_ref": {
+      "type": "string",
+      "pattern": "^(claude|codex):[A-Za-z0-9][A-Za-z0-9_-]{0,63}$(?![\\s\\S])"
+    },
+    "provider": { "enum": ["claude", "codex"] },
+    "auth_mode": {
+      "enum": [
+        "wif",
+        "subscription-token",
+        "api-key",
+        "chatgpt-oauth",
+        "access-token"
+      ]
+    },
+    "environment": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@+-]*$(?![\\s\\S])"
+    },
+    "role": {
+      "enum": ["implementer", "local-reviewer", "pr-reviewer"]
+    },
+    "ready": { "type": "boolean" },
+    "isolation": {
+      "enum": [
+        "credential-isolated",
+        "per-lease-isolated",
+        "copied-credential-development",
+        "unproven"
+      ]
+    },
+    "authentication_exception_acknowledged": { "type": "boolean" },
+    "isolation_exception_acknowledged": { "type": "boolean" },
+    "checked_at": { "$ref": "#/$defs/utcTimestamp" },
+    "valid_until": { "$ref": "#/$defs/utcTimestamp" },
+    "probe_cost": {
+      "enum": ["none", "provider-request-possible", "provider-request-incurred"]
+    },
+    "probe_timeout_milliseconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 30000
+    },
+    "probe_interactive": { "const": false },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metadata-valid",
+        "credential-source-available",
+        "identity-token-current",
+        "harness-trusted",
+        "provider-principal-verified",
+        "expected-tenant-verified",
+        "automation-policy-permits",
+        "credential-isolation-proven"
+      ],
+      "properties": {
+        "metadata-valid": { "$ref": "#/$defs/metadataCheck" },
+        "credential-source-available": { "$ref": "#/$defs/credentialSourceCheck" },
+        "identity-token-current": { "$ref": "#/$defs/identityTokenCheck" },
+        "harness-trusted": { "$ref": "#/$defs/harnessCheck" },
+        "provider-principal-verified": { "$ref": "#/$defs/principalCheck" },
+        "expected-tenant-verified": { "$ref": "#/$defs/tenantCheck" },
+        "automation-policy-permits": { "$ref": "#/$defs/policyCheck" },
+        "credential-isolation-proven": { "$ref": "#/$defs/isolationCheck" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "provider": { "const": "claude" } } },
+      "then": {
+        "properties": {
+          "profile_ref": { "pattern": "^claude:" },
+          "auth_mode": {
+            "enum": ["wif", "subscription-token", "api-key"]
+          },
+          "checks": {
+            "properties": {
+              "expected-tenant-verified": {
+                "not": {
+                  "properties": {
+                    "reason_code": { "const": "workspace-mismatch" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "provider": { "const": "codex" } } },
+      "then": {
+        "properties": {
+          "profile_ref": { "pattern": "^codex:" },
+          "auth_mode": {
+            "enum": ["wif", "chatgpt-oauth", "api-key", "access-token"]
+          },
+          "checks": {
+            "properties": {
+              "expected-tenant-verified": {
+                "not": {
+                  "properties": {
+                    "reason_code": { "const": "organization-mismatch" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "auth_mode": { "const": "wif" },
+            "authentication_exception_acknowledged": { "const": false },
+            "checks": {
+              "properties": {
+                "identity-token-current": {
+                  "oneOf": [
+                    { "$ref": "#/$defs/passingCheck" },
+                    { "$ref": "#/$defs/staleIdentityTokenCheck" }
+                  ]
+                },
+                "automation-policy-permits": {
+                  "oneOf": [
+                    { "$ref": "#/$defs/passingCheck" },
+                    { "$ref": "#/$defs/policyDeniedCheck" }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "auth_mode": {
+              "enum": [
+                "subscription-token",
+                "api-key",
+                "chatgpt-oauth",
+                "access-token"
+              ]
+            },
+            "environment": { "const": "local-development" },
+            "authentication_exception_acknowledged": { "const": false },
+            "checks": {
+              "properties": {
+                "identity-token-current": {
+                  "$ref": "#/$defs/notApplicableCheck"
+                },
+                "automation-policy-permits": {
+                  "oneOf": [
+                    { "$ref": "#/$defs/passingCheck" },
+                    { "$ref": "#/$defs/policyDeniedCheck" }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "auth_mode": {
+              "enum": [
+                "subscription-token",
+                "api-key",
+                "chatgpt-oauth",
+                "access-token"
+              ]
+            },
+            "environment": { "not": { "const": "local-development" } },
+            "authentication_exception_acknowledged": { "const": false },
+            "checks": {
+              "properties": {
+                "identity-token-current": {
+                  "$ref": "#/$defs/notApplicableCheck"
+                },
+                "automation-policy-permits": {
+                  "oneOf": [
+                    { "$ref": "#/$defs/authenticationExceptionRequiredCheck" },
+                    { "$ref": "#/$defs/policyDeniedCheck" }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "auth_mode": {
+              "enum": [
+                "subscription-token",
+                "api-key",
+                "chatgpt-oauth",
+                "access-token"
+              ]
+            },
+            "environment": { "not": { "const": "local-development" } },
+            "authentication_exception_acknowledged": { "const": true },
+            "checks": {
+              "properties": {
+                "identity-token-current": {
+                  "$ref": "#/$defs/notApplicableCheck"
+                },
+                "automation-policy-permits": {
+                  "oneOf": [
+                    { "$ref": "#/$defs/authenticationExceptionAcknowledgedCheck" },
+                    { "$ref": "#/$defs/policyDeniedCheck" }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "isolation": {
+              "enum": ["credential-isolated", "per-lease-isolated"]
+            },
+            "isolation_exception_acknowledged": { "const": false },
+            "checks": {
+              "properties": {
+                "credential-isolation-proven": {
+                  "$ref": "#/$defs/passingCheck"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "isolation": { "const": "copied-credential-development" },
+            "isolation_exception_acknowledged": { "const": false },
+            "checks": {
+              "properties": {
+                "credential-isolation-proven": {
+                  "$ref": "#/$defs/isolationExceptionRequiredCheck"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "isolation": { "const": "copied-credential-development" },
+            "isolation_exception_acknowledged": { "const": true },
+            "checks": {
+              "properties": {
+                "credential-isolation-proven": {
+                  "$ref": "#/$defs/isolationExceptionAcknowledgedCheck"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "isolation": { "const": "unproven" },
+            "isolation_exception_acknowledged": { "const": false },
+            "checks": {
+              "properties": {
+                "credential-isolation-proven": {
+                  "$ref": "#/$defs/unprovenIsolationCheck"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "ready": { "const": true },
+            "checks": { "$ref": "#/$defs/readyChecks" }
+          }
+        },
+        {
+          "properties": {
+            "ready": { "const": false },
+            "checks": { "not": { "$ref": "#/$defs/readyChecks" } }
+          }
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": {
+          "ready": { "const": true },
+          "isolation": { "const": "copied-credential-development" }
+        }
+      },
+      "then": {
+        "anyOf": [
+          { "properties": { "environment": { "const": "local-development" } } },
+          { "properties": { "role": { "const": "pr-reviewer" } } }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "isolation": { "const": "copied-credential-development" },
+          "environment": { "not": { "const": "local-development" } },
+          "role": { "not": { "const": "pr-reviewer" } }
+        }
+      },
+      "then": {
+        "properties": {
+          "checks": {
+            "properties": {
+              "automation-policy-permits": {
+                "$ref": "#/$defs/policyDeniedCheck"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?!0000-)[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-5][0-9](\\.[0-9]{1,9})?Z$(?![\\s\\S])"
+    },
+    "readinessCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason_code"],
+      "properties": {
+        "status": {
+          "enum": ["pass", "warn", "fail", "unknown", "not-applicable"]
+        },
+        "reason_code": {
+          "oneOf": [
+            { "$ref": "#/$defs/readinessReasonCode" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "readinessReasonCode": {
+      "enum": [
+        "metadata-invalid",
+        "credential-source-unavailable",
+        "identity-token-stale",
+        "harness-untrusted",
+        "principal-unverified",
+        "principal-mismatch",
+        "expected-tenant-unverified",
+        "organization-mismatch",
+        "workspace-mismatch",
+        "automation-policy-denied",
+        "authentication-exception-required",
+        "authentication-exception-acknowledged",
+        "isolation-exception-required",
+        "isolation-exception-acknowledged",
+        "isolation-unproven",
+        "probe-not-run",
+        "probe-failed",
+        "unsupported-platform",
+        "not-applicable"
+      ]
+    },
+    "passingCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/readinessCheck" },
+        {
+          "properties": {
+            "status": { "const": "pass" },
+            "reason_code": { "type": "null" }
+          }
+        }
+      ]
+    },
+    "notApplicableCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/readinessCheck" },
+        {
+          "properties": {
+            "status": { "const": "not-applicable" },
+            "reason_code": { "const": "not-applicable" }
+          }
+        }
+      ]
+    },
+    "failedCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/readinessCheck" },
+        { "properties": { "status": { "const": "fail" } } }
+      ]
+    },
+    "unknownCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/readinessCheck" },
+        { "properties": { "status": { "const": "unknown" } } }
+      ]
+    },
+    "warningCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/readinessCheck" },
+        { "properties": { "status": { "const": "warn" } } }
+      ]
+    },
+    "metadataCheck": {
+      "oneOf": [
+        { "$ref": "#/$defs/passingCheck" },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/failedCheck" },
+            {
+              "properties": {
+                "reason_code": {
+                  "enum": ["metadata-invalid", "unsupported-platform"]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "credentialSourceCheck": {
+      "oneOf": [
+        { "$ref": "#/$defs/passingCheck" },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/failedCheck" },
+            {
+              "properties": {
+                "reason_code": { "const": "credential-source-unavailable" }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "staleIdentityTokenCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/failedCheck" },
+        { "properties": { "reason_code": { "const": "identity-token-stale" } } }
+      ]
+    },
+    "identityTokenCheck": {
+      "oneOf": [
+        { "$ref": "#/$defs/passingCheck" },
+        { "$ref": "#/$defs/staleIdentityTokenCheck" },
+        { "$ref": "#/$defs/notApplicableCheck" }
+      ]
+    },
+    "harnessCheck": {
+      "oneOf": [
+        { "$ref": "#/$defs/passingCheck" },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/failedCheck" },
+            {
+              "properties": {
+                "reason_code": {
+                  "enum": ["harness-untrusted", "unsupported-platform"]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "principalCheck": {
+      "oneOf": [
+        { "$ref": "#/$defs/passingCheck" },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/unknownCheck" },
+            {
+              "properties": {
+                "reason_code": {
+                  "enum": ["principal-unverified", "probe-not-run"]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/failedCheck" },
+            {
+              "properties": {
+                "reason_code": {
+                  "enum": ["principal-mismatch", "probe-failed"]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "tenantCheck": {
+      "oneOf": [
+        { "$ref": "#/$defs/passingCheck" },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/unknownCheck" },
+            {
+              "properties": {
+                "reason_code": {
+                  "enum": ["expected-tenant-unverified", "probe-not-run"]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/failedCheck" },
+            {
+              "properties": {
+                "reason_code": {
+                  "enum": [
+                    "organization-mismatch",
+                    "workspace-mismatch",
+                    "probe-failed"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "policyDeniedCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/failedCheck" },
+        { "properties": { "reason_code": { "const": "automation-policy-denied" } } }
+      ]
+    },
+    "authenticationExceptionRequiredCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/failedCheck" },
+        {
+          "properties": {
+            "reason_code": { "const": "authentication-exception-required" }
+          }
+        }
+      ]
+    },
+    "authenticationExceptionAcknowledgedCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/warningCheck" },
+        {
+          "properties": {
+            "reason_code": { "const": "authentication-exception-acknowledged" }
+          }
+        }
+      ]
+    },
+    "policyCheck": {
+      "oneOf": [
+        { "$ref": "#/$defs/passingCheck" },
+        { "$ref": "#/$defs/policyDeniedCheck" },
+        { "$ref": "#/$defs/authenticationExceptionRequiredCheck" },
+        { "$ref": "#/$defs/authenticationExceptionAcknowledgedCheck" }
+      ]
+    },
+    "isolationExceptionRequiredCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/failedCheck" },
+        {
+          "properties": {
+            "reason_code": { "const": "isolation-exception-required" }
+          }
+        }
+      ]
+    },
+    "isolationExceptionAcknowledgedCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/warningCheck" },
+        {
+          "properties": {
+            "reason_code": { "const": "isolation-exception-acknowledged" }
+          }
+        }
+      ]
+    },
+    "unprovenIsolationCheck": {
+      "allOf": [
+        { "$ref": "#/$defs/failedCheck" },
+        { "properties": { "reason_code": { "const": "isolation-unproven" } } }
+      ]
+    },
+    "isolationCheck": {
+      "oneOf": [
+        { "$ref": "#/$defs/passingCheck" },
+        { "$ref": "#/$defs/isolationExceptionRequiredCheck" },
+        { "$ref": "#/$defs/isolationExceptionAcknowledgedCheck" },
+        { "$ref": "#/$defs/unprovenIsolationCheck" }
+      ]
+    },
+    "commonReadyChecks": {
+      "type": "object",
+      "properties": {
+        "metadata-valid": { "$ref": "#/$defs/passingCheck" },
+        "credential-source-available": { "$ref": "#/$defs/passingCheck" },
+        "harness-trusted": { "$ref": "#/$defs/passingCheck" },
+        "provider-principal-verified": { "$ref": "#/$defs/passingCheck" },
+        "expected-tenant-verified": { "$ref": "#/$defs/passingCheck" }
+      }
+    },
+    "readyAuthenticationChecks": {
+      "type": "object",
+      "oneOf": [
+        {
+          "properties": {
+            "identity-token-current": { "$ref": "#/$defs/passingCheck" },
+            "automation-policy-permits": { "$ref": "#/$defs/passingCheck" }
+          }
+        },
+        {
+          "properties": {
+            "identity-token-current": { "$ref": "#/$defs/notApplicableCheck" },
+            "automation-policy-permits": { "$ref": "#/$defs/passingCheck" }
+          }
+        },
+        {
+          "properties": {
+            "identity-token-current": { "$ref": "#/$defs/notApplicableCheck" },
+            "automation-policy-permits": {
+              "$ref": "#/$defs/authenticationExceptionAcknowledgedCheck"
+            }
+          }
+        }
+      ]
+    },
+    "readyChecks": {
+      "allOf": [
+        { "$ref": "#/$defs/commonReadyChecks" },
+        { "$ref": "#/$defs/readyAuthenticationChecks" },
+        {
+          "type": "object",
+          "properties": {
+            "credential-isolation-proven": {
+              "oneOf": [
+                { "$ref": "#/$defs/passingCheck" },
+                { "$ref": "#/$defs/isolationExceptionAcknowledgedCheck" }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

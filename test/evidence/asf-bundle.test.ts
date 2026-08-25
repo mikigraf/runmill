@@ -18,6 +18,13 @@ import {
   type AsfEvidenceValidationFailure,
   type TrustedAsfEvidenceSigner,
 } from "../../src/evidence/asf-validator.js";
+import {
+  ASF_EVIDENCE_EXPECTATIONS_SCHEMA,
+  ASF_EVIDENCE_TRUST_SCHEMA,
+  parseAsfEvidenceExpectationsDocument,
+  parseAsfEvidenceTrustDocument,
+  verifyPortableAsfEvidenceBundle,
+} from "../../src/evidence/portable-verifier.js";
 import { FakeClock } from "../../src/testing/fake-clock.js";
 
 const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -394,6 +401,54 @@ function signed(
   });
 }
 
+function portableTrustDocument(): Record<string, unknown> {
+  return {
+    schema: ASF_EVIDENCE_TRUST_SCHEMA,
+    signers: [
+      {
+        key_id: KEY_ID,
+        public_key_pem: publicKey
+          .export({ type: "spki", format: "pem" })
+          .toString(),
+        valid_from: "2026-01-01T00:00:00Z",
+        valid_until: "2027-01-01T00:00:00Z",
+        revoked_at: null,
+      },
+    ],
+  };
+}
+
+function portableExpectationsDocument(): Record<string, unknown> {
+  const value = expected();
+  return {
+    schema: ASF_EVIDENCE_EXPECTATIONS_SCHEMA,
+    run_id: value.runId,
+    attempt_id: value.attemptId,
+    work_order_id: value.workOrderId,
+    work_order_envelope_digest: value.workOrderEnvelopeDigest,
+    work_order_payload_digest: value.workOrderPayloadDigest,
+    effective_policy_digest: value.effectivePolicyDigest,
+    forge: value.forge,
+    repository: value.repository,
+    base_ref: value.baseRef,
+    base_sha: value.baseSha,
+    candidate_sha: value.candidateSha,
+    tree_digest: value.treeDigest,
+    normalized_diff_digest: value.normalizedDiffDigest,
+    changed_paths: [...value.changedPaths],
+    required_local_check_ids: [...value.requiredLocalCheckIds],
+    required_ci_contexts: [...value.requiredCiContexts],
+    require_local_review: value.requireLocalReview,
+    require_pull_request_review: value.requirePullRequestReview,
+    pull_request: {
+      number: value.pullRequest.number,
+      url: value.pullRequest.url,
+      head_ref: value.pullRequest.headRef,
+      base_ref: value.pullRequest.baseRef,
+    },
+  };
+}
+
 function validate(
   raw: unknown,
   options: {
@@ -586,5 +641,50 @@ describe("signed portable ASF evidence", () => {
         resolver: { read: async () => Buffer.alloc(0) },
       }),
     ).rejects.toMatchObject({ failure: "missing-evidence" });
+  });
+
+  it("verifies a bundle from portable trust and authoritative-facts documents", async () => {
+    const result = await verifyPortableAsfEvidenceBundle({
+      bundle: signed(),
+      trust: portableTrustDocument(),
+      expectations: portableExpectationsDocument(),
+      clock: new FakeClock("2026-08-21T10:21:00Z"),
+      artifactResolver: {
+        async read(input) {
+          const content = ARTIFACT_CONTENT.get(input.expectedDigest);
+          if (content === undefined) throw new Error("missing test artifact");
+          return Buffer.from(content, "utf8");
+        },
+      },
+    });
+
+    expect(result.kind).toBe("delivery");
+    if (result.kind !== "delivery") throw new Error("unexpected terminal bundle");
+    expect(result.validated.signer).toEqual({
+      keyId: KEY_ID,
+      algorithm: "EdDSA",
+      verified: true,
+    });
+    expect(result.artifacts?.artifacts.verified).toBe(true);
+    expect(result.artifacts?.artifacts.count).toBe(
+      result.validated.bundle.statement.predicate.artifacts.length,
+    );
+  });
+
+  it("rejects contradictory portable trust metadata before touching a bundle", () => {
+    const trust = portableTrustDocument();
+    trust.signers = [
+      ...(trust.signers as unknown[]),
+      ...(trust.signers as unknown[]),
+    ];
+    expect(() => parseAsfEvidenceTrustDocument(trust)).toThrow(
+      /duplicate key ids/u,
+    );
+    expect(() =>
+      parseAsfEvidenceExpectationsDocument({
+        ...portableExpectationsDocument(),
+        unexpected: true,
+      }),
+    ).toThrow(/unexpected/u);
   });
 });

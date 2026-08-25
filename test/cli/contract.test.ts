@@ -182,7 +182,25 @@ describe("CLI surface", () => {
     expect(optionNames(program, "mcp serve").has("--stdio")).toBe(true);
     expect(COMMANDS.has("service start")).toBe(true);
     expect(optionNames(program, "service start").has("--mode")).toBe(true);
+    expect(optionNames(program, "service start").has("--config")).toBe(true);
     expect(optionNames(program, "service start").has("--runtime-module")).toBe(
+      true,
+    );
+    expect(optionNames(program, "service start").has("--observation")).toBe(true);
+    expect(optionNames(program, "service start").has("--observation-key")).toBe(
+      true,
+    );
+    expect(optionNames(program, "service start").has("--observation-key-id")).toBe(
+      true,
+    );
+    expect(optionNames(program, "service doctor").has("--config")).toBe(true);
+    expect(optionNames(program, "service doctor").has("--observation")).toBe(
+      true,
+    );
+    expect(optionNames(program, "service doctor").has("--observation-key")).toBe(
+      true,
+    );
+    expect(optionNames(program, "service doctor").has("--observation-key-id")).toBe(
       true,
     );
   });
@@ -403,6 +421,7 @@ describe("documentation", () => {
   });
 
   const ASF_ONLY_COMMANDS = new Set([
+    "service doctor",
     "service start",
     "service status",
     "service stop",

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.service-health.v1.schema.json",
+  "title": "ctxlane service health v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "process_liveness",
+    "store_available",
+    "recovery_complete",
+    "controller_channel_ready",
+    "policy_trust_root_valid",
+    "profile_readiness",
+    "harness_ready",
+    "capacity_available",
+    "audit_export_healthy",
+    "ready"
+  ],
+  "properties": {
+    "schema": { "const": "ctxlane.service-health/v1" },
+    "process_liveness": { "type": "boolean" },
+    "store_available": { "type": "boolean" },
+    "recovery_complete": { "type": "boolean" },
+    "controller_channel_ready": { "type": "boolean" },
+    "policy_trust_root_valid": { "type": "boolean" },
+    "profile_readiness": { "type": "boolean" },
+    "harness_ready": { "type": "boolean" },
+    "capacity_available": { "type": "boolean" },
+    "audit_export_healthy": { "type": "boolean" },
+    "ready": { "type": "boolean" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "ready": { "const": true } } },
+      "then": {
+        "properties": {
+          "process_liveness": { "const": true },
+          "store_available": { "const": true },
+          "recovery_complete": { "const": true },
+          "controller_channel_ready": { "const": true },
+          "policy_trust_root_valid": { "const": true },
+          "profile_readiness": { "const": true },
+          "harness_ready": { "const": true },
+          "capacity_available": { "const": true },
+          "audit_export_healthy": { "const": true }
+        }
+      }
+    }
+  ]
+}

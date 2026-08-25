@@ -1,26 +1,35 @@
+import { createPublicKey, type KeyObject } from "node:crypto";
 import {
   closeSync,
   constants,
   fstatSync,
   lstatSync,
   openSync,
+  readFileSync,
   realpathSync,
   type Stats,
 } from "node:fs";
 import { dirname, extname, isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
 import { asfDaemonRuntimePaths, type RuntimePaths } from "../daemon/control.js";
+import { SystemClock } from "../platform/clock.js";
 import {
   AsfWorkerHost,
   AsfWorkerHostReadinessError,
+  verifyAsfWorkerReadinessBinding,
+  type AsfWorkerReadinessBinding,
   type AsfWorkerHostOptions,
   type AsfWorkerHostService,
 } from "./worker-host.js";
+import {
+  parseProductionModeConfig,
+} from "./production-readiness.js";
 
 export const ASF_WORKER_RUNTIME_MODULE_ENV = "RUNMILL_ASF_RUNTIME_MODULE" as const;
 
 const MAX_RUNTIME_PATH_BYTES = 4_096;
 const MAX_RUNTIME_MODULE_BYTES = 1024 * 1024;
+const MAX_READINESS_DOCUMENT_BYTES = 4 * 1024 * 1024;
 const FACTORY_EXPORT = "createAsfWorkerHostOptions";
 const ALLOWED_MODULE_EXTENSIONS: ReadonlySet<string> = new Set([".js", ".mjs", ".cjs", ".ts"]);
 const HOST_OPTION_KEYS: ReadonlySet<string> = new Set([
@@ -37,6 +46,7 @@ const HOST_OPTION_KEYS: ReadonlySet<string> = new Set([
 const REQUIRED_SERVICE_METHODS = [
   "submitWorkOrder",
   "getRun",
+  "lookupSubmission",
   "listRunEvents",
   "getEvidence",
   "requestCancellation",
@@ -52,11 +62,25 @@ export interface AsfWorkerRuntimeFactoryContext {
   readonly mode: "asf-worker";
   readonly startedAt: string;
   readonly runtimePaths: RuntimePaths;
+  /**
+   * The operator's declarative production-mode document, when the explicit
+   * `service start --config` handoff is used.  This is a path only: the
+   * trusted composition owns parsing and must bind its host options to this
+   * exact path.  Omitting it preserves the advanced runtime-module API.
+   */
+  readonly productionConfigPath?: string | undefined;
 }
 
 export interface StartAsfWorkerFromRuntimeOptions {
   readonly mode: "asf-worker";
   readonly runtimeModulePath?: string | undefined;
+  /** Explicit operator configuration passed by `service start --config`. */
+  readonly productionConfigPath?: string | undefined;
+  /** Signed live-readiness observation consumed independently of the module. */
+  readonly readinessObservationPath?: string | undefined;
+  /** Pinned Ed25519 evaluator key used by the process-owned readiness gate. */
+  readonly readinessEvaluatorKeyPath?: string | undefined;
+  readonly readinessEvaluatorKeyId?: string | undefined;
   readonly env?: NodeJS.ProcessEnv | undefined;
   /** Supplied by the trusted caller's injected clock. */
   readonly startedAt: string;
@@ -216,6 +240,145 @@ function validAbsolutePath(value: unknown): value is string {
   );
 }
 
+interface TrustedReadFile {
+  readonly descriptor: number;
+  readonly identity: Stats;
+}
+
+/**
+ * Open an operator-owned input only after checking the complete path and then
+ * re-checking the opened inode. Readiness, configuration, and evaluator-key
+ * files are authority inputs; a merely non-symlink final component is not
+ * sufficient when an ancestor or hard link can be replaced by another user.
+ */
+function openTrustedReadFile(path: string): TrustedReadFile {
+  if (typeof process.getuid !== "function") {
+    throw new Error("owner identity is unavailable on this platform");
+  }
+  const currentUid = process.getuid();
+  const requested = lstatSync(path);
+  if (
+    !requested.isFile() ||
+    requested.isSymbolicLink() ||
+    requested.nlink !== 1 ||
+    (requested.uid !== 0 && requested.uid !== currentUid) ||
+    (requested.mode & 0o022) !== 0
+  ) {
+    throw new Error("file ownership or mode is unsafe");
+  }
+  const canonicalPath = realpathSync(path);
+  const canonicalEntry = lstatSync(canonicalPath);
+  const parent = lstatSync(dirname(canonicalPath));
+  if (
+    !canonicalEntry.isFile() ||
+    canonicalEntry.isSymbolicLink() ||
+    canonicalEntry.nlink !== 1 ||
+    (canonicalEntry.uid !== 0 && canonicalEntry.uid !== currentUid) ||
+    (canonicalEntry.mode & 0o022) !== 0 ||
+    !parent.isDirectory() ||
+    parent.isSymbolicLink() ||
+    (parent.uid !== 0 && parent.uid !== currentUid) ||
+    (parent.mode & 0o022) !== 0 ||
+    !sameFile(requested, canonicalEntry)
+  ) {
+    throw new Error("file path or parent ownership is unsafe");
+  }
+
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const identity = fstatSync(descriptor);
+    if (
+      !identity.isFile() ||
+      identity.nlink !== 1 ||
+      (identity.uid !== 0 && identity.uid !== currentUid) ||
+      (identity.mode & 0o022) !== 0 ||
+      !sameFile(identity, requested) ||
+      !sameFile(identity, canonicalEntry)
+    ) {
+      throw new Error("file changed during secure open");
+    }
+    return { descriptor, identity };
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    throw error;
+  }
+}
+
+function readBoundedJsonDocument(path: string, label: string): unknown {
+  let descriptor: number | undefined;
+  try {
+    ({ descriptor } = openTrustedReadFile(path));
+    const bytes = readFileSync(descriptor);
+    if (bytes.byteLength > MAX_READINESS_DOCUMENT_BYTES) {
+      throw new Error("file exceeds the 4 MiB readiness limit");
+    }
+    try {
+      return JSON.parse(bytes.toString("utf8")) as unknown;
+    } catch {
+      throw new Error("contains invalid JSON");
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unavailable";
+    return refuse(`${label}-invalid: ${detail}`);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function readTrustedEd25519PublicKey(path: string): KeyObject {
+  let descriptor: number | undefined;
+  try {
+    ({ descriptor } = openTrustedReadFile(path));
+    const bytes = readFileSync(descriptor);
+    if (bytes.byteLength === 0 || bytes.byteLength > MAX_READINESS_DOCUMENT_BYTES) {
+      throw new Error("file is empty or exceeds the 4 MiB readiness limit");
+    }
+    const key = createPublicKey(bytes);
+    if (key.type !== "public" || key.asymmetricKeyType !== "ed25519") {
+      throw new Error("key is not a public Ed25519 key");
+    }
+    return key;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unavailable";
+    return refuse(`readiness-evaluator-key-invalid: ${detail}`);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function loadReadinessBinding(
+  productionConfigPath: string,
+  observationPath: string | undefined,
+  evaluatorKeyPath: string | undefined,
+  evaluatorKeyId: string | undefined,
+): AsfWorkerReadinessBinding {
+  if (
+    observationPath === undefined ||
+    evaluatorKeyPath === undefined ||
+    evaluatorKeyId === undefined ||
+    !validAbsolutePath(observationPath) ||
+    !validAbsolutePath(evaluatorKeyPath) ||
+    evaluatorKeyId.trim() === ""
+  ) {
+    return refuse("runtime-readiness-attestation-required");
+  }
+  const config = parseProductionModeConfig(
+    readBoundedJsonDocument(productionConfigPath, "production-config"),
+  );
+  if (config.mode !== "asf-worker") {
+    return refuse("production-config-must-be-asf-worker");
+  }
+  const publicKey = readTrustedEd25519PublicKey(evaluatorKeyPath);
+  return {
+    readSignedObservation: () => readBoundedJsonDocument(observationPath, "readiness-observation"),
+    evaluatorKeyId,
+    evaluatorPublicKey: publicKey,
+    productionConfig: config,
+    clock: new SystemClock(),
+  };
+}
+
 function pathsMatch(left: RuntimePaths, right: RuntimePaths): boolean {
   return (
     left.directory === right.directory &&
@@ -262,6 +425,8 @@ function assertFactoryOptions(
     options["startedAt"] !== context.startedAt ||
     !validAbsolutePath(options["repoRoot"]) ||
     !validAbsolutePath(options["configPath"]) ||
+    (context.productionConfigPath !== undefined &&
+      options["configPath"] !== context.productionConfigPath) ||
     service === undefined ||
     REQUIRED_SERVICE_METHODS.some((method) => typeof service[method] !== "function") ||
     authentication === undefined ||
@@ -349,14 +514,40 @@ export async function startAsfWorkerFromRuntime(
   }
   const runtimePaths = asfDaemonRuntimePaths(env);
   if (!validRuntimePaths(runtimePaths)) return refuse("runtime-control-path-invalid");
+  const productionConfigPath = input.productionConfigPath;
+  if (
+    productionConfigPath !== undefined &&
+    !validAbsolutePath(productionConfigPath)
+  ) {
+    return refuse("production-config-path-invalid");
+  }
+  const readinessBinding =
+    productionConfigPath === undefined
+      ? undefined
+      : loadReadinessBinding(
+          productionConfigPath,
+          input.readinessObservationPath,
+          input.readinessEvaluatorKeyPath,
+          input.readinessEvaluatorKeyId,
+        );
+  if (readinessBinding !== undefined) {
+    // Refuse before importing operator code when the process-owned
+    // attestation is malformed, stale, or not ready. Host startup repeats the
+    // check after the module handoff and before every authority-bearing gate.
+    await verifyAsfWorkerReadinessBinding(readinessBinding);
+  }
   const context: AsfWorkerRuntimeFactoryContext = Object.freeze({
     mode: "asf-worker",
     startedAt,
     runtimePaths: Object.freeze(runtimePaths),
+    ...(productionConfigPath === undefined ? {} : { productionConfigPath }),
   });
   const options = await loadFactoryOptions(path, context);
   try {
-    return await AsfWorkerHost.start(options);
+    return await AsfWorkerHost.start({
+      ...options,
+      ...(readinessBinding === undefined ? {} : { readinessBinding }),
+    });
   } catch (error) {
     if (error instanceof AsfWorkerHostReadinessError) throw error;
     return refuse("host-start-failed");

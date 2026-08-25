@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { createPublicKey, KeyObject } from "node:crypto";
 import {
   closeSync,
+  constants,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -82,6 +85,8 @@ import packageJson from "../../package.json" with { type: "json" };
 
 const VERSION = packageJson.version;
 
+const MAX_PRODUCTION_READINESS_DOCUMENT_BYTES = 4 * 1024 * 1024;
+
 /** Documented, stable exit codes so runmill is scriptable. */
 export const EXIT = {
   ok: 0,
@@ -118,6 +123,66 @@ function emit(opts: GlobalOpts, human: string, data: unknown): void {
     process.stdout.write(`${JSON.stringify(data, null, 2)}\n`);
   } else if (opts.quiet !== true) {
     process.stdout.write(`${human}\n`);
+  }
+}
+
+/**
+ * Read a non-secret, operator-provided JSON document without allowing a
+ * diagnostic command to follow a changing or non-regular filesystem object.
+ * Explicit readiness and evidence commands never open the Runmill state store,
+ * sockets, credentials, or runtime module; they only parse bounded documents
+ * named by the caller.
+ */
+function readBoundedJsonDocument(path: string, label: string): unknown {
+  const resolved = resolve(path);
+  let descriptor: number | undefined;
+  try {
+    const metadata = lstatSync(resolved);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error("not a regular file");
+    }
+    descriptor = openSync(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const bytes = readFileSync(descriptor);
+    if (bytes.byteLength > MAX_PRODUCTION_READINESS_DOCUMENT_BYTES) {
+      throw new Error("file exceeds the 4 MiB diagnostic limit");
+    }
+    try {
+      return JSON.parse(bytes.toString("utf8")) as unknown;
+    } catch {
+      throw new Error("contains invalid JSON");
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unavailable";
+    throw new Error(`${label} document is unavailable or invalid: ${detail}`);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+/** Read an explicitly trusted public key without following a changing path. */
+function readBoundedEd25519PublicKey(path: string, label: string): KeyObject {
+  const resolved = resolve(path);
+  let descriptor: number | undefined;
+  try {
+    const metadata = lstatSync(resolved);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error("not a regular file");
+    }
+    descriptor = openSync(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const bytes = readFileSync(descriptor);
+    if (bytes.byteLength === 0 || bytes.byteLength > MAX_PRODUCTION_READINESS_DOCUMENT_BYTES) {
+      throw new Error("file is empty or exceeds the 4 MiB diagnostic limit");
+    }
+    const key = createPublicKey(bytes);
+    if (key.type !== "public" || key.asymmetricKeyType !== "ed25519") {
+      throw new Error("key is not a public Ed25519 key");
+    }
+    return key;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unavailable";
+    throw new Error(`${label} is unavailable or invalid: ${detail}`);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
   }
 }
 
@@ -414,7 +479,8 @@ export function buildProgram(): Command {
     if (
       ["demo", "status", "stop", "tui"].includes(actionCommand.name()) ||
       (actionCommand.name() === "serve" && actionCommand.parent?.name() === "mcp") ||
-      actionCommand.parent?.name() === "service"
+      actionCommand.parent?.name() === "service" ||
+      actionCommand.parent?.name() === "evidence"
     )
       return;
     recordMilestone(dataDir(), "installed_at", new Date());
@@ -888,15 +954,78 @@ export function buildProgram(): Command {
     .description("Start a production-gated ASF worker in the foreground")
     .requiredOption("--mode <mode>", "must be the explicit mode `asf-worker`")
     .option(
+      "--config <path>",
+      "validated declarative ASF production-mode document",
+    )
+    .option(
       "--runtime-module <absolute-path>",
       "trusted deployment composition (or set RUNMILL_ASF_RUNTIME_MODULE)",
     )
+    .option(
+      "--observation <path>",
+      "signed live-readiness observation used by the process-owned startup gate",
+    )
+    .option(
+      "--observation-key <path>",
+      "trusted public Ed25519 evaluator key used by the startup gate",
+    )
+    .option(
+      "--observation-key-id <id>",
+      "expected evaluator key id in the signed observation envelope",
+    )
     .action(
-      async (cmdOpts: { mode: string; runtimeModule?: string | undefined }) => {
+      async (cmdOpts: {
+        mode: string;
+        config?: string | undefined;
+        runtimeModule?: string | undefined;
+        observation?: string | undefined;
+        observationKey?: string | undefined;
+        observationKeyId?: string | undefined;
+      }) => {
         const opts = program.opts<GlobalOpts>();
         try {
           if (cmdOpts.mode !== "asf-worker") {
             throw new Error("runmill service start requires --mode asf-worker");
+          }
+          // The declarative document is a policy handoff, not a source of
+          // executable dependencies. Validate it before importing any module
+          // and require the trusted composition to bind its host options to
+          // the same exact path. A complete first-party composition is still
+          // intentionally unavailable, so a module remains mandatory.
+          const productionConfigPath = cmdOpts.config ?? opts.config;
+          const resolvedProductionConfigPath =
+            productionConfigPath === undefined
+              ? undefined
+              : resolve(productionConfigPath);
+          if (resolvedProductionConfigPath !== undefined) {
+            const { parseProductionModeConfig } = await import(
+              "../asf/production-readiness.js"
+            );
+            const config = parseProductionModeConfig(
+              readBoundedJsonDocument(
+                resolvedProductionConfigPath,
+                "production-mode configuration",
+              ),
+            );
+            if (config.mode !== "asf-worker") {
+              throw new Error(
+                "runmill service start --config requires mode asf-worker",
+              );
+            }
+          }
+          const readinessObservationPath =
+            cmdOpts.observation === undefined ? undefined : resolve(cmdOpts.observation);
+          const readinessEvaluatorKeyPath =
+            cmdOpts.observationKey === undefined ? undefined : resolve(cmdOpts.observationKey);
+          if (
+            resolvedProductionConfigPath === undefined &&
+            (readinessObservationPath !== undefined ||
+              readinessEvaluatorKeyPath !== undefined ||
+              cmdOpts.observationKeyId !== undefined)
+          ) {
+            throw new Error(
+              "runmill service start readiness options require --config",
+            );
           }
           // This import is intentionally confined to the explicit ASF command.
           // Standalone start/daemon/demo/run paths never load the worker host or
@@ -908,9 +1037,21 @@ export function buildProgram(): Command {
           const host = await startAsfWorkerFromRuntime({
             mode: "asf-worker",
             startedAt,
+            ...(resolvedProductionConfigPath === undefined
+              ? {}
+              : { productionConfigPath: resolvedProductionConfigPath }),
             ...(cmdOpts.runtimeModule === undefined
               ? {}
               : { runtimeModulePath: cmdOpts.runtimeModule }),
+            ...(readinessObservationPath === undefined
+              ? {}
+              : { readinessObservationPath }),
+            ...(readinessEvaluatorKeyPath === undefined
+              ? {}
+              : { readinessEvaluatorKeyPath }),
+            ...(cmdOpts.observationKeyId === undefined
+              ? {}
+              : { readinessEvaluatorKeyId: cmdOpts.observationKeyId }),
           });
           const requestStop = (): void => {
             // waitUntilStopped owns reporting the same failure below.
@@ -936,6 +1077,127 @@ export function buildProgram(): Command {
         }
       },
     );
+
+  serviceCommand
+    .command("doctor")
+    .description("Evaluate an explicit ASF production-readiness configuration and observation")
+    .option(
+      "--observation <path>",
+      "signed JSON live-readiness observation envelope; required for ASF production readiness",
+    )
+    .option(
+      "--observation-key <path>",
+      "trusted public Ed25519 evaluator key in PEM/DER form; required with --observation",
+    )
+    .option(
+      "--observation-key-id <id>",
+      "expected evaluator key id in the signed observation envelope; required with --observation",
+    )
+    .action(async (cmdOpts: {
+      observation?: string | undefined;
+      observationKey?: string | undefined;
+      observationKeyId?: string | undefined;
+    }) => {
+      const opts = program.opts<GlobalOpts>();
+      try {
+        // Keep the evaluator behind the explicit ASF service surface. The
+        // ordinary standalone CLI never imports or reads these documents.
+        const { evaluateProductionReadiness, parseProductionModeConfig } = await import(
+          "../asf/production-readiness.js",
+        );
+        const { verifySignedAsfReadinessObservation } = await import(
+          "../asf/readiness-attestation.js",
+        );
+        const { inspectAsfFirstPartyComposition } = await import(
+          "../asf/first-party-composition.js"
+        );
+        const configPath = opts.config;
+        if (configPath === undefined) {
+          throw new Error(
+            "runmill service doctor requires the global --config <path> option",
+          );
+        }
+        const configDocument = readBoundedJsonDocument(
+          configPath,
+          "production-mode configuration",
+        );
+        const config = parseProductionModeConfig(configDocument);
+        let observation: unknown;
+        let observationAttestation: {
+          readonly schema: string;
+          readonly key_id: string;
+          readonly observation_digest: string;
+        } | null = null;
+        if (cmdOpts.observation !== undefined) {
+          if (
+            cmdOpts.observationKey === undefined ||
+            cmdOpts.observationKeyId === undefined
+          ) {
+            throw new Error(
+              "runmill service doctor requires --observation-key and --observation-key-id with --observation",
+            );
+          }
+          const signed = verifySignedAsfReadinessObservation(
+            readBoundedJsonDocument(
+              cmdOpts.observation,
+              "production-readiness observation",
+            ),
+            {
+              keyId: cmdOpts.observationKeyId,
+              publicKey: readBoundedEd25519PublicKey(
+                cmdOpts.observationKey,
+                "production-readiness evaluator key",
+              ),
+            },
+          );
+          observation = signed.observation;
+          observationAttestation = {
+            schema: signed.schema,
+            key_id: signed.key_id,
+            observation_digest: signed.observation_digest,
+          };
+        } else if (
+          cmdOpts.observationKey !== undefined ||
+          cmdOpts.observationKeyId !== undefined
+        ) {
+          throw new Error(
+            "runmill service doctor accepts observation key options only with --observation",
+          );
+        }
+        const report = evaluateProductionReadiness(
+          config,
+          observation,
+          new SystemClock(),
+        );
+        const failed = report.checks
+          .filter((check) => !check.passed)
+          .map((check) => check.id);
+        const human =
+          report.decision === "ready"
+            ? `${report.mode} readiness is ready.`
+            : report.decision === "development-only"
+              ? `${report.mode} is development-only; production readiness is not asserted.`
+              : `${report.mode} readiness is refused.${
+                  failed.length === 0 ? "" : ` Failed checks: ${failed.join(", ")}.`
+                }`;
+        // Diagnostic-only: the first-party composition manifest never feeds
+        // readyToStart/decision. It surfaces the fail-closed gap so operators
+        // can see it without it affecting the doctor's readiness verdict.
+        const firstPartyComposition =
+          report.mode === "asf-worker" ? inspectAsfFirstPartyComposition() : null;
+        emit(opts, human, {
+          ...report,
+          configPath: resolve(configPath),
+          observationPath:
+            cmdOpts.observation === undefined ? null : resolve(cmdOpts.observation),
+          observationAttestation,
+          firstPartyComposition,
+        });
+        process.exitCode = report.decision === "refuse" ? EXIT.blocked : EXIT.ok;
+      } catch (err) {
+        fail(err, opts);
+      }
+    });
 
   serviceCommand
     .command("status")
@@ -1016,6 +1278,111 @@ export function buildProgram(): Command {
         fail(err, opts);
       }
     });
+
+  const evidenceCommand = program
+    .command("evidence")
+    .description("Verify portable signed delivery evidence without opening Runmill state");
+
+  evidenceCommand
+    .command("verify <bundle>")
+    .description("Independently verify a signed evidence bundle against trusted facts")
+    .requiredOption("--trust <path>", "trusted Ed25519 signer document")
+    .requiredOption(
+      "--expectations <path>",
+      "authoritative candidate and delivery expectations document",
+    )
+    .option(
+      "--artifacts-dir <absolute-path>",
+      "optional flat CAS directory; re-hash every referenced artifact body",
+    )
+    .action(
+      async (
+        bundlePath: string,
+        cmdOpts: {
+          trust: string;
+          expectations: string;
+          artifactsDir?: string | undefined;
+        },
+      ) => {
+        const opts = program.opts<GlobalOpts>();
+        try {
+          // This is deliberately a portable, state-free command. A verifier
+          // must be usable on an evidence handoff host that has no Runmill DB,
+          // control socket, provider credentials, or live repository access.
+          const { verifyPortableAsfEvidenceBundle, createFilesystemAsfEvidenceArtifactResolver } =
+            await import("../evidence/portable-verifier.js");
+          const bundle = readBoundedJsonDocument(bundlePath, "evidence bundle");
+          const trust = readBoundedJsonDocument(cmdOpts.trust, "evidence trust");
+          const expectations = readBoundedJsonDocument(
+            cmdOpts.expectations,
+            "evidence expectations",
+          );
+          const result = await verifyPortableAsfEvidenceBundle({
+            bundle,
+            trust,
+            expectations,
+            ...(cmdOpts.artifactsDir === undefined
+              ? {}
+              : {
+                  artifactResolver: createFilesystemAsfEvidenceArtifactResolver(
+                    cmdOpts.artifactsDir,
+                  ),
+                }),
+          });
+          const artifacts =
+            result.artifacts === null
+              ? null
+              : {
+                  verified: true,
+                  count: result.artifacts.artifacts.count,
+                  totalBytes: result.artifacts.artifacts.totalBytes,
+                  manifestDigest: result.artifacts.artifacts.manifestDigest,
+                };
+          emit(
+            opts,
+            `Evidence bundle ${result.validated.bundleDigest} verified` +
+              (artifacts === null ? "." : " with artifact contents."),
+            {
+              schema: "runmill.asf-evidence-verification-report/v1",
+              verified: true,
+              verificationLevel:
+                artifacts === null ? "statement-and-signature" : "artifact-contents",
+              bundleDigest: result.validated.bundleDigest,
+              candidateSha: result.validated.candidateSha,
+              signer: result.validated.signer,
+              artifacts,
+              bundlePath: resolve(bundlePath),
+              trustPath: resolve(cmdOpts.trust),
+              expectationsPath: resolve(cmdOpts.expectations),
+              artifactsDirectory:
+                cmdOpts.artifactsDir === undefined
+                  ? null
+                  : resolve(cmdOpts.artifactsDir),
+            },
+          );
+          process.exitCode = EXIT.ok;
+        } catch (err) {
+          const { isAsfEvidenceValidationError } = await import(
+            "../evidence/portable-verifier.js",
+          );
+          if (isAsfEvidenceValidationError(err)) {
+            emit(
+              opts,
+              `Evidence verification refused (${err.failure}).`,
+              {
+                schema: "runmill.asf-evidence-verification-report/v1",
+                verified: false,
+                failure: err.failure,
+                reason: err.message,
+              },
+            );
+            process.exitCode = EXIT.blocked;
+            return;
+          }
+          fail(err, opts);
+        }
+      },
+    );
 
   program
     .command("daemon")

@@ -653,6 +653,18 @@ function daemon(calls: AsfControlRequest[]): AsfDaemonControlClient {
         };
       case "asf.get_run":
         return { run: runRow(request.runId), admission: admission(), latestSequence: 12 };
+      case "asf.lookup_submission":
+        return {
+          disposition: "found",
+          run: runRow(),
+          admission: {
+            ...admission(),
+            idempotencyKey: request.idempotencyKey,
+            payloadDigest: request.payloadDigest,
+            envelopeDigest: request.envelopeDigest,
+          },
+          latestSequence: 12,
+        };
       case "asf.list_run_events":
         {
           const after = request.after ?? 0;
@@ -769,7 +781,7 @@ async function expectInvalidServiceResponse(input: {
 }
 
 describe("AsfMcpServer protocol", () => {
-  it("negotiates the pinned MCP revision and advertises only the nine bounded tools", async () => {
+  it("negotiates the pinned MCP revision and advertises only the ten bounded tools", async () => {
     const calls: AsfControlRequest[] = [];
     const server = new AsfMcpServer({ controlClient: daemon(calls) });
     await ready(server);
@@ -778,6 +790,7 @@ describe("AsfMcpServer protocol", () => {
     expect(result.tools.map((tool: { name: string }) => tool.name)).toEqual([
       "runmill_submit_work_order",
       "runmill_get_run",
+      "runmill_lookup_submission",
       "runmill_list_run_events",
       "runmill_get_evidence",
       "runmill_request_cancel",
@@ -853,9 +866,32 @@ describe("AsfMcpServer protocol", () => {
     });
     expect(snapshot.structuredContent).not.toHaveProperty("ownerId");
 
+    const recovered = rpcResult(
+      await server.handleMessage(
+        request(4, "tools/call", {
+          name: "runmill_lookup_submission",
+          arguments: {
+            idempotency_key: "tenant-1/ENG-1/attempt-1",
+            payload_digest: DIGEST_A,
+            envelope_digest: DIGEST_B,
+          },
+        }),
+      ),
+    );
+    expect(recovered.structuredContent).toMatchObject({
+      disposition: "found",
+      run: { run_id: "run-1", admission: { idempotency_key: "tenant-1/ENG-1/attempt-1" } },
+    });
+
     expect(calls).toEqual([
       { type: "asf.submit_work_order", envelope: envelope() },
       { type: "asf.get_run", runId: "run-1" },
+      {
+        type: "asf.lookup_submission",
+        idempotencyKey: "tenant-1/ENG-1/attempt-1",
+        payloadDigest: DIGEST_A,
+        envelopeDigest: DIGEST_B,
+      },
     ]);
   });
 
@@ -922,6 +958,40 @@ describe("AsfMcpServer protocol", () => {
       { type: "asf.health" },
     ]);
     expect(JSON.stringify(toolCalls)).not.toMatch(/merge_now|arbitrary_command|token/iu);
+  });
+
+  it("keeps an idempotency or digest mismatch indistinguishable from an unknown submission", async () => {
+    const calls: AsfControlRequest[] = [];
+    const server = new AsfMcpServer({
+      controlClient: async (request) => {
+        calls.push(request);
+        return { disposition: "not-found" };
+      },
+    });
+    await ready(server);
+
+    const result = rpcResult(
+      await server.handleMessage(
+        request(2, "tools/call", {
+          name: "runmill_lookup_submission",
+          arguments: {
+            idempotency_key: "tenant-1/ENG-1/attempt-1",
+            payload_digest: DIGEST_A,
+            envelope_digest: DIGEST_B,
+          },
+        }),
+      ),
+    );
+    expect(result.structuredContent).toEqual({ disposition: "not-found" });
+    expect(JSON.stringify(result)).not.toContain("run-1");
+    expect(calls).toEqual([
+      {
+        type: "asf.lookup_submission",
+        idempotencyKey: "tenant-1/ENG-1/attempt-1",
+        payloadDigest: DIGEST_A,
+        envelopeDigest: DIGEST_B,
+      },
+    ]);
   });
 
   it("keeps numeric control cursors behind opaque, run-bound MCP cursors", async () => {
@@ -994,7 +1064,7 @@ describe("AsfMcpServer protocol", () => {
     expect(calls).toEqual([]);
   });
 
-  it("rejects every unadvertised authority and extra fields on all nine tools", async () => {
+  it("rejects every unadvertised authority and extra fields on all ten tools", async () => {
     const calls: AsfControlRequest[] = [];
     const server = new AsfMcpServer({ controlClient: daemon(calls) });
     await ready(server);
@@ -1019,6 +1089,14 @@ describe("AsfMcpServer protocol", () => {
     const strictCalls = [
       ["runmill_submit_work_order", { envelope: envelope() }],
       ["runmill_get_run", { run_id: "run-1" }],
+      [
+        "runmill_lookup_submission",
+        {
+          idempotency_key: "tenant-acme/ENG-123/attempt_01",
+          payload_digest: DIGEST_A,
+          envelope_digest: DIGEST_B,
+        },
+      ],
       ["runmill_list_run_events", { run_id: "run-1" }],
       ["runmill_get_evidence", { run_id: "run-1" }],
       ["runmill_request_cancel", { request: cancellationRequest() }],
@@ -1997,6 +2075,30 @@ describe("AsfMcpServer protocol", () => {
     expect(sent.map((line) => JSON.parse(line))).toEqual([
       { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
       { jsonrpc: "2.0", id: 7, error: { code: -32601, message: "Method not found" } },
+    ]);
+  });
+
+  it("rejects duplicate JSON-RPC keys before dispatching to the daemon", async () => {
+    const calls: AsfControlRequest[] = [];
+    const sent: string[] = [];
+    const transport: McpNdjsonTransport = {
+      incoming: (async function* () {
+        yield '{"jsonrpc":"2.0","id":1,"id":2,"method":"initialize","params":{}}\n';
+      })(),
+      send(line) {
+        sent.push(line);
+      },
+    };
+    const controlClient: AsfDaemonControlClient = async (request) => {
+      calls.push(request);
+      return {};
+    };
+
+    await serveAsfMcpTransport(new AsfMcpServer({ controlClient }), transport);
+
+    expect(calls).toEqual([]);
+    expect(sent.map((line) => JSON.parse(line))).toEqual([
+      { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
     ]);
   });
 });

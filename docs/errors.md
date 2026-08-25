@@ -18,6 +18,20 @@ edit that, then run `npm run docs:errors`.
 | [`RM-APPROVAL-004`](#rm-approval-004) | Approval signer lacks authority | no |
 | [`RM-CANCEL-001`](#rm-cancel-001) | Cancellation request is invalid or conflicting | no |
 | [`RM-RECON-001`](#rm-recon-001) | Reconciliation request is invalid or unresolved | yes |
+| [`RM-PROD-001`](#rm-prod-001) | First-party ASF deployment composition is unavailable | yes |
+| [`RM-PROD-002`](#rm-prod-002) | ASF admission cannot safely adopt or replay the requested attempt | yes |
+| [`RM-PROD-003`](#rm-prod-003) | Canonical ctxlane lease lifecycle is not qualified | yes |
+| [`RM-PROD-004`](#rm-prod-004) | Trusted provider harness or credential-free tools are unavailable | yes |
+| [`RM-PROD-005`](#rm-prod-005) | Durable execution recovery is incomplete | yes |
+| [`RM-PROD-006`](#rm-prod-006) | Run event stream integrity is unavailable | yes |
+| [`RM-PROD-007`](#rm-prod-007) | GitHub effect ownership or reconciliation is unavailable | yes |
+| [`RM-PROD-008`](#rm-prod-008) | Exact-candidate verification or review is unavailable | yes |
+| [`RM-PROD-009`](#rm-prod-009) | Signed attempt evidence is incomplete | yes |
+| [`RM-PROD-010`](#rm-prod-010) | Credential-free evidence verification is unavailable | yes |
+| [`RM-PROD-011`](#rm-prod-011) | Cancellation, approval, or acknowledgement is not safely bound | yes |
+| [`RM-PROD-012`](#rm-prod-012) | ASF worker readiness is incomplete | yes |
+| [`RM-PROD-013`](#rm-prod-013) | OpenTelemetry or operational metrics are unavailable | yes |
+| [`RM-PROD-014`](#rm-prod-014) | ASF worker documentation or packaging is incomplete | yes |
 | [`RM-EVID-008`](#rm-evid-008) | ASF evidence binding is invalid | no |
 | [`RM-SELECT-002`](#rm-select-002) | Issue does not map to a repository | no |
 | [`RM-SELECT-003`](#rm-select-003) | Issue is too underspecified to build a task packet | no |
@@ -200,6 +214,188 @@ Reconciliation may change whether a recorded external effect is safe to retry. O
 
 - Retry the original reconciliation operation id and request unchanged
 - Inspect the protected effect evidence if deterministic observation is blocked
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-001
+
+**First-party ASF deployment composition is unavailable**
+
+A production worker must wire every authority, identity, sandbox, delivery, evidence, and readiness boundary from operator configuration rather than an ad-hoc runtime module.
+
+**Fix (pick one)**
+
+- Install a supported production composition and declarative configuration
+- Use the explicit runtime-module seam only for a deployment qualified separately
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-002
+
+**ASF admission cannot safely adopt or replay the requested attempt**
+
+Idempotent Work Order submission must distinguish an exact retry from changed authority and must not create a second attempt after a lost response.
+
+**Fix (pick one)**
+
+- Retry the original signed envelope with the original payload and envelope digests
+- Use a new attempt and idempotency key for changed work
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-003
+
+**Canonical ctxlane lease lifecycle is not qualified**
+
+Provider identity must remain bound to the exact role, policy, generation, harness, and terminal cleanup evidence for the entire attempt.
+
+**Fix (pick one)**
+
+- Restore the authenticated ctxlane service and lease lifecycle before starting the worker
+- Reconcile or revoke every protected lease before retrying the attempt
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-004
+
+**Trusted provider harness or credential-free tools are unavailable**
+
+The coding agent must not receive provider credentials or reach protected control channels outside the fixed host-side harness and sandbox.
+
+**Fix (pick one)**
+
+- Restore the qualified provider harness and sandbox denial probes
+- Remove any credential, socket, or network exposure before retrying
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-005
+
+**Durable execution recovery is incomplete**
+
+Every irreversible effect and cleanup checkpoint must be durable before the next effect, and recovery must never infer success from missing evidence.
+
+**Fix (pick one)**
+
+- Run the recovery controller and reconcile the exact prior attempt
+- Create a new attempt only after the previous authority and effects are terminal
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-006
+
+**Run event stream integrity is unavailable**
+
+Events must remain append-only, gap-aware, run-bound, and digest-linked so evidence can be verified without trusting an incomplete or cross-run history.
+
+**Fix (pick one)**
+
+- Restore the durable event stream and its compaction snapshot
+- Retry only after the run-bound cursor and previous-event digest validate
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-007
+
+**GitHub effect ownership or reconciliation is unavailable**
+
+Branch and pull-request effects require durable intent, exact candidate binding, and observation before retry after an ambiguous response.
+
+**Fix (pick one)**
+
+- Restore protected GitHub permissions and deterministic reconciliation
+- Observe the exact candidate and remote effect before retrying
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-008
+
+**Exact-candidate verification or review is unavailable**
+
+Required checks and independent review must cover the exact candidate with complete, uncontradicted evidence before delivery authority can proceed.
+
+**Fix (pick one)**
+
+- Restore the required check and review evidence for the exact candidate
+- Resolve every missing, stale, skipped, or contradictory verification result
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-009
+
+**Signed attempt evidence is incomplete**
+
+A successful delivery claim must bind Work Order, policy, identity, candidate, checks, effects, approvals, artifacts, budget, and terminal cleanup to one signed evidence graph.
+
+**Fix (pick one)**
+
+- Finalize the missing evidence artifacts and re-run the exact-candidate finalizer
+- Stop and retain the workspace when an authority-bearing input is contradictory
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-010
+
+**Credential-free evidence verification is unavailable**
+
+Reviewers must be able to verify the signed closure pack without starting Runmill or contacting a provider, so verification cannot depend on the original worker runtime.
+
+**Fix (pick one)**
+
+- Provide the closure pack, public trust policy, and required artifacts to the verifier
+- Do not treat an unverifiable bundle as a successful delivery
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-011
+
+**Cancellation, approval, or acknowledgement is not safely bound**
+
+Cancellation must fence authority before returning, while approvals and acknowledgements must remain signed, candidate-bound, expiring, and idempotent.
+
+**Fix (pick one)**
+
+- Retry the original signed cancellation or approval request unchanged
+- Reconcile the exact evidence digest before acknowledging the outcome
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-012
+
+**ASF worker readiness is incomplete**
+
+Startup cannot be authorized by a partial checklist: identity, sandbox, evidence, GitHub, retention, control, heartbeat, and telemetry gates must all be proven.
+
+**Fix (pick one)**
+
+- Run `runmill doctor` and resolve every failed production readiness gate
+- Keep ASF mode stopped while any required evaluator result is unknown
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-013
+
+**OpenTelemetry or operational metrics are unavailable**
+
+Production operations require correlated, low-cardinality traces, metrics, and logs without placing prompts, credentials, lease capabilities, or protected artifact bytes in telemetry.
+
+**Fix (pick one)**
+
+- Restore the configured OTLP exporter and non-secret telemetry health check
+- Remove secret-bearing attributes before retrying the worker
+
+Recoverable: the run can continue once resolved.
+
+## RM-PROD-014
+
+**ASF worker documentation or packaging is incomplete**
+
+Operators need explicit service, MCP, configuration, installation, rotation, backup, and upgrade instructions before a production worker can be supported.
+
+**Fix (pick one)**
+
+- Ship the operator guide, declarative sample, and package smoke-test output
+- Keep standalone quick start and ASF opt-in boundaries documented
 
 Recoverable: the run can continue once resolved.
 

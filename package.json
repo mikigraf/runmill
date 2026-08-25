@@ -13,13 +13,16 @@
   },
   "files": [
     "dist",
+    "dist-native",
     "docs",
     "runmill.schema.json",
     "examples/quickstart",
-    "examples/eval"
+    "examples/eval",
+    "examples/asf-worker"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "npm run build:native && tsc -p tsconfig.build.json",
+    "build:native": "node scripts/build-ctxlane-native.mjs",
     "dev": "tsx src/cli/main.ts",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -33,6 +36,7 @@
     "docs:errors": "tsx scripts/gen-error-docs.ts",
     "docs:check": "tsx scripts/gen-error-docs.ts --check",
     "verify:linux": "./scripts/verify-linux.sh",
+    "verify:ctxlane-fixtures": "tsx scripts/check-ctxlane-fixture-freshness.ts",
     "test:coverage": "vitest run --coverage",
     "prepublishOnly": "npm run check && npm run package:check"
   },

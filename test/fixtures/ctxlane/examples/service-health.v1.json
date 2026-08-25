@@ -1,0 +1,13 @@
+{
+  "schema": "ctxlane.service-health/v1",
+  "process_liveness": true,
+  "store_available": true,
+  "recovery_complete": true,
+  "controller_channel_ready": true,
+  "policy_trust_root_valid": true,
+  "profile_readiness": false,
+  "harness_ready": false,
+  "capacity_available": false,
+  "audit_export_healthy": false,
+  "ready": false
+}

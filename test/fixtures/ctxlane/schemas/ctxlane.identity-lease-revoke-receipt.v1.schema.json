@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.identity-lease-revoke-receipt.v1.schema.json",
+  "title": "ctxlane identity lease revocation receipt v1",
+  "$ref": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.lease-view.v1.schema.json"
+}

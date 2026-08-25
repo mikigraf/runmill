@@ -78,6 +78,10 @@ import {
   type ConfirmedBranchEffect,
   type ConfirmedPullRequestEffect,
 } from "./github-effects.js";
+import type {
+  AsfTelemetryAttributeInput,
+  AsfTelemetryRecorder,
+} from "./telemetry.js";
 import {
   isTerminalRunEventPhase,
   type RunEvent,
@@ -513,6 +517,12 @@ export interface AsfPrDeliveryRunnerOptions {
   readonly clock: Clock;
   readonly workerId: string;
   readonly maxEventScan?: number | undefined;
+  /**
+   * Non-authoritative observability sink. Recorder failures are swallowed and
+   * can never change a delivery outcome, and only closed-vocabulary attributes
+   * plus bounded correlation ids are emitted.
+   */
+  readonly telemetry?: AsfTelemetryRecorder | undefined;
 }
 
 export type AsfStructuredStopPhase =
@@ -1031,6 +1041,27 @@ function eventTypeForStop(phase: AsfStructuredStopPhase): string {
       return "run.failed";
   }
 }
+
+/** Closed mapping from lifecycle stage to the closed telemetry stage vocabulary. */
+const TELEMETRY_STAGE_BY_DELIVERY_STAGE: Readonly<
+  Record<AsfDeliveryStage, NonNullable<AsfTelemetryAttributeInput["stage"]>>
+> = Object.freeze({
+  "repository-lease": "admission",
+  "identity-leases": "identity",
+  workspace: "implementation",
+  "task-packet": "implementation",
+  "implementer-session": "implementation",
+  candidate: "implementation",
+  "local-verification": "verification",
+  "local-review": "review",
+  "candidate-invalidation": "implementation",
+  "branch-push": "delivery",
+  "pull-request": "delivery",
+  ci: "delivery",
+  "pull-request-review": "review",
+  evidence: "evidence",
+  cleanup: "cleanup",
+});
 
 function isDeliveryStop(error: unknown): error is AsfDeliveryStop {
   return error instanceof AsfDeliveryStop;
@@ -2097,22 +2128,98 @@ export class AsfPrDeliveryRunner {
   }> {
     if (stage !== "cleanup") this.#assertRunBudget(context, parsed);
     const binding = this.#binding(parsed, context);
-    const prepared = this.#intent(context, parsed, stage, operation);
-    const observation = await invoke({
-      binding,
-      intent: prepared.intent,
-      intentMode: prepared.mode,
-      signal: context.signal,
-    });
-    this.#throwIfAborted(context.signal);
-    this.#assertFence(context, binding);
-    this.#options.intents.confirm({
-      intentId: prepared.intent.intent_id,
-      intentDigest: prepared.intent.intent_digest,
-      observationDigest: observation.evidence_digest,
-      binding,
-    });
-    return { intent: prepared.intent, observation };
+    const startedAt = this.#telemetryMonotonicMs();
+    try {
+      const prepared = this.#intent(context, parsed, stage, operation);
+      const observation = await invoke({
+        binding,
+        intent: prepared.intent,
+        intentMode: prepared.mode,
+        signal: context.signal,
+      });
+      this.#throwIfAborted(context.signal);
+      this.#assertFence(context, binding);
+      this.#options.intents.confirm({
+        intentId: prepared.intent.intent_id,
+        intentDigest: prepared.intent.intent_digest,
+        observationDigest: observation.evidence_digest,
+        binding,
+      });
+      this.#recordStageTelemetry(stage, binding, startedAt, "succeeded");
+      return { intent: prepared.intent, observation };
+    } catch (error) {
+      this.#recordStageTelemetry(stage, binding, startedAt, "failed");
+      throw error;
+    }
+  }
+
+  /**
+   * Non-authoritative stage observability. Sink or recorder failures are
+   * swallowed so telemetry can never change a delivery outcome, and no
+   * candidate content, secret, or free-form message leaves this seam.
+   */
+  #recordStageTelemetry(
+    stage: AsfDeliveryStage,
+    binding: AsfDeliveryBinding,
+    startedAt: number | undefined,
+    outcome: "succeeded" | "failed",
+  ): void {
+    const recorder = this.#options.telemetry;
+    if (recorder === undefined) return;
+    try {
+      const finishedAt = this.#telemetryMonotonicMs();
+      const elapsedMs =
+        startedAt === undefined ||
+        finishedAt === undefined ||
+        finishedAt < startedAt
+          ? undefined
+          : finishedAt - startedAt;
+      const attributes: AsfTelemetryAttributeInput = {
+        component: "runner",
+        stage: TELEMETRY_STAGE_BY_DELIVERY_STAGE[stage],
+        outcome,
+        run_id: binding.runId,
+        work_order_id: binding.workOrderId,
+        attempt_id: binding.attemptId,
+      };
+      this.#discardTelemetryResult(
+        recorder.log?.(
+          "runmill.asf.run.event",
+          outcome === "succeeded" ? "info" : "error",
+          attributes,
+        ),
+      );
+      if (elapsedMs !== undefined) {
+        this.#discardTelemetryResult(
+          recorder.histogram(
+            "runmill.asf.operation.duration",
+            elapsedMs,
+            "ms",
+            attributes,
+          ),
+        );
+      }
+    } catch {
+      // Observability is never authoritative for delivery.
+    }
+  }
+
+  #telemetryMonotonicMs(): number | undefined {
+    try {
+      const value = this.#options.clock.monotonicMs();
+      return Number.isFinite(value) && value >= 0 ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  #discardTelemetryResult(result: unknown): void {
+    if (result === undefined) return;
+    try {
+      void Promise.resolve(result).catch(() => undefined);
+    } catch {
+      // A hostile thenable is still non-authoritative telemetry input.
+    }
   }
 
   #reserveProviderBudget(

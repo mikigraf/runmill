@@ -104,7 +104,8 @@ export function createAsfWorkerHostOptions(
   return {
     mode: "asf-worker",
     repoRoot: process.cwd(),
-    configPath: join(process.cwd(), "test-asf-runtime.json"),
+    configPath:
+      context.productionConfigPath ?? join(process.cwd(), "test-asf-runtime.json"),
     startedAt: context.startedAt,
     controlAuthentication: {
       verify: async () => undefined,
@@ -128,6 +129,9 @@ export function createAsfWorkerHostOptions(
       },
       getRun: () => {
         throw new Error("fixture has no runs");
+      },
+      lookupSubmission: () => {
+        throw new Error("fixture has no submissions");
       },
       listRunEvents: () => {
         throw new Error("fixture has no events");

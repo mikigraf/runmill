@@ -1,0 +1,82 @@
+{
+  "schema": "runmill.production-mode/v1",
+  "mode": "asf-worker",
+  "asf": {
+    "hosting": "single-tenant",
+    "backlog": {
+      "selection_enabled": false,
+      "mutations_enabled": false
+    },
+    "trust": {
+      "work_order_signers": [
+        {
+          "key_id": "replace-with-work-order-key",
+          "algorithm": "EdDSA"
+        }
+      ],
+      "approval_signers": [
+        {
+          "key_id": "replace-with-approval-key",
+          "algorithm": "EdDSA"
+        }
+      ]
+    },
+    "ctxlane": {
+      "endpoint": "unix:///run/ctxlane/automation.sock",
+      "audience": "runmill-asf",
+      "lease_renewal_ms": 30000
+    },
+    "harness": {
+      "backend": "host-credential-harness",
+      "credential_boundary": "trusted-host-only",
+      "repository_tools": "runmill-sandbox-gateway",
+      "implementer_sessions": "secure-resumable",
+      "reviewer_sessions": "fresh-non-resumable"
+    },
+    "sandbox": {
+      "mechanism": "bubblewrap",
+      "base_image": "read-only",
+      "workspace": "ephemeral",
+      "resource_limits_required": true,
+      "resource_limits": {
+        "cpu_millis": 2000,
+        "memory_mib": 4096,
+        "processes": 256,
+        "file_size_mib": 1024,
+        "wall_time_ms": 7200000
+      },
+      "verification_environment": "fresh-candidate",
+      "tools_network": {
+        "mode": "disabled"
+      },
+      "verification_network": "disabled"
+    },
+    "mcp": {
+      "transport": "stdio-private-control",
+      "service_control_endpoint": "unix:///run/runmill/asf-control.sock",
+      "trusted_controller_ids": ["replace-with-controller-id"],
+      "expose_to_workers": false
+    },
+    "worker": {
+      "worker_id": "replace-with-worker-id",
+      "heartbeat_interval_ms": 5000,
+      "stale_after_ms": 20000,
+      "max_concurrency": 4,
+      "readiness_max_age_ms": 60000
+    },
+    "retention": {
+      "run_state_days": 365,
+      "portable_artifact_days": 365,
+      "protected_artifact_days": 30
+    },
+    "github": {
+      "closure_target": "pr",
+      "credential_boundary": "trusted-controller-only",
+      "contents_permission": "write",
+      "pull_requests_permission": "write",
+      "checks_permission": "read",
+      "merge_permission": "none",
+      "administration_permission": "none"
+    }
+  }
+}

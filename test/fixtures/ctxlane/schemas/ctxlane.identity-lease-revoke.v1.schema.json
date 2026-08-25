@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.identity-lease-revoke.v1.schema.json",
+  "title": "ctxlane identity lease revocation parameters v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["client_request_id", "lease_id"],
+  "properties": {
+    "client_request_id": { "$ref": "#/$defs/clientRequestId" },
+    "lease_id": { "$ref": "#/$defs/leaseId" }
+  },
+  "$defs": {
+    "clientRequestId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@+-]*$(?![\\s\\S])"
+    },
+    "leaseId": {
+      "type": "string",
+      "pattern": "^lease_[0-7][0-9A-HJKMNP-TV-Z]{25}$(?![\\s\\S])"
+    }
+  }
+}

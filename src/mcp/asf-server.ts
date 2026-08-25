@@ -20,6 +20,7 @@ import { signedAsfTerminalEvidenceBundleSchema } from "../evidence/asf-terminal.
 import { sha256Digest } from "../asf/canonical-json.js";
 import type { AsfControlAuthenticationProvider } from "../asf/control-auth.js";
 import { ERROR_CATALOG } from "../errors/runmill-error.js";
+import { strictJsonDecode } from "../identity/ctxlane-transport.js";
 import {
   asfDaemonRuntimePaths,
   requestDaemon,
@@ -139,6 +140,18 @@ const getRunDaemonResultSchema = z
   })
   .strict();
 
+const lookupSubmissionDaemonResultSchema = z.discriminatedUnion("disposition", [
+  z.object({ disposition: z.literal("not-found") }).strict(),
+  z
+    .object({
+      disposition: z.literal("found"),
+      run: asfRunRowSchema,
+      admission: safeAdmissionSchema,
+      latestSequence: z.number().int().nonnegative(),
+    })
+    .strict(),
+]);
+
 const eventPageDaemonResultSchema = z
   .object({
     events: z.array(runEventSchema).max(1_000),
@@ -159,6 +172,13 @@ const submitArgumentsSchema = z
   .object({ envelope: workOrderEnvelopeSchema })
   .strict();
 const getRunArgumentsSchema = z.object({ run_id: identifierSchema }).strict();
+const lookupSubmissionArgumentsSchema = z
+  .object({
+    idempotency_key: identifierSchema,
+    payload_digest: digestSchema,
+    envelope_digest: digestSchema,
+  })
+  .strict();
 const listRunEventsArgumentsSchema = z
   .object({
     run_id: identifierSchema,
@@ -226,6 +246,19 @@ const publicAdmissionSchema = z
 const publicGetRunResultSchema = publicRunCursorSnapshotSchema
   .extend({ admission: publicAdmissionSchema })
   .strict();
+
+const publicLookupSubmissionResultSchema = z.discriminatedUnion(
+  "disposition",
+  [
+    z.object({ disposition: z.literal("not-found") }).strict(),
+    z
+      .object({
+        disposition: z.literal("found"),
+        run: publicGetRunResultSchema,
+      })
+      .strict(),
+  ],
+);
 
 const publicEventPageResultSchema = z
   .object({
@@ -436,6 +469,7 @@ interface McpToolDefinition {
   readonly name:
     | "runmill_submit_work_order"
     | "runmill_get_run"
+    | "runmill_lookup_submission"
     | "runmill_list_run_events"
     | "runmill_get_evidence"
     | "runmill_request_cancel"
@@ -478,6 +512,13 @@ export const ASF_MCP_TOOLS: readonly McpToolDefinition[] = Object.freeze([
     description: "Get the current safe snapshot and outcome of one durable ASF run.",
     inputSchema: jsonSchema(getRunArgumentsSchema),
     outputSchema: toolOutputJsonSchema(publicGetRunResultSchema),
+  },
+  {
+    name: "runmill_lookup_submission",
+    description:
+      "Recover a lost submission only when its idempotency key and exact Work Order digests match.",
+    inputSchema: jsonSchema(lookupSubmissionArgumentsSchema),
+    outputSchema: toolOutputJsonSchema(publicLookupSubmissionResultSchema),
   },
   {
     name: "runmill_list_run_events",
@@ -1095,6 +1136,59 @@ export class AsfMcpServer {
           return success(id, toolFailure(error, input.data.run_id));
         }
       }
+      case "runmill_lookup_submission": {
+        const input = lookupSubmissionArgumentsSchema.safeParse(args);
+        if (!input.success) {
+          return success(id, invalidToolArguments(input.error));
+        }
+        try {
+          const raw = await this.#requestControl({
+            type: "asf.lookup_submission",
+            idempotencyKey: input.data.idempotency_key,
+            payloadDigest: input.data.payload_digest,
+            envelopeDigest: input.data.envelope_digest,
+          });
+          const result = parseDaemonResult(lookupSubmissionDaemonResultSchema, raw);
+          if (result.disposition === "not-found") {
+            return success(id, toolSuccess({ disposition: "not-found" }));
+          }
+          assertRunBindings(
+            result.run.runId,
+            result.run,
+            result.admission.workOrderId,
+            result.admission.attemptId,
+          );
+          if (
+            result.admission.idempotencyKey !== input.data.idempotency_key ||
+            result.admission.payloadDigest !== input.data.payload_digest ||
+            result.admission.envelopeDigest !== input.data.envelope_digest ||
+            result.run.stateVersion !== result.latestSequence
+          ) {
+            throw new InvalidDaemonResultError({
+              issues: [{ path: "lookup", code: "binding_mismatch" }],
+            });
+          }
+          const output = publicLookupSubmissionResultSchema.parse({
+            disposition: "found",
+            run: {
+              ...publicRunSnapshot(result.run, result.latestSequence),
+              admission: {
+                idempotency_key: result.admission.idempotencyKey,
+                tenant_id: result.admission.tenantId,
+                payload_digest: result.admission.payloadDigest,
+                envelope_digest: result.admission.envelopeDigest,
+                effective_policy_digest: result.admission.effectivePolicyDigest,
+                signature_key_id: result.admission.signatureKeyId,
+                signature_algorithm: result.admission.signatureAlgorithm,
+                accepted_at: result.admission.acceptedAt,
+              },
+            },
+          });
+          return success(id, toolSuccess(output));
+        } catch (error) {
+          return success(id, toolFailure(error));
+        }
+      }
       case "runmill_list_run_events": {
         const input = listRunEventsArgumentsSchema.safeParse(args);
         if (!input.success) {
@@ -1421,7 +1515,7 @@ export async function serveAsfMcpTransport(
   const processLine = async (line: string): Promise<void> => {
     let raw: unknown;
     try {
-      raw = JSON.parse(line) as unknown;
+      raw = strictJsonDecode(line);
     } catch {
       await transport.send(`${JSON.stringify(protocolError(null, -32700, "Parse error"))}\n`);
       return;

@@ -1,0 +1,41 @@
+{
+  "schema": "ctxlane.profile-list/v1",
+  "profiles": [
+    {
+      "profile_uid": "profile_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "profile_ref": "codex:automation-production",
+      "provider": "codex",
+      "auth_mode": "wif",
+      "eligible": true,
+      "environment_count": 1,
+      "roles": ["implementer"],
+      "caller_subject_count": 1,
+      "lease_ttl_seconds": 900,
+      "max_session_seconds": 14400,
+      "max_concurrent_leases": 1,
+      "concurrency_mode": "exclusive",
+      "shared_state_isolation_requirement": null,
+      "require_workload_identity": true,
+      "authentication_exception_acknowledged": false,
+      "isolation_exception_acknowledged": false
+    },
+    {
+      "profile_uid": "profile_71ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "profile_ref": "claude:automation-review",
+      "provider": "claude",
+      "auth_mode": "subscription-token",
+      "eligible": false,
+      "environment_count": 0,
+      "roles": [],
+      "caller_subject_count": 0,
+      "lease_ttl_seconds": 900,
+      "max_session_seconds": 14400,
+      "max_concurrent_leases": 1,
+      "concurrency_mode": "exclusive",
+      "shared_state_isolation_requirement": null,
+      "require_workload_identity": true,
+      "authentication_exception_acknowledged": false,
+      "isolation_exception_acknowledged": false
+    }
+  ]
+}

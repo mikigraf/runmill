@@ -82,6 +82,12 @@ export type AsfControlRequest =
   | { readonly type: "asf.submit_work_order"; readonly envelope: Record<string, unknown> }
   | { readonly type: "asf.get_run"; readonly runId: string }
   | {
+      readonly type: "asf.lookup_submission";
+      readonly idempotencyKey: string;
+      readonly payloadDigest: string;
+      readonly envelopeDigest: string;
+    }
+  | {
       readonly type: "asf.list_run_events";
       readonly runId: string;
       readonly after?: number | undefined;
@@ -119,6 +125,14 @@ const controlRequestSchema = z.discriminatedUnion("type", [
     })
     .strict(),
   z.object({ type: z.literal("asf.get_run"), runId: z.string().min(1) }).strict(),
+  z
+    .object({
+      type: z.literal("asf.lookup_submission"),
+      idempotencyKey: z.string().min(1).max(1_024),
+      payloadDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+      envelopeDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+    })
+    .strict(),
   z
     .object({
       type: z.literal("asf.list_run_events"),

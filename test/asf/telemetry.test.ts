@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   ASF_TELEMETRY_COUNTER_NAMES,
+  ASF_TELEMETRY_GAUGE_NAMES,
   ASF_TELEMETRY_HISTOGRAM_NAMES,
+  ASF_TELEMETRY_LOG_NAMES,
   ASF_TELEMETRY_SCHEMA,
   ASF_TELEMETRY_SPAN_NAMES,
+  OtlpHttpAsfTelemetrySink,
   SafeAsfTelemetryRecorder,
   createNoopAsfTelemetryRecorder,
   parseAsfTelemetrySignal,
@@ -55,16 +58,43 @@ describe("ASF telemetry contract", () => {
     expect(ASF_TELEMETRY_COUNTER_NAMES).toContain(
       "runmill.asf.recovery.actions",
     );
+    expect(ASF_TELEMETRY_COUNTER_NAMES).toEqual([
+      "runmill.asf.work_orders.accepted",
+      "runmill.asf.work_orders.refused",
+      "runmill.asf.run.invocations",
+      "runmill.asf.recovery.actions",
+      "runmill.asf.identity.leases",
+      "runmill.asf.stale_fence.rejections",
+      "runmill.asf.effects.ambiguous",
+      "runmill.asf.evidence.acknowledgements",
+      "runmill.asf.cleanup.failures",
+      "runmill.asf.quarantines",
+    ]);
     expect(ASF_TELEMETRY_HISTOGRAM_NAMES).toEqual([
       "runmill.asf.operation.duration",
       "runmill.asf.queue.latency",
+      "runmill.asf.recovery.duration",
+      "runmill.asf.reconciliation.continuation_lag",
+      "runmill.asf.evidence.acknowledgement_lag",
+    ]);
+    expect(ASF_TELEMETRY_LOG_NAMES).toEqual([
+      "runmill.asf.service.event",
+      "runmill.asf.run.event",
+      "runmill.asf.recovery.event",
+      "runmill.asf.security.event",
+    ]);
+    expect(ASF_TELEMETRY_GAUGE_NAMES).toEqual([
+      "runmill.asf.queue.depth",
+      "runmill.asf.run.active",
     ]);
     expect(Object.isFrozen(ASF_TELEMETRY_SPAN_NAMES)).toBe(true);
     expect(Object.isFrozen(ASF_TELEMETRY_COUNTER_NAMES)).toBe(true);
+    expect(Object.isFrozen(ASF_TELEMETRY_GAUGE_NAMES)).toBe(true);
     expect(Object.isFrozen(ASF_TELEMETRY_HISTOGRAM_NAMES)).toBe(true);
+    expect(Object.isFrozen(ASF_TELEMETRY_LOG_NAMES)).toBe(true);
   });
 
-  it("emits exact frozen span, counter, and histogram signals", () => {
+  it("emits exact frozen span, counter, gauge, and histogram signals", () => {
     const sink = new RecordingSink();
     const recorder = new SafeAsfTelemetryRecorder({
       clock: new FakeClock(NOW),
@@ -80,6 +110,7 @@ describe("ASF telemetry contract", () => {
       component: "admission",
       outcome: "succeeded",
     });
+    recorder.gauge("runmill.asf.queue.depth", 2, { component: "runner" });
     recorder.histogram("runmill.asf.operation.duration", 12.5, "ms", {
       component: "runner",
       operation: "run-complete",
@@ -104,6 +135,11 @@ describe("ASF telemetry contract", () => {
         kind: "counter",
         name: "runmill.asf.work_orders.accepted",
         value: 1,
+      }),
+      expect.objectContaining({
+        kind: "gauge",
+        name: "runmill.asf.queue.depth",
+        value: 2,
       }),
       expect.objectContaining({
         kind: "histogram",
@@ -133,8 +169,6 @@ describe("ASF telemetry contract", () => {
 
   it.each([
     ["unknown", "value"],
-    ["run_id", "run-secret"],
-    ["work_order_id", "wo-secret"],
     ["candidate_sha", "a".repeat(40)],
     ["lease_id", "lease-secret"],
     ["execution_handle", "exec-secret"],
@@ -166,6 +200,21 @@ describe("ASF telemetry contract", () => {
     expect(parseAsfTelemetrySignal({ ...base, value: Number.NaN })).toBeNull();
     expect(parseAsfTelemetrySignal({ ...base, unit: "bytes" })).toBeNull();
     expect(parseAsfTelemetrySignal({ ...base, unit: "s" })).toBeNull();
+  });
+
+  it("rejects invalid point-in-time gauge values", () => {
+    const base = {
+      schema: ASF_TELEMETRY_SCHEMA,
+      kind: "gauge",
+      name: "runmill.asf.queue.depth",
+      value: 0,
+      timestamp: NOW,
+      attributes: { mode: "asf-worker", component: "runner" },
+    };
+    expect(parseAsfTelemetrySignal(base)).not.toBeNull();
+    expect(parseAsfTelemetrySignal({ ...base, value: -1 })).toBeNull();
+    expect(parseAsfTelemetrySignal({ ...base, value: Number.NaN })).toBeNull();
+    expect(parseAsfTelemetrySignal({ ...base, name: "runmill.asf.unknown" })).toBeNull();
   });
 
   it("rejects invalid completed-span durations and legacy phase records", () => {
@@ -201,6 +250,65 @@ describe("ASF telemetry contract", () => {
         attributes: { ...base.attributes, component: "github" },
       }),
     ).toBeNull();
+  });
+
+  it("accepts only bounded non-secret correlation identifiers", () => {
+    const base = {
+      schema: ASF_TELEMETRY_SCHEMA,
+      kind: "counter",
+      name: "runmill.asf.run.invocations",
+      value: 1,
+      timestamp: NOW,
+      attributes: {
+        mode: "asf-worker",
+        tenant_id: "tenant-acme",
+        work_order_id: "wo_01",
+        attempt_id: "attempt_01",
+        run_id: "run_01",
+        invocation_id: "invocation_01",
+        candidate_sha: `sha256:${"a".repeat(64)}`,
+      },
+    };
+    expect(parseAsfTelemetrySignal(base)).not.toBeNull();
+    expect(
+      parseAsfTelemetrySignal({
+        ...base,
+        attributes: { ...base.attributes, candidate_sha: "candidate-bytes" },
+      }),
+    ).toBeNull();
+    expect(
+      parseAsfTelemetrySignal({
+        ...base,
+        attributes: { ...base.attributes, run_id: "../secret" },
+      }),
+    ).toBeNull();
+    expect(
+      parseAsfTelemetrySignal({
+        ...base,
+        attributes: { ...base.attributes, prompt: "never-accepted" },
+      }),
+    ).toBeNull();
+  });
+
+  it("accepts only closed structured log events", () => {
+    const base = {
+      schema: ASF_TELEMETRY_SCHEMA,
+      kind: "log",
+      name: "runmill.asf.run.event",
+      severity: "error",
+      timestamp: NOW,
+      attributes: {
+        mode: "asf-worker",
+        run_id: "run_01",
+      },
+    };
+    expect(parseAsfTelemetrySignal(base)).toMatchObject({
+      kind: "log",
+      name: "runmill.asf.run.event",
+      severity: "error",
+    });
+    expect(parseAsfTelemetrySignal({ ...base, name: "runmill.asf.free-form" })).toBeNull();
+    expect(parseAsfTelemetrySignal({ ...base, message: "secret" })).toBeNull();
   });
 
   it("snapshots signal data without invoking property getters", () => {
@@ -350,6 +458,7 @@ describe("ASF telemetry contract", () => {
     expect(() =>
       recorder.counter("runmill.asf.run.invocations", 1),
     ).not.toThrow();
+    expect(() => recorder.gauge("runmill.asf.queue.depth", 0)).not.toThrow();
     expect(sink.signals).toEqual([]);
   });
 
@@ -359,5 +468,155 @@ describe("ASF telemetry contract", () => {
     expect(() =>
       recorder.histogram("runmill.asf.queue.latency", 0, "ms"),
     ).not.toThrow();
+  });
+});
+
+describe("OTLP/HTTP telemetry adapter", () => {
+  it("maps completed spans and metrics to standard OTLP JSON envelopes", async () => {
+    const requests: { url: string; request: { body: string; headers: Readonly<Record<string, string>> } }[] = [];
+    const sink = new OtlpHttpAsfTelemetrySink({
+      endpoint: "https://otel.example.invalid/otlp/v1/traces",
+      headers: { Authorization: "Bearer operator-configured-token" },
+      httpClient: async (url, request) => {
+        requests.push({ url, request });
+        return { ok: true, status: 200 };
+      },
+    });
+
+    await sink.record({
+      schema: ASF_TELEMETRY_SCHEMA,
+      kind: "span",
+      name: "runmill.asf.run.dispatch",
+      timestamp: NOW,
+      duration_ms: 12.5,
+      attributes: {
+        mode: "asf-worker",
+        component: "runner",
+        operation: "run-dispatch",
+        outcome: "succeeded",
+      },
+    });
+    await sink.record({
+      schema: ASF_TELEMETRY_SCHEMA,
+      kind: "counter",
+      name: "runmill.asf.run.invocations",
+      timestamp: NOW,
+      value: 1,
+      attributes: { mode: "asf-worker", component: "runner", outcome: "succeeded" },
+    });
+    await sink.record({
+      schema: ASF_TELEMETRY_SCHEMA,
+      kind: "gauge",
+      name: "runmill.asf.queue.depth",
+      timestamp: NOW,
+      value: 2,
+      attributes: { mode: "asf-worker", component: "runner" },
+    });
+    await sink.record({
+      schema: ASF_TELEMETRY_SCHEMA,
+      kind: "log",
+      name: "runmill.asf.run.event",
+      severity: "error",
+      timestamp: NOW,
+      attributes: { mode: "asf-worker", run_id: "run_01" },
+    });
+
+    expect(requests.map(({ url }) => url)).toEqual([
+      "https://otel.example.invalid/otlp/v1/traces",
+      "https://otel.example.invalid/otlp/v1/metrics",
+      "https://otel.example.invalid/otlp/v1/metrics",
+      "https://otel.example.invalid/otlp/v1/logs",
+    ]);
+    expect(requests[0]?.request.headers).toMatchObject({
+      "content-type": "application/json",
+      authorization: "Bearer operator-configured-token",
+    });
+    const spanEnvelope = JSON.parse(requests[0]?.request.body ?? "null") as {
+      resourceSpans?: readonly {
+        scopeSpans?: readonly { spans?: readonly Record<string, unknown>[] }[];
+      }[];
+    };
+    const span = spanEnvelope.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.[0];
+    expect(span).toMatchObject({ name: "runmill.asf.run.dispatch", kind: 1 });
+    if (span === undefined) throw new Error("OTLP span envelope is missing its span");
+    expect(span.traceId).toMatch(/^[0-9a-f]{32}$/u);
+    expect(span.spanId).toMatch(/^[0-9a-f]{16}$/u);
+    expect(span.attributes).toEqual(
+      expect.arrayContaining([
+        { key: "mode", value: { stringValue: "asf-worker" } },
+        { key: "outcome", value: { stringValue: "succeeded" } },
+      ]),
+    );
+    const metricEnvelope = JSON.parse(requests[1]?.request.body ?? "null") as {
+      resourceMetrics?: readonly {
+        scopeMetrics?: readonly { metrics?: readonly Record<string, unknown>[] }[];
+      }[];
+    };
+    expect(metricEnvelope.resourceMetrics?.[0]?.scopeMetrics?.[0]?.metrics?.[0]).toMatchObject({
+      name: "runmill.asf.run.invocations",
+      sum: { dataPoints: [{ asDouble: 1 }], aggregationTemporality: 2, isMonotonic: true },
+    });
+    const gaugeEnvelope = JSON.parse(requests[2]?.request.body ?? "null") as {
+      resourceMetrics?: readonly {
+        scopeMetrics?: readonly { metrics?: readonly Record<string, unknown>[] }[];
+      }[];
+    };
+    expect(gaugeEnvelope.resourceMetrics?.[0]?.scopeMetrics?.[0]?.metrics?.[0]).toMatchObject({
+      name: "runmill.asf.queue.depth",
+      gauge: { dataPoints: [{ asDouble: 2 }] },
+    });
+    const logEnvelope = JSON.parse(requests[3]?.request.body ?? "null") as {
+      resourceLogs?: readonly {
+        scopeLogs?: readonly { logRecords?: readonly Record<string, unknown>[] }[];
+      }[];
+    };
+    expect(logEnvelope.resourceLogs?.[0]?.scopeLogs?.[0]?.logRecords?.[0]).toMatchObject({
+      severityText: "ERROR",
+      body: { stringValue: "runmill.asf.run.event" },
+      attributes: expect.arrayContaining([
+        { key: "run_id", value: { stringValue: "run_01" } },
+      ]),
+    });
+    expect(sink.health()).toEqual({
+      schema: "runmill.asf-otlp-http-telemetry-health/v1",
+      status: "healthy",
+      consecutiveFailures: 0,
+      lastSuccessAt: NOW,
+    });
+  });
+
+  it("tracks exporter failures without exposing response bodies or changing recorder authority", async () => {
+    const sink = new OtlpHttpAsfTelemetrySink({
+      endpoint: "http://127.0.0.1:4318",
+      httpClient: async () => ({ ok: false, status: 503 }),
+    });
+    expect(sink.health().status).toBe("unknown");
+    await expect(
+      sink.record({
+        schema: ASF_TELEMETRY_SCHEMA,
+        kind: "histogram",
+        name: "runmill.asf.queue.latency",
+        timestamp: NOW,
+        value: 4,
+        unit: "ms",
+        attributes: { mode: "asf-worker" },
+      }),
+    ).rejects.toThrow("HTTP 503");
+    expect(sink.health()).toMatchObject({
+      status: "degraded",
+      consecutiveFailures: 1,
+      lastSuccessAt: null,
+    });
+  });
+
+  it.each([
+    "file:///tmp/otel",
+    "https://user:password@otel.example.invalid",
+    "https://otel.example.invalid?token=secret",
+    "not a url",
+  ])("rejects unsafe OTLP endpoint %s", (endpoint) => {
+    expect(() => new OtlpHttpAsfTelemetrySink({ endpoint })).toThrow(
+      "OTLP endpoint",
+    );
   });
 });

@@ -24,7 +24,11 @@ import {
   CTXLANE_IDENTITY_LEASE_SCHEMA,
   ctxlaneAutomationErrorSchema,
   ctxlaneIdentityLeaseRequestSchema,
+  ctxlaneIdentityLeaseCloseSchema,
+  ctxlaneIdentityLeaseRevokeSchema,
+  ctxlaneIdentityLeaseRenewSchema,
   ctxlaneIdentityLeaseSchema,
+  ctxlaneLeaseViewSchema,
   ctxlaneWorkOrderAuthorizationSchema,
   isAtOrBeforeUtc,
   isStrictlyBeforeUtc,
@@ -32,6 +36,10 @@ import {
   type CtxlaneIdentityLease,
   type CtxlaneIdentityLeaseRequest,
   type CtxlaneAutomationError,
+  type CtxlaneIdentityLeaseClose,
+  type CtxlaneIdentityLeaseRenew,
+  type CtxlaneIdentityLeaseRevoke,
+  type CtxlaneLeaseView,
 } from "./ctxlane-contracts.js";
 import {
   DEFAULT_CTXLANE_REQUEST_TIMEOUT_MS,
@@ -42,17 +50,25 @@ import {
 
 export { CTXLANE_IDENTITY_LEASE_REQUEST_SCHEMA, CTXLANE_IDENTITY_LEASE_SCHEMA };
 export {
+  CTXLANE_NATIVE_SEQPACKET_DEPLOYMENT_CONTRACT,
+  CTXLANE_NATIVE_SEQPACKET_TRANSPORT_QUALIFICATION,
+  CTXLANE_NATIVE_SEQPACKET_TRANSPORT_STATUS,
+  CTXLANE_STDIO_AUTOMATION_TRANSPORT_QUALIFICATION,
   CTXLANE_UNIX_AUTOMATION_TRANSPORT_QUALIFICATION,
   DEFAULT_CTXLANE_REQUEST_TIMEOUT_MS,
   MAX_CTXLANE_CONTROL_MESSAGE_BYTES,
   MAX_CTXLANE_REQUEST_TIMEOUT_MS,
   CtxlaneIdentityProtocolError,
   CtxlaneJsonDuplicateKeyError,
+  CtxlaneStdioAutomationClient,
+  CtxlaneNativeSeqpacketAutomationClient,
   CtxlaneUnixAutomationClient,
   strictJsonDecode,
 } from "./ctxlane-transport.js";
 export type {
   CtxlaneIdentityLeaseAcquisitionClient,
+  CtxlaneStdioAutomationClientOptions,
+  CtxlaneNativeSeqpacketAutomationClientOptions,
   CtxlaneUnixAutomationClientOptions,
 } from "./ctxlane-transport.js";
 
@@ -200,10 +216,73 @@ export interface CtxlaneLeaseRevocationRequest {
 }
 
 /**
+ * Serialize Runmill's protected lifecycle request into ctxlane's exact public
+ * parameter shape. The returned object is still only a request proposal; a
+ * deployment must send it over ctxlane's authenticated private channel.
+ */
+export function ctxlaneRenewParameters(
+  request: CtxlaneLeaseRenewalRequest,
+): CtxlaneIdentityLeaseRenew {
+  try {
+    const parsed = ctxlaneIdentityLeaseRenewSchema.safeParse({
+      client_request_id: request.lease.ctxlane.clientRequestId,
+      lease_id: request.lease.leaseId,
+      requested_ttl_seconds: request.requestedTtlSeconds,
+    });
+    if (parsed.success) return parsed.data;
+  } catch {
+    // Hostile getter-bearing requests are invalid parameters.
+  }
+  throw new CtxlaneIdentityProtocolError(
+    "ctxlane renewal parameters failed contract validation",
+  );
+}
+
+/** Serialize a protected Runmill close request into ctxlane parameters. */
+export function ctxlaneCloseParameters(
+  request: CtxlaneLeaseCloseRequest,
+): CtxlaneIdentityLeaseClose {
+  try {
+    const parsed = ctxlaneIdentityLeaseCloseSchema.safeParse({
+      client_request_id: request.lease.ctxlane.clientRequestId,
+      lease_id: request.lease.leaseId,
+      reason: request.disposition,
+    });
+    if (parsed.success) return parsed.data;
+  } catch {
+    // Hostile getter-bearing requests are invalid parameters.
+  }
+  throw new CtxlaneIdentityProtocolError(
+    "ctxlane close parameters failed contract validation",
+  );
+}
+
+/** Serialize a protected Runmill revoke request into ctxlane parameters. */
+export function ctxlaneRevokeParameters(
+  request: CtxlaneLeaseRevocationRequest,
+): CtxlaneIdentityLeaseRevoke {
+  try {
+    const parsed = ctxlaneIdentityLeaseRevokeSchema.safeParse({
+      client_request_id: request.lease.ctxlane.clientRequestId,
+      lease_id: request.lease.leaseId,
+    });
+    if (parsed.success) return parsed.data;
+  } catch {
+    // Hostile getter-bearing requests are invalid parameters.
+  }
+  throw new CtxlaneIdentityProtocolError(
+    "ctxlane revoke parameters failed contract validation",
+  );
+}
+
+/**
  * Trusted in-process lifecycle boundary supplied by the deployment.
  *
- * ctxlane has not published lifecycle request wire schemas. These methods
- * therefore make no wire-format claim and may return only a full published
+ * ctxlane publishes lifecycle parameter objects and capability-free
+ * `ctxlane.lease-view/v1` receipts. Those public receipts intentionally omit
+ * the execution handle and cannot carry the fencing transition required by
+ * this authority-bearing boundary. These methods therefore remain an
+ * operator-supplied private channel and may return only a full published
  * `ctxlane.identity-lease/v1` object or published automation error.
  */
 export interface CtxlaneLeaseLifecycleClient {
@@ -428,6 +507,15 @@ function freezeIdentityLease(
 function safePublishedLease(raw: unknown): CtxlaneIdentityLease | null {
   try {
     const parsed = ctxlaneIdentityLeaseSchema.safeParse(raw);
+    return parsed.success ? deepFreezeSnapshot(parsed.data) : null;
+  } catch {
+    return null;
+  }
+}
+
+function safePublishedLeaseView(raw: unknown): CtxlaneLeaseView | null {
+  try {
+    const parsed = ctxlaneLeaseViewSchema.safeParse(raw);
     return parsed.success ? deepFreezeSnapshot(parsed.data) : null;
   } catch {
     return null;
@@ -1004,6 +1092,12 @@ export class CtxlaneProviderIdentityBroker implements ProviderIdentityBroker {
   ): CtxlaneIdentityLease {
     if (safePublishedAutomationError(raw) !== null) {
       throw identityFailure(`${stage} refusal`, runId);
+    }
+    if (safePublishedLeaseView(raw) !== null) {
+      // A capability-free MCP receipt is valid data, but it is never an
+      // authority-bearing identity lease. Keep this branch explicit so a
+      // future schema expansion cannot silently promote the view.
+      throw identityFailure(`${stage} capability-free lease view`, runId);
     }
     const lease = safePublishedLease(raw);
     if (lease === null)

@@ -175,6 +175,7 @@ export type AsfControlService = Pick<
   AsfWorkerService,
   | "submitWorkOrder"
   | "getRun"
+  | "lookupSubmission"
   | "listRunEvents"
   | "getEvidence"
   | "requestCancellation"
@@ -199,6 +200,12 @@ export async function handleAsfControlRequest(
       return service.submitWorkOrder(request.envelope);
     case "asf.get_run":
       return service.getRun(request.runId);
+    case "asf.lookup_submission":
+      return service.lookupSubmission({
+        idempotencyKey: request.idempotencyKey,
+        payloadDigest: request.payloadDigest,
+        envelopeDigest: request.envelopeDigest,
+      });
     case "asf.list_run_events":
       return service.listRunEvents(request.runId, request.after ?? 0, request.limit ?? 100);
     case "asf.get_evidence":

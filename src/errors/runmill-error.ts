@@ -179,6 +179,162 @@ export const ERROR_CATALOG = {
     recoverable: true,
   },
 
+  // -- ASF production qualification -----------------------------------
+  "RM-PROD-001": {
+    title: "First-party ASF deployment composition is unavailable",
+    why:
+      "A production worker must wire every authority, identity, sandbox, delivery, evidence, " +
+      "and readiness boundary from operator configuration rather than an ad-hoc runtime module.",
+    fixes: [
+      { description: "Install a supported production composition and declarative configuration" },
+      { description: "Use the explicit runtime-module seam only for a deployment qualified separately" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-002": {
+    title: "ASF admission cannot safely adopt or replay the requested attempt",
+    why:
+      "Idempotent Work Order submission must distinguish an exact retry from changed authority and " +
+      "must not create a second attempt after a lost response.",
+    fixes: [
+      { description: "Retry the original signed envelope with the original payload and envelope digests" },
+      { description: "Use a new attempt and idempotency key for changed work" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-003": {
+    title: "Canonical ctxlane lease lifecycle is not qualified",
+    why:
+      "Provider identity must remain bound to the exact role, policy, generation, harness, and " +
+      "terminal cleanup evidence for the entire attempt.",
+    fixes: [
+      { description: "Restore the authenticated ctxlane service and lease lifecycle before starting the worker" },
+      { description: "Reconcile or revoke every protected lease before retrying the attempt" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-004": {
+    title: "Trusted provider harness or credential-free tools are unavailable",
+    why:
+      "The coding agent must not receive provider credentials or reach protected control channels " +
+      "outside the fixed host-side harness and sandbox.",
+    fixes: [
+      { description: "Restore the qualified provider harness and sandbox denial probes" },
+      { description: "Remove any credential, socket, or network exposure before retrying" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-005": {
+    title: "Durable execution recovery is incomplete",
+    why:
+      "Every irreversible effect and cleanup checkpoint must be durable before the next effect, " +
+      "and recovery must never infer success from missing evidence.",
+    fixes: [
+      { description: "Run the recovery controller and reconcile the exact prior attempt" },
+      { description: "Create a new attempt only after the previous authority and effects are terminal" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-006": {
+    title: "Run event stream integrity is unavailable",
+    why:
+      "Events must remain append-only, gap-aware, run-bound, and digest-linked so evidence can be " +
+      "verified without trusting an incomplete or cross-run history.",
+    fixes: [
+      { description: "Restore the durable event stream and its compaction snapshot" },
+      { description: "Retry only after the run-bound cursor and previous-event digest validate" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-007": {
+    title: "GitHub effect ownership or reconciliation is unavailable",
+    why:
+      "Branch and pull-request effects require durable intent, exact candidate binding, and " +
+      "observation before retry after an ambiguous response.",
+    fixes: [
+      { description: "Restore protected GitHub permissions and deterministic reconciliation" },
+      { description: "Observe the exact candidate and remote effect before retrying" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-008": {
+    title: "Exact-candidate verification or review is unavailable",
+    why:
+      "Required checks and independent review must cover the exact candidate with complete, " +
+      "uncontradicted evidence before delivery authority can proceed.",
+    fixes: [
+      { description: "Restore the required check and review evidence for the exact candidate" },
+      { description: "Resolve every missing, stale, skipped, or contradictory verification result" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-009": {
+    title: "Signed attempt evidence is incomplete",
+    why:
+      "A successful delivery claim must bind Work Order, policy, identity, candidate, checks, " +
+      "effects, approvals, artifacts, budget, and terminal cleanup to one signed evidence graph.",
+    fixes: [
+      { description: "Finalize the missing evidence artifacts and re-run the exact-candidate finalizer" },
+      { description: "Stop and retain the workspace when an authority-bearing input is contradictory" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-010": {
+    title: "Credential-free evidence verification is unavailable",
+    why:
+      "Reviewers must be able to verify the signed closure pack without starting Runmill or " +
+      "contacting a provider, so verification cannot depend on the original worker runtime.",
+    fixes: [
+      { description: "Provide the closure pack, public trust policy, and required artifacts to the verifier" },
+      { description: "Do not treat an unverifiable bundle as a successful delivery" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-011": {
+    title: "Cancellation, approval, or acknowledgement is not safely bound",
+    why:
+      "Cancellation must fence authority before returning, while approvals and acknowledgements " +
+      "must remain signed, candidate-bound, expiring, and idempotent.",
+    fixes: [
+      { description: "Retry the original signed cancellation or approval request unchanged" },
+      { description: "Reconcile the exact evidence digest before acknowledging the outcome" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-012": {
+    title: "ASF worker readiness is incomplete",
+    why:
+      "Startup cannot be authorized by a partial checklist: identity, sandbox, evidence, GitHub, " +
+      "retention, control, heartbeat, and telemetry gates must all be proven.",
+    fixes: [
+      { description: "Run `runmill doctor` and resolve every failed production readiness gate" },
+      { description: "Keep ASF mode stopped while any required evaluator result is unknown" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-013": {
+    title: "OpenTelemetry or operational metrics are unavailable",
+    why:
+      "Production operations require correlated, low-cardinality traces, metrics, and logs without " +
+      "placing prompts, credentials, lease capabilities, or protected artifact bytes in telemetry.",
+    fixes: [
+      { description: "Restore the configured OTLP exporter and non-secret telemetry health check" },
+      { description: "Remove secret-bearing attributes before retrying the worker" },
+    ],
+    recoverable: true,
+  },
+  "RM-PROD-014": {
+    title: "ASF worker documentation or packaging is incomplete",
+    why:
+      "Operators need explicit service, MCP, configuration, installation, rotation, backup, and " +
+      "upgrade instructions before a production worker can be supported.",
+    fixes: [
+      { description: "Ship the operator guide, declarative sample, and package smoke-test output" },
+      { description: "Keep standalone quick start and ASF opt-in boundaries documented" },
+    ],
+    recoverable: true,
+  },
+
   // -- ASF evidence/outcome ---------------------------------------------
   "RM-EVID-008": {
     title: "ASF evidence binding is invalid",

@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.profile-list.v1.schema.json",
+  "title": "ctxlane profile list v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "profiles"],
+  "properties": {
+    "schema": { "const": "ctxlane.profile-list/v1" },
+    "profiles": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/automationProfileView" }
+    }
+  },
+  "$defs": {
+    "automationProfileView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_uid",
+        "profile_ref",
+        "provider",
+        "auth_mode",
+        "eligible",
+        "environment_count",
+        "roles",
+        "caller_subject_count",
+        "lease_ttl_seconds",
+        "max_session_seconds",
+        "max_concurrent_leases",
+        "concurrency_mode",
+        "shared_state_isolation_requirement",
+        "require_workload_identity",
+        "authentication_exception_acknowledged",
+        "isolation_exception_acknowledged"
+      ],
+      "properties": {
+        "profile_uid": {
+          "type": "string",
+          "pattern": "^profile_[0-7][0-9A-HJKMNP-TV-Z]{25}$(?![\\s\\S])"
+        },
+        "profile_ref": {
+          "type": "string",
+          "pattern": "^(claude|codex):[A-Za-z0-9][A-Za-z0-9_-]{0,63}$(?![\\s\\S])"
+        },
+        "provider": { "enum": ["claude", "codex"] },
+        "auth_mode": {
+          "enum": [
+            "wif",
+            "subscription-token",
+            "api-key",
+            "chatgpt-oauth",
+            "access-token"
+          ]
+        },
+        "eligible": { "type": "boolean" },
+        "environment_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 32
+        },
+        "roles": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 3,
+          "items": {
+            "enum": ["implementer", "local-reviewer", "pr-reviewer"]
+          }
+        },
+        "caller_subject_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 64
+        },
+        "lease_ttl_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "max_session_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 604800
+        },
+        "max_concurrent_leases": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "concurrency_mode": { "enum": ["exclusive", "shared"] },
+        "shared_state_isolation_requirement": {
+          "oneOf": [
+            { "enum": ["stateless", "per-lease-isolated"] },
+            { "type": "null" }
+          ]
+        },
+        "require_workload_identity": { "type": "boolean" },
+        "authentication_exception_acknowledged": { "type": "boolean" },
+        "isolation_exception_acknowledged": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "provider": { "const": "claude" } } },
+          "then": {
+            "properties": {
+              "profile_ref": { "pattern": "^claude:" },
+              "auth_mode": {
+                "enum": ["wif", "subscription-token", "api-key"]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "provider": { "const": "codex" } } },
+          "then": {
+            "properties": {
+              "profile_ref": { "pattern": "^codex:" },
+              "auth_mode": {
+                "enum": ["wif", "chatgpt-oauth", "api-key", "access-token"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "concurrency_mode": { "const": "exclusive" } }
+          },
+          "then": {
+            "properties": {
+              "max_concurrent_leases": { "const": 1 },
+              "shared_state_isolation_requirement": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "concurrency_mode": { "const": "shared" } }
+          },
+          "then": {
+            "properties": {
+              "max_concurrent_leases": { "minimum": 2 },
+              "shared_state_isolation_requirement": {
+                "enum": ["stateless", "per-lease-isolated"]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "eligible": { "const": true } } },
+          "then": {
+            "properties": {
+              "environment_count": { "minimum": 1 },
+              "roles": { "minItems": 1 },
+              "caller_subject_count": { "minimum": 1 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "auth_mode": { "const": "wif" } } },
+          "then": {
+            "properties": {
+              "authentication_exception_acknowledged": { "const": false }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "require_workload_identity": { "const": true } }
+          },
+          "then": {
+            "properties": {
+              "authentication_exception_acknowledged": { "const": false }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "schema": "ctxlane.identity-lease-renew-acknowledgement/v1",
+  "lease_id": "lease_01ARZ3NDEKTSV4RRFFQ69G5FB0",
+  "fencing_generation": 2
+}

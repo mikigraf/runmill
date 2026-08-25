@@ -1,0 +1,28 @@
+{
+  "schema": "ctxlane.automation-readiness/v1",
+  "profile_uid": "profile_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "profile_ref": "codex:automation-production",
+  "provider": "codex",
+  "auth_mode": "wif",
+  "environment": "production",
+  "role": "implementer",
+  "ready": true,
+  "isolation": "credential-isolated",
+  "authentication_exception_acknowledged": false,
+  "isolation_exception_acknowledged": false,
+  "checked_at": "2026-08-21T10:00:00Z",
+  "valid_until": "2026-08-21T10:05:00Z",
+  "probe_cost": "provider-request-incurred",
+  "probe_timeout_milliseconds": 5000,
+  "probe_interactive": false,
+  "checks": {
+    "metadata-valid": { "status": "pass", "reason_code": null },
+    "credential-source-available": { "status": "pass", "reason_code": null },
+    "identity-token-current": { "status": "pass", "reason_code": null },
+    "harness-trusted": { "status": "pass", "reason_code": null },
+    "provider-principal-verified": { "status": "pass", "reason_code": null },
+    "expected-tenant-verified": { "status": "pass", "reason_code": null },
+    "automation-policy-permits": { "status": "pass", "reason_code": null },
+    "credential-isolation-proven": { "status": "pass", "reason_code": null }
+  }
+}

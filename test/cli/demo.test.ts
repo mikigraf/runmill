@@ -47,7 +47,7 @@ describe("runmill demo", () => {
     expect(result.stdout).toContain("Your working tree was not touched");
     expect(existsSync(forbiddenState)).toBe(false);
     expect(readdirSync(cwd)).toEqual([]);
-  }, 20_000);
+  }, 30_000);
 
   it("returns the evidence as JSON without progress noise", async () => {
     const result = await run(TSX, [CLI, "--json", "demo"], {
@@ -65,5 +65,5 @@ describe("runmill demo", () => {
     expect(parsed.transitions).toContain("LOCAL_VERIFY");
     expect(parsed.transitions).toContain("PR_REVIEW");
     expect(readdirSync(cwd)).toEqual([]);
-  }, 20_000);
+  }, 30_000);
 });

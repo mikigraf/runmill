@@ -1,3 +1,8 @@
+import {
+  createHash,
+  generateKeyPairSync,
+  sign as signBytes,
+} from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,11 +19,200 @@ import {
   type AsfReferenceCompositionInput,
   type AsfReferenceShutdownController,
 } from "../../src/asf/reference-composition.js";
+import { canonicalJson, sha256Digest } from "../../src/asf/canonical-json.js";
+import {
+  WorkOrderAdmissionService,
+  workOrderSigningPayload,
+  type AsfAdmissionPolicy,
+  type RepositoryAdmissionEvidence,
+  type WorkOrderEnvelope,
+  type WorkOrderPayload,
+} from "../../src/asf/work-order.js";
 import { StateStore } from "../../src/state/store.js";
 import { createNoopAsfTelemetryRecorder } from "../../src/asf/telemetry.js";
 import { FakeClock } from "../../src/testing/fake-clock.js";
 
 const NOW = "2026-08-21T10:00:00.000Z";
+const BASE_SHA = "a".repeat(40);
+const OBSERVED_BASE_SHA = "b".repeat(40);
+const REPOSITORY_POLICY_BYTES = Buffer.from("checks: []\n", "utf8");
+const rawDigest = (bytes: Uint8Array): `sha256:${string}` =>
+  `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+const REPOSITORY_POLICY_DIGEST = rawDigest(REPOSITORY_POLICY_BYTES);
+const FORGE_PROTECTION_BYTES = Buffer.from(
+  canonicalJson({
+    schema: "runmill.github-base-protection/v1",
+    repository: "acme/payments",
+    base_ref: "refs/heads/main",
+    protection: {
+      required_checks: ["branch/test"],
+      requires_approval: false,
+      requires_conversation_resolution: false,
+      uses_merge_queue: false,
+    },
+  }),
+  "utf8",
+);
+const FORGE_PROTECTION_DIGEST = rawDigest(FORGE_PROTECTION_BYTES);
+const DIGEST = {
+  source: `sha256:${"1".repeat(64)}`,
+  workOrderPolicy: `sha256:${"2".repeat(64)}`,
+  harness: `sha256:${"3".repeat(64)}`,
+  operator: `sha256:${"5".repeat(64)}`,
+} as const;
+const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+
+function referencePayload(): WorkOrderPayload {
+  return {
+    schema: "asf.work-order/v1",
+    work_order_id: "wo_reference_composition",
+    tenant_id: "tenant-acme",
+    work_item_id: "ENG-REFERENCE",
+    attempt_id: "attempt_01",
+    idempotency_key: "tenant-acme/ENG-REFERENCE/attempt_01",
+    source: {
+      system: "linear",
+      external_id: "ENG-REFERENCE",
+      snapshot_digest: DIGEST.source,
+    },
+    repository: {
+      forge: "github",
+      repository: "acme/payments",
+      base_ref: "refs/heads/main",
+      base_sha: BASE_SHA,
+    },
+    objective: {
+      title: "Exercise the reference composition",
+      description: "Prove the signed admission and durable lookup seam.",
+      acceptance_criteria: ["the accepted run is recoverable by exact digests"],
+      non_goals: ["live provider or GitHub effects"],
+    },
+    scope: {
+      allowed_paths: ["src/**", "test/**"],
+      forbidden_paths: [".github/**", ".runmill/**"],
+      risk_class: "low",
+    },
+    verification: {
+      required_local_check_ids: ["unit"],
+      required_remote_checks: ["ci/test"],
+      policy_snapshot_digest: REPOSITORY_POLICY_DIGEST,
+    },
+    identities: {
+      implementer: "codex:asf-production",
+      local_reviewer: "claude:asf-review",
+      pr_reviewer: "claude:asf-review",
+    },
+    runtime: {
+      sandbox_profile: "linux-production-v1",
+      tool_policy: "repo-change-v1",
+      network_policy: "provider-only-v1",
+    },
+    budgets: {
+      wall_seconds: 7_200,
+      max_cost_usd: 10,
+      max_agent_invocations: 12,
+      max_fix_iterations: 3,
+    },
+    delivery: {
+      closure_target: "pr",
+      draft_pr: false,
+      merge_policy_ref: null,
+    },
+    policy_digest: DIGEST.workOrderPolicy,
+    harness_digest: DIGEST.harness,
+  };
+}
+
+function referenceEnvelope(): WorkOrderEnvelope {
+  const envelope: WorkOrderEnvelope = {
+    schema: "asf.work-order-envelope/v1",
+    key_id: "asf-signing-key-2026-01",
+    algorithm: "EdDSA",
+    issued_at: "2026-08-21T10:00:00Z",
+    not_before: "2026-08-21T10:00:00Z",
+    expires_at: "2026-08-21T10:15:00Z",
+    payload: referencePayload(),
+    signature: "base64url:AA",
+  };
+  envelope.signature = `base64url:${signBytes(
+    null,
+    Buffer.from(workOrderSigningPayload(envelope), "utf8"),
+    privateKey,
+  ).toString("base64url")}`;
+  return envelope;
+}
+
+function referencePolicy(): AsfAdmissionPolicy {
+  return {
+    operatorPolicyDigest: DIGEST.operator,
+    tenantIds: ["tenant-acme"],
+    policyDigests: [DIGEST.workOrderPolicy],
+    harnessDigests: [DIGEST.harness],
+    repository: {
+      forge: "github",
+      repository: "acme/payments",
+      baseRef: "refs/heads/main",
+    },
+    trustedSigners: [{ keyId: "asf-signing-key-2026-01", publicKey }],
+    authority: {
+      pathScope: {
+        allowedPaths: ["src/**", "test/**"],
+        forbiddenPaths: [".github/**", ".runmill/**"],
+      },
+      definedLocalCheckIds: ["unit"],
+      authorizedRepositoryCheckIds: [],
+      requiredLocalCheckIds: ["unit"],
+      requiredRemoteChecks: ["security/scan"],
+      allowedRiskClasses: ["low"],
+      allowedClosureTargets: ["pr"],
+      identityProfiles: {
+        implementer: ["codex:asf-production"],
+        localReviewer: ["claude:asf-review"],
+        prReviewer: ["claude:asf-review"],
+      },
+      requireIndependentReviewers: true,
+      sandboxProfiles: ["linux-production-v1"],
+      toolPolicies: ["repo-change-v1"],
+      networkPolicies: ["provider-only-v1"],
+      budgetLimits: {
+        wallSeconds: 3_600,
+        maxCostUsd: 8,
+        maxAgentInvocations: 10,
+        maxFixIterations: 2,
+      },
+    },
+  };
+}
+
+function referenceRepositoryEvidence(): RepositoryAdmissionEvidence {
+  return {
+    forge: "github",
+    repository: "acme/payments",
+    baseRef: "refs/heads/main",
+    observedBaseSha: OBSERVED_BASE_SHA,
+    requestedBaseShaReachable: true,
+    repositoryPolicyDigest: REPOSITORY_POLICY_DIGEST,
+    repositoryPolicyBaseSha: BASE_SHA,
+    repositoryPolicyPath: ".runmill/checks.yaml",
+    repositoryPolicyBytesBase64: REPOSITORY_POLICY_BYTES.toString("base64"),
+    forgeProtectionDigest: FORGE_PROTECTION_DIGEST,
+    forgeProtectionBaseRef: "refs/heads/main",
+    forgeProtectionBytesBase64: FORGE_PROTECTION_BYTES.toString("base64"),
+    constraints: {
+      pathScope: {
+        allowedPaths: ["src/**", "test/**"],
+        forbiddenPaths: ["src/generated/**"],
+      },
+      definedLocalCheckIds: [],
+      requiredLocalCheckIds: [],
+      requiredRemoteChecks: [],
+    },
+    forgeProtection: {
+      pullRequestsAllowed: true,
+      requiredRemoteChecks: ["branch/test"],
+    },
+  };
+}
 
 function method(): ReturnType<typeof vi.fn> {
   return vi.fn();
@@ -27,6 +221,7 @@ function method(): ReturnType<typeof vi.fn> {
 function fixture(): {
   readonly input: AsfReferenceCompositionInput;
   readonly bind: ReturnType<typeof vi.fn>;
+  readonly databasePath: string;
   readonly shutdown: {
     readonly stopReconciliation: ReturnType<typeof vi.fn>;
     readonly retireIdentities: ReturnType<typeof vi.fn>;
@@ -36,7 +231,8 @@ function fixture(): {
 } {
   const root = mkdtempSync(join(tmpdir(), "runmill-asf-reference-"));
   const clock = new FakeClock(NOW);
-  const store = StateStore.open(join(root, "state.sqlite"), { clock });
+  const databasePath = join(root, "state.sqlite");
+  const store = StateStore.open(databasePath, { clock });
   const bind = method();
   const shutdown = {
     stopReconciliation: vi.fn(async () => undefined),
@@ -77,7 +273,7 @@ function fixture(): {
     budget: { checkRun: method(), reserve: method(), complete: method() },
   } as unknown as AsfReferenceCompositionInput["delivery"];
   const controls = {
-    admission: { submit: method() },
+    admission: { submit: method(), lookupSubmission: method() },
     cancellation: { request: method() },
     approval: { record: method() },
     evidence: { getEvidence: method() },
@@ -115,6 +311,7 @@ function fixture(): {
   return {
     input,
     bind,
+    databasePath,
     shutdown,
     close: () => {
       store.close();
@@ -216,6 +413,71 @@ describe("ASF reference composition", () => {
       expect(test.shutdown.stopReconciliation).toHaveBeenCalledTimes(1);
       expect(test.shutdown.retireIdentities).toHaveBeenCalledTimes(1);
       expect(test.shutdown.cleanupResources).toHaveBeenCalledTimes(1);
+    } finally {
+      test.close();
+    }
+  });
+
+  it("runs signed Work Order admission through the composed service and recovers by exact digests", async () => {
+    const test = fixture();
+    try {
+      const envelope = referenceEnvelope();
+      const admission = new WorkOrderAdmissionService({
+        store: test.input.store,
+        policy: referencePolicy(),
+        repository: { observe: async () => referenceRepositoryEvidence() },
+        clock: test.input.clock,
+        runId: () => "run_reference_composition",
+      });
+      const options = createAsfReferenceWorkerHostOptions({
+        ...test.input,
+        controls: { ...test.input.controls, admission },
+      });
+
+      await expect(options.service.submitWorkOrder(envelope)).resolves.toMatchObject({
+        runId: "run_reference_composition",
+        disposition: "accepted",
+        payloadDigest: sha256Digest(envelope.payload),
+      });
+      await expect(options.service.requestStop()).resolves.toBeUndefined();
+
+      const lookup = options.service.lookupSubmission({
+        idempotencyKey: envelope.payload.idempotency_key,
+        payloadDigest: sha256Digest(envelope.payload),
+        envelopeDigest: sha256Digest(envelope),
+      });
+      expect(lookup).toMatchObject({
+        disposition: "found",
+        snapshot: {
+          run: { runId: "run_reference_composition", mode: "asf-worker" },
+          admission: {
+            idempotencyKey: envelope.payload.idempotency_key,
+            payloadDigest: sha256Digest(envelope.payload),
+            envelopeDigest: sha256Digest(envelope),
+          },
+        },
+      });
+
+      const reopened = StateStore.open(test.databasePath, { clock: test.input.clock });
+      try {
+        expect(reopened.getAsfRunSnapshot("run_reference_composition")).toMatchObject({
+          run: { runId: "run_reference_composition", mode: "asf-worker" },
+          admission: {
+            payloadDigest: sha256Digest(envelope.payload),
+            envelopeDigest: sha256Digest(envelope),
+          },
+        });
+      } finally {
+        reopened.close();
+      }
+
+      expect(
+        options.service.lookupSubmission({
+          idempotencyKey: envelope.payload.idempotency_key,
+          payloadDigest: sha256Digest({ ...envelope.payload, objective: { ...envelope.payload.objective, title: "tampered" } }),
+          envelopeDigest: sha256Digest(envelope),
+        }),
+      ).toEqual({ disposition: "not-found" });
     } finally {
       test.close();
     }

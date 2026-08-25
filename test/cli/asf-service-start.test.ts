@@ -4,6 +4,7 @@ import {
   chmodSync,
   existsSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -16,6 +17,7 @@ import {
   type RuntimePaths,
 } from "../../src/daemon/control.js";
 import { run, runWithInput } from "../../src/platform/process.js";
+import { writeSignedReadinessArtifacts } from "../asf/readiness-test-fixture.js";
 
 const CLI = resolve(process.cwd(), "src/cli/main.ts");
 const TSX = resolve(process.cwd(), "node_modules/.bin/tsx");
@@ -103,8 +105,15 @@ describe("runmill service start", () => {
     const asfRegistry = join(directory, "asf", "asf-worker.json");
     const keyFile = join(directory, "asf-control.key");
     const dataDir = join(directory, "data");
+    const productionConfig = join(directory, "asf-worker.json");
     writeFileSync(keyFile, "asf-service-integration-control-key-00000001\n", { mode: 0o600 });
     chmodSync(keyFile, 0o600);
+    writeFileSync(
+      productionConfig,
+      readFileSync(resolve(process.cwd(), "examples/asf-worker/production-mode.json")),
+      { mode: 0o600 },
+    );
+    const readiness = writeSignedReadinessArtifacts(directory);
 
     standalone = await DaemonControlServer.start({
       paths: standalonePaths,
@@ -147,11 +156,29 @@ describe("runmill service start", () => {
     };
     let stdout = "";
     let stderr = "";
-    child = spawn(TSX, [CLI, "service", "start", "--mode", "asf-worker"], {
+    child = spawn(
+      TSX,
+      [
+        CLI,
+        "service",
+        "start",
+        "--mode",
+        "asf-worker",
+        "--config",
+        productionConfig,
+        "--observation",
+        readiness.observationPath,
+        "--observation-key",
+        readiness.keyPath,
+        "--observation-key-id",
+        readiness.keyId,
+      ],
+      {
       cwd: directory,
       env: environment,
       stdio: ["ignore", "pipe", "pipe"],
-    });
+      },
+    );
     child.stdout?.setEncoding("utf8");
     child.stderr?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
@@ -248,5 +275,35 @@ describe("runmill service start", () => {
     expect(wrongMode.stderr).toContain("requires --mode asf-worker");
     expect(wrongMode.stderr).not.toContain("runtime-module-file");
     expect(existsSync(join(directory, "data"))).toBe(false);
+
+    const nonAsfConfig = join(directory, "standalone.json");
+    writeFileSync(
+      nonAsfConfig,
+      JSON.stringify({ schema: "runmill.production-mode/v1", mode: "standalone" }),
+      { mode: 0o600 },
+    );
+    const wrongConfig = await run(
+      TSX,
+      [
+        CLI,
+        "service",
+        "start",
+        "--mode",
+        "asf-worker",
+        "--config",
+        nonAsfConfig,
+      ],
+      {
+        cwd: directory,
+        env: {
+          ...process.env,
+          RUNMILL_DATA_DIR: join(directory, "data-config"),
+          RUNMILL_ASF_RUNTIME_MODULE: join(directory, "must-not-be-read.mjs"),
+        },
+      },
+    );
+    expect(wrongConfig.code).toBe(1);
+    expect(wrongConfig.stderr).toContain("requires mode asf-worker");
+    expect(existsSync(join(directory, "data-config"))).toBe(false);
   });
 });
