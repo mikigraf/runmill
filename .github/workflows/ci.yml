@@ -30,6 +30,27 @@ jobs:
       - name: Generated documentation is current
         run: npm run docs:check
 
+  native-transport:
+    name: Linux native ctxlane transport
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm install --global npm@11.15.0
+      - run: npm ci
+      - name: Install the native transport fixture runtime
+        run: sudo apt-get update && sudo apt-get install -y python3
+      - name: Build the Linux native transport artifact
+        run: npm run build:native
+      - name: Require a non-empty architecture-matched addon
+        run: test -s "dist-native/linux-$(node -p 'process.arch')/ctxlane-seqpacket.node"
+      - name: Run native transport boundary tests
+        run: npx vitest run test/identity/ctxlane-native-transport.test.ts
+
   test:
     name: test (Node ${{ matrix.node }}, ${{ matrix.os }})
     # Both platforms are first-class execution targets and their sandbox

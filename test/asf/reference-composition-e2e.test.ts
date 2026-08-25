@@ -407,15 +407,22 @@ class RecordingCtxlaneClient implements CtxlaneIdentityLeaseAcquisitionClient {
 }
 
 class FixtureLifecycleClient implements CtxlaneLeaseLifecycleClient {
+  readonly renewRequests: CtxlaneLeaseRenewalRequest[] = [];
+  readonly closeRequests: CtxlaneLeaseCloseRequest[] = [];
+  readonly revokeRequests: CtxlaneLeaseRevocationRequest[] = [];
+
   async renew(request: CtxlaneLeaseRenewalRequest): Promise<unknown> {
+    this.renewRequests.push(request);
     return request.lease;
   }
 
-  async close(_request: CtxlaneLeaseCloseRequest): Promise<unknown> {
+  async close(request: CtxlaneLeaseCloseRequest): Promise<unknown> {
+    this.closeRequests.push(request);
     return undefined;
   }
 
-  async revoke(_request: CtxlaneLeaseRevocationRequest): Promise<unknown> {
+  async revoke(request: CtxlaneLeaseRevocationRequest): Promise<unknown> {
+    this.revokeRequests.push(request);
     return undefined;
   }
 }
@@ -1038,9 +1045,10 @@ describe("ASF reference composition deterministic qualification boundary", () =>
       // a separate, deterministic host-side seam. The reference assembler
       // intentionally does not synthesize this transport or expose the lease
       // capability to the delivery runner.
+      const brokerLifecycle = new FixtureLifecycleClient();
       const broker = new CtxlaneProviderIdentityBroker({
         client: ctxlaneClient,
-        lifecycleClient: new FixtureLifecycleClient(),
+        lifecycleClient: brokerLifecycle,
         authority: {
           resolveAcquisitionAuthority: (request) =>
             ctxlaneAuthorityFor(
@@ -1063,6 +1071,26 @@ describe("ASF reference composition deterministic qualification boundary", () =>
         fencingGeneration: 41,
         requestedDurationMs: CTXLANE_REQUEST.requested_ttl_seconds * 1_000,
       });
+      // The deterministic fixture has no authenticated lifecycle service. A
+      // real broker must therefore refuse every lifecycle operation rather
+      // than treating an empty fixture response as authority. This proves
+      // the safe unqualified path without implying native provider readiness.
+      await expect(broker.renew(implementerLease)).rejects.toMatchObject({
+        code: "RM-AUTH-003",
+      });
+      await expect(
+        broker.close(implementerLease, "completed"),
+      ).rejects.toMatchObject({ code: "RM-AUTH-003" });
+      await expect(
+        broker.revoke(implementerLease, "fixture lifecycle unavailable"),
+      ).rejects.toMatchObject({ code: "RM-AUTH-003" });
+      expect(brokerLifecycle.renewRequests).toHaveLength(1);
+      expect(brokerLifecycle.closeRequests).toHaveLength(1);
+      expect(brokerLifecycle.revokeRequests).toHaveLength(1);
+      expect(brokerLifecycle.closeRequests[0]?.disposition).toBe("completed");
+      expect(brokerLifecycle.revokeRequests[0]?.reason).toBe(
+        "fixture lifecycle unavailable",
+      );
       const sandbox = new DeterministicCredentialFreeSandbox();
       const gateway = new RepositoryToolGateway({
         clock,
