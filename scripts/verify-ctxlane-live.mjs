@@ -13,6 +13,10 @@ const required = [
   "RUNMILL_CTXLANE_PROFILE_REF",
   "RUNMILL_CTXLANE_ENVIRONMENT",
   "RUNMILL_CTXLANE_ROLE",
+  "RUNMILL_CTXLANE_ENDPOINT",
+  "RUNMILL_CTXLANE_EXPECTED_PEER_EXECUTABLE",
+  "RUNMILL_CTXLANE_EXPECTED_PEER_CGROUP",
+  "RUNMILL_CTXLANE_LIVE_REQUEST_FILE",
 ];
 
 if (platform !== "linux") {
@@ -91,7 +95,8 @@ const invocations = [
       "--config",
       "vitest.live.config.ts",
       "test/live/ctxlane-service-health.live.test.ts",
-      "test/live/ctxlane-profile-readiness.live.test.ts",
+    "test/live/ctxlane-profile-readiness.live.test.ts",
+    "test/live/ctxlane-identity-lifecycle.live.test.ts",
     ],
   ],
 ];
