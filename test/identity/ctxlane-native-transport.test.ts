@@ -1,7 +1,6 @@
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { describe, expect, it } from "vitest";
@@ -294,7 +293,12 @@ describe("CtxlaneNativeSeqpacketAutomationClient", () => {
     "Linux native addon live seqpacket fixture",
     () => {
       it("round-trips one record while attesting the live peer executable and cgroup", async () => {
-        const fixtureRoot = mkdtempSync(join(tmpdir(), "runmill-ctxlane-seqpacket-"));
+        // The native transport intentionally rejects world-writable ancestors.
+        // Keep the live fixture below the protected checkout instead of /tmp,
+        // whose sticky bit would make the production boundary reject it.
+        const fixtureRoot = mkdtempSync(
+          join(process.cwd(), "node_modules", ".runmill-ctxlane-seqpacket-"),
+        );
         const socketPath = join(fixtureRoot, "ctxlane.sock");
         const pythonServer = spawn(
           "python3",
@@ -371,7 +375,9 @@ describe("CtxlaneNativeSeqpacketAutomationClient", () => {
       });
 
       it("refuses the same live endpoint when peer cgroup policy is tampered", async () => {
-        const fixtureRoot = mkdtempSync(join(tmpdir(), "runmill-ctxlane-seqpacket-"));
+        const fixtureRoot = mkdtempSync(
+          join(process.cwd(), "node_modules", ".runmill-ctxlane-seqpacket-"),
+        );
         const socketPath = join(fixtureRoot, "ctxlane.sock");
         const pythonServer = spawn(
           "python3",
