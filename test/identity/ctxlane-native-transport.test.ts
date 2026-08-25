@@ -1,6 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { describe, expect, it } from "vitest";
 import {
   CTXLANE_NATIVE_SEQPACKET_DEPLOYMENT_CONTRACT,
@@ -283,6 +286,146 @@ describe("CtxlaneNativeSeqpacketAutomationClient", () => {
         await expect(client.acquire(fixtureRequest)).rejects.toThrow(
           /ctxlane control endpoint is not a private socket|ctxlane native exchange failed|ctxlane control connection failed/,
         );
+      });
+    },
+  );
+
+  describe.runIf(nativeSeqpacketArtifactAvailable)(
+    "Linux native addon live seqpacket fixture",
+    () => {
+      it("round-trips one record while attesting the live peer executable and cgroup", async () => {
+        const fixtureRoot = mkdtempSync(join(tmpdir(), "runmill-ctxlane-seqpacket-"));
+        const socketPath = join(fixtureRoot, "ctxlane.sock");
+        const pythonServer = spawn(
+          "python3",
+          [
+            "-c",
+            [
+              "import json, os, socket, sys",
+              "path = sys.argv[1]",
+              "server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)",
+              "server.bind(path)",
+              "os.chmod(path, 0o600)",
+              "server.listen(1)",
+              "print('ready', flush=True)",
+              "connection, _ = server.accept()",
+              "connection.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)",
+              "request = connection.recv(262144)",
+              "decoded = json.loads(request.decode('utf-8'))",
+              "response = {'schema': 'ctxlane.live-fixture-response/v1', 'client_request_id': decoded['client_request_id']} ",
+              "connection.send(json.dumps(response, separators=(',', ':')).encode('utf-8'))",
+              "connection.close()",
+              "server.close()",
+            ].join("\n"),
+            socketPath,
+          ],
+          { stdio: ["ignore", "pipe", "inherit"] },
+        );
+        const stdout = createInterface({ input: pythonServer.stdout });
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+              reject(new Error(`seqpacket fixture exited before ready (${code ?? signal ?? "unknown"})`));
+            };
+            pythonServer.once("exit", onExit);
+            stdout.once("line", (line) => {
+              pythonServer.off("exit", onExit);
+              if (line !== "ready") {
+                reject(new Error(`unexpected seqpacket fixture readiness: ${line}`));
+                return;
+              }
+              resolve();
+            });
+          });
+
+          if (pythonServer.pid === undefined) {
+            throw new Error("seqpacket fixture has no child pid");
+          }
+          const peerExecutable = realpathSync(`/proc/${pythonServer.pid}/exe`);
+          const peerCgroup = readFileSync(`/proc/${pythonServer.pid}/cgroup`, "utf8").trim();
+          const client = new CtxlaneNativeSeqpacketAutomationClient({
+            endpoint: `unix://${socketPath}`,
+            expectedPeerExecutable: peerExecutable,
+            expectedPeerCgroup: peerCgroup,
+            trustedOwnerUids: [0, process.getuid?.() ?? 0],
+          });
+
+          await expect(client.acquire(fixtureRequest)).resolves.toEqual({
+            schema: "ctxlane.live-fixture-response/v1",
+            client_request_id: fixtureRequest.client_request_id,
+          });
+          await new Promise<void>((resolve, reject) => {
+            pythonServer.once("exit", (code, signal) =>
+              code === 0
+                ? resolve()
+                : reject(new Error(`seqpacket fixture failed (${code ?? signal ?? "unknown"})`)),
+            );
+          });
+        } finally {
+          stdout.close();
+          if (!pythonServer.killed && pythonServer.exitCode === null) {
+            pythonServer.kill("SIGTERM");
+          }
+          rmSync(fixtureRoot, { recursive: true, force: true });
+        }
+      });
+
+      it("refuses the same live endpoint when peer cgroup policy is tampered", async () => {
+        const fixtureRoot = mkdtempSync(join(tmpdir(), "runmill-ctxlane-seqpacket-"));
+        const socketPath = join(fixtureRoot, "ctxlane.sock");
+        const pythonServer = spawn(
+          "python3",
+          [
+            "-c",
+            [
+              "import os, socket, sys, time",
+              "path = sys.argv[1]",
+              "server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)",
+              "server.bind(path)",
+              "os.chmod(path, 0o600)",
+              "server.listen(1)",
+              "print('ready', flush=True)",
+              "connection, _ = server.accept()",
+              "time.sleep(2)",
+            ].join("\n"),
+            socketPath,
+          ],
+          { stdio: ["ignore", "pipe", "inherit"] },
+        );
+        const stdout = createInterface({ input: pythonServer.stdout });
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+              reject(new Error(`seqpacket fixture exited before ready (${code ?? signal ?? "unknown"})`));
+            };
+            pythonServer.once("exit", onExit);
+            stdout.once("line", (line) => {
+              pythonServer.off("exit", onExit);
+              if (line === "ready") {
+                resolve();
+              } else {
+                reject(new Error("fixture was not ready"));
+              }
+            });
+          });
+          if (pythonServer.pid === undefined) throw new Error("seqpacket fixture has no child pid");
+          const client = new CtxlaneNativeSeqpacketAutomationClient({
+            endpoint: `unix://${socketPath}`,
+            expectedPeerExecutable: realpathSync(`/proc/${pythonServer.pid}/exe`),
+            expectedPeerCgroup: "0::/tampered-by-test",
+            trustedOwnerUids: [0, process.getuid?.() ?? 0],
+            timeoutMs: 500,
+          });
+          await expect(client.acquire(fixtureRequest)).rejects.toThrow(
+            "ctxlane peer cgroup does not match policy",
+          );
+        } finally {
+          stdout.close();
+          if (!pythonServer.killed && pythonServer.exitCode === null) {
+            pythonServer.kill("SIGTERM");
+          }
+          rmSync(fixtureRoot, { recursive: true, force: true });
+        }
       });
     },
   );

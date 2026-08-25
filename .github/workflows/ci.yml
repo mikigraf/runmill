@@ -42,6 +42,8 @@ jobs:
           cache: npm
       - run: npm install --global npm@11.15.0
       - run: npm ci
+      - name: Install the native transport fixture runtime
+        run: sudo apt-get update && sudo apt-get install -y python3
       - name: Build the Linux native transport artifact
         run: npm run build:native
       - name: Require a non-empty architecture-matched addon
