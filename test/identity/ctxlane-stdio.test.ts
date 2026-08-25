@@ -57,6 +57,15 @@ function client(path: string, digest: string, timeoutMs = 1_000) {
   });
 }
 
+function responseScript(result: unknown): string {
+  const response = JSON.stringify({
+    jsonrpc: "2.0",
+    id: "req-1",
+    result,
+  });
+  return `read _request; printf '%s\\n' '${response}'`;
+}
+
 describe("CtxlaneStdioAutomationClient", () => {
   it("pins the executable, uses fixed args, and clears its environment", async () => {
     const target = executable(
@@ -88,6 +97,43 @@ describe("CtxlaneStdioAutomationClient", () => {
     await expect(
       bridge.call("ctxlane_acquire_identity_lease", REQUEST, "req-1"),
     ).rejects.toThrow("observation methods only");
+  });
+
+  it.each([
+    "expected_row_version",
+    "fencing_generation",
+    "execution_handle",
+    "lease_id",
+  ])(
+    "rejects %s when nested in an observation response array",
+    async (forbiddenKey) => {
+      const target = executable(
+        responseScript({
+          observations: [
+            {
+              nested: [{ [forbiddenKey]: "sensitive-controller-value" }],
+            },
+          ],
+        }),
+      );
+      await expect(
+        client(target.path, target.digest).call("ctxlane_health", {}, "req-1"),
+      ).rejects.toThrow("ctxlane returned invalid JSON");
+    },
+  );
+
+  it("does not include a forbidden response value in the protocol error", async () => {
+    const sensitiveValue = "sensitive-execution-handle-value";
+    const target = executable(
+      responseScript({
+        nested: { values: [{ execution_handle: sensitiveValue }] },
+      }),
+    );
+    const failure = await client(target.path, target.digest)
+      .call("ctxlane_health", {}, "req-1")
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(CtxlaneIdentityProtocolError);
+    expect(String((failure as Error).message)).not.toContain(sensitiveValue);
   });
 
   it("refuses a digest mismatch and a symlink before spawning", async () => {
