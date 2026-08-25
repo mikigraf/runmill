@@ -275,7 +275,7 @@ describe("CtxlaneTransport", () => {
       socketType: "SOCK_SEQPACKET",
       helperProcessAllowed: false,
       streamFallbackAllowed: false,
-      lifecycleStatus: "private-lifecycle-response-not-published",
+      lifecycleStatus: "ctxlane.identity-lease-lifecycle-private/v1",
     });
     expect(client.qualification).not.toBe("native-seqpacket-authenticated");
   });

@@ -1,7 +1,7 @@
 /**
  * Bounded byte-for-byte freshness check for the vendored ctxlane fixtures.
  *
- * Compares the exact forty-three files listed in test/fixtures/ctxlane/PROVENANCE.md
+ * Compares the exact forty-five files listed in test/fixtures/ctxlane/PROVENANCE.md
  * against a sibling ctxlane publication checkout. Offline and credential-free:
  * it only reads local files. CI never has that sibling checkout, so the
  * default with no source given must stay a safe no-op — this is a
@@ -25,6 +25,8 @@ const SCHEMA_NAMES = [
   "ctxlane.work-order-authorization.v1.schema.json",
   "ctxlane.identity-lease-request.v1.schema.json",
   "ctxlane.identity-lease.v1.schema.json",
+  "ctxlane.identity-lease-lifecycle-private-request.v1.schema.json",
+  "ctxlane.identity-lease-lifecycle-private-response.v1.schema.json",
   "ctxlane.automation-error.v1.schema.json",
   "ctxlane.identity-lease-close-receipt.v1.schema.json",
   "ctxlane.identity-lease-close.v1.schema.json",

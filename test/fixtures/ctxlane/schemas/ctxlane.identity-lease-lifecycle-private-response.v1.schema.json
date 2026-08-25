@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.identity-lease-lifecycle-private-response.v1.schema.json",
+  "title": "ctxlane private identity lease lifecycle response v1",
+  "description": "Authenticated-channel-only lifecycle response. Public callers receive only lease-view receipts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "operation", "client_request_id", "result"],
+  "properties": {
+    "schema": { "const": "ctxlane.identity-lease-lifecycle-private/v1" },
+    "operation": { "enum": ["renew", "revoke", "close"] },
+    "client_request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@+\\-]*$"
+    },
+    "result": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "lease"],
+          "properties": {
+            "kind": { "const": "lease" },
+            "lease": {
+              "$ref": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.identity-lease.v1.schema.json"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "error"],
+          "properties": {
+            "kind": { "const": "error" },
+            "error": {
+              "$ref": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.automation-error.v1.schema.json"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

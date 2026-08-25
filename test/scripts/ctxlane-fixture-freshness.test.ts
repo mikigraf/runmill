@@ -41,7 +41,7 @@ describe("ctxlane fixture freshness check", () => {
     const result = await run(TSX, [SCRIPT, "--source", directory], { cwd: process.cwd(), env: process.env });
 
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("check passed: 43 files match");
+    expect(result.stdout).toContain("check passed: 45 files match");
     expect(result.stdout).toContain("[OK] schemas/ctxlane.work-order-authorization.v1.schema.json");
     expect(result.stdout).toContain("[OK] examples/work-order-signing-vector.v1.json");
     expect(result.stdout).toContain("[OK] examples/profile-list.v1.json");

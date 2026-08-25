@@ -7,6 +7,7 @@ import { z } from "zod";
  * - `ctxlane.work-order-authorization/v1`
  * - `ctxlane.identity-lease-request/v1`
  * - `ctxlane.identity-lease/v1`
+ * - authenticated private identity-lease lifecycle request/response envelopes
  * - lifecycle parameter objects and `ctxlane.lease-view/v1`
  *
  * These schemas are transcribed field-for-field, pattern-for-pattern, from
@@ -28,6 +29,8 @@ export const CTXLANE_IDENTITY_LEASE_REQUEST_SCHEMA =
   "ctxlane.identity-lease-request/v1" as const;
 export const CTXLANE_IDENTITY_LEASE_SCHEMA =
   "ctxlane.identity-lease/v1" as const;
+export const CTXLANE_IDENTITY_LEASE_LIFECYCLE_PRIVATE_SCHEMA =
+  "ctxlane.identity-lease-lifecycle-private/v1" as const;
 export const CTXLANE_LEASE_VIEW_SCHEMA = "ctxlane.lease-view/v1" as const;
 export const CTXLANE_IDENTITY_LEASE_RENEW_ACKNOWLEDGEMENT_SCHEMA =
   "ctxlane.identity-lease-renew-acknowledgement/v1" as const;
@@ -1783,3 +1786,207 @@ export const ctxlaneLeaseAcquireAutomationErrorSchema = z
 export type CtxlaneLeaseAcquireAutomationError = z.infer<
   typeof ctxlaneLeaseAcquireAutomationErrorSchema
 >;
+
+const PRIVATE_LIFECYCLE_OPERATION_VALUES = [
+  "renew",
+  "revoke",
+  "close",
+] as const;
+export type CtxlaneIdentityLeaseLifecyclePrivateOperation =
+  (typeof PRIVATE_LIFECYCLE_OPERATION_VALUES)[number];
+const privateLifecycleOperationSchema = z.enum(
+  PRIVATE_LIFECYCLE_OPERATION_VALUES,
+);
+
+const PRIVATE_LIFECYCLE_REASON_VALUES = [
+  "completed",
+  "worker-failed",
+  "operator-revoked",
+  "policy-revoked",
+  "principal-mismatch",
+  "heartbeat-lost",
+  "process-unverifiable",
+  "generation-superseded",
+  "renewal-acknowledgement-failed",
+  "service-recovery",
+  "internal-error",
+] as const;
+export type CtxlaneIdentityLeaseLifecyclePrivateReason =
+  (typeof PRIVATE_LIFECYCLE_REASON_VALUES)[number];
+const privateLifecycleReasonSchema = z.enum(PRIVATE_LIFECYCLE_REASON_VALUES);
+
+const privateLifecycleRequestSchema = z
+  .object({
+    schema: z.literal(CTXLANE_IDENTITY_LEASE_LIFECYCLE_PRIVATE_SCHEMA),
+    operation: privateLifecycleOperationSchema,
+    client_request_id: lifecycleClientRequestIdSchema,
+    lease: ctxlaneIdentityLeaseSchema,
+    requested_ttl_seconds: z.number().int().min(1).max(86_400).optional(),
+    reason: privateLifecycleReasonSchema.optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    // The private Rust wire type requires a live, capability-bearing lease;
+    // a public lease-view or terminal lease can never authorize a mutation.
+    if (value.lease.status !== "active" && value.lease.status !== "renewing") {
+      issue(
+        context,
+        ["lease", "status"],
+        "private lifecycle requests require an active or renewing lease",
+      );
+    }
+    if (value.lease.execution_handle === null) {
+      issue(
+        context,
+        ["lease", "execution_handle"],
+        "private lifecycle requests require an execution handle",
+      );
+    }
+    if (value.lease.fencing_generation === null) {
+      issue(
+        context,
+        ["lease", "fencing_generation"],
+        "private lifecycle requests require a fencing generation",
+      );
+    }
+    if (value.lease.effective_policy_digest === null) {
+      issue(
+        context,
+        ["lease", "effective_policy_digest"],
+        "private lifecycle requests require an effective policy digest",
+      );
+    }
+
+    const hasRequestedTtl = value.requested_ttl_seconds !== undefined;
+    const hasReason = value.reason !== undefined;
+    if (value.operation === "renew") {
+      if (!hasRequestedTtl) {
+        issue(
+          context,
+          ["requested_ttl_seconds"],
+          "renew requires requested_ttl_seconds",
+        );
+      }
+      if (hasReason) {
+        issue(context, ["reason"], "renew must not include reason");
+      }
+    } else {
+      if (hasRequestedTtl) {
+        issue(
+          context,
+          ["requested_ttl_seconds"],
+          `${value.operation} must not include requested_ttl_seconds`,
+        );
+      }
+      if (!hasReason) {
+        issue(context, ["reason"], `${value.operation} requires reason`);
+      } else if (
+        value.operation === "close" &&
+        value.reason !== "completed" &&
+        value.reason !== "worker-failed"
+      ) {
+        issue(
+          context,
+          ["reason"],
+          "close reason must be completed or worker-failed",
+        );
+      } else if (
+        value.operation === "revoke" &&
+        (value.reason === "completed" || value.reason === "worker-failed")
+      ) {
+        issue(
+          context,
+          ["reason"],
+          "revoke reason must be a revocation reason",
+        );
+      }
+    }
+  });
+
+export const ctxlaneIdentityLeaseLifecyclePrivateRequestSchema =
+  privateLifecycleRequestSchema;
+
+export type CtxlaneIdentityLeaseLifecyclePrivateRequest = z.infer<
+  typeof ctxlaneIdentityLeaseLifecyclePrivateRequestSchema
+>;
+
+const privateLifecycleLeaseResultSchema = z
+  .object({
+    kind: z.literal("lease"),
+    lease: ctxlaneIdentityLeaseSchema,
+  })
+  .strict();
+const privateLifecycleErrorResultSchema = z
+  .object({
+    kind: z.literal("error"),
+    error: ctxlaneAutomationErrorSchema,
+  })
+  .strict();
+
+export const ctxlaneIdentityLeaseLifecyclePrivateResponseSchema = z
+  .object({
+    schema: z.literal(CTXLANE_IDENTITY_LEASE_LIFECYCLE_PRIVATE_SCHEMA),
+    operation: privateLifecycleOperationSchema,
+    client_request_id: lifecycleClientRequestIdSchema,
+    result: z.discriminatedUnion("kind", [
+      privateLifecycleLeaseResultSchema,
+      privateLifecycleErrorResultSchema,
+    ]),
+  })
+  .strict();
+
+export type CtxlaneIdentityLeaseLifecyclePrivateResponse = z.infer<
+  typeof ctxlaneIdentityLeaseLifecyclePrivateResponseSchema
+>;
+
+function parsePrivateLifecycleContract<T>(
+  schema: z.ZodType<T>,
+  raw: unknown,
+  label: string,
+): T {
+  const parsed = schema.safeParse(raw);
+  if (!parsed.success) {
+    throw new Error(
+      `${label} failed contract validation: ${parsed.error.issues
+        .map((entry) => `${entry.path.join(".") || "<root>"}: ${entry.message}`)
+        .join("; ")}`,
+    );
+  }
+  return parsed.data;
+}
+
+/** Parse an already decoded private lifecycle request without coercion. */
+export function parseCtxlaneIdentityLeaseLifecyclePrivateRequest(
+  raw: unknown,
+): CtxlaneIdentityLeaseLifecyclePrivateRequest {
+  return parsePrivateLifecycleContract(
+    ctxlaneIdentityLeaseLifecyclePrivateRequestSchema,
+    raw,
+    "ctxlane private lifecycle request",
+  );
+}
+
+/** Parse an already decoded private lifecycle response without coercion. */
+export function parseCtxlaneIdentityLeaseLifecyclePrivateResponse(
+  raw: unknown,
+): CtxlaneIdentityLeaseLifecyclePrivateResponse {
+  return parsePrivateLifecycleContract(
+    ctxlaneIdentityLeaseLifecyclePrivateResponseSchema,
+    raw,
+    "ctxlane private lifecycle response",
+  );
+}
+
+/** Serialize a validated private lifecycle request for the private channel. */
+export function serializeCtxlaneIdentityLeaseLifecyclePrivateRequest(
+  raw: unknown,
+): string {
+  return JSON.stringify(parseCtxlaneIdentityLeaseLifecyclePrivateRequest(raw));
+}
+
+/** Serialize a validated private lifecycle response for the private channel. */
+export function serializeCtxlaneIdentityLeaseLifecyclePrivateResponse(
+  raw: unknown,
+): string {
+  return JSON.stringify(parseCtxlaneIdentityLeaseLifecyclePrivateResponse(raw));
+}

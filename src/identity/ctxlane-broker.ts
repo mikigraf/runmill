@@ -21,6 +21,7 @@ import type {
 } from "./ctxlane-authority.js";
 import {
   CTXLANE_IDENTITY_LEASE_REQUEST_SCHEMA,
+  CTXLANE_IDENTITY_LEASE_LIFECYCLE_PRIVATE_SCHEMA,
   CTXLANE_IDENTITY_LEASE_SCHEMA,
   ctxlaneAutomationErrorSchema,
   ctxlaneIdentityLeaseRequestSchema,
@@ -48,7 +49,37 @@ import {
   type CtxlaneIdentityLeaseAcquisitionClient,
 } from "./ctxlane-transport.js";
 
-export { CTXLANE_IDENTITY_LEASE_REQUEST_SCHEMA, CTXLANE_IDENTITY_LEASE_SCHEMA };
+export {
+  CTXLANE_IDENTITY_LEASE_LIFECYCLE_PRIVATE_SCHEMA,
+  CTXLANE_IDENTITY_LEASE_REQUEST_SCHEMA,
+  CTXLANE_IDENTITY_LEASE_SCHEMA,
+};
+export {
+  ctxlaneIdentityLeaseLifecyclePrivateRequestSchema,
+  ctxlaneIdentityLeaseLifecyclePrivateResponseSchema,
+  parseCtxlaneIdentityLeaseLifecyclePrivateRequest,
+  parseCtxlaneIdentityLeaseLifecyclePrivateResponse,
+  serializeCtxlaneIdentityLeaseLifecyclePrivateRequest,
+  serializeCtxlaneIdentityLeaseLifecyclePrivateResponse,
+} from "./ctxlane-contracts.js";
+export type {
+  CtxlaneIdentityLeaseLifecyclePrivateRequest,
+  CtxlaneIdentityLeaseLifecyclePrivateResponse,
+  CtxlaneIdentityLeaseLifecyclePrivateOperation,
+  CtxlaneIdentityLeaseLifecyclePrivateReason,
+} from "./ctxlane-contracts.js";
+export {
+  CtxlanePrivateLifecycleClient,
+  validateCtxlaneIdentityLeaseInspectResponse,
+  validateCtxlanePrivateLifecycleResponse,
+} from "./ctxlane-private-lifecycle.js";
+export type { CtxlanePrivateLifecycleExchange } from "./ctxlane-private-lifecycle.js";
+export {
+  CtxlaneAuthenticatedMcpLifecycleClient,
+} from "./ctxlane-mcp-lifecycle.js";
+export type {
+  CtxlaneAuthenticatedLifecycleExchange,
+} from "./ctxlane-mcp-lifecycle.js";
 export {
   CTXLANE_NATIVE_SEQPACKET_DEPLOYMENT_CONTRACT,
   CTXLANE_NATIVE_SEQPACKET_TRANSPORT_QUALIFICATION,
@@ -63,6 +94,7 @@ export {
   CtxlaneStdioAutomationClient,
   CtxlaneNativeSeqpacketAutomationClient,
   CtxlaneUnixAutomationClient,
+  decodeNativeSeqpacketResponse,
   strictJsonDecode,
 } from "./ctxlane-transport.js";
 export type {
@@ -1154,7 +1186,7 @@ export class CtxlaneProviderIdentityBroker implements ProviderIdentityBroker {
   ): void {
     const ctxlane = current.ctxlane;
     if (
-      published.status !== "active" ||
+      (published.status !== "active" && published.status !== "renewing") ||
       published.lease_id !== current.leaseId ||
       published.tenant_id !== ctxlane.tenantId ||
       published.work_order_id !== current.workOrderId ||
@@ -1221,7 +1253,8 @@ export class CtxlaneProviderIdentityBroker implements ProviderIdentityBroker {
   #assertActive(lease: CtxlaneProviderIdentityLease, stage: string): void {
     const now = this.#clock.now().getTime();
     if (
-      lease.ctxlane.status !== "active" ||
+      (lease.ctxlane.status !== "active" &&
+        lease.ctxlane.status !== "renewing") ||
       !Number.isFinite(now) ||
       utcTimestampOrderKey(lease.issuedAt) >
         exactMilliseconds(now + this.#maximumClockSkewMs) ||

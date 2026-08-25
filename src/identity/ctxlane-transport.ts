@@ -57,7 +57,7 @@ export const CTXLANE_NATIVE_SEQPACKET_DEPLOYMENT_CONTRACT = Object.freeze({
     "ctxlane.identity-lease/v1",
     "ctxlane.automation-error/v1",
   ] as const),
-  lifecycleStatus: "private-lifecycle-response-not-published" as const,
+  lifecycleStatus: "ctxlane.identity-lease-lifecycle-private/v1" as const,
   helperProcessAllowed: false as const,
   streamFallbackAllowed: false as const,
 });
@@ -82,6 +82,10 @@ const CTXLANE_STDIO_OBSERVATION_METHODS = new Set([
 
 const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/u;
 const MAX_EXECUTABLE_PATH_BYTES = 4_096;
+// The native addon passes these values through fixed-size C buffers. Keep the
+// TypeScript boundary one byte below the native capacity so a caller cannot
+// smuggle a truncated policy value through N-API string conversion.
+const MAX_NATIVE_POLICY_TEXT_BYTES = 4_095;
 const STDIO_KILL_GRACE_MS = 250;
 
 const CONTROL_CHARACTER_PATTERN = new RegExp(
@@ -391,6 +395,73 @@ function loadCtxlaneNativeAddon(): CtxlaneNativeSeqpacketAddon | undefined {
 
 const ctxlaneNativeAddon = loadCtxlaneNativeAddon();
 
+function validateNativePeerPolicy(
+  expectedPeerExecutable: string,
+  expectedPeerCgroup: string,
+): void {
+  if (
+    !isAbsolute(expectedPeerExecutable) ||
+    expectedPeerExecutable !== normalize(expectedPeerExecutable) ||
+    Buffer.byteLength(expectedPeerExecutable, "utf8") === 0 ||
+    Buffer.byteLength(expectedPeerExecutable, "utf8") >
+      MAX_NATIVE_POLICY_TEXT_BYTES ||
+    CONTROL_CHARACTER_PATTERN.test(expectedPeerExecutable)
+  ) {
+    throw new CtxlaneIdentityProtocolError(
+      "ctxlane native peer executable policy is not a safe absolute path",
+    );
+  }
+  if (
+    !expectedPeerCgroup.startsWith("0::/") ||
+    Buffer.byteLength(expectedPeerCgroup, "utf8") === 0 ||
+    Buffer.byteLength(expectedPeerCgroup, "utf8") >
+      MAX_NATIVE_POLICY_TEXT_BYTES ||
+    CONTROL_CHARACTER_PATTERN.test(expectedPeerCgroup)
+  ) {
+    throw new CtxlaneIdentityProtocolError(
+      "ctxlane native peer cgroup policy is not a safe cgroup-v2 identity",
+    );
+  }
+}
+
+/**
+ * Decode exactly one response record returned by the native addon.
+ *
+ * The addon already enforces the seqpacket and truncation rules in C. This
+ * second boundary check is intentional: a replacement or ABI-incompatible
+ * addon must not turn an arbitrary JS value or an oversized Buffer into an
+ * authority-bearing response.
+ */
+export function decodeNativeSeqpacketResponse(
+  result: unknown,
+  maxMessageBytes: number,
+): unknown {
+  if (!Buffer.isBuffer(result)) {
+    throw new CtxlaneIdentityProtocolError(
+      "ctxlane native exchange returned an invalid record",
+    );
+  }
+  if (result.byteLength === 0) {
+    throw new CtxlaneIdentityProtocolError("ctxlane returned an empty response");
+  }
+  if (result.byteLength > maxMessageBytes) {
+    throw new CtxlaneIdentityProtocolError(
+      "ctxlane response exceeds the control limit",
+    );
+  }
+  let responseText: string;
+  try {
+    responseText = new TextDecoder("utf-8", { fatal: true }).decode(result);
+  } catch {
+    throw new CtxlaneIdentityProtocolError("ctxlane returned invalid UTF-8");
+  }
+  try {
+    return strictJsonDecode(responseText);
+  } catch {
+    throw new CtxlaneIdentityProtocolError("ctxlane returned invalid JSON");
+  }
+}
+
 export interface CtxlaneNativeSeqpacketAutomationClientOptions {
   readonly endpoint: string;
   readonly timeoutMs?: number | undefined;
@@ -449,8 +520,27 @@ export class CtxlaneNativeSeqpacketAutomationClient
       );
     }
     this.#trustedOwnerUids = [...new Set(owners)];
-    this.#expectedPeerExecutable = options.expectedPeerExecutable ?? "";
-    this.#expectedPeerCgroup = options.expectedPeerCgroup ?? "";
+    const expectedPeerExecutable = options.expectedPeerExecutable ?? "";
+    const expectedPeerCgroup = options.expectedPeerCgroup ?? "";
+    if (
+      typeof expectedPeerExecutable !== "string" ||
+      typeof expectedPeerCgroup !== "string"
+    ) {
+      throw new CtxlaneIdentityProtocolError(
+        "ctxlane native peer policy values must be strings",
+      );
+    }
+    this.#expectedPeerExecutable = expectedPeerExecutable;
+    this.#expectedPeerCgroup = expectedPeerCgroup;
+    if (
+      this.#expectedPeerExecutable.length > 0 &&
+      this.#expectedPeerCgroup.length > 0
+    ) {
+      validateNativePeerPolicy(
+        this.#expectedPeerExecutable,
+        this.#expectedPeerCgroup,
+      );
+    }
   }
 
   async acquire(
@@ -503,17 +593,7 @@ export class CtxlaneNativeSeqpacketAutomationClient
     if (signal?.aborted === true) {
       throw new CtxlaneIdentityProtocolError("ctxlane request was cancelled");
     }
-    let responseText: string;
-    try {
-      responseText = new TextDecoder("utf-8", { fatal: true }).decode(result);
-    } catch {
-      throw new CtxlaneIdentityProtocolError("ctxlane returned invalid UTF-8");
-    }
-    try {
-      return strictJsonDecode(responseText);
-    } catch {
-      throw new CtxlaneIdentityProtocolError("ctxlane returned invalid JSON");
-    }
+    return decodeNativeSeqpacketResponse(result, this.#maxMessageBytes);
   }
 }
 

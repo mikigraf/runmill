@@ -7,6 +7,8 @@ import {
   ctxlaneProfileListSchema,
   ctxlaneIdentityLeaseCloseSchema,
   ctxlaneIdentityLeaseCloseReceiptSchema,
+  ctxlaneIdentityLeaseLifecyclePrivateRequestSchema,
+  ctxlaneIdentityLeaseLifecyclePrivateResponseSchema,
   ctxlaneIdentityLeaseInspectSchema,
   ctxlaneIdentityLeaseInspectReceiptSchema,
   ctxlaneIdentityLeaseRequestSchema,
@@ -20,11 +22,17 @@ import {
   ctxlaneServiceHealthSchema,
   ctxlaneLeaseAcquireAutomationErrorSchema,
   ctxlaneWorkOrderAuthorizationSchema,
+  parseCtxlaneIdentityLeaseLifecyclePrivateRequest,
+  parseCtxlaneIdentityLeaseLifecyclePrivateResponse,
+  serializeCtxlaneIdentityLeaseLifecyclePrivateRequest,
+  serializeCtxlaneIdentityLeaseLifecyclePrivateResponse,
+  CTXLANE_IDENTITY_LEASE_LIFECYCLE_PRIVATE_SCHEMA,
   isAtOrBeforeUtc,
   isStrictlyBeforeUtc,
   utcTimestampNanosecondDelta,
   utcTimestampOrderKey,
 } from "../../src/identity/ctxlane-contracts.js";
+import { strictJsonDecode } from "../../src/identity/ctxlane-transport.js";
 
 const FIXTURES_DIR = join(__dirname, "..", "fixtures", "ctxlane", "examples");
 
@@ -78,6 +86,35 @@ const lifecycleFixtures = {
   viewRevoked: loadFixture("lease-view-revoked.v1.json"),
 } as const;
 
+const privateLifecycleClientRequestId = "req_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+function privateLifecycleRequest(
+  operation: "renew" | "revoke" | "close",
+  fields: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    schema: CTXLANE_IDENTITY_LEASE_LIFECYCLE_PRIVATE_SCHEMA,
+    operation,
+    client_request_id: privateLifecycleClientRequestId,
+    lease: clone(identityLeaseActiveFixture),
+    ...fields,
+  };
+}
+
+function privateLifecycleLeaseResponse(
+  operation: "renew" | "revoke" | "close" = "renew",
+): Record<string, unknown> {
+  return {
+    schema: CTXLANE_IDENTITY_LEASE_LIFECYCLE_PRIVATE_SCHEMA,
+    operation,
+    client_request_id: privateLifecycleClientRequestId,
+    result: {
+      kind: "lease",
+      lease: clone(identityLeaseActiveFixture),
+    },
+  };
+}
+
 describe("vendored ctxlane v1 fixtures parse byte-for-byte", () => {
   it("accepts the vendored work-order-authorization example", () => {
     expect(ctxlaneWorkOrderAuthorizationSchema.safeParse(workOrderAuthorizationFixture).success).toBe(
@@ -115,6 +152,112 @@ describe("vendored ctxlane v1 fixtures parse byte-for-byte", () => {
     ["development exception", readinessFixtures.developmentException],
   ] as const)("accepts the vendored %s automation-readiness example", (_label, fixture) => {
     expect(ctxlaneAutomationReadinessSchema.safeParse(fixture).success).toBe(true);
+  });
+});
+
+describe("ctxlane private lifecycle contract", () => {
+  it.each([
+    ["renew", { requested_ttl_seconds: 900 }],
+    ["revoke", { reason: "operator-revoked" }],
+    ["revoke", { reason: "policy-revoked" }],
+    ["revoke", { reason: "principal-mismatch" }],
+    ["revoke", { reason: "heartbeat-lost" }],
+    ["revoke", { reason: "process-unverifiable" }],
+    ["revoke", { reason: "generation-superseded" }],
+    ["revoke", { reason: "renewal-acknowledgement-failed" }],
+    ["revoke", { reason: "service-recovery" }],
+    ["revoke", { reason: "internal-error" }],
+    ["close", { reason: "completed" }],
+    ["close", { reason: "worker-failed" }],
+  ] as const)("accepts the %s private operation shape", (operation, fields) => {
+    const request = privateLifecycleRequest(operation, fields);
+    expect(ctxlaneIdentityLeaseLifecyclePrivateRequestSchema.safeParse(request).success).toBe(
+      true,
+    );
+    expect(parseCtxlaneIdentityLeaseLifecyclePrivateRequest(request).operation).toBe(operation);
+  });
+
+  it.each([
+    ["renew with reason", privateLifecycleRequest("renew", { requested_ttl_seconds: 900, reason: "operator-revoked" })],
+    ["renew without ttl", privateLifecycleRequest("renew")],
+    ["revoke without reason", privateLifecycleRequest("revoke")],
+    ["revoke with close reason", privateLifecycleRequest("revoke", { reason: "completed" })],
+    ["revoke with worker-failed reason", privateLifecycleRequest("revoke", { reason: "worker-failed" })],
+    ["revoke with ttl", privateLifecycleRequest("revoke", { reason: "operator-revoked", requested_ttl_seconds: 900 })],
+    ["close without reason", privateLifecycleRequest("close")],
+    ["close with revoke reason", privateLifecycleRequest("close", { reason: "operator-revoked" })],
+    ["close with ttl", privateLifecycleRequest("close", { reason: "completed", requested_ttl_seconds: 900 })],
+  ] as const)("rejects the invalid %s reason/field matrix", (_label, request) => {
+    expect(ctxlaneIdentityLeaseLifecyclePrivateRequestSchema.safeParse(request).success).toBe(
+      false,
+    );
+    expect(() => parseCtxlaneIdentityLeaseLifecyclePrivateRequest(request)).toThrow(
+      /failed contract validation/u,
+    );
+  });
+
+  it("rejects unknown members and preserves the private execution capability", () => {
+    const request = privateLifecycleRequest("renew", { requested_ttl_seconds: 900 });
+    const unknownRequest = { ...request, unknown_field: true };
+    expect(ctxlaneIdentityLeaseLifecyclePrivateRequestSchema.safeParse(unknownRequest).success).toBe(
+      false,
+    );
+
+    const serialized = serializeCtxlaneIdentityLeaseLifecyclePrivateRequest(request);
+    const parsed = parseCtxlaneIdentityLeaseLifecyclePrivateRequest(JSON.parse(serialized));
+    expect(parsed.lease.execution_handle).toBe(identityLeaseActiveFixture.execution_handle);
+    expect(serialized).toContain(identityLeaseActiveFixture.execution_handle as string);
+  });
+
+  it("rejects duplicate JSON members before private contract parsing", () => {
+    const duplicate = JSON.stringify(privateLifecycleRequest("renew", { requested_ttl_seconds: 900 }))
+      .replace('"operation":"renew"', '"operation":"renew","operation":"revoke"');
+    expect(() => strictJsonDecode(duplicate)).toThrow(/duplicate object member/u);
+  });
+
+  it("accepts lease and correlated automation-error private response results", () => {
+    const leaseResponse = privateLifecycleLeaseResponse();
+    const parsedLeaseResponse = parseCtxlaneIdentityLeaseLifecyclePrivateResponse(leaseResponse);
+    expect(parsedLeaseResponse.result.kind).toBe("lease");
+    if (parsedLeaseResponse.result.kind === "lease") {
+      expect(parsedLeaseResponse.result.lease.execution_handle).toBe(
+        identityLeaseActiveFixture.execution_handle,
+      );
+    }
+
+    const errorResponse = {
+      ...privateLifecycleLeaseResponse("revoke"),
+      result: {
+        kind: "error",
+        error: {
+          ...automationErrorFixture,
+          operation: "lease-revoke",
+          client_request_id: privateLifecycleClientRequestId,
+        },
+      },
+    };
+    expect(ctxlaneIdentityLeaseLifecyclePrivateResponseSchema.safeParse(errorResponse).success).toBe(
+      true,
+    );
+    expect(
+      JSON.parse(serializeCtxlaneIdentityLeaseLifecyclePrivateResponse(errorResponse)).result.kind,
+    ).toBe("error");
+  });
+
+  it("rejects unknown response members and capability-free lease views", () => {
+    const unknownResponse = { ...privateLifecycleLeaseResponse(), unknown_field: true };
+    expect(ctxlaneIdentityLeaseLifecyclePrivateResponseSchema.safeParse(unknownResponse).success).toBe(
+      false,
+    );
+
+    const capabilityFreeResponse = privateLifecycleLeaseResponse();
+    capabilityFreeResponse.result = {
+      kind: "lease",
+      lease: lifecycleFixtures.viewActive,
+    };
+    expect(
+      ctxlaneIdentityLeaseLifecyclePrivateResponseSchema.safeParse(capabilityFreeResponse).success,
+    ).toBe(false);
   });
 });
 
