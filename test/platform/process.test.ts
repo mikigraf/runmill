@@ -126,4 +126,18 @@ describe("runWithInput", () => {
     expect(result.stderr).toContain("refused");
     expect(result.stderr).not.toContain(secret);
   });
+
+  it("terminates the child tree when the caller aborts", async () => {
+    const controller = new AbortController();
+    const pending = runWithInput(
+      process.execPath,
+      ["--input-type=module", "-e", "process.stdin.resume(); setTimeout(() => {}, 60000);"],
+      "",
+      { signal: controller.signal },
+    );
+    controller.abort();
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.stderr).toContain("command cancelled");
+  });
 });

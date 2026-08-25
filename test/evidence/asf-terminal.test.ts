@@ -12,6 +12,11 @@ import {
 } from "../../src/evidence/asf-terminal.js";
 import { IN_TOTO_STATEMENT_V1 } from "../../src/evidence/asf-bundle.js";
 import { AsfEvidenceValidationError } from "../../src/evidence/asf-validator.js";
+import {
+  ASF_EVIDENCE_TRUST_SCHEMA,
+  ASF_TERMINAL_EVIDENCE_EXPECTATIONS_SCHEMA,
+  verifyPortableAsfEvidenceBundle,
+} from "../../src/evidence/portable-verifier.js";
 import { canonicalJson, sha256Digest } from "../../src/asf/canonical-json.js";
 import { parseRunEvent } from "../../src/asf/run-event.js";
 import {
@@ -358,7 +363,59 @@ function validate(
   });
 }
 
+function portableTerminalExpectations(): Record<string, unknown> {
+  return {
+    schema: ASF_TERMINAL_EVIDENCE_EXPECTATIONS_SCHEMA,
+    run_id: "run-01",
+    work_order_id: "wo-01",
+    attempt_id: "attempt-01",
+    work_order_envelope_digest: ENVELOPE_DIGEST,
+    work_order_payload_digest: PAYLOAD_DIGEST,
+    effective_policy_digest: POLICY_DIGEST,
+    repository: "acme/widgets",
+    base_sha: BASE_SHA,
+    candidate_sha: null,
+    terminal_phase: "FAILED",
+    terminal_event_seq: 2,
+    cleanup_observation_digest: CLEANUP_DIGEST,
+    delivery_bundle_digest: null,
+    preceding_event_chain_digest: EVENT_CHAIN_DIGEST,
+    provider_budget: PROVIDER_BUDGET,
+    side_effects: SIDE_EFFECTS,
+    admitted_at: ADMITTED_AT,
+    terminal_evidence_at: TERMINAL_AT,
+    elapsed_ms: Date.parse(TERMINAL_AT) - Date.parse(ADMITTED_AT),
+  };
+}
+
 describe("signed portable ASF terminal evidence", () => {
+  it("verifies terminal evidence through the state-free portable handoff", async () => {
+    const result = await verifyPortableAsfEvidenceBundle({
+      bundle: sign(statement({ phase: "FAILED" })),
+      trust: {
+        schema: ASF_EVIDENCE_TRUST_SCHEMA,
+        signers: [
+          {
+            key_id: "terminal-evidence-2026",
+            public_key_pem: publicKey
+              .export({ type: "spki", format: "pem" })
+              .toString(),
+            valid_from: "2026-01-01T00:00:00.000Z",
+            valid_until: "2027-01-01T00:00:00.000Z",
+            revoked_at: null,
+          },
+        ],
+      },
+      expectations: portableTerminalExpectations(),
+      clock,
+    });
+
+    expect(result.kind).toBe("terminal");
+    if (result.kind !== "terminal") throw new Error("unexpected delivery bundle");
+    expect(result.validated.terminalPhase).toBe("FAILED");
+    expect(result.artifacts).toBeNull();
+  });
+
   it("chains successful delivery to exact post-cleanup terminal evidence", () => {
     const bundle = sign(
       statement({ phase: "COMPLETED", candidateSha: CANDIDATE_SHA }),

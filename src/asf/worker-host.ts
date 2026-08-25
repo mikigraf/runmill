@@ -1,3 +1,4 @@
+import type { KeyLike } from "node:crypto";
 import { z } from "zod";
 import {
   asfDaemonRuntimePaths,
@@ -11,11 +12,17 @@ import { handleAsfControlRequest, type AsfControlService } from "./control.js";
 import type { AsfControlAuthenticationVerifier } from "./control-auth.js";
 import { asfHealthReportSchema, type AsfHealthReport } from "./health.js";
 import {
+  verifySignedAsfReadinessObservation,
+} from "./readiness-attestation.js";
+import {
   ASF_PRODUCTION_READINESS_CHECK_IDS_V1_DISABLED,
   ASF_PRODUCTION_READINESS_REPORT_SCHEMA,
+  evaluateProductionReadiness,
   hasCanonicalAsfProductionReadinessChecks,
+  type AsfWorkerProductionConfig,
   type ProductionReadinessReport,
 } from "./production-readiness.js";
+import type { Clock } from "../platform/clock.js";
 
 const readyProductionReportSchema = z
   .object({
@@ -70,6 +77,19 @@ export interface AsfWorkerHostControlServerFactory {
   start(options: ControlServerOptions): Promise<AsfWorkerHostControlServer>;
 }
 
+/**
+ * Process-owned readiness binding. Runtime modules may provide a report, but
+ * they cannot choose the observation path, evaluator key, policy config, or
+ * clock used to authorize the host.
+ */
+export interface AsfWorkerReadinessBinding {
+  readonly readSignedObservation: () => unknown | Promise<unknown>;
+  readonly evaluatorKeyId: string;
+  readonly evaluatorPublicKey: KeyLike;
+  readonly productionConfig: AsfWorkerProductionConfig;
+  readonly clock: Clock;
+}
+
 export interface AsfWorkerHostOptions {
   /** Deliberate runtime guard: this host cannot be selected implicitly. */
   readonly mode: "asf-worker";
@@ -86,6 +106,8 @@ export interface AsfWorkerHostOptions {
    * report. A standalone/development result can never authorize this host.
    */
   readonly readiness: () => ProductionReadinessReport | Promise<ProductionReadinessReport>;
+  /** Injected by the explicit production runtime entrypoint, never by its module. */
+  readonly readinessBinding?: AsfWorkerReadinessBinding | undefined;
   readonly controlServerFactory?: AsfWorkerHostControlServerFactory | undefined;
   readonly onBackgroundError?: ((error: unknown) => void) | undefined;
 }
@@ -118,6 +140,41 @@ export class AsfWorkerHostReadinessError extends Error {
     this.domain = domain;
     this.reasons = safeReasons;
   }
+}
+
+/**
+ * Verify the process-owned signed readiness binding without invoking a
+ * runtime-module callback or touching the durable worker service. The runtime
+ * entrypoint uses this before importing the operator module; host startup and
+ * every authority-bearing request repeat it because the observation is a
+ * replaceable, time-bounded file.
+ */
+export async function verifyAsfWorkerReadinessBinding(
+  binding: AsfWorkerReadinessBinding,
+): Promise<void> {
+  let independentlyEvaluated: ProductionReadinessReport;
+  try {
+    const signed = verifySignedAsfReadinessObservation(
+      await binding.readSignedObservation(),
+      {
+        keyId: binding.evaluatorKeyId,
+        publicKey: binding.evaluatorPublicKey,
+      },
+    );
+    independentlyEvaluated = evaluateProductionReadiness(
+      binding.productionConfig,
+      signed.observation,
+      binding.clock,
+    );
+  } catch (error) {
+    if (error instanceof AsfWorkerHostReadinessError) throw error;
+    const reason =
+      error instanceof Error && error.name === "AsfReadinessObservationVerificationError"
+        ? "readiness-attestation-invalid"
+        : "readiness-attestation-probe-failed";
+    throw new AsfWorkerHostReadinessError("production", [reason]);
+  }
+  assertReadyProductionReport(independentlyEvaluated);
 }
 
 /**
@@ -172,7 +229,7 @@ export class AsfWorkerHost {
       ]);
     }
 
-    await requireProductionReady(options.readiness);
+    await requireProductionReady(options.readiness, options.readinessBinding);
     await requireHealthy(options.service);
 
     const lifecycle: HostLifecycle = {
@@ -264,7 +321,7 @@ async function dispatchControlRequest(
     throw new Error("ASF worker service is stopping and is not accepting authority-bearing requests");
   }
   if (PRODUCTION_GATED_REQUESTS.has(request.type)) {
-    await requireProductionReady(options.readiness);
+    await requireProductionReady(options.readiness, options.readinessBinding);
     if (STRICT_ADMISSION_HEALTH_REQUESTS.has(request.type)) {
       await requireHealthy(options.service);
     } else {
@@ -292,7 +349,29 @@ function isAuthorityBearing(request: AsfControlRequest): boolean {
 
 async function requireProductionReady(
   readiness: AsfWorkerHostOptions["readiness"],
+  binding: AsfWorkerHostOptions["readinessBinding"],
 ): Promise<void> {
+  if (binding !== undefined) {
+    await verifyAsfWorkerReadinessBinding(binding);
+
+    let callbackReport: unknown;
+    try {
+      callbackReport = await readiness();
+    } catch {
+      throw new AsfWorkerHostReadinessError("production", ["probe-failed"]);
+    }
+    const callbackParsed = readyProductionReportSchema.safeParse(callbackReport);
+    if (
+      !callbackParsed.success ||
+      !hasCanonicalAsfProductionReadinessChecks(callbackParsed.data.checks)
+    ) {
+      throw new AsfWorkerHostReadinessError("production", [
+        "readiness-report-invalid",
+      ]);
+    }
+    return;
+  }
+
   let raw: unknown;
   try {
     raw = await readiness();
@@ -323,6 +402,22 @@ async function requireProductionReady(
     "production",
     checks.length === 0 ? ["invalid-or-not-ready-report"] : checks,
   );
+}
+
+function assertReadyProductionReport(report: ProductionReadinessReport): void {
+  const parsed = readyProductionReportSchema.safeParse(report);
+  if (!parsed.success) {
+    const failed = report.checks.filter((check) => !check.passed).map((check) => check.id);
+    throw new AsfWorkerHostReadinessError(
+      "production",
+      failed.length === 0 ? ["invalid-or-not-ready-report"] : failed,
+    );
+  }
+  if (!hasCanonicalAsfProductionReadinessChecks(parsed.data.checks)) {
+    throw new AsfWorkerHostReadinessError("production", [
+      "readiness-check-set-incomplete-or-unknown",
+    ]);
+  }
 }
 
 async function requireHealthy(service: AsfWorkerHostService): Promise<AsfHealthReport> {

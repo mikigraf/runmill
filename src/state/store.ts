@@ -3776,7 +3776,9 @@ export class StateStore {
         intent.candidate_sha !== row.lifecycleCandidateSha ||
         expectedRole !== row.role ||
         expectedProviderCandidateSha !== row.providerCandidateSha ||
-        asfProviderInvocationId(row.effectKey, row.role) !== row.invocationId ||
+        (intent.stage === "candidate" &&
+          asfProviderInvocationId(row.effectKey, row.role) !==
+            row.invocationId) ||
         !ASF_DELIVERY_IDENTIFIER.test(row.effectKey) ||
         !ASF_DELIVERY_IDENTIFIER.test(row.intentId) ||
         !ASF_DELIVERY_IDENTIFIER.test(row.runId) ||

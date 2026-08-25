@@ -15,6 +15,7 @@ import {
 import type {
   SubmitWorkOrderResult,
   WorkOrderAdmissionService,
+  AsfSubmissionLookupResult,
 } from "./work-order.js";
 import type {
   AsfCancellationService,
@@ -39,7 +40,10 @@ import type { AsfHealthReport, AsfHealthService } from "./health.js";
 import type {
   AsfTelemetryAttributeInput,
   AsfTelemetryCounterName,
+  AsfTelemetryGaugeName,
   AsfTelemetryHistogramName,
+  AsfTelemetryLogName,
+  AsfTelemetryLogSeverity,
   AsfTelemetryRecorder,
   AsfTelemetrySpanName,
   AsfTelemetryUnit,
@@ -61,7 +65,8 @@ export type AsfWorkerStore = Pick<
   | "compactAsfRunEvents"
 >;
 
-export type AsfWorkOrderSubmitter = Pick<WorkOrderAdmissionService, "submit">;
+export type AsfWorkOrderSubmitter = Pick<WorkOrderAdmissionService, "submit"> &
+  Partial<Pick<WorkOrderAdmissionService, "lookupSubmission">>;
 
 export type AsfRunnerTransition = Omit<
   Parameters<AsfWorkerStore["transitionAsfRun"]>[0],
@@ -151,6 +156,11 @@ export interface AsfRunSnapshot {
   readonly run: AsfRunRow;
   readonly admission: SafeAsfAdmissionSnapshot;
   readonly latestSequence: number;
+}
+
+export interface AsfSubmissionLookup {
+  readonly disposition: "found" | "not-found";
+  readonly snapshot?: AsfRunSnapshot;
 }
 
 export interface AsfWorkerRuntimeSnapshot {
@@ -367,18 +377,21 @@ export class AsfWorkerService {
       throw error;
     }
     this.#schedule(admitted.runId);
+    const correlation = { run_id: admitted.runId } as const;
     this.#telemetryOperation(
       "runmill.asf.work_order.admission",
       startedAt,
       "admission",
       "work-order-admit",
       "succeeded",
+      correlation,
     );
     if (admitted.disposition === "accepted") {
       this.#telemetryCounter("runmill.asf.work_orders.accepted", 1, {
         component: "admission",
         operation: "work-order-admit",
         outcome: "succeeded",
+        ...correlation,
       });
     }
     return admitted;
@@ -437,6 +450,45 @@ export class AsfWorkerService {
       run: { ...snapshot.run },
       admission: safeAdmission(snapshot.admission),
       latestSequence: snapshot.latestSequence,
+    };
+  }
+
+  /**
+   * Recover a submission after a lost response only when both immutable Work
+   * Order digests match. A missing or mismatched assertion is intentionally
+   * indistinguishable from an unknown idempotency key.
+   */
+  lookupSubmission(input: {
+    readonly idempotencyKey: string;
+    readonly payloadDigest: string;
+    readonly envelopeDigest: string;
+  }): AsfSubmissionLookup {
+    const lookup = this.#admission.lookupSubmission;
+    if (typeof lookup !== "function") {
+      throw new Error("ASF submission lookup is not configured for this worker service");
+    }
+    const result: AsfSubmissionLookupResult = lookup.call(this.#admission, input);
+    if (
+      result === null ||
+      typeof result !== "object" ||
+      (result.disposition !== "found" && result.disposition !== "not-found") ||
+      result.disposition === "not-found" ||
+      typeof result.runId !== "string" ||
+      result.runId.trim() === ""
+    ) {
+      return { disposition: "not-found" };
+    }
+    const snapshot = this.#store.getAsfRunSnapshot(result.runId);
+    if (snapshot === undefined) {
+      throw new Error("ASF submission lookup found an admission without its durable run");
+    }
+    return {
+      disposition: "found",
+      snapshot: {
+        run: { ...snapshot.run },
+        admission: safeAdmission(snapshot.admission),
+        latestSequence: snapshot.latestSequence,
+      },
     };
   }
 
@@ -668,16 +720,28 @@ export class AsfWorkerService {
 
   /** Stop taking work, leave queued work durable, and finish active safe boundaries. */
   async requestStop(): Promise<void> {
+    let cleanupError: unknown;
+    const cancelSafely = (task: AsfScheduledTask): void => {
+      try {
+        task.cancel();
+      } catch (error) {
+        cleanupError ??= error;
+      }
+    };
     if (!this.#stopping) {
       this.#stopping = true;
-      this.#retryTask?.cancel();
+      const retryTask = this.#retryTask;
       this.#retryTask = undefined;
-      for (const task of this.#delayedWakeTasks.values()) task.cancel();
+      if (retryTask !== undefined) cancelSafely(retryTask);
+      const delayedWakeTasks = [...this.#delayedWakeTasks.values()];
       this.#delayedWakeTasks.clear();
-      for (const task of this.#eventRetentionTasks.values()) task.cancel();
+      for (const task of delayedWakeTasks) cancelSafely(task);
+      const eventRetentionTasks = [...this.#eventRetentionTasks.values()];
       this.#eventRetentionTasks.clear();
+      for (const task of eventRetentionTasks) cancelSafely(task);
       const activeIds = new Set(this.#activeRuns.keys());
       this.#queue.splice(0);
+      this.#emitRuntimeGauges();
       for (const runId of [...this.#scheduled]) {
         if (!activeIds.has(runId)) this.#scheduled.delete(runId);
       }
@@ -687,6 +751,11 @@ export class AsfWorkerService {
       await new Promise<void>((resolve) => this.#idleWaiters.add(resolve));
     }
     this.#emitStopTelemetry();
+    if (cleanupError !== undefined) {
+      throw cleanupError instanceof Error
+        ? cleanupError
+        : new Error("ASF scheduled task cancellation failed");
+    }
   }
 
   #wakeRun(runId: string): void {
@@ -705,6 +774,7 @@ export class AsfWorkerService {
     }
     this.#scheduled.add(runId);
     this.#queue.push(runId);
+    this.#emitRuntimeGauges();
     this.#requestPump();
     return true;
   }
@@ -799,6 +869,7 @@ export class AsfWorkerService {
         leaseLost: false,
       };
       this.#activeRuns.set(runId, active);
+      this.#emitRuntimeGauges();
       this.#scheduleHeartbeat(runId, active);
       void this.#execute(runId, active, ownership.takeover)
         .catch((error: unknown) => this.#reportBackgroundError(error, runId))
@@ -838,6 +909,7 @@ export class AsfWorkerService {
   ): Promise<void> {
     const generation = active.generation;
     const startedAt = this.#telemetryMonotonicMs();
+    const correlation = this.#telemetryCorrelation(runId);
     let telemetryFinished = false;
     const finishTelemetry = (
       outcome: NonNullable<AsfTelemetryAttributeInput["outcome"]>,
@@ -847,6 +919,7 @@ export class AsfWorkerService {
       if (telemetryFinished) return;
       telemetryFinished = true;
       const attributes: AsfTelemetryAttributeInput = {
+        ...correlation,
         component: "runner",
         operation: "run-dispatch",
         outcome,
@@ -862,9 +935,21 @@ export class AsfWorkerService {
         "run-dispatch",
         outcome,
         {
+          ...correlation,
           disposition,
           ...(reason_code === undefined ? {} : { reason_code }),
           ...(takeover ? { recovery_mode: "takeover" as const } : {}),
+        },
+      );
+      this.#telemetryLog(
+        "runmill.asf.run.event",
+        outcome === "succeeded"
+          ? "info"
+          : outcome === "failed"
+            ? "error"
+            : "warn",
+        {
+          ...attributes,
         },
       );
     };
@@ -1381,6 +1466,7 @@ export class AsfWorkerService {
     active.cancellationTask?.cancel();
     active.cancellationTask = undefined;
     this.#activeRuns.delete(runId);
+    this.#emitRuntimeGauges();
   }
 
   #resolveIdleWaiters(): void {
@@ -1395,6 +1481,25 @@ export class AsfWorkerService {
       return Number.isFinite(value) && value >= 0 ? value : undefined;
     } catch {
       return undefined;
+    }
+  }
+
+  /** Return only bounded, non-secret identifiers for telemetry correlation. */
+  #telemetryCorrelation(runId: string): AsfTelemetryAttributeInput {
+    try {
+      const snapshot = this.#store.getAsfRunSnapshot(runId);
+      return {
+        run_id: runId,
+        ...(snapshot === undefined
+          ? {}
+          : {
+              tenant_id: snapshot.admission.tenantId,
+              work_order_id: snapshot.admission.workOrderId,
+              attempt_id: snapshot.admission.attemptId,
+            }),
+      };
+    } catch {
+      return { run_id: runId };
     }
   }
 
@@ -1471,6 +1576,27 @@ export class AsfWorkerService {
     }
   }
 
+  #telemetryGauge(
+    name: AsfTelemetryGaugeName,
+    value: number,
+    attributes: AsfTelemetryAttributeInput,
+  ): void {
+    try {
+      this.#discardTelemetryResult(
+        this.#telemetry?.gauge?.(name, value, attributes),
+      );
+    } catch {
+      // Even a nonconforming telemetry adapter cannot affect worker authority.
+    }
+  }
+
+  /** Emit non-authoritative point-in-time queue and active-run depths. */
+  #emitRuntimeGauges(): void {
+    const attributes = { component: "runner" as const };
+    this.#telemetryGauge("runmill.asf.queue.depth", this.#queue.length, attributes);
+    this.#telemetryGauge("runmill.asf.run.active", this.#activeRuns.size, attributes);
+  }
+
   #telemetryHistogram(
     name: AsfTelemetryHistogramName,
     value: number,
@@ -1501,9 +1627,28 @@ export class AsfWorkerService {
   #reportBackgroundError(error: unknown, runId: string): void {
     try {
       this.#onBackgroundError?.(error, runId);
+      this.#telemetryLog("runmill.asf.run.event", "error", {
+        ...this.#telemetryCorrelation(runId),
+        component: "runner",
+        operation: "run-dispatch",
+        outcome: "failed",
+        reason_code: "unknown",
+      });
     } catch {
       // A diagnostic callback cannot be allowed to create an unhandled
       // rejection in the detached execution path.
+    }
+  }
+
+  #telemetryLog(
+    name: AsfTelemetryLogName,
+    severity: AsfTelemetryLogSeverity,
+    attributes: AsfTelemetryAttributeInput,
+  ): void {
+    try {
+      this.#discardTelemetryResult(this.#telemetry?.log?.(name, severity, attributes));
+    } catch {
+      // A nonconforming telemetry adapter cannot affect worker authority.
     }
   }
 }

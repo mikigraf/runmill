@@ -550,10 +550,25 @@ describe("TrustedProviderHarness", () => {
     const result = execution.result;
 
     expect(sandbox.calls).toHaveLength(1);
-    expect(sandbox.calls[0]?.sandbox.env).toEqual({});
-    expect(sandbox.calls[0]?.sandbox.policy.allowNetwork).toBe(false);
+    const sandboxInvocation = sandbox.calls[0]!;
+    expect(sandboxInvocation.sandbox.env).toEqual({});
+    expect(sandboxInvocation.sandbox.policy.allowNetwork).toBe(false);
+    expect(sandboxInvocation.isolation).toEqual({
+      network: "disabled",
+      inheritEnvironment: false,
+      providerCredentials: "denied",
+      hostCredentialPaths: "denied",
+      hostSockets: "denied",
+      otherWorkspaces: "denied",
+      candidate: CANDIDATE,
+      freshCandidate: true,
+    });
+    const serializedSandboxInvocation = JSON.stringify(sandboxInvocation);
+    expect(serializedSandboxInvocation).not.toContain(PROVIDER_CREDENTIAL);
+    expect(serializedSandboxInvocation).not.toContain(EXECUTION_HANDLE);
+    expect(serializedSandboxInvocation).not.toContain("ctxlane/private.sock");
     const publicData = `${JSON.stringify(result)}${protectedToolResult}${JSON.stringify(
-      sandbox.calls[0]?.sandbox.env,
+      sandboxInvocation.sandbox.env,
     )}`;
     for (const protectedValue of protectedValues)
       expect(publicData).not.toContain(protectedValue);

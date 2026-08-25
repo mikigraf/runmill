@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.identity-lease-renew-acknowledgement.v1.schema.json",
+  "title": "ctxlane identity lease renewal acknowledgement v1",
+  "description": "Authenticated harness-channel acknowledgement; not an MCP parameter object.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "lease_id", "fencing_generation"],
+  "properties": {
+    "schema": { "const": "ctxlane.identity-lease-renew-acknowledgement/v1" },
+    "lease_id": { "$ref": "#/$defs/leaseId" },
+    "fencing_generation": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    }
+  },
+  "$defs": {
+    "leaseId": {
+      "type": "string",
+      "pattern": "^lease_[0-7][0-9A-HJKMNP-TV-Z]{25}$(?![\\s\\S])"
+    }
+  }
+}

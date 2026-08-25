@@ -4,6 +4,33 @@
 
 This coverage contract supplies the evidence for the **Verify** stage of Runmill's delivery loop.
 
+## Portable signed-bundle verification
+
+A verifier host can check a delivered signed evidence bundle without a Runmill
+database, control socket, provider credential, or repository checkout:
+
+```bash
+runmill evidence verify evidence.json \
+  --trust trusted-signers.json \
+  --expectations candidate-facts.json \
+  --artifacts-dir /var/lib/runmill/evidence-cas
+```
+
+The trust document uses `runmill.asf-evidence-trust/v1` and contains exactly one
+or more Ed25519 public keys with bounded validity windows. Delivery-bundle facts
+use `runmill.asf-evidence-expectations/v1`; they are authoritative candidate,
+policy, check, review, and pull-request observations rather than claims copied
+from the signed statement. The command validates the schema, canonical digest,
+signature, exact candidate bindings, required evidence, and content-addressed
+artifact references. Supplying `--artifacts-dir` additionally re-hashes every
+referenced CAS body with bounded byte and aggregate limits.
+
+Terminal cleanup bundles use `runmill.asf-terminal-evidence-expectations/v1`.
+They verify the terminal event chain, cleanup observation, provider-budget
+ledger, and side-effect ledger; terminal bundles do not have a portable artifact
+manifest, so `--artifacts-dir` is refused for them. A malformed or contradictory
+bundle exits non-zero and never becomes an authority decision.
+
 Most automation treats a green command as proof. It is not. A command that exits 0 answers
 exactly one question — *did this process end well?* — and merge-readiness depends on four:
 

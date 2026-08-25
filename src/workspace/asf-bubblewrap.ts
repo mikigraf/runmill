@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createServer } from "node:net";
 import {
   accessSync,
   constants,
@@ -697,7 +698,7 @@ async function qualify(context: QualificationContext): Promise<AsfBubblewrapQual
   writeFileSync(join(workspace, "readable"), "workspace-visible", { mode: 0o600 });
   writeFileSync(outside, "other-workspace-secret", { mode: 0o600 });
   writeFileSync(homeSecret, "credential-secret", { mode: 0o600 });
-  writeFileSync(socketCanary, "socket-path-secret", { mode: 0o600 });
+  const socketServer = createServer((connection) => connection.destroy());
 
   const qualificationLimits = {
     cpuMillis: 30_000,
@@ -748,6 +749,13 @@ async function qualify(context: QualificationContext): Promise<AsfBubblewrapQual
   };
 
   try {
+    await new Promise<void>((resolve, reject) => {
+      socketServer.once("error", reject);
+      socketServer.listen(socketCanary, () => {
+        socketServer.removeListener("error", reject);
+        resolve();
+      });
+    });
     const read = requireExit(await probe("/usr/bin/cat", [join(workspace, "readable")]), "workspace read");
     if (read.stdout.trim() !== "workspace-visible") {
       refuse("qualification-failed", "workspace read probe returned contradictory bytes");
@@ -766,7 +774,11 @@ async function qualify(context: QualificationContext): Promise<AsfBubblewrapQual
     requireDenied(await probe("/usr/bin/touch", [join(workspace, ".git", "forbidden")]), "", "Git metadata write");
     requireDenied(await probe("/usr/bin/cat", [outside]), "other-workspace-secret", "sibling read");
     requireDenied(await probe("/usr/bin/cat", [homeSecret]), "credential-secret", "credential read");
-    requireDenied(await probe("/usr/bin/cat", [socketCanary]), "socket-path-secret", "host socket path");
+    // `readlink -e` succeeds for a real socket inode but must fail when the
+    // host path is absent from the worker namespace. Reading a regular file
+    // would only prove file-content denial and would not exercise the socket
+    // path boundary required by CTX-SEC-002.
+    requireDenied(await probe("/usr/bin/readlink", ["-e", socketCanary]), "", "host socket path");
     requireDenied(
       await probe(context.unshare.path, ["--user", "--map-root-user", "/usr/bin/true"]),
       "",
@@ -901,6 +913,9 @@ async function qualify(context: QualificationContext): Promise<AsfBubblewrapQual
     };
     return { ...unsigned, qualification_digest: sha256Digest(unsigned) };
   } finally {
+    if (socketServer.listening) {
+      await new Promise<void>((resolve) => socketServer.close(() => resolve()));
+    }
     rmSync(probeRoot, { recursive: true, force: true });
   }
 }

@@ -12,6 +12,9 @@ import type { CtxlaneAcquisitionAuthority } from "../../src/identity/ctxlane-aut
 import {
   CtxlaneIdentityProtocolError,
   CtxlaneProviderIdentityBroker,
+  ctxlaneCloseParameters,
+  ctxlaneRenewParameters,
+  ctxlaneRevokeParameters,
   strictJsonDecode,
   type CtxlaneIdentityLeaseAcquisitionClient,
   type CtxlaneLeaseCloseRequest,
@@ -216,6 +219,22 @@ function publishedFromInternal(
             : null,
     ...overrides,
   };
+}
+
+/**
+ * Draft ctxlane lifecycle projections intentionally do not carry capabilities.
+ * They are useful for inspection but must never be accepted by Runmill's
+ * protected renew/close/revoke boundary as an identity lease.
+ */
+function capabilityFreeLeaseView(
+  lease: CtxlaneIdentityLease,
+): Record<string, unknown> {
+  const {
+    execution_handle: _executionHandle,
+    fencing_generation: _fencingGeneration,
+    ...view
+  } = clone(lease);
+  return { ...view, schema: "ctxlane.lease-view/v1" };
 }
 
 interface SetupOptions {
@@ -573,6 +592,61 @@ describe("CtxlaneProviderIdentityBroker acquisition", () => {
 });
 
 describe("CtxlaneProviderIdentityBroker lifecycle", () => {
+  it("serializes protected lifecycle proposals to the exact ctxlane parameter fixtures", async () => {
+    const { lease } = await acquireActive();
+    const renewFixture = fixture<Record<string, unknown>>(
+      "lease-renew-request.v1.json",
+    );
+    const closeFixture = fixture<Record<string, unknown>>(
+      "lease-close-request.v1.json",
+    );
+    const revokeFixture = fixture<Record<string, unknown>>(
+      "lease-revoke-request.v1.json",
+    );
+    // The examples use a separate illustrative request-id namespace; the
+    // live proposal must preserve the acquisition request id exactly.
+    renewFixture.client_request_id = lease.ctxlane.clientRequestId;
+    closeFixture.client_request_id = lease.ctxlane.clientRequestId;
+    revokeFixture.client_request_id = lease.ctxlane.clientRequestId;
+
+    expect(
+      ctxlaneRenewParameters({ lease, requestedTtlSeconds: 900 }),
+    ).toEqual(renewFixture);
+    expect(
+      ctxlaneCloseParameters({ lease, disposition: "completed" }),
+    ).toEqual(closeFixture);
+    expect(
+      ctxlaneRevokeParameters({ lease, reason: "operator cancellation" }),
+    ).toEqual(revokeFixture);
+  });
+
+  it.each(["renew", "close", "revoke"] as const)(
+    "rejects a capability-free ctxlane lease view from %s",
+    async (operation) => {
+      const { broker, lease, lifecycle } = await acquireActive();
+      const response = capabilityFreeLeaseView(ACTIVE_FIXTURE);
+
+      if (operation === "renew") {
+        lifecycle.renewResponse = () => response;
+        await expect(broker.renew(lease)).rejects.toMatchObject({
+          code: "RM-AUTH-003",
+        });
+        expect(lifecycle.revokeRequests).toHaveLength(0);
+      } else if (operation === "close") {
+        lifecycle.closeResponse = () => response;
+        await expect(broker.close(lease, "completed")).rejects.toMatchObject({
+          code: "RM-AUTH-003",
+        });
+        expect(lifecycle.revokeRequests).toHaveLength(0);
+      } else {
+        lifecycle.revokeResponse = () => response;
+        await expect(broker.revoke(lease, "operator cancellation")).rejects.toMatchObject({
+          code: "RM-AUTH-003",
+        });
+      }
+    },
+  );
+
   it("renews through the in-process boundary with a greater ctxlane generation", async () => {
     const { broker, clock, lease, lifecycle } = await acquireActive();
     clock.advanceMinutes(1);

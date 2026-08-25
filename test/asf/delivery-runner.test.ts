@@ -53,11 +53,13 @@ import type {
   WorkOrderEnvelope,
 } from "../../src/asf/work-order.js";
 import type { ArtifactVerifiedAsfEvidenceBundle } from "../../src/evidence/asf-validator.js";
-import type {
-  AsfTerminalEvidenceIntent,
-  AsfTerminalEvidencePlan,
-  SignedAsfTerminalEvidenceBundle,
-  ValidatedAsfTerminalEvidenceBundle,
+import {
+  validateSignedAsfTerminalEvidenceBundle,
+  type AsfTerminalEvidenceExpectations,
+  type AsfTerminalEvidenceIntent,
+  type AsfTerminalEvidencePlan,
+  type SignedAsfTerminalEvidenceBundle,
+  type ValidatedAsfTerminalEvidenceBundle,
 } from "../../src/evidence/asf-terminal.js";
 import {
   ASF_TRUSTED_IMPLEMENTER_RESUME_DESCRIPTOR_SCHEMA,
@@ -86,6 +88,10 @@ import {
   buildAsfTerminalEffectLedger,
   type AsfTerminalEffect,
 } from "../../src/evidence/asf-terminal-effects.js";
+import type {
+  AsfTelemetryAttributeInput,
+  AsfTelemetryRecorder,
+} from "../../src/asf/telemetry.js";
 
 const NOW = "2026-08-21T10:00:00.000Z";
 const LATER = "2026-08-21T10:05:00.000Z";
@@ -2405,6 +2411,60 @@ describe("AsfPrDeliveryRunner", () => {
     expect(test.log).not.toContain("finalize:terminal-evidence");
   });
 
+  it("emits bounded stage telemetry without letting a recorder failure change a failing stage", async () => {
+    const emitted: {
+      readonly kind: "log" | "histogram";
+      readonly name: string;
+      readonly attributes: AsfTelemetryAttributeInput;
+    }[] = [];
+    const recorder: AsfTelemetryRecorder = {
+      span() {
+        throw new Error("telemetry sink is unavailable");
+      },
+      counter() {
+        throw new Error("telemetry sink is unavailable");
+      },
+      histogram(name, _value, _unit, attributes = {}) {
+        emitted.push({ kind: "histogram", name, attributes });
+        throw new Error("telemetry sink is unavailable");
+      },
+      log(name, _severity, attributes = {}) {
+        emitted.push({ kind: "log", name, attributes });
+      },
+    };
+    const test = harness();
+    test.runnerOptions.repositoryLease.acquire = async () => {
+      test.log.push("effect:repository-lease");
+      throw new Error("protected repository adapter failure");
+    };
+
+    await new AsfPrDeliveryRunner({
+      ...test.runnerOptions,
+      telemetry: recorder,
+    }).run(test.context);
+
+    // The failing stage still fails exactly as it does without telemetry.
+    expect(test.store.run.state).toBe("BLOCKED_EXTERNAL");
+    expect(test.store.run.candidateSha).toBeNull();
+    expect(test.log).toContain("intent:repository-lease");
+    expect(test.log).not.toContain("confirm:repository-lease");
+
+    expect(emitted.map((signal) => `${signal.kind}:${signal.name}`)).toEqual([
+      "log:runmill.asf.run.event",
+      "histogram:runmill.asf.operation.duration",
+    ]);
+    for (const signal of emitted) {
+      expect(signal.attributes).toEqual({
+        component: "runner",
+        stage: "admission",
+        outcome: "failed",
+        run_id: test.context.runId,
+        work_order_id: test.store.run.workOrderId,
+        attempt_id: test.store.run.attemptId,
+      });
+    }
+  });
+
   it("cancels before first execution with signed cleanup evidence and no fabricated candidate", async () => {
     const test = harness();
     test.store.transition({
@@ -2742,6 +2802,99 @@ describe("AsfPrDeliveryRunner", () => {
     expect(test.log.indexOf("observe:final-pr-delivery")).toBeLessThan(
       test.log.indexOf("transition:PR_DELIVERED"),
     );
+  });
+
+  it("covers credential-free runner completion with the production terminal signer (non-qualified)", async () => {
+    const test = harness();
+    const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+    const signingKey = {
+      keyId: "deterministic-terminal-key",
+      privateKey,
+      publicKey,
+      validFrom: "2026-01-01T00:00:00.000Z",
+      validUntil: "2027-01-01T00:00:00.000Z",
+    };
+    const runnerOptions: AsfPrDeliveryRunnerOptions = {
+      ...test.runnerOptions,
+      // This test exercises the real signer against deterministic adapters. It
+      // is intentionally not a production qualification claim.
+      terminalEvidence:
+        new ProductionAsfTerminalEvidenceFinalizationController({
+          signingKey,
+          clock: test.clock,
+        }),
+    };
+
+    await new AsfPrDeliveryRunner(runnerOptions).run(test.context);
+
+    expect(test.store.run.state).toBe("COMPLETED");
+    const bundle = test.store.terminalBundle;
+    if (bundle === undefined) throw new Error("terminal evidence bundle missing");
+    expect(bundle.signature).toMatch(/^base64url:[A-Za-z0-9_-]{86}$/u);
+    expect(bundle.signature).not.toBe(`base64url:${"A".repeat(86)}`);
+    expect(bundle.statement.predicate.run.terminal_phase).toBe("COMPLETED");
+    expect(bundle.statement.predicate.source.candidate_sha).toBe(CANDIDATE_1);
+    expect(bundle.statement.predicate.evidence.delivery_bundle_digest).toBe(
+      BUNDLE_DIGEST,
+    );
+    expect(bundle.statement.predicate.cleanup.observation_digest).toBe(
+      EVIDENCE_DIGEST,
+    );
+    expect(bundle.statement.predicate.evidence.preceding_event_chain_digest).toBe(
+      sha256Digest(test.store.events.slice(0, -1)),
+    );
+
+    const predicate = bundle.statement.predicate;
+    const expected: AsfTerminalEvidenceExpectations = {
+      runId: predicate.run.run_id,
+      workOrderId: predicate.run.work_order_id,
+      attemptId: predicate.run.attempt_id,
+      workOrderEnvelopeDigest: predicate.admission.work_order_envelope_digest,
+      workOrderPayloadDigest: predicate.admission.work_order_payload_digest,
+      effectivePolicyDigest: predicate.admission.effective_policy_digest,
+      repository: predicate.source.repository,
+      baseSha: predicate.source.base_sha,
+      candidateSha: CANDIDATE_1,
+      terminalPhase: "COMPLETED",
+      terminalEventSeq: predicate.run.terminal_event_seq,
+      cleanupObservationDigest: EVIDENCE_DIGEST,
+      deliveryBundleDigest: BUNDLE_DIGEST,
+      precedingEventChainDigest:
+        predicate.evidence.preceding_event_chain_digest,
+      providerBudget: predicate.budget.provider_usage,
+      sideEffects: predicate.side_effects,
+      admittedAt: predicate.timing.admitted_at,
+      terminalEvidenceAt: predicate.timing.terminal_evidence_at,
+      elapsedMs: predicate.timing.elapsed_ms,
+    };
+    const trustedSigner = {
+      keyId: signingKey.keyId,
+      publicKey: signingKey.publicKey,
+      validFrom: signingKey.validFrom,
+      validUntil: signingKey.validUntil,
+      revokedAt: null,
+    };
+    expect(
+      validateSignedAsfTerminalEvidenceBundle(bundle, {
+        clock: test.clock,
+        trustedSigners: [trustedSigner],
+        expected,
+      }),
+    ).toMatchObject({
+      terminalPhase: "COMPLETED",
+      candidateSha: CANDIDATE_1,
+      signer: { keyId: signingKey.keyId, algorithm: "EdDSA", verified: true },
+    });
+
+    const tampered = structuredClone(bundle);
+    tampered.signature = `base64url:${"A".repeat(86)}`;
+    expect(() =>
+      validateSignedAsfTerminalEvidenceBundle(tampered, {
+        clock: test.clock,
+        trustedSigners: [trustedSigner],
+        expected,
+      }),
+    ).toThrow(/signature|Ed25519/u);
   });
 
   it("captures exact identity-bound resume metadata and carries it only through resumable checkpoints", async () => {

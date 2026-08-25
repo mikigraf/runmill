@@ -7,6 +7,7 @@ import { z } from "zod";
  * - `ctxlane.work-order-authorization/v1`
  * - `ctxlane.identity-lease-request/v1`
  * - `ctxlane.identity-lease/v1`
+ * - lifecycle parameter objects and `ctxlane.lease-view/v1`
  *
  * These schemas are transcribed field-for-field, pattern-for-pattern, from
  * the vendored upstream JSON Schema documents under
@@ -27,6 +28,11 @@ export const CTXLANE_IDENTITY_LEASE_REQUEST_SCHEMA =
   "ctxlane.identity-lease-request/v1" as const;
 export const CTXLANE_IDENTITY_LEASE_SCHEMA =
   "ctxlane.identity-lease/v1" as const;
+export const CTXLANE_LEASE_VIEW_SCHEMA = "ctxlane.lease-view/v1" as const;
+export const CTXLANE_IDENTITY_LEASE_RENEW_ACKNOWLEDGEMENT_SCHEMA =
+  "ctxlane.identity-lease-renew-acknowledgement/v1" as const;
+export const CTXLANE_SERVICE_HEALTH_SCHEMA =
+  "ctxlane.service-health/v1" as const;
 
 const CTXLANE_ROLE_VALUES = [
   "implementer",
@@ -40,6 +46,367 @@ export type CtxlaneProvider = (typeof CTXLANE_PROVIDER_VALUES)[number];
 
 const roleSchema = z.enum(CTXLANE_ROLE_VALUES);
 const providerSchema = z.enum(CTXLANE_PROVIDER_VALUES);
+
+/**
+ * Exact ctxlane service-health v1 result returned by the authenticated MCP
+ * health tool.  This is deliberately separate from an identity lease: a
+ * healthy controller channel does not grant a provider identity or prove a
+ * lease acquisition.
+ */
+export const ctxlaneServiceHealthSchema = z
+  .object({
+    schema: z.literal(CTXLANE_SERVICE_HEALTH_SCHEMA),
+    process_liveness: z.boolean(),
+    store_available: z.boolean(),
+    recovery_complete: z.boolean(),
+    controller_channel_ready: z.boolean(),
+    policy_trust_root_valid: z.boolean(),
+    profile_readiness: z.boolean(),
+    harness_ready: z.boolean(),
+    capacity_available: z.boolean(),
+    audit_export_healthy: z.boolean(),
+    ready: z.boolean(),
+  })
+  .strict()
+  .superRefine((health, context) => {
+    if (
+      health.ready &&
+      [
+        health.process_liveness,
+        health.store_available,
+        health.recovery_complete,
+        health.controller_channel_ready,
+        health.policy_trust_root_valid,
+        health.profile_readiness,
+        health.harness_ready,
+        health.capacity_available,
+        health.audit_export_healthy,
+      ].some((value) => !value)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["ready"],
+        message: "ready may be true only when every service-health prerequisite is true",
+      });
+    }
+  });
+
+export type CtxlaneServiceHealth = z.infer<typeof ctxlaneServiceHealthSchema>;
+
+export const CTXLANE_AUTOMATION_READINESS_SCHEMA =
+  "ctxlane.automation-readiness/v1" as const;
+
+const readinessProfileUidSchema = z
+  .string()
+  .regex(/^profile_[0-7][0-9A-HJKMNP-TV-Z]{25}$(?![\s\S])/u);
+const readinessProfileRefSchema = z
+  .string()
+  .regex(/^(claude|codex):[A-Za-z0-9][A-Za-z0-9_-]{0,63}$(?![\s\S])/u);
+const readinessProviderSchema = providerSchema;
+const readinessRoleSchema = roleSchema;
+const readinessAuthModeSchema = z.enum([
+  "wif",
+  "subscription-token",
+  "api-key",
+  "chatgpt-oauth",
+  "access-token",
+] as const);
+const readinessIsolationSchema = z.enum([
+  "credential-isolated",
+  "per-lease-isolated",
+  "copied-credential-development",
+  "unproven",
+] as const);
+const readinessEnvironmentSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._:@+-]*$(?![\s\S])/u);
+const readinessUtcTimestampSchema = z
+  .string()
+  .regex(
+    /^(?!0000-)[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-5][0-9](\.[0-9]{1,9})?Z$(?![\s\S])/u,
+  )
+  .refine(isCanonicalUtcTimestamp, "must be a canonical UTC RFC 3339 timestamp");
+const READINESS_CLAUDE_AUTH_MODE_VALUES = [
+  "wif",
+  "subscription-token",
+  "api-key",
+] as const;
+const READINESS_CODEX_AUTH_MODE_VALUES = [
+  "wif",
+  "chatgpt-oauth",
+  "api-key",
+  "access-token",
+] as const;
+
+const READINESS_STATUS_VALUES = [
+  "pass",
+  "warn",
+  "fail",
+  "unknown",
+  "not-applicable",
+] as const;
+const READINESS_REASON_CODE_VALUES = [
+  "metadata-invalid",
+  "credential-source-unavailable",
+  "identity-token-stale",
+  "harness-untrusted",
+  "principal-unverified",
+  "principal-mismatch",
+  "expected-tenant-unverified",
+  "organization-mismatch",
+  "workspace-mismatch",
+  "automation-policy-denied",
+  "authentication-exception-required",
+  "authentication-exception-acknowledged",
+  "isolation-exception-required",
+  "isolation-exception-acknowledged",
+  "isolation-unproven",
+  "probe-not-run",
+  "probe-failed",
+  "unsupported-platform",
+  "not-applicable",
+] as const;
+const readinessStatusSchema = z.enum(READINESS_STATUS_VALUES);
+const readinessReasonCodeSchema = z.enum(READINESS_REASON_CODE_VALUES);
+const readinessCheckSchema = z
+  .object({
+    status: readinessStatusSchema,
+    reason_code: z.union([readinessReasonCodeSchema, z.null()]),
+  })
+  .strict();
+
+const READINESS_CHECK_NAMES = [
+  "metadata-valid",
+  "credential-source-available",
+  "identity-token-current",
+  "harness-trusted",
+  "provider-principal-verified",
+  "expected-tenant-verified",
+  "automation-policy-permits",
+  "credential-isolation-proven",
+] as const;
+
+const readinessChecksSchema = z
+  .object({
+    "metadata-valid": readinessCheckSchema,
+    "credential-source-available": readinessCheckSchema,
+    "identity-token-current": readinessCheckSchema,
+    "harness-trusted": readinessCheckSchema,
+    "provider-principal-verified": readinessCheckSchema,
+    "expected-tenant-verified": readinessCheckSchema,
+    "automation-policy-permits": readinessCheckSchema,
+    "credential-isolation-proven": readinessCheckSchema,
+  })
+  .strict();
+
+const PROBE_COST_VALUES = [
+  "none",
+  "provider-request-possible",
+  "provider-request-incurred",
+] as const;
+const readinessProbeCostSchema = z.enum(PROBE_COST_VALUES);
+
+type ReadinessCheck = z.infer<typeof readinessCheckSchema>;
+type ReadinessChecks = z.infer<typeof readinessChecksSchema>;
+
+function readinessCheckIs(
+  check: ReadinessCheck,
+  status: (typeof READINESS_STATUS_VALUES)[number],
+  reasonCode: (typeof READINESS_REASON_CODE_VALUES)[number] | null,
+): boolean {
+  return check.status === status && check.reason_code === reasonCode;
+}
+
+function readinessCheckIn(
+  check: ReadinessCheck,
+  allowed: readonly [
+    (typeof READINESS_STATUS_VALUES)[number],
+    (typeof READINESS_REASON_CODE_VALUES)[number] | null,
+  ][],
+): boolean {
+  return allowed.some(([status, reasonCode]) => readinessCheckIs(check, status, reasonCode));
+}
+
+function addReadinessIssue(
+  context: z.RefinementCtx,
+  path: readonly PropertyKey[],
+  message: string,
+): void {
+  context.addIssue({ code: "custom", path: [...path], message });
+}
+
+function checkReadinessChecks(checks: ReadinessChecks, context: z.RefinementCtx): void {
+  const allowed: Record<keyof ReadinessChecks, readonly [
+    (typeof READINESS_STATUS_VALUES)[number],
+    (typeof READINESS_REASON_CODE_VALUES)[number] | null,
+  ][]> = {
+    "metadata-valid": [
+      ["pass", null],
+      ["fail", "metadata-invalid"],
+      ["fail", "unsupported-platform"],
+    ],
+    "credential-source-available": [
+      ["pass", null],
+      ["fail", "credential-source-unavailable"],
+    ],
+    "identity-token-current": [
+      ["pass", null],
+      ["fail", "identity-token-stale"],
+      ["not-applicable", "not-applicable"],
+    ],
+    "harness-trusted": [
+      ["pass", null],
+      ["fail", "harness-untrusted"],
+      ["fail", "unsupported-platform"],
+    ],
+    "provider-principal-verified": [
+      ["pass", null],
+      ["unknown", "principal-unverified"],
+      ["unknown", "probe-not-run"],
+      ["fail", "principal-mismatch"],
+      ["fail", "probe-failed"],
+    ],
+    "expected-tenant-verified": [
+      ["pass", null],
+      ["unknown", "expected-tenant-unverified"],
+      ["unknown", "probe-not-run"],
+      ["fail", "organization-mismatch"],
+      ["fail", "workspace-mismatch"],
+      ["fail", "probe-failed"],
+    ],
+    "automation-policy-permits": [
+      ["pass", null],
+      ["fail", "automation-policy-denied"],
+      ["fail", "authentication-exception-required"],
+      ["warn", "authentication-exception-acknowledged"],
+    ],
+    "credential-isolation-proven": [
+      ["pass", null],
+      ["fail", "isolation-exception-required"],
+      ["fail", "isolation-unproven"],
+      ["warn", "isolation-exception-acknowledged"],
+    ],
+  };
+  for (const name of READINESS_CHECK_NAMES) {
+    if (!readinessCheckIn(checks[name], allowed[name])) {
+      addReadinessIssue(
+        context,
+        ["checks", name],
+        "status and reason_code are not a published ctxlane readiness combination",
+      );
+    }
+  }
+}
+
+function readinessChecksAreReady(checks: ReadinessChecks): boolean {
+  const common = [
+    checks["metadata-valid"],
+    checks["credential-source-available"],
+    checks["harness-trusted"],
+    checks["provider-principal-verified"],
+    checks["expected-tenant-verified"],
+  ].every((check) => readinessCheckIs(check, "pass", null));
+  const authentication =
+    readinessCheckIs(checks["identity-token-current"], "pass", null) &&
+    readinessCheckIs(checks["automation-policy-permits"], "pass", null);
+  const nonWifAuthentication =
+    readinessCheckIs(checks["identity-token-current"], "not-applicable", "not-applicable") &&
+    (readinessCheckIs(checks["automation-policy-permits"], "pass", null) ||
+      readinessCheckIs(
+        checks["automation-policy-permits"],
+        "warn",
+        "authentication-exception-acknowledged",
+      ));
+  const isolation =
+    readinessCheckIs(checks["credential-isolation-proven"], "pass", null) ||
+    readinessCheckIs(
+      checks["credential-isolation-proven"],
+      "warn",
+      "isolation-exception-acknowledged",
+    );
+  return common && (authentication || nonWifAuthentication) && isolation;
+}
+
+/** Exact ctxlane automation-readiness/v1 observation, never an authority grant. */
+export const ctxlaneAutomationReadinessSchema = z
+  .object({
+    schema: z.literal(CTXLANE_AUTOMATION_READINESS_SCHEMA),
+    profile_uid: readinessProfileUidSchema,
+    profile_ref: readinessProfileRefSchema,
+    provider: readinessProviderSchema,
+    auth_mode: readinessAuthModeSchema,
+    environment: readinessEnvironmentSchema,
+    role: readinessRoleSchema,
+    ready: z.boolean(),
+    isolation: readinessIsolationSchema,
+    authentication_exception_acknowledged: z.boolean(),
+    isolation_exception_acknowledged: z.boolean(),
+    checked_at: readinessUtcTimestampSchema,
+    valid_until: readinessUtcTimestampSchema,
+    probe_cost: readinessProbeCostSchema,
+    probe_timeout_milliseconds: z.number().int().min(1).max(30_000),
+    probe_interactive: z.literal(false),
+    checks: readinessChecksSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    assertProfileNamespace(context, value.provider, value.profile_ref, ["profile_ref"]);
+    if (!isStrictlyBeforeUtc(value.checked_at, value.valid_until)) {
+      addReadinessIssue(context, ["valid_until"], "valid_until must be strictly after checked_at");
+    }
+    if (
+      (value.provider === "claude" && !READINESS_CLAUDE_AUTH_MODE_VALUES.includes(value.auth_mode as never)) ||
+      (value.provider === "codex" && !READINESS_CODEX_AUTH_MODE_VALUES.includes(value.auth_mode as never))
+    ) {
+      addReadinessIssue(context, ["auth_mode"], "auth_mode is not supported by provider");
+    }
+    checkReadinessChecks(value.checks, context);
+    const identity = value.checks["identity-token-current"];
+    if (value.auth_mode !== "wif" && !readinessCheckIs(identity, "not-applicable", "not-applicable")) {
+      addReadinessIssue(context, ["checks", "identity-token-current"], "non-WIF auth must use not-applicable identity check");
+    }
+    if (value.provider === "claude" && value.checks["expected-tenant-verified"].reason_code === "workspace-mismatch") {
+      addReadinessIssue(context, ["checks", "expected-tenant-verified"], "Claude readiness cannot use workspace-mismatch");
+    }
+    if (value.provider === "codex" && value.checks["expected-tenant-verified"].reason_code === "organization-mismatch") {
+      addReadinessIssue(context, ["checks", "expected-tenant-verified"], "Codex readiness cannot use organization-mismatch");
+    }
+    const isolationCheck = value.checks["credential-isolation-proven"];
+    if (value.isolation === "credential-isolated" || value.isolation === "per-lease-isolated") {
+      if (value.isolation_exception_acknowledged || !readinessCheckIs(isolationCheck, "pass", null)) {
+        addReadinessIssue(context, ["isolation"], "isolated modes require a passing isolation check and no exception acknowledgement");
+      }
+    } else if (value.isolation === "copied-credential-development") {
+      const expected = value.isolation_exception_acknowledged
+        ? ["warn", "isolation-exception-acknowledged"] as const
+        : ["fail", "isolation-exception-required"] as const;
+      if (!readinessCheckIs(isolationCheck, expected[0], expected[1])) {
+        addReadinessIssue(context, ["checks", "credential-isolation-proven"], "copied credential mode has an invalid isolation exception state");
+      }
+      if (value.ready && value.environment !== "local-development" && value.role !== "pr-reviewer") {
+        addReadinessIssue(context, ["ready"], "ready copied-credential profiles are limited to local-development or pr-reviewer");
+      }
+      if (!value.ready && value.environment !== "local-development" && value.role !== "pr-reviewer" && !readinessCheckIs(value.checks["automation-policy-permits"], "fail", "automation-policy-denied")) {
+        addReadinessIssue(context, ["checks", "automation-policy-permits"], "copied credentials outside local development require denied automation policy");
+      }
+    } else if (!readinessCheckIs(isolationCheck, "fail", "isolation-unproven")) {
+      addReadinessIssue(context, ["checks", "credential-isolation-proven"], "unproven isolation requires an isolation-unproven failure");
+    }
+    const computedReady = readinessChecksAreReady(value.checks);
+    if (value.ready !== computedReady) {
+      addReadinessIssue(context, ["ready"], "ready must exactly match the published readiness checks");
+    }
+    if (value.ready && value.authentication_exception_acknowledged && value.checks["automation-policy-permits"].reason_code !== "authentication-exception-acknowledged") {
+      addReadinessIssue(context, ["authentication_exception_acknowledged"], "acknowledged authentication exception requires its warning check");
+    }
+    if (!value.authentication_exception_acknowledged && value.checks["automation-policy-permits"].reason_code === "authentication-exception-acknowledged") {
+      addReadinessIssue(context, ["authentication_exception_acknowledged"], "authentication exception warning requires acknowledgement");
+    }
+  });
+
+export type CtxlaneAutomationReadiness = z.infer<typeof ctxlaneAutomationReadinessSchema>;
 
 // `$defs/logSafeId`
 const LOG_SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@+-]*$(?![\s\S])/u;
@@ -501,6 +868,190 @@ export type CtxlaneIdentityLeaseRequest = z.infer<
   typeof ctxlaneIdentityLeaseRequestSchema
 >;
 
+// The lifecycle parameter schemas are deliberately separate from the
+// authority-bearing in-process lifecycle interface in `ctxlane-broker.ts`.
+// They are the exact public ctxlane operation shapes: no `schema` member is
+// present because these objects are operation parameters, and no capability
+// is returned by their corresponding MCP receipts.
+const lifecycleClientRequestIdSchema = logSafeIdSchema;
+const lifecycleLeaseIdSchema = leaseIdSchema;
+
+/** `ctxlane.identity-lease-renew.v1` parameters. */
+export const ctxlaneIdentityLeaseRenewSchema = z
+  .object({
+    client_request_id: lifecycleClientRequestIdSchema,
+    lease_id: lifecycleLeaseIdSchema,
+    requested_ttl_seconds: z.number().int().min(1).max(86_400),
+  })
+  .strict();
+
+export type CtxlaneIdentityLeaseRenew = z.infer<
+  typeof ctxlaneIdentityLeaseRenewSchema
+>;
+
+/** `ctxlane.identity-lease-revoke.v1` parameters. */
+export const ctxlaneIdentityLeaseRevokeSchema = z
+  .object({
+    client_request_id: lifecycleClientRequestIdSchema,
+    lease_id: lifecycleLeaseIdSchema,
+  })
+  .strict();
+
+export type CtxlaneIdentityLeaseRevoke = z.infer<
+  typeof ctxlaneIdentityLeaseRevokeSchema
+>;
+
+/** `ctxlane.identity-lease-close.v1` parameters. */
+export const ctxlaneIdentityLeaseCloseSchema = z
+  .object({
+    client_request_id: lifecycleClientRequestIdSchema,
+    lease_id: lifecycleLeaseIdSchema,
+    reason: z.enum(["completed", "worker-failed"]),
+  })
+  .strict();
+
+export type CtxlaneIdentityLeaseClose = z.infer<
+  typeof ctxlaneIdentityLeaseCloseSchema
+>;
+
+/** `ctxlane.identity-lease-inspect.v1` parameters. */
+export const ctxlaneIdentityLeaseInspectSchema = z
+  .object({
+    client_request_id: lifecycleClientRequestIdSchema,
+    lease_id: lifecycleLeaseIdSchema,
+  })
+  .strict();
+
+export type CtxlaneIdentityLeaseInspect = z.infer<
+  typeof ctxlaneIdentityLeaseInspectSchema
+>;
+
+/** `ctxlane.identity-lease-renew-acknowledgement.v1`. */
+export const ctxlaneIdentityLeaseRenewAcknowledgementSchema = z
+  .object({
+    schema: z.literal(CTXLANE_IDENTITY_LEASE_RENEW_ACKNOWLEDGEMENT_SCHEMA),
+    lease_id: lifecycleLeaseIdSchema,
+    fencing_generation: z.number()
+      .int()
+      .min(1)
+      .max(9_007_199_254_740_991),
+  })
+  .strict();
+
+export type CtxlaneIdentityLeaseRenewAcknowledgement = z.infer<
+  typeof ctxlaneIdentityLeaseRenewAcknowledgementSchema
+>;
+
+// `ctxlane.lease-view/v1` intentionally has broader identifier patterns than
+// the authority-bearing identity lease. Transcribe those patterns exactly;
+// do not reuse the stricter lease/profile UID schemas and accidentally reject
+// a valid capability-free inspection result.
+const leaseViewLabelSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$(?![\s\S])/u);
+const leaseViewDigestSchema = z
+  .string()
+  .regex(/^sha256:[0-9a-f]{64}$(?![\s\S])/u);
+const leaseViewTimestampSchema = utcTimestampSchema;
+const leaseViewStatusSchema = z.enum([
+  "requested",
+  "active",
+  "renewing",
+  "closed",
+  "revoked",
+  "expired",
+  "refused",
+  "error",
+]);
+const leaseViewProfileUidSchema = z
+  .string()
+  .regex(/^profile_[A-Za-z0-9]{26}$(?![\s\S])/u);
+const leaseViewProfileRefSchema = z
+  .string()
+  .regex(/^(claude|codex):[A-Za-z0-9][A-Za-z0-9_-]{0,63}$(?![\s\S])/u);
+const leaseViewRepositorySchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$(?![\s\S])/u);
+const leaseViewCallerSubjectSchema = z
+  .string()
+  .regex(/^caller:[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$(?![\s\S])/u);
+const leaseViewHostIdentitySchema = z
+  .string()
+  .regex(/^host:[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$(?![\s\S])/u);
+const leaseViewWorkerIdentitySchema = z
+  .string()
+  .regex(/^worker:[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$(?![\s\S])/u);
+const leaseViewPrincipalRefSchema = z
+  .string()
+  .regex(/^(user|service-account):[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$(?![\s\S])/u);
+const leaseViewWorkspaceRefSchema = z
+  .string()
+  .regex(/^(claude-organization|chatgpt-workspace):[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$(?![\s\S])/u);
+const leaseViewAuthModeSchema = z.enum([
+  "wif",
+  "subscription-token",
+  "api-key",
+  "chatgpt-oauth",
+  "access-token",
+]);
+const leaseViewIsolationSchema = z.enum([
+  "credential-isolated",
+  "per-lease-isolated",
+  "unproven",
+  "copied-credential-development",
+]);
+const leaseViewReasonCodeSchema = z
+  .string()
+  .regex(/^[a-z0-9-]{1,64}$(?![\s\S])/u);
+
+/** `ctxlane.lease-view/v1`, the capability-free lifecycle/inspection view. */
+export const ctxlaneLeaseViewSchema = z
+  .object({
+    schema: z.literal(CTXLANE_LEASE_VIEW_SCHEMA),
+    lease_id: z.string().regex(/^lease_[A-Za-z0-9]{26}$(?![\s\S])/u),
+    status: leaseViewStatusSchema,
+    tenant_id: leaseViewLabelSchema,
+    work_order_id: leaseViewLabelSchema,
+    work_order_digest: leaseViewDigestSchema,
+    run_id: leaseViewLabelSchema,
+    attempt_id: leaseViewLabelSchema,
+    role: roleSchema,
+    provider: providerSchema,
+    profile_uid: leaseViewProfileUidSchema,
+    profile_ref: leaseViewProfileRefSchema,
+    repository: leaseViewRepositorySchema,
+    workspace_id: leaseViewLabelSchema,
+    environment: leaseViewLabelSchema,
+    caller_subject: leaseViewCallerSubjectSchema,
+    host_identity: leaseViewHostIdentitySchema,
+    worker_identity: z.union([leaseViewWorkerIdentitySchema, z.null()]),
+    principal_ref: z.union([leaseViewPrincipalRefSchema, z.null()]),
+    workspace_ref: z.union([leaseViewWorkspaceRefSchema, z.null()]),
+    auth_mode: z.union([leaseViewAuthModeSchema, z.null()]),
+    issued_at: leaseViewTimestampSchema,
+    expires_at: z.union([leaseViewTimestampSchema, z.null()]),
+    maximum_expires_at: z.union([leaseViewTimestampSchema, z.null()]),
+    isolation: z.union([leaseViewIsolationSchema, z.null()]),
+    effective_policy_digest: z.union([leaseViewDigestSchema, z.null()]),
+    refusal_code: z.union([leaseViewReasonCodeSchema, z.null()]),
+    reason_code: z.union([leaseViewReasonCodeSchema, z.null()]),
+  })
+  .strict();
+
+export type CtxlaneLeaseView = z.infer<typeof ctxlaneLeaseViewSchema>;
+
+// Receipt schemas are aliases in the published contract: each receipt
+// references the same capability-free lease-view object.
+export const ctxlaneIdentityLeaseRenewReceiptSchema = ctxlaneLeaseViewSchema;
+export const ctxlaneIdentityLeaseRevokeReceiptSchema = ctxlaneLeaseViewSchema;
+export const ctxlaneIdentityLeaseCloseReceiptSchema = ctxlaneLeaseViewSchema;
+export const ctxlaneIdentityLeaseInspectReceiptSchema = ctxlaneLeaseViewSchema;
+
+export type CtxlaneIdentityLeaseRenewReceipt = CtxlaneLeaseView;
+export type CtxlaneIdentityLeaseRevokeReceipt = CtxlaneLeaseView;
+export type CtxlaneIdentityLeaseCloseReceipt = CtxlaneLeaseView;
+export type CtxlaneIdentityLeaseInspectReceipt = CtxlaneLeaseView;
+
 const CTXLANE_LEASE_STATUS_VALUES = [
   "requested",
   "active",
@@ -880,6 +1431,97 @@ export const ctxlaneIdentityLeaseSchema = z
   });
 
 export type CtxlaneIdentityLease = z.infer<typeof ctxlaneIdentityLeaseSchema>;
+
+/**
+ * Exact, capability-free ctxlane profile-list/v1 projection. A listed profile
+ * is metadata only; this object contains no credential, lease, or execution
+ * authority and cannot be used to skip a fresh readiness evaluation.
+ */
+export const CTXLANE_PROFILE_LIST_SCHEMA = "ctxlane.profile-list/v1" as const;
+
+const profileListConcurrencyModeSchema = z.enum(["exclusive", "shared"] as const);
+const profileListSharedStateIsolationSchema = z.union([
+  z.enum(["stateless", "per-lease-isolated"] as const),
+  z.null(),
+]);
+
+const ctxlaneProfileListEntrySchema = z
+  .object({
+    profile_uid: profileUidSchema,
+    profile_ref: profileRefSchema,
+    provider: providerSchema,
+    auth_mode: authModeSchema,
+    eligible: z.boolean(),
+    environment_count: z.number().int().min(0).max(32),
+    roles: z.array(roleSchema).max(3),
+    caller_subject_count: z.number().int().min(0).max(64),
+    lease_ttl_seconds: z.number().int().min(1).max(86_400),
+    max_session_seconds: z.number().int().min(1).max(604_800),
+    max_concurrent_leases: z.number().int().min(1).max(64),
+    concurrency_mode: profileListConcurrencyModeSchema,
+    shared_state_isolation_requirement: profileListSharedStateIsolationSchema,
+    require_workload_identity: z.boolean(),
+    authentication_exception_acknowledged: z.boolean(),
+    isolation_exception_acknowledged: z.boolean(),
+  })
+  .strict()
+  .superRefine((profile, context) => {
+    assertProfileNamespace(context, profile.provider, profile.profile_ref, ["profile_ref"]);
+    if (new Set(profile.roles).size !== profile.roles.length) {
+      issue(context, ["roles"], "roles must contain unique values");
+    }
+    if (
+      profile.provider === "claude" &&
+      !(CLAUDE_AUTH_MODE_VALUES as readonly string[]).includes(profile.auth_mode)
+    ) {
+      issue(context, ["auth_mode"], "auth_mode is not supported by Claude");
+    }
+    if (
+      profile.provider === "codex" &&
+      !(CODEX_AUTH_MODE_VALUES as readonly string[]).includes(profile.auth_mode)
+    ) {
+      issue(context, ["auth_mode"], "auth_mode is not supported by Codex");
+    }
+    if (profile.concurrency_mode === "exclusive") {
+      if (profile.max_concurrent_leases !== 1) {
+        issue(context, ["max_concurrent_leases"], "exclusive profiles must allow exactly one lease");
+      }
+      if (profile.shared_state_isolation_requirement !== null) {
+        issue(context, ["shared_state_isolation_requirement"], "exclusive profiles must not declare shared-state isolation");
+      }
+    } else {
+      if (profile.max_concurrent_leases < 2) {
+        issue(context, ["max_concurrent_leases"], "shared profiles must allow at least two leases");
+      }
+      if (profile.shared_state_isolation_requirement === null) {
+        issue(context, ["shared_state_isolation_requirement"], "shared profiles must declare shared-state isolation");
+      }
+    }
+    if (profile.eligible) {
+      if (profile.environment_count < 1) {
+        issue(context, ["environment_count"], "eligible profiles must expose at least one environment");
+      }
+      if (profile.roles.length < 1) {
+        issue(context, ["roles"], "eligible profiles must expose at least one role");
+      }
+      if (profile.caller_subject_count < 1) {
+        issue(context, ["caller_subject_count"], "eligible profiles must expose at least one caller subject");
+      }
+    }
+    if ((profile.auth_mode === "wif" || profile.require_workload_identity) && profile.authentication_exception_acknowledged) {
+      issue(context, ["authentication_exception_acknowledged"], "WIF or workload-identity-required profiles cannot acknowledge an authentication exception");
+    }
+  });
+
+export const ctxlaneProfileListSchema = z
+  .object({
+    schema: z.literal(CTXLANE_PROFILE_LIST_SCHEMA),
+    profiles: z.array(ctxlaneProfileListEntrySchema),
+  })
+  .strict();
+
+export type CtxlaneProfileListEntry = z.infer<typeof ctxlaneProfileListEntrySchema>;
+export type CtxlaneProfileList = z.infer<typeof ctxlaneProfileListSchema>;
 
 // `ctxlane.automation-error/v1`: pre-attribution failures, transcribed
 // field-for-field from the vendored JSON Schema's `oneOf` operation/code/

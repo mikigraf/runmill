@@ -79,6 +79,14 @@ Backlog → Claim → Implement → Verify → Review → Pull request → CI �
 
 The agents write and review code. Runmill controls backlog changes, repository effects, pull requests, and merge decisions.
 
+Portable signed delivery evidence can be checked on a separate, state-free host:
+
+```bash
+runmill evidence verify evidence.json --trust trusted-signers.json --expectations candidate-facts.json
+```
+
+Add `--artifacts-dir` to re-hash the content-addressed artifact bodies as well as the signed statement.
+
 ## Why Runmill exists
 
 ### One issue has one owner

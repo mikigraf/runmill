@@ -521,6 +521,7 @@ describe("AsfWorkerService submission", () => {
       telemetry: {
         span: () => fail("span"),
         counter: () => fail("counter"),
+        gauge: () => fail("gauge"),
         histogram: () => fail("histogram"),
       },
       onBackgroundError: (error) => backgroundErrors.push(error),
@@ -533,6 +534,7 @@ describe("AsfWorkerService submission", () => {
 
     expect(telemetryCalls).toContain("span");
     expect(telemetryCalls).toContain("counter");
+    expect(telemetryCalls).toContain("gauge");
     expect(telemetryCalls).toContain("histogram");
     expect(backgroundErrors).toEqual([]);
     expect(store.getAsfRun("run_01")).toMatchObject({
@@ -625,6 +627,17 @@ describe("AsfWorkerService submission", () => {
           (counter) => counter.name === "runmill.asf.work_orders.accepted",
         ),
       ).toHaveLength(disposition === "accepted" ? 1 : 0);
+      if (disposition === "accepted") {
+        expect(counters).toContainEqual({
+          name: "runmill.asf.work_orders.accepted",
+          attributes: {
+            component: "admission",
+            operation: "work-order-admit",
+            outcome: "succeeded",
+            run_id: "run_01",
+          },
+        });
+      }
     },
   );
 
@@ -2101,6 +2114,49 @@ describe("AsfWorkerService reads", () => {
     );
   });
 
+  it("recovers a submission only when both immutable Work Order digests match", () => {
+    const store = new FakeStore();
+    store.addRun();
+    store.latestSequence = 42;
+    const worker = service({
+      store,
+      admission: {
+        async submit() {
+          return admissionResult();
+        },
+        lookupSubmission(input) {
+          if (
+            input.idempotencyKey !== admissionRecord().idempotencyKey ||
+            input.payloadDigest !== DIGEST_A ||
+            input.envelopeDigest !== DIGEST_B
+          ) {
+            return { disposition: "not-found" };
+          }
+          return { disposition: "found", runId: "run_01" };
+        },
+      },
+      runner: async () => undefined,
+    });
+
+    expect(
+      worker.lookupSubmission({
+        idempotencyKey: admissionRecord().idempotencyKey,
+        payloadDigest: DIGEST_A,
+        envelopeDigest: DIGEST_B,
+      }),
+    ).toMatchObject({
+      disposition: "found",
+      snapshot: { run: { runId: "run_01" }, latestSequence: 42 },
+    });
+    expect(
+      worker.lookupSubmission({
+        idempotencyKey: admissionRecord().idempotencyKey,
+        payloadDigest: DIGEST_C,
+        envelopeDigest: DIGEST_B,
+      }),
+    ).toEqual({ disposition: "not-found" });
+  });
+
   it("delegates cursor pages without reshaping or dropping gap metadata", () => {
     const store = new FakeStore();
     const page: AsfEventPage = {
@@ -2495,6 +2551,10 @@ describe("AsfWorkerService run invocation telemetry", () => {
           attributes: {
             component: "runner",
             operation: "run-dispatch",
+            tenant_id: "tenant-acme",
+            work_order_id: "wo_01",
+            attempt_id: "attempt_01",
+            run_id: "run_01",
             ...scenario.attributes,
           },
         },

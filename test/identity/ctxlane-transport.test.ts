@@ -4,8 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  CTXLANE_NATIVE_SEQPACKET_DEPLOYMENT_CONTRACT,
+  CTXLANE_NATIVE_SEQPACKET_TRANSPORT_STATUS,
   CTXLANE_UNIX_AUTOMATION_TRANSPORT_QUALIFICATION,
   CtxlaneIdentityProtocolError,
+  CtxlaneNativeSeqpacketAutomationClient,
   CtxlaneUnixAutomationClient,
 } from "../../src/identity/ctxlane-broker.js";
 import type { CtxlaneIdentityLeaseRequest } from "../../src/identity/ctxlane-contracts.js";
@@ -124,6 +127,64 @@ describe("CtxlaneTransport", () => {
     );
   });
 
+  it("native transport refuses unsupported hosts or an unbuilt addon", async () => {
+    const client = new CtxlaneNativeSeqpacketAutomationClient({
+      endpoint: "unix:///private/fixture.sock",
+    });
+    await expect(client.acquire(fixtureRequest)).rejects.toThrow(
+      process.platform === "linux"
+        ? "native SOCK_SEQPACKET addon is unavailable"
+        : "native SOCK_SEQPACKET transport is Linux-only",
+    );
+  });
+
+  it("native transport rejects Linux sockaddr paths before native loading", () => {
+    const longPath = `/private/${"x".repeat(120)}`;
+    expect(
+      () => new CtxlaneNativeSeqpacketAutomationClient({ endpoint: `unix://${longPath}` }),
+    ).toThrow("exceeds the Linux sockaddr limit");
+  });
+
+  it("native transport requires explicit peer executable and cgroup policy", async () => {
+    if (process.platform !== "linux") return;
+    const client = new CtxlaneNativeSeqpacketAutomationClient({
+      endpoint: "unix:///private/fixture.sock",
+    });
+    await expect(client.acquire(fixtureRequest)).rejects.toThrow(
+      "native peer executable and cgroup policy are required",
+    );
+  });
+
+  it("refuses authority over SOCK_STREAM without an explicit development opt-in", async () => {
+    const { socketPath, cleanup } = await unixFixture(() => {
+      throw new Error("unqualified stream must not contact the handler");
+    });
+    cleanups.push(cleanup);
+
+    const client = new CtxlaneUnixAutomationClient({
+      endpoint: `unix://${socketPath}`,
+    });
+    await expect(client.acquire(fixtureRequest)).rejects.toThrow(
+      "native authenticated SOCK_SEQPACKET transport is unavailable",
+    );
+  });
+
+  it("publishes an unqualified native deployment contract without claiming qualification", () => {
+    const client = new CtxlaneUnixAutomationClient({
+      endpoint: "unix:///private/fixture.sock",
+    });
+    expect(CTXLANE_NATIVE_SEQPACKET_DEPLOYMENT_CONTRACT).toMatchObject({
+      schema: "ctxlane.runmill-native-seqpacket-contract/v1",
+      status: CTXLANE_NATIVE_SEQPACKET_TRANSPORT_STATUS,
+      addressFamily: "AF_UNIX",
+      socketType: "SOCK_SEQPACKET",
+      helperProcessAllowed: false,
+      streamFallbackAllowed: false,
+      lifecycleStatus: "private-lifecycle-response-not-published",
+    });
+    expect(client.qualification).not.toBe("native-seqpacket-authenticated");
+  });
+
   it("exact direct request is observed and response resolves", async () => {
     const { socketPath, cleanup } = await unixFixture((request) => {
       expect(request).toEqual(fixtureRequest);
@@ -133,6 +194,7 @@ describe("CtxlaneTransport", () => {
 
     const client = new CtxlaneUnixAutomationClient({
       endpoint: `unix://${socketPath}`,
+      allowDevelopmentOnlyTransport: true,
     });
     const response = await client.acquire(fixtureRequest);
     expect(response).toBeDefined();
@@ -147,6 +209,7 @@ describe("CtxlaneTransport", () => {
     chmodSync(socketPath, 0o666);
     const client = new CtxlaneUnixAutomationClient({
       endpoint: `unix://${socketPath}`,
+      allowDevelopmentOnlyTransport: true,
     });
 
     await expect(client.acquire(fixtureRequest)).rejects.toThrow(
@@ -182,6 +245,7 @@ describe("CtxlaneTransport", () => {
 
     const client = new CtxlaneUnixAutomationClient({
       endpoint: `unix://${socketPath}`,
+      allowDevelopmentOnlyTransport: true,
     });
     await expect(client.acquire(fixtureRequest)).rejects.toThrow(
       CtxlaneIdentityProtocolError,
@@ -200,6 +264,7 @@ describe("CtxlaneTransport", () => {
     } as CtxlaneIdentityLeaseRequest;
     const client = new CtxlaneUnixAutomationClient({
       endpoint: `unix://${socketPath}`,
+      allowDevelopmentOnlyTransport: true,
     });
 
     await expect(client.acquire(malformed)).rejects.toThrow(
@@ -219,6 +284,7 @@ describe("CtxlaneTransport", () => {
     } as CtxlaneIdentityLeaseRequest;
     const client = new CtxlaneUnixAutomationClient({
       endpoint: `unix://${socketPath}`,
+      allowDevelopmentOnlyTransport: true,
     });
 
     await expect(client.acquire(mismatch)).rejects.toThrow(
@@ -234,6 +300,7 @@ describe("CtxlaneTransport", () => {
 
     const client = new CtxlaneUnixAutomationClient({
       endpoint: `unix://${socketPath}`,
+      allowDevelopmentOnlyTransport: true,
     });
     await expect(client.acquire(fixtureRequest)).rejects.toThrow(
       "ctxlane returned invalid UTF-8",
@@ -248,6 +315,7 @@ describe("CtxlaneTransport", () => {
 
     const client = new CtxlaneUnixAutomationClient({
       endpoint: `unix://${socketPath}`,
+      allowDevelopmentOnlyTransport: true,
     });
     await expect(client.acquire(fixtureRequest)).rejects.toThrow(
       "ctxlane returned invalid JSON",
@@ -264,6 +332,7 @@ describe("CtxlaneTransport", () => {
     const client = new CtxlaneUnixAutomationClient({
       endpoint: `unix://${socketPath}`,
       timeoutMs: 40,
+      allowDevelopmentOnlyTransport: true,
     });
     await expect(client.acquire(fixtureRequest)).rejects.toThrow(
       "ctxlane request timed out",
@@ -279,6 +348,7 @@ describe("CtxlaneTransport", () => {
     const client = new CtxlaneUnixAutomationClient({
       endpoint: `unix://${socketPath}`,
       timeoutMs: 40,
+      allowDevelopmentOnlyTransport: true,
     });
     await expect(client.acquire(fixtureRequest)).rejects.toThrow(
       "ctxlane request timed out",

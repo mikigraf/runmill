@@ -64,6 +64,8 @@ export interface RunOptions {
 export interface RunWithInputOptions extends RunOptions {
   /** Start a new session so interactive tools cannot reopen the caller's TTY. */
   readonly detached?: boolean | undefined;
+  /** Stop the child process tree when the caller's operation is cancelled. */
+  readonly signal?: AbortSignal | undefined;
 }
 
 /**
@@ -109,6 +111,15 @@ export async function runWithInput(
   options: RunWithInputOptions = {},
 ): Promise<RunResult> {
   return new Promise((resolve) => {
+    if (options.signal?.aborted === true) {
+      resolve({
+        ok: false,
+        stdout: "",
+        stderr: "command cancelled",
+        code: null,
+      });
+      return;
+    }
     const stdout = new BoundedCapture(MAX_BUFFER_BYTES);
     const stderr = new BoundedCapture(MAX_BUFFER_BYTES);
     let child: ChildProcess;
@@ -131,6 +142,13 @@ export async function runWithInput(
 
     let spawnError: Error | undefined;
     let timedOut = false;
+    let cancelled = false;
+    const abort = (): void => {
+      if (cancelled) return;
+      cancelled = true;
+      terminateTree(child);
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
     const cancelTimer =
       options.timeoutMs === undefined
         ? () => undefined
@@ -145,15 +163,17 @@ export async function runWithInput(
     });
     child.on("close", (code) => {
       cancelTimer();
+      options.signal?.removeEventListener("abort", abort);
       const failure = [
         stderr.text(),
         ...(timedOut ? [`command timed out after ${String(options.timeoutMs)} ms`] : []),
+        ...(cancelled ? ["command cancelled"] : []),
         ...(spawnError === undefined ? [] : [spawnError.message]),
       ]
         .filter((part) => part !== "")
         .join("\n");
       resolve({
-        ok: code === 0 && !timedOut && spawnError === undefined,
+        ok: code === 0 && !timedOut && !cancelled && spawnError === undefined,
         stdout: stdout.text(),
         stderr: failure,
         code,
@@ -164,6 +184,9 @@ export async function runWithInput(
     // command failure reported through close/stderr, not an unhandled event.
     child.stdin?.on("error", () => undefined);
     child.stdin?.end(input);
+    // Close the small check-to-listener race if the caller aborted while the
+    // child was being spawned and its stdio handlers were installed.
+    if (options.signal !== undefined && options.signal.aborted) abort();
   });
 }
 

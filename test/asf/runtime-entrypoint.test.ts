@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -20,6 +21,7 @@ import {
   ASF_PRODUCTION_READINESS_CHECK_IDS_V1_DISABLED,
   ASF_PRODUCTION_READINESS_REPORT_SCHEMA,
 } from "../../src/asf/production-readiness.js";
+import { writeSignedReadinessArtifacts } from "./readiness-test-fixture.js";
 
 const NOW = "2026-08-21T10:05:00.000Z";
 const GLOBAL_FACTORY = "__runmillAsfRuntimeTestFactory";
@@ -162,6 +164,7 @@ function validOptions(
     service: {
       submitWorkOrder: vi.fn(),
       getRun: vi.fn(),
+      lookupSubmission: vi.fn(),
       listRunEvents: vi.fn(),
       getEvidence: vi.fn(),
       requestCancellation: vi.fn(),
@@ -305,6 +308,24 @@ describe("trusted ASF runtime composition", () => {
         startedAt: NOW,
       }),
     ).rejects.toMatchObject({ reason: "runtime-module-control-path-conflict" });
+
+    const missingAuthentication = moduleFile();
+    (globalThis as Record<string, unknown>)[GLOBAL_FACTORY] = (
+      context: AsfWorkerRuntimeFactoryContext,
+    ) =>
+      validOptions(context, {
+        controlAuthentication: {
+          verify: undefined,
+        } as unknown as AsfWorkerHostOptions["controlAuthentication"],
+      });
+    await expect(
+      startAsfWorkerFromRuntime({
+        mode: "asf-worker",
+        runtimeModulePath: missingAuthentication,
+        env: env(),
+        startedAt: NOW,
+      }),
+    ).rejects.toMatchObject({ reason: "runtime-module-options-invalid" });
   });
 
   it("does not expose errors thrown while importing or invoking the module", async () => {
@@ -392,6 +413,137 @@ describe("trusted ASF runtime composition", () => {
     await host.stop();
     await expect(lifetime).resolves.toBeUndefined();
     expect(existsSync(observed?.runtimePaths.registry as string)).toBe(false);
+  });
+
+  it("binds an explicit declarative config handoff to the exact host config path", async () => {
+    const runtime = moduleFile();
+    const productionConfigPath = join(directory, "operator-asf.json");
+    writeFileSync(
+      productionConfigPath,
+      readFileSync(join(process.cwd(), "examples/asf-worker/production-mode.json")),
+      { mode: 0o600 },
+    );
+    const readiness = writeSignedReadinessArtifacts(directory);
+    let observed: AsfWorkerRuntimeFactoryContext | undefined;
+    (globalThis as Record<string, unknown>)[GLOBAL_FACTORY] = (
+      context: AsfWorkerRuntimeFactoryContext,
+    ) => {
+      observed = context;
+      return validOptions(context, { configPath: productionConfigPath });
+    };
+
+    const host = await startAsfWorkerFromRuntime({
+      mode: "asf-worker",
+      runtimeModulePath: runtime,
+      productionConfigPath,
+      readinessObservationPath: readiness.observationPath,
+      readinessEvaluatorKeyPath: readiness.keyPath,
+      readinessEvaluatorKeyId: readiness.keyId,
+      env: env(),
+      startedAt: NOW,
+    });
+    expect(observed?.productionConfigPath).toBe(productionConfigPath);
+    await host.stop();
+
+    const mismatched = moduleFile();
+    (globalThis as Record<string, unknown>)[GLOBAL_FACTORY] = (
+      context: AsfWorkerRuntimeFactoryContext,
+    ) => validOptions(context, { configPath: join(directory, "other.json") });
+    await expect(
+      startAsfWorkerFromRuntime({
+        mode: "asf-worker",
+        runtimeModulePath: mismatched,
+        productionConfigPath,
+        readinessObservationPath: readiness.observationPath,
+        readinessEvaluatorKeyPath: readiness.keyPath,
+        readinessEvaluatorKeyId: readiness.keyId,
+        env: env(),
+        startedAt: NOW,
+      }),
+    ).rejects.toMatchObject({ reason: "runtime-module-options-invalid" });
+  });
+
+  it("rejects an invalid signed observation before importing the runtime module", async () => {
+    const runtime = moduleFile("throw new Error('must-not-load');\n");
+    const productionConfigPath = join(directory, "operator-asf.json");
+    writeFileSync(
+      productionConfigPath,
+      readFileSync(join(process.cwd(), "examples/asf-worker/production-mode.json")),
+      { mode: 0o600 },
+    );
+    const readiness = writeSignedReadinessArtifacts(directory);
+    writeFileSync(readiness.observationPath, "{}\n", { mode: 0o600 });
+
+    await expect(
+      startAsfWorkerFromRuntime({
+        mode: "asf-worker",
+        runtimeModulePath: runtime,
+        productionConfigPath,
+        readinessObservationPath: readiness.observationPath,
+        readinessEvaluatorKeyPath: readiness.keyPath,
+        readinessEvaluatorKeyId: readiness.keyId,
+        env: env(),
+        startedAt: NOW,
+      }),
+    ).rejects.toMatchObject({
+      name: "AsfWorkerHostReadinessError",
+      reasons: ["readiness-attestation-invalid"],
+    });
+  });
+
+  it("rejects writable production inputs before importing the runtime module", async () => {
+    const runtime = moduleFile("throw new Error('must-not-load');\n");
+    const productionConfigPath = join(directory, "operator-asf.json");
+    writeFileSync(
+      productionConfigPath,
+      readFileSync(join(process.cwd(), "examples/asf-worker/production-mode.json")),
+      { mode: 0o600 },
+    );
+    const readiness = writeSignedReadinessArtifacts(directory);
+
+    chmodSync(productionConfigPath, 0o664);
+    await expect(
+      startAsfWorkerFromRuntime({
+        mode: "asf-worker",
+        runtimeModulePath: runtime,
+        productionConfigPath,
+        readinessObservationPath: readiness.observationPath,
+        readinessEvaluatorKeyPath: readiness.keyPath,
+        readinessEvaluatorKeyId: readiness.keyId,
+        env: env(),
+        startedAt: NOW,
+      }),
+    ).rejects.toMatchObject({ reason: expect.stringContaining("production-config-invalid") });
+
+    chmodSync(productionConfigPath, 0o600);
+    chmodSync(readiness.keyPath, 0o664);
+    await expect(
+      startAsfWorkerFromRuntime({
+        mode: "asf-worker",
+        runtimeModulePath: runtime,
+        productionConfigPath,
+        readinessObservationPath: readiness.observationPath,
+        readinessEvaluatorKeyPath: readiness.keyPath,
+        readinessEvaluatorKeyId: readiness.keyId,
+        env: env(),
+        startedAt: NOW,
+      }),
+    ).rejects.toMatchObject({
+      reason: expect.stringContaining("readiness-evaluator-key-invalid"),
+    });
+  });
+
+  it("rejects a non-absolute declarative config handoff before loading the module", async () => {
+    const runtime = moduleFile("throw new Error('must-not-load');\n");
+    await expect(
+      startAsfWorkerFromRuntime({
+        mode: "asf-worker",
+        runtimeModulePath: runtime,
+        productionConfigPath: "operator-asf.json",
+        env: env(),
+        startedAt: NOW,
+      }),
+    ).rejects.toMatchObject({ reason: "production-config-path-invalid" });
   });
 
   it("preserves the host's production-readiness refusal without recovering", async () => {

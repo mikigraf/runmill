@@ -43,6 +43,13 @@ const idempotencyKeySchema = z
   .min(1)
   .max(768)
   .regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/u);
+const submissionLookupSchema = z
+  .object({
+    idempotencyKey: idempotencyKeySchema,
+    payloadDigest: digestSchema,
+    envelopeDigest: digestSchema,
+  })
+  .strict();
 const repositorySchema = z.string().regex(/^[^/\s]+\/[^/\s]+$/u);
 const baseRefSchema = z.string().refine((value) => {
   if (!value.startsWith("refs/heads/")) return false;
@@ -338,6 +345,11 @@ export interface AsfWorkOrderAdmissionStore {
     readonly payloadDigest: string;
     readonly effectivePolicy: EffectiveAsfPolicy;
   }): { readonly runId: string; readonly created: boolean };
+}
+
+export interface AsfSubmissionLookupResult {
+  readonly disposition: "found" | "not-found";
+  readonly runId?: string;
 }
 
 export interface SubmitWorkOrderResult {
@@ -1030,5 +1042,33 @@ export class WorkOrderAdmissionService {
       disposition: admitted.created ? "accepted" : "existing",
       payloadDigest: validated.payloadDigest,
     };
+  }
+
+  /**
+   * Recover an accepted submission after a lost response without exposing a
+   * run when the caller's immutable digest assertions do not match.
+   */
+  lookupSubmission(input: {
+    readonly idempotencyKey: string;
+    readonly payloadDigest: string;
+    readonly envelopeDigest: string;
+  }): AsfSubmissionLookupResult {
+    let parsed: z.infer<typeof submissionLookupSchema>;
+    try {
+      const candidate = submissionLookupSchema.safeParse(input);
+      if (!candidate.success) return { disposition: "not-found" };
+      parsed = candidate.data;
+    } catch {
+      return { disposition: "not-found" };
+    }
+    const existing = this.#store.getAsfAdmission(parsed.idempotencyKey);
+    if (
+      existing === undefined ||
+      existing.payloadDigest !== parsed.payloadDigest ||
+      existing.envelopeDigest !== parsed.envelopeDigest
+    ) {
+      return { disposition: "not-found" };
+    }
+    return { disposition: "found", runId: existing.runId };
   }
 }

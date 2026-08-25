@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdtempSync } from "node:fs";
+import { createPublicKey } from "node:crypto";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,6 +20,7 @@ import {
   type AsfWorkerHostControlServer,
   type AsfWorkerHostControlServerFactory,
   type AsfWorkerHostOptions,
+  type AsfWorkerReadinessBinding,
   type AsfWorkerHostService,
 } from "../../src/asf/worker-host.js";
 import {
@@ -24,13 +31,16 @@ import {
 import {
   ASF_PRODUCTION_READINESS_CHECK_IDS_V1_DISABLED,
   ASF_PRODUCTION_READINESS_REPORT_SCHEMA,
+  parseProductionModeConfig,
   type ProductionReadinessReport,
 } from "../../src/asf/production-readiness.js";
 import {
   AsfControlRequestAuthenticator,
   AsfControlRequestSigner,
 } from "../../src/asf/control-auth.js";
+import { SystemClock } from "../../src/platform/clock.js";
 import { FakeClock } from "../../src/testing/fake-clock.js";
+import { writeSignedReadinessArtifacts } from "./readiness-test-fixture.js";
 
 const NOW = "2026-08-21T10:05:00.000Z";
 const CONTROL_KEY = {
@@ -229,6 +239,7 @@ interface FakeService extends AsfWorkerHostService {
   readonly health: ReturnType<typeof vi.fn>;
   readonly submitWorkOrder: ReturnType<typeof vi.fn>;
   readonly getRun: ReturnType<typeof vi.fn>;
+  readonly lookupSubmission: ReturnType<typeof vi.fn>;
   readonly requestCancellation: ReturnType<typeof vi.fn>;
 }
 
@@ -239,6 +250,7 @@ function fakeService(getHealth: () => unknown = () => healthReport()): FakeServi
     health: vi.fn(async () => getHealth()),
     submitWorkOrder: vi.fn(async () => ({ runId: "run_01", accepted: true })),
     getRun: vi.fn((runId: string) => ({ run: { runId } })),
+    lookupSubmission: vi.fn(() => ({ disposition: "not-found" })),
     listRunEvents: vi.fn(() => ({ events: [] })),
     getEvidence: vi.fn(() => ({ schema: "test-evidence" })),
     requestCancellation: vi.fn(() => ({ disposition: "recorded" })),
@@ -285,7 +297,98 @@ function hostOptions(
   };
 }
 
+function processOwnedReadinessBinding(directory: string): {
+  readonly binding: AsfWorkerReadinessBinding;
+  readonly observationPath: string;
+} {
+  const artifacts = writeSignedReadinessArtifacts(directory);
+  const parsedConfig = parseProductionModeConfig(
+    JSON.parse(
+      readFileSync(join(process.cwd(), "examples/asf-worker/production-mode.json"), "utf8"),
+    ) as unknown,
+  );
+  if (parsedConfig.mode !== "asf-worker") throw new Error("test config must be ASF worker mode");
+  return {
+    observationPath: artifacts.observationPath,
+    binding: {
+      readSignedObservation: () =>
+        JSON.parse(readFileSync(artifacts.observationPath, "utf8")) as unknown,
+      evaluatorKeyId: artifacts.keyId,
+      evaluatorPublicKey: createPublicKey(readFileSync(artifacts.keyPath)),
+      productionConfig: parsedConfig,
+      clock: new SystemClock(),
+    },
+  };
+}
+
 describe("AsfWorkerHost", () => {
+  it("binds startup and authority checks to an independently verified signed observation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "runmill-asf-readiness-binding-"));
+    try {
+      const { binding, observationPath } = processOwnedReadinessBinding(directory);
+      const service = fakeService();
+      const factory = new FakeControlServerFactory();
+      const host = await AsfWorkerHost.start(
+        hostOptions(service, factory, { readinessBinding: binding }),
+      );
+
+      expect(service.recover).toHaveBeenCalledTimes(1);
+      await host.stop();
+
+      const signed = JSON.parse(readFileSync(observationPath, "utf8")) as {
+        observation: { ctxlane: { reachable: boolean } };
+      };
+      signed.observation.ctxlane.reachable = false;
+      writeFileSync(observationPath, `${JSON.stringify(signed)}\n`, { mode: 0o600 });
+
+      const refusedService = fakeService();
+      await expect(
+        AsfWorkerHost.start(
+          hostOptions(refusedService, new FakeControlServerFactory(), {
+            readinessBinding: binding,
+          }),
+        ),
+      ).rejects.toMatchObject({
+        name: "AsfWorkerHostReadinessError",
+        domain: "production",
+        reasons: ["readiness-attestation-invalid"],
+      });
+      expect(refusedService.recover).not.toHaveBeenCalled();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("re-verifies the process-owned observation before authority-bearing requests", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "runmill-asf-readiness-request-"));
+    try {
+      const { binding, observationPath } = processOwnedReadinessBinding(directory);
+      const service = fakeService();
+      const factory = new FakeControlServerFactory();
+      const host = await AsfWorkerHost.start(
+        hostOptions(service, factory, { readinessBinding: binding }),
+      );
+
+      const signed = JSON.parse(readFileSync(observationPath, "utf8")) as {
+        observation: { ctxlane: { reachable: boolean } };
+      };
+      signed.observation.ctxlane.reachable = false;
+      writeFileSync(observationPath, `${JSON.stringify(signed)}\n`, { mode: 0o600 });
+
+      await expect(
+        factory.handle({ type: "asf.submit_work_order", envelope: {} }),
+      ).rejects.toMatchObject({
+        name: "AsfWorkerHostReadinessError",
+        domain: "production",
+        reasons: ["readiness-attestation-invalid"],
+      });
+      expect(service.submitWorkOrder).not.toHaveBeenCalled();
+      await host.stop();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("recovers exactly once before opening the ASF-only control service", async () => {
     const service = fakeService();
     const factory = new FakeControlServerFactory();

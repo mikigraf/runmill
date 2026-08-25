@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { generateKeyPairSync } from "node:crypto";
 import {
   ASF_READINESS_OBSERVATION_SCHEMA,
   ASF_PRODUCTION_READINESS_CHECK_IDS_V1_DISABLED,
@@ -13,6 +14,11 @@ import {
   type AsfReadinessObservation,
   type AsfWorkerProductionConfig,
 } from "../../src/asf/production-readiness.js";
+import {
+  AsfReadinessObservationVerificationError,
+  signAsfReadinessObservation,
+  verifySignedAsfReadinessObservation,
+} from "../../src/asf/readiness-attestation.js";
 import { FakeClock } from "../../src/testing/fake-clock.js";
 
 const NOW = "2026-08-21T10:00:10Z";
@@ -278,6 +284,38 @@ describe("production mode selection", () => {
 });
 
 describe("ASF worker readiness", () => {
+  it("binds live-readiness evidence to an explicit Ed25519 evaluator key", () => {
+    const keys = generateKeyPairSync("ed25519");
+    const signed = signAsfReadinessObservation({
+      observation: observation(),
+      keyId: "readiness-evaluator-2026",
+      privateKey: keys.privateKey,
+    });
+
+    expect(
+      verifySignedAsfReadinessObservation(signed, {
+        keyId: "readiness-evaluator-2026",
+        publicKey: keys.publicKey,
+      }),
+    ).toEqual(signed);
+
+    const tampered = structuredClone(signed);
+    tampered.observation.github.repository_reachable = false;
+    expect(() =>
+      verifySignedAsfReadinessObservation(tampered, {
+        keyId: "readiness-evaluator-2026",
+        publicKey: keys.publicKey,
+      }),
+    ).toThrow(AsfReadinessObservationVerificationError);
+
+    expect(() =>
+      verifySignedAsfReadinessObservation(signed, {
+        keyId: "different-evaluator",
+        publicKey: keys.publicKey,
+      }),
+    ).toThrow(/not the configured evaluator key/u);
+  });
+
   it("accepts an explicit Linux PR-only deployment only after every proof passes", () => {
     const config = parseProductionModeConfig(asfConfig());
     const report = evaluateProductionReadiness(config, observation(), clock());

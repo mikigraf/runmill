@@ -3,8 +3,21 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   ctxlaneAutomationErrorSchema,
+  ctxlaneAutomationReadinessSchema,
+  ctxlaneProfileListSchema,
+  ctxlaneIdentityLeaseCloseSchema,
+  ctxlaneIdentityLeaseCloseReceiptSchema,
+  ctxlaneIdentityLeaseInspectSchema,
+  ctxlaneIdentityLeaseInspectReceiptSchema,
   ctxlaneIdentityLeaseRequestSchema,
+  ctxlaneIdentityLeaseRenewAcknowledgementSchema,
+  ctxlaneIdentityLeaseRenewReceiptSchema,
+  ctxlaneIdentityLeaseRenewSchema,
+  ctxlaneIdentityLeaseRevokeSchema,
+  ctxlaneIdentityLeaseRevokeReceiptSchema,
   ctxlaneIdentityLeaseSchema,
+  ctxlaneLeaseViewSchema,
+  ctxlaneServiceHealthSchema,
   ctxlaneLeaseAcquireAutomationErrorSchema,
   ctxlaneWorkOrderAuthorizationSchema,
   isAtOrBeforeUtc,
@@ -40,6 +53,30 @@ const identityLeaseRefusedFixture = loadFixture("identity-lease-refused.v1.json"
   unknown
 >;
 const automationErrorFixture = loadFixture("automation-error.v1.json") as Record<string, unknown>;
+const serviceHealthFixture = loadFixture("service-health.v1.json") as Record<string, unknown>;
+const profileListFixture = loadFixture("profile-list.v1.json") as Record<string, unknown>;
+const readinessFixtures = {
+  ready: loadFixture("automation-readiness-ready.v1.json"),
+  notReady: loadFixture("automation-readiness-not-ready.v1.json"),
+  developmentException: loadFixture("automation-readiness-development-exception.v1.json"),
+} as const;
+const lifecycleFixtures = {
+  closeRequest: loadFixture("lease-close-request.v1.json"),
+  closeReceipt: loadFixture("lease-close-receipt.v1.json"),
+  inspectRequest: loadFixture("lease-inspect-request.v1.json"),
+  inspectReceipt: loadFixture("lease-inspect-receipt.v1.json"),
+  renewRequest: loadFixture("lease-renew-request.v1.json"),
+  renewReceipt: loadFixture("lease-renew-receipt.v1.json"),
+  renewAcknowledgement: loadFixture("lease-renew-acknowledgement.v1.json"),
+  revokeRequest: loadFixture("lease-revoke-request.v1.json"),
+  revokeReceipt: loadFixture("lease-revoke-receipt.v1.json"),
+  viewActive: loadFixture("lease-view-active.v1.json"),
+  viewPerLeaseIsolated: loadFixture("lease-view-per-lease-isolated.v1.json"),
+  viewClosed: loadFixture("lease-view-closed.v1.json"),
+  viewRefused: loadFixture("lease-view-refused.v1.json"),
+  viewRenewing: loadFixture("lease-view-renewing.v1.json"),
+  viewRevoked: loadFixture("lease-view-revoked.v1.json"),
+} as const;
 
 describe("vendored ctxlane v1 fixtures parse byte-for-byte", () => {
   it("accepts the vendored work-order-authorization example", () => {
@@ -63,6 +100,146 @@ describe("vendored ctxlane v1 fixtures parse byte-for-byte", () => {
   it("accepts the vendored automation-error example", () => {
     expect(ctxlaneAutomationErrorSchema.safeParse(automationErrorFixture).success).toBe(true);
   });
+
+  it("accepts the vendored service-health example", () => {
+    expect(ctxlaneServiceHealthSchema.safeParse(serviceHealthFixture).success).toBe(true);
+  });
+
+  it("accepts the vendored profile-list example", () => {
+    expect(ctxlaneProfileListSchema.safeParse(profileListFixture).success).toBe(true);
+  });
+
+  it.each([
+    ["ready", readinessFixtures.ready],
+    ["not-ready", readinessFixtures.notReady],
+    ["development exception", readinessFixtures.developmentException],
+  ] as const)("accepts the vendored %s automation-readiness example", (_label, fixture) => {
+    expect(ctxlaneAutomationReadinessSchema.safeParse(fixture).success).toBe(true);
+  });
+});
+
+describe("ctxlane automation-readiness fail-closed bindings", () => {
+  it("rejects a ready result with a failed common prerequisite", () => {
+    const mutated = clone(readinessFixtures.ready as Record<string, unknown>);
+    const checks = mutated.checks as Record<string, Record<string, unknown>>;
+    checks["harness-trusted"] = { status: "fail", reason_code: "harness-untrusted" };
+    expect(ctxlaneAutomationReadinessSchema.safeParse(mutated).success).toBe(false);
+  });
+
+  it("rejects provider-incompatible auth and tenant reason combinations", () => {
+    const authMutated = clone(readinessFixtures.ready as Record<string, unknown>);
+    authMutated.auth_mode = "subscription-token";
+    expect(ctxlaneAutomationReadinessSchema.safeParse(authMutated).success).toBe(false);
+
+    const tenantMutated = clone(readinessFixtures.ready as Record<string, unknown>);
+    const checks = tenantMutated.checks as Record<string, Record<string, unknown>>;
+    checks["expected-tenant-verified"] = {
+      status: "fail",
+      reason_code: "organization-mismatch",
+    };
+    tenantMutated.ready = false;
+    expect(ctxlaneAutomationReadinessSchema.safeParse(tenantMutated).success).toBe(false);
+  });
+
+  it("rejects non-interactive results with an invalid validity interval", () => {
+    const mutated = clone(readinessFixtures.ready as Record<string, unknown>);
+    mutated.probe_interactive = true;
+    mutated.valid_until = mutated.checked_at;
+    expect(ctxlaneAutomationReadinessSchema.safeParse(mutated).success).toBe(false);
+  });
+});
+
+describe("ctxlane profile-list fail-closed bindings", () => {
+  it.each([
+    ["provider namespace", (profile: Record<string, unknown>) => {
+      profile.profile_ref = "claude:automation-production";
+    }],
+    ["shared concurrency", (profile: Record<string, unknown>) => {
+      profile.concurrency_mode = "shared";
+      profile.max_concurrent_leases = 1;
+      profile.shared_state_isolation_requirement = null;
+    }],
+    ["eligible scope", (profile: Record<string, unknown>) => {
+      profile.eligible = true;
+      profile.environment_count = 0;
+      profile.roles = [];
+      profile.caller_subject_count = 0;
+    }],
+    ["WIF exception", (profile: Record<string, unknown>) => {
+      profile.authentication_exception_acknowledged = true;
+    }],
+  ] as const)("rejects an invalid %s projection", (_label, mutate) => {
+    const mutated = clone(profileListFixture);
+    const profiles = mutated.profiles as Array<Record<string, unknown>>;
+    mutate(profiles[0]!);
+    expect(ctxlaneProfileListSchema.safeParse(mutated).success).toBe(false);
+  });
+
+  it("rejects duplicate roles and authority-bearing fields", () => {
+    const duplicateRoles = clone(profileListFixture);
+    const profiles = duplicateRoles.profiles as Array<Record<string, unknown>>;
+    profiles[0]!.roles = ["implementer", "implementer"];
+    expect(ctxlaneProfileListSchema.safeParse(duplicateRoles).success).toBe(false);
+
+    const capability = clone(profileListFixture);
+    const capabilityProfiles = capability.profiles as Array<Record<string, unknown>>;
+    capabilityProfiles[0]!.execution_handle = "exec_01ARZ3NDEKTSV4RRFFQ69G5FB0";
+    expect(ctxlaneProfileListSchema.safeParse(capability).success).toBe(false);
+  });
+});
+
+describe("vendored ctxlane lifecycle contracts", () => {
+  it.each([
+    ["renew parameters", ctxlaneIdentityLeaseRenewSchema, lifecycleFixtures.renewRequest],
+    ["revoke parameters", ctxlaneIdentityLeaseRevokeSchema, lifecycleFixtures.revokeRequest],
+    ["close parameters", ctxlaneIdentityLeaseCloseSchema, lifecycleFixtures.closeRequest],
+    ["inspect parameters", ctxlaneIdentityLeaseInspectSchema, lifecycleFixtures.inspectRequest],
+    [
+      "renew acknowledgement",
+      ctxlaneIdentityLeaseRenewAcknowledgementSchema,
+      lifecycleFixtures.renewAcknowledgement,
+    ],
+    ["renew receipt", ctxlaneIdentityLeaseRenewReceiptSchema, lifecycleFixtures.renewReceipt],
+    ["revoke receipt", ctxlaneIdentityLeaseRevokeReceiptSchema, lifecycleFixtures.revokeReceipt],
+    ["close receipt", ctxlaneIdentityLeaseCloseReceiptSchema, lifecycleFixtures.closeReceipt],
+    ["inspect receipt", ctxlaneIdentityLeaseInspectReceiptSchema, lifecycleFixtures.inspectReceipt],
+    ["active lease view", ctxlaneLeaseViewSchema, lifecycleFixtures.viewActive],
+    [
+      "per-lease-isolated lease view",
+      ctxlaneLeaseViewSchema,
+      lifecycleFixtures.viewPerLeaseIsolated,
+    ],
+    ["closed lease view", ctxlaneLeaseViewSchema, lifecycleFixtures.viewClosed],
+    ["refused lease view", ctxlaneLeaseViewSchema, lifecycleFixtures.viewRefused],
+    ["renewing lease view", ctxlaneLeaseViewSchema, lifecycleFixtures.viewRenewing],
+    ["revoked lease view", ctxlaneLeaseViewSchema, lifecycleFixtures.viewRevoked],
+  ] as const)("accepts the published %s example", (_label, schema, fixture) => {
+    expect(schema.safeParse(fixture).success).toBe(true);
+  });
+
+  it("rejects capability-bearing fields from the capability-free lease view", () => {
+    const mutated = clone(lifecycleFixtures.viewActive as Record<string, unknown>);
+    mutated.execution_handle = "exec_01ARZ3NDEKTSV4RRFFQ69G5FB0";
+    mutated.fencing_generation = 2;
+    expect(ctxlaneLeaseViewSchema.safeParse(mutated).success).toBe(false);
+    expect(ctxlaneIdentityLeaseSchema.safeParse(lifecycleFixtures.viewActive).success).toBe(false);
+  });
+
+  it.each([
+    ["renew parameters", ctxlaneIdentityLeaseRenewSchema, lifecycleFixtures.renewRequest],
+    ["revoke parameters", ctxlaneIdentityLeaseRevokeSchema, lifecycleFixtures.revokeRequest],
+    ["close parameters", ctxlaneIdentityLeaseCloseSchema, lifecycleFixtures.closeRequest],
+    ["inspect parameters", ctxlaneIdentityLeaseInspectSchema, lifecycleFixtures.inspectRequest],
+    [
+      "renew acknowledgement",
+      ctxlaneIdentityLeaseRenewAcknowledgementSchema,
+      lifecycleFixtures.renewAcknowledgement,
+    ],
+  ] as const)("rejects unknown fields on %s", (_label, schema, fixture) => {
+    const mutated = clone(fixture as Record<string, unknown>);
+    mutated.unexpected_field = "surprise";
+    expect(schema.safeParse(mutated).success).toBe(false);
+  });
 });
 
 describe("unknown and missing fields", () => {
@@ -71,6 +248,9 @@ describe("unknown and missing fields", () => {
     ["identity-lease-request", ctxlaneIdentityLeaseRequestSchema, identityLeaseRequestFixture],
     ["identity-lease", ctxlaneIdentityLeaseSchema, identityLeaseActiveFixture],
     ["automation-error", ctxlaneAutomationErrorSchema, automationErrorFixture],
+    ["service-health", ctxlaneServiceHealthSchema, serviceHealthFixture],
+    ["profile-list", ctxlaneProfileListSchema, profileListFixture],
+    ["automation-readiness", ctxlaneAutomationReadinessSchema, readinessFixtures.ready],
   ];
 
   for (const [label, schema, fixture] of cases) {
@@ -688,5 +868,83 @@ describe("lease-acquire automation-error narrowing", () => {
     const mutated = clone(automationErrorFixture);
     mutated.lease_id = "lease_01ARZ3NDEKTSV4RRFFQ69G5FB0";
     expect(ctxlaneLeaseAcquireAutomationErrorSchema.safeParse(mutated).success).toBe(false);
+  });
+});
+
+describe("regression: rejects old invented Runmill projection fields in identity-lease-request", () => {
+  it("rejects an identity-lease-request with invented 'tenant' field instead of 'tenant_id'", () => {
+    const mutated = clone(identityLeaseRequestFixture);
+    // Introduce the old invented field
+    mutated.tenant = "tenant-acme";
+    const result = ctxlaneIdentityLeaseRequestSchema.safeParse(mutated);
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects an identity-lease-request with invented 'requested_profile' field instead of 'profile_ref'", () => {
+    const mutated = clone(identityLeaseRequestFixture);
+    mutated.requested_profile = "codex:automation-production";
+    const result = ctxlaneIdentityLeaseRequestSchema.safeParse(mutated);
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects an identity-lease-request with invented 'requested_duration_ms' field instead of 'requested_ttl_seconds'", () => {
+    const mutated = clone(identityLeaseRequestFixture);
+    mutated.requested_duration_ms = 900_000;
+    const result = ctxlaneIdentityLeaseRequestSchema.safeParse(mutated);
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts canonical identity-lease-request with profile_ref, requested_ttl_seconds, and policy_digest", () => {
+    const result = ctxlaneIdentityLeaseRequestSchema.safeParse(identityLeaseRequestFixture);
+    expect(result.success).toBe(true);
+    expect(result.data).toBeDefined();
+    if (result.data) {
+      expect(result.data.profile_ref).toBe("codex:automation-production");
+      expect(result.data.requested_ttl_seconds).toBe(900);
+      expect(result.data.policy_digest).toBeNull();
+    }
+  });
+});
+
+describe("regression: validates canonical identity-lease response fields", () => {
+  it("requires principal_ref in active lease (resolved status)", () => {
+    const mutated = clone(identityLeaseActiveFixture);
+    mutated.principal_ref = null;
+    const result = ctxlaneIdentityLeaseSchema.safeParse(mutated);
+    expect(result.success).toBe(false);
+  });
+
+  it("requires effective_policy_digest in active lease (resolved status)", () => {
+    const mutated = clone(identityLeaseActiveFixture);
+    mutated.effective_policy_digest = null;
+    const result = ctxlaneIdentityLeaseSchema.safeParse(mutated);
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts canonical active lease with profile_ref, principal_ref, and effective_policy_digest", () => {
+    const result = ctxlaneIdentityLeaseSchema.safeParse(identityLeaseActiveFixture);
+    expect(result.success).toBe(true);
+    expect(result.data).toBeDefined();
+    if (result.data) {
+      expect(result.data.profile_ref).toBe("codex:automation-production");
+      expect(result.data.principal_ref).toBe("service-account:automation-worker");
+      expect(result.data.effective_policy_digest).toBe(
+        "sha256:bb42590da6d8c5c0c0103b67572979c60d3c44a5a5a2cfa74f469e8cd7cf3d12",
+      );
+    }
+  });
+
+  it("rejects active lease with invented camelCase 'policyDigest' field", () => {
+    const mutated = clone(identityLeaseActiveFixture);
+    mutated.policyDigest = "sha256:bb42590da6d8c5c0c0103b67572979c60d3c44a5a5a2cfa74f469e8cd7cf3d12";
+    const result = ctxlaneIdentityLeaseSchema.safeParse(mutated);
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects active lease with invented 'principalRef' camelCase field", () => {
+    const mutated = clone(identityLeaseActiveFixture);
+    mutated.principalRef = "service-account:automation-worker";
+    const result = ctxlaneIdentityLeaseSchema.safeParse(mutated);
+    expect(result.success).toBe(false);
   });
 });

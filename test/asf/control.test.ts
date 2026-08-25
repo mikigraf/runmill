@@ -23,7 +23,7 @@ function asfRequest(raw: unknown): AsfControlRequest {
 }
 
 describe("handleAsfControlRequest", () => {
-  it("maps exactly the nine bounded ASF service operations", async () => {
+  it("maps exactly the ten bounded ASF service operations", async () => {
     const calls: unknown[] = [];
     const service: AsfControlService = {
       submitWorkOrder: async (envelope) => {
@@ -37,6 +37,10 @@ describe("handleAsfControlRequest", () => {
       getRun: (runId) => {
         calls.push(["get", runId]);
         return { run: { runId } } as ReturnType<AsfControlService["getRun"]>;
+      },
+      lookupSubmission: (input) => {
+        calls.push(["lookup", input]);
+        return { disposition: "not-found" };
       },
       listRunEvents: (runId, after, limit) => {
         calls.push(["events", runId, after, limit]);
@@ -158,6 +162,17 @@ describe("handleAsfControlRequest", () => {
     await expect(
       handleAsfControlRequest(
         service,
+        asfRequest({
+          type: "asf.lookup_submission",
+          idempotencyKey: "tenant/wo/attempt",
+          payloadDigest: digest,
+          envelopeDigest: digest,
+        }),
+      ),
+    ).resolves.toMatchObject({ disposition: "not-found" });
+    await expect(
+      handleAsfControlRequest(
+        service,
         asfRequest({ type: "asf.list_run_events", runId: "run_01J", after: 7 }),
       ),
     ).resolves.toMatchObject({ nextCursor: 7 });
@@ -188,6 +203,14 @@ describe("handleAsfControlRequest", () => {
     expect(calls).toEqual([
       ["submit", { schema: "asf.work-order-envelope/v1" }],
       ["get", "run_01J"],
+      [
+        "lookup",
+        {
+          idempotencyKey: "tenant/wo/attempt",
+          payloadDigest: digest,
+          envelopeDigest: digest,
+        },
+      ],
       ["events", "run_01J", 7, 100],
       ["evidence", "run_01J"],
       ["cancel", cancellation],

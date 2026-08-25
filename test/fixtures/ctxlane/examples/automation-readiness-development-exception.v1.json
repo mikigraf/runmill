@@ -1,0 +1,34 @@
+{
+  "schema": "ctxlane.automation-readiness/v1",
+  "profile_uid": "profile_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "profile_ref": "claude:local-development",
+  "provider": "claude",
+  "auth_mode": "subscription-token",
+  "environment": "local-development",
+  "role": "implementer",
+  "ready": true,
+  "isolation": "copied-credential-development",
+  "authentication_exception_acknowledged": false,
+  "isolation_exception_acknowledged": true,
+  "checked_at": "2026-08-21T10:00:00Z",
+  "valid_until": "2026-08-21T10:05:00Z",
+  "probe_cost": "none",
+  "probe_timeout_milliseconds": 5000,
+  "probe_interactive": false,
+  "checks": {
+    "metadata-valid": { "status": "pass", "reason_code": null },
+    "credential-source-available": { "status": "pass", "reason_code": null },
+    "identity-token-current": {
+      "status": "not-applicable",
+      "reason_code": "not-applicable"
+    },
+    "harness-trusted": { "status": "pass", "reason_code": null },
+    "provider-principal-verified": { "status": "pass", "reason_code": null },
+    "expected-tenant-verified": { "status": "pass", "reason_code": null },
+    "automation-policy-permits": { "status": "pass", "reason_code": null },
+    "credential-isolation-proven": {
+      "status": "warn",
+      "reason_code": "isolation-exception-acknowledged"
+    }
+  }
+}
