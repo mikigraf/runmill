@@ -15,6 +15,7 @@ import type { CredentialFreeSandboxExecution } from "../../src/agent/tool-gatewa
 import { runControlledProcess } from "../../src/platform/process.js";
 import { FakeClock } from "../../src/testing/fake-clock.js";
 import {
+  ASF_BUBBLEWRAP_CTXLANE_CONTROL_SOCKET_CANARY,
   AsfBubblewrapProductionSandbox,
   buildAsfBubblewrapArgs,
   buildAsfPrlimitArgs,
@@ -67,6 +68,11 @@ function repository(parent = temporaryDirectory("runmill-asf-bwrap-repo-")): {
 }
 
 describe("buildAsfBubblewrapArgs", () => {
+  it("uses a synthetic, explicitly ctxlane-shaped socket canary for qualification only", () => {
+    expect(ASF_BUBBLEWRAP_CTXLANE_CONTROL_SOCKET_CANARY).toBe("host-run/ctxlane/control.sock");
+    expect(ASF_BUBBLEWRAP_CTXLANE_CONTROL_SOCKET_CANARY).not.toMatch(/^\/run\//u);
+  });
+
   it("uses mandatory namespaces and no downgrade-capable isolation flags", () => {
     const args = buildAsfBubblewrapArgs({
       workspaceRoot: "/private/runmill/workspaces/run-1",
@@ -398,6 +404,8 @@ describe("AsfBubblewrapProductionSandbox", () => {
         sibling_read_denied: true,
         credential_read_denied: true,
         host_socket_path_denied: true,
+        ctxlane_control_socket_path: ASF_BUBBLEWRAP_CTXLANE_CONTROL_SOCKET_CANARY,
+        ctxlane_control_socket_path_denied: true,
         network_interfaces: ["lo"],
       });
       const denied = await sandbox.executeObserved(input);

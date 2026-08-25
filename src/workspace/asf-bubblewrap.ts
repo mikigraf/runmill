@@ -33,6 +33,13 @@ import type { SandboxResult } from "./sandbox.js";
 export const ASF_BUBBLEWRAP_QUALIFICATION_SCHEMA =
   "asf.bubblewrap-qualification/v1" as const;
 export const ASF_BUBBLEWRAP_EXECUTION_SCHEMA = "asf.bubblewrap-execution/v1" as const;
+/**
+ * Relative path used only by the planted qualification fixture.  It is not a
+ * production ctxlane endpoint: the host-side probe creates a socket here and
+ * verifies that the worker namespace cannot resolve it.
+ */
+export const ASF_BUBBLEWRAP_CTXLANE_CONTROL_SOCKET_CANARY =
+  "host-run/ctxlane/control.sock" as const;
 
 const GIT_SHA = /^[a-f0-9]{40}$/u;
 const SAFE_ENV_KEYS = new Set(["PATH", "LANG", "LC_ALL", "TZ"]);
@@ -173,6 +180,9 @@ export interface AsfBubblewrapQualificationObservation {
     readonly sibling_read_denied: true;
     readonly credential_read_denied: true;
     readonly host_socket_path_denied: true;
+    /** The synthetic ctxlane-shaped control socket was absent in the worker namespace. */
+    readonly ctxlane_control_socket_path: typeof ASF_BUBBLEWRAP_CTXLANE_CONTROL_SOCKET_CANARY;
+    readonly ctxlane_control_socket_path_denied: true;
     readonly nested_user_namespace_denied: true;
     readonly cloud_metadata_route_absent: true;
     readonly environment_keys: readonly string[];
@@ -691,14 +701,17 @@ async function qualify(context: QualificationContext): Promise<AsfBubblewrapQual
   const outside = join(probeRoot, "other-workspace-secret");
   const homeSecret = join(probeRoot, "host-home", ".ssh", "id_probe");
   const socketCanary = join(probeRoot, "host-run", "docker.sock");
+  const ctxlaneSocketCanary = join(probeRoot, ASF_BUBBLEWRAP_CTXLANE_CONTROL_SOCKET_CANARY);
   mkdirSync(join(workspace, ".git"), { recursive: true, mode: 0o700 });
   mkdirSync(join(workspace, ".runmill"), { recursive: true, mode: 0o700 });
   mkdirSync(dirname(homeSecret), { recursive: true, mode: 0o700 });
   mkdirSync(dirname(socketCanary), { recursive: true, mode: 0o700 });
+  mkdirSync(dirname(ctxlaneSocketCanary), { recursive: true, mode: 0o700 });
   writeFileSync(join(workspace, "readable"), "workspace-visible", { mode: 0o600 });
   writeFileSync(outside, "other-workspace-secret", { mode: 0o600 });
   writeFileSync(homeSecret, "credential-secret", { mode: 0o600 });
   const socketServer = createServer((connection) => connection.destroy());
+  const ctxlaneSocketServer = createServer((connection) => connection.destroy());
 
   const qualificationLimits = {
     cpuMillis: 30_000,
@@ -749,13 +762,22 @@ async function qualify(context: QualificationContext): Promise<AsfBubblewrapQual
   };
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      socketServer.once("error", reject);
-      socketServer.listen(socketCanary, () => {
-        socketServer.removeListener("error", reject);
-        resolve();
-      });
-    });
+    await Promise.all([
+      new Promise<void>((resolve, reject) => {
+        socketServer.once("error", reject);
+        socketServer.listen(socketCanary, () => {
+          socketServer.removeListener("error", reject);
+          resolve();
+        });
+      }),
+      new Promise<void>((resolve, reject) => {
+        ctxlaneSocketServer.once("error", reject);
+        ctxlaneSocketServer.listen(ctxlaneSocketCanary, () => {
+          ctxlaneSocketServer.removeListener("error", reject);
+          resolve();
+        });
+      }),
+    ]);
     const read = requireExit(await probe("/usr/bin/cat", [join(workspace, "readable")]), "workspace read");
     if (read.stdout.trim() !== "workspace-visible") {
       refuse("qualification-failed", "workspace read probe returned contradictory bytes");
@@ -779,6 +801,14 @@ async function qualify(context: QualificationContext): Promise<AsfBubblewrapQual
     // would only prove file-content denial and would not exercise the socket
     // path boundary required by CTX-SEC-002.
     requireDenied(await probe("/usr/bin/readlink", ["-e", socketCanary]), "", "host socket path");
+    // Keep this canary deliberately synthetic.  The production endpoint is
+    // operator-configured and is never copied into a worker; this proves the
+    // specific ctxlane-shaped control-socket path cannot cross the boundary.
+    requireDenied(
+      await probe("/usr/bin/readlink", ["-e", ctxlaneSocketCanary]),
+      "",
+      "ctxlane control socket path",
+    );
     requireDenied(
       await probe(context.unshare.path, ["--user", "--map-root-user", "/usr/bin/true"]),
       "",
@@ -888,6 +918,8 @@ async function qualify(context: QualificationContext): Promise<AsfBubblewrapQual
         sibling_read_denied: true as const,
         credential_read_denied: true as const,
         host_socket_path_denied: true as const,
+        ctxlane_control_socket_path: ASF_BUBBLEWRAP_CTXLANE_CONTROL_SOCKET_CANARY,
+        ctxlane_control_socket_path_denied: true as const,
         nested_user_namespace_denied: true as const,
         cloud_metadata_route_absent: true as const,
         environment_keys: environmentKeys,
@@ -915,6 +947,9 @@ async function qualify(context: QualificationContext): Promise<AsfBubblewrapQual
   } finally {
     if (socketServer.listening) {
       await new Promise<void>((resolve) => socketServer.close(() => resolve()));
+    }
+    if (ctxlaneSocketServer.listening) {
+      await new Promise<void>((resolve) => ctxlaneSocketServer.close(() => resolve()));
     }
     rmSync(probeRoot, { recursive: true, force: true });
   }
