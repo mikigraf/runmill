@@ -36,6 +36,7 @@
     "docs:errors": "tsx scripts/gen-error-docs.ts",
     "docs:check": "tsx scripts/gen-error-docs.ts --check",
     "verify:linux": "./scripts/verify-linux.sh",
+    "verify:ctxlane-live": "node scripts/verify-ctxlane-live.mjs",
     "verify:ctxlane-fixtures": "tsx scripts/check-ctxlane-fixture-freshness.ts",
     "test:coverage": "vitest run --coverage",
     "prepublishOnly": "npm run check && npm run package:check"

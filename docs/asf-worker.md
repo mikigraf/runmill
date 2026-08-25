@@ -443,6 +443,26 @@ The live test is skipped unless both variables are set on Linux, and it does not
 provider readiness, lease acquisition, lifecycle authority, or the complete ASF composition is
 qualified.
 
+For a strict qualification run that must not silently skip missing Linux or service
+configuration, use the repository runner. Build the architecture-matched native addon first;
+the runner requires and exercises the native `SOCK_SEQPACKET` boundary fixture:
+
+```bash
+npm run build:native
+RUNMILL_CTXLANE_BINARY=/usr/local/bin/ctxlane \
+RUNMILL_CTXLANE_ROOT=/var/lib/ctxlane \
+RUNMILL_CTXLANE_CLIENT_REQUEST_ID=req_01ARZ3NDEKTSV4RRFFQ69G5FAV \
+RUNMILL_CTXLANE_PROFILE_UID=profile_01ARZ3NDEKTSV4RRFFQ69G5FAV \
+RUNMILL_CTXLANE_PROFILE_REF=codex:automation-production \
+RUNMILL_CTXLANE_ENVIRONMENT=production \
+RUNMILL_CTXLANE_ROLE=implementer \
+npm run verify:ctxlane-live
+```
+
+This command refuses on non-Linux hosts, missing configuration, or a missing native addon. It
+still reports observation and transport qualification only; it does not claim provider WIF,
+lease lifecycle, harness isolation, or complete ASF production qualification.
+
 To qualify one operator-selected provider profile, run the separate readiness probe with all
 request fields pinned explicitly:
 
