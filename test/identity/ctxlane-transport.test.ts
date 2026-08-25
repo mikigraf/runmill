@@ -1,4 +1,5 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +27,34 @@ const fixtureRequest: CtxlaneIdentityLeaseRequest = JSON.parse(
     "utf-8",
   ),
 );
+
+interface NativeSeqpacketAddonFixture {
+  exchange(
+    socketPath: string,
+    request: Buffer,
+    maxMessageBytes: number,
+    timeoutMs: number,
+    expectedPeerExecutable: string,
+    expectedPeerCgroup: string,
+    trustedOwnerUids: readonly number[],
+  ): Promise<Buffer>;
+}
+
+const nativeSeqpacketArtifact = join(
+  __dirname,
+  "..",
+  "..",
+  "dist-native",
+  `linux-${process.arch}`,
+  "ctxlane-seqpacket.node",
+);
+const nativeSeqpacketArtifactAvailable =
+  process.platform === "linux" && existsSync(nativeSeqpacketArtifact);
+const nativeRequire = createRequire(import.meta.url);
+
+function loadNativeSeqpacketAddonFixture(): NativeSeqpacketAddonFixture {
+  return nativeRequire(nativeSeqpacketArtifact) as NativeSeqpacketAddonFixture;
+}
 
 interface UnixFixtureHandler {
   (
@@ -130,7 +159,7 @@ describe("CtxlaneTransport", () => {
   it("native transport refuses unsupported hosts or an unbuilt addon", async () => {
     const client = new CtxlaneNativeSeqpacketAutomationClient({
       endpoint: "unix:///private/fixture.sock",
-      expectedPeerExecutable: process.execPath,
+      expectedPeerExecutable: "/usr/bin/true",
       expectedPeerCgroup: "0::/run/ctxlane",
     });
     await expect(client.acquire(fixtureRequest)).rejects.toThrow(
@@ -156,6 +185,70 @@ describe("CtxlaneTransport", () => {
       "native peer executable and cgroup policy are required",
     );
   });
+
+  describe.runIf(process.platform === "linux")(
+    "Linux native SOCK_SEQPACKET guardrails",
+    () => {
+      it("keeps the native transport explicitly unqualified", () => {
+        const client = new CtxlaneNativeSeqpacketAutomationClient({
+          endpoint: "unix:///private/fixture.sock",
+          expectedPeerExecutable: process.execPath,
+          expectedPeerCgroup: "0::/run/ctxlane",
+        });
+        expect(client.qualification).toBe("native-seqpacket-unqualified");
+      });
+
+      it("rejects malformed records before consulting the native addon", async () => {
+        const client = new CtxlaneNativeSeqpacketAutomationClient({
+          endpoint: "unix:///private/fixture.sock",
+          expectedPeerExecutable: process.execPath,
+          expectedPeerCgroup: "0::/run/ctxlane",
+        });
+        await expect(
+          client.acquire({
+            ...fixtureRequest,
+            unexpected: true,
+          } as CtxlaneIdentityLeaseRequest),
+        ).rejects.toThrow("ctxlane request is malformed or unbound");
+      });
+
+      it.runIf(nativeSeqpacketArtifactAvailable)(
+        "rejects an oversized record at the native boundary",
+        () => {
+          const addon = loadNativeSeqpacketAddonFixture();
+          expect(() =>
+            addon.exchange(
+              "/private/fixture.sock",
+              Buffer.from(JSON.stringify(fixtureRequest), "utf8"),
+              1_024,
+              1_000,
+              process.execPath,
+              "0::/run/ctxlane",
+              [process.getuid?.() ?? 0],
+            ),
+          ).toThrow("ctxlane native exchange arguments are outside safe bounds");
+        },
+      );
+
+      it.runIf(nativeSeqpacketArtifactAvailable)(
+        "rejects a path beyond the Linux sockaddr limit at the native boundary",
+        () => {
+          const addon = loadNativeSeqpacketAddonFixture();
+          expect(() =>
+            addon.exchange(
+              `/private/${"x".repeat(110)}`,
+              Buffer.from("{}", "utf8"),
+              1_024,
+              1_000,
+              process.execPath,
+              "0::/run/ctxlane",
+              [process.getuid?.() ?? 0],
+            ),
+          ).toThrow("ctxlane native exchange arguments are outside safe bounds");
+        },
+      );
+    },
+  );
 
   it("refuses authority over SOCK_STREAM without an explicit development opt-in", async () => {
     const { socketPath, cleanup } = await unixFixture(() => {
