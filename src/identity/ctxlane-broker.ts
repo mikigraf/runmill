@@ -76,6 +76,7 @@ export {
 export type { CtxlanePrivateLifecycleExchange } from "./ctxlane-private-lifecycle.js";
 export {
   CtxlaneAuthenticatedMcpLifecycleClient,
+  CtxlaneNativeSeqpacketLifecycleExchange,
 } from "./ctxlane-mcp-lifecycle.js";
 export type {
   CtxlaneAuthenticatedLifecycleExchange,
@@ -101,6 +102,7 @@ export type {
   CtxlaneIdentityLeaseAcquisitionClient,
   CtxlaneStdioAutomationClientOptions,
   CtxlaneNativeSeqpacketAutomationClientOptions,
+  CtxlaneNativeSeqpacketRecordExchange,
   CtxlaneUnixAutomationClientOptions,
 } from "./ctxlane-transport.js";
 

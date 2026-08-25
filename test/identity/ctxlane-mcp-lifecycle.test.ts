@@ -25,8 +25,10 @@ import type { CtxlaneAcquisitionAuthority } from "../../src/identity/ctxlane-aut
 import {
   CtxlaneAuthenticatedMcpLifecycleClient,
   CtxlaneProviderIdentityBroker,
+  CtxlaneNativeSeqpacketLifecycleExchange,
   type CtxlaneIdentityLeaseAcquisitionClient,
   type CtxlaneIdentityLeaseLifecyclePrivateRequest,
+  type CtxlaneNativeSeqpacketRecordExchange,
 } from "../../src/identity/ctxlane-broker.js";
 import {
   ctxlaneIdentityLeaseInspectSchema,
@@ -289,6 +291,24 @@ class RecordingProviderTransport implements TrustedProviderTransport {
   }
 }
 
+class RecordingNativeRecordExchange
+  implements CtxlaneNativeSeqpacketRecordExchange
+{
+  readonly payloads: Uint8Array[] = [];
+  readonly responses: unknown[];
+
+  constructor(...responses: unknown[]) {
+    this.responses = [...responses];
+  }
+
+  async exchangeRecord(payload: Uint8Array): Promise<unknown> {
+    this.payloads.push(new Uint8Array(payload));
+    const response = this.responses.shift();
+    if (response === undefined) throw new Error("record response unavailable");
+    return response;
+  }
+}
+
 function providerRequest(lease: IdentityLease): AsfProviderRequest {
   return {
     schema: ASF_PROVIDER_REQUEST_SCHEMA,
@@ -461,5 +481,66 @@ describe("authenticated local ctxlane MCP lifecycle", () => {
       client_request_id: REQUEST.client_request_id,
       lease_id: ACTIVE.lease_id,
     })).status).toBe("revoked");
+  });
+});
+
+describe("native seqpacket lifecycle exchange", () => {
+  it("sends private mutations as exact records and unwraps capability-free inspect", async () => {
+    const privateRequest: CtxlaneIdentityLeaseLifecyclePrivateRequest = {
+      schema: "ctxlane.identity-lease-lifecycle-private/v1",
+      operation: "revoke",
+      client_request_id: REQUEST.client_request_id,
+      lease: clone(ACTIVE),
+      reason: "operator-revoked",
+    };
+    const privateResponse: CtxlaneIdentityLeaseLifecyclePrivateResponse = {
+      schema: "ctxlane.identity-lease-lifecycle-private/v1",
+      operation: "revoke",
+      client_request_id: REQUEST.client_request_id,
+      result: { kind: "lease", lease: { ...clone(ACTIVE), status: "revoked", execution_handle: null, reason_code: "operator-revoked" } },
+    };
+    const transport = new RecordingNativeRecordExchange(
+      privateResponse,
+      { jsonrpc: "2.0", id: REQUEST.client_request_id, result: fixture<CtxlaneLeaseView>("lease-view-active.v1.json") },
+    );
+    const exchange = new CtxlaneNativeSeqpacketLifecycleExchange(transport);
+
+    await expect(exchange.privateLifecycle(privateRequest)).resolves.toEqual(privateResponse);
+    const inspected = await exchange.inspect({
+      client_request_id: REQUEST.client_request_id,
+      lease_id: ACTIVE.lease_id,
+    });
+    expect(inspected).toEqual(fixture<CtxlaneLeaseView>("lease-view-active.v1.json"));
+    expect(transport.payloads).toHaveLength(2);
+    expect(JSON.parse(new TextDecoder().decode(transport.payloads[0]))).toEqual(privateRequest);
+    expect(JSON.parse(new TextDecoder().decode(transport.payloads[1])).method).toBe(
+      "ctxlane_get_identity_lease",
+    );
+  });
+
+  it("rejects an inspect response correlated to another request", async () => {
+    const transport = new RecordingNativeRecordExchange({
+      jsonrpc: "2.0",
+      id: "different-request",
+      result: fixture<CtxlaneLeaseView>("lease-view-active.v1.json"),
+    });
+    const exchange = new CtxlaneNativeSeqpacketLifecycleExchange(transport);
+
+    await expect(
+      exchange.inspect({
+        client_request_id: REQUEST.client_request_id,
+        lease_id: ACTIVE.lease_id,
+      }),
+    ).rejects.toThrow("inspect response correlation failed");
+  });
+
+  it("rejects malformed private mutation input before transport", async () => {
+    const transport = new RecordingNativeRecordExchange({});
+    const exchange = new CtxlaneNativeSeqpacketLifecycleExchange(transport);
+
+    await expect(
+      exchange.privateLifecycle({} as CtxlaneIdentityLeaseLifecyclePrivateRequest),
+    ).rejects.toThrow("private lifecycle request failed contract validation");
+    expect(transport.payloads).toHaveLength(0);
   });
 });
