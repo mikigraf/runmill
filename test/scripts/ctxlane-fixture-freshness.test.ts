@@ -51,7 +51,7 @@ describe("ctxlane fixture freshness check", () => {
     directory = buildSourceTree();
     const changedPath = join(directory, "schemas", "ctxlane.automation-error.v1.schema.json");
     const original = readFileSync(changedPath, "utf8");
-    writeFileSync(changedPath, original.replace("{", "{ "));
+    writeFileSync(changedPath, `${original}\n`);
 
     const result = await run(TSX, [SCRIPT, "--source", directory], { cwd: process.cwd(), env: process.env });
 
