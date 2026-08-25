@@ -54,9 +54,12 @@ function loadNativeSeqpacketAddonFixture(): NativeSeqpacketAddonFixture {
   return nativeRequire(nativeSeqpacketArtifact) as NativeSeqpacketAddonFixture;
 }
 
+// The native addon snapshots the configured peer executable before the async
+// exchange, so the policy path must be a real protected executable on Linux.
+// /usr/bin/true is the stable fixture already used by ctxlane-transport.test.ts.
 const validOptions = {
   endpoint: "unix:///private/ctxlane.sock",
-  expectedPeerExecutable: "/usr/bin/ctxlane",
+  expectedPeerExecutable: "/usr/bin/true",
   expectedPeerCgroup: "0::/run/ctxlane",
 } as const;
 
@@ -275,10 +278,7 @@ describe("CtxlaneNativeSeqpacketAutomationClient", () => {
       });
 
       it("rejects a missing private endpoint without stream fallback", async () => {
-        const client = new CtxlaneNativeSeqpacketAutomationClient({
-          ...validOptions,
-          expectedPeerExecutable: process.execPath,
-        });
+        const client = new CtxlaneNativeSeqpacketAutomationClient(validOptions);
 
         await expect(client.acquire(fixtureRequest)).rejects.toThrow(
           /ctxlane control endpoint is not a private socket|ctxlane native exchange failed|ctxlane control connection failed/,
