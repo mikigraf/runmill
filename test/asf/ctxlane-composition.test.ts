@@ -28,10 +28,14 @@ import {
 import type { AsfEffectInput } from "../../src/asf/delivery-runner.js";
 import {
   AsfCtxlaneIdentityCompositionError,
+  createAsfCtxlaneIdentityProductionController,
   createAsfCtxlaneIdentityController,
 } from "../../src/asf/ctxlane-composition.js";
 import { sha256Digest, type JsonValue } from "../../src/asf/canonical-json.js";
 import { FakeClock } from "../../src/testing/fake-clock.js";
+import {
+  CTXLANE_NATIVE_SEQPACKET_AUTHENTICATED_TRANSPORT_QUALIFICATION,
+} from "../../src/identity/ctxlane-transport.js";
 
 const FIXTURES = join(__dirname, "..", "fixtures", "ctxlane", "examples");
 const readFixture = <T>(name: string): T =>
@@ -167,7 +171,10 @@ function authorityFor(
 
 class RecordingClient implements CtxlaneIdentityLeaseAcquisitionClient {
   readonly requests: CtxlaneIdentityLeaseRequest[] = [];
-  constructor(readonly response: (request: CtxlaneIdentityLeaseRequest) => unknown) {}
+  constructor(
+    readonly response: (request: CtxlaneIdentityLeaseRequest) => unknown,
+    readonly qualification?: string,
+  ) {}
   async acquire(request: CtxlaneIdentityLeaseRequest): Promise<unknown> {
     this.requests.push(clone(request));
     return this.response(request);
@@ -239,9 +246,32 @@ function composition(
   client: CtxlaneIdentityLeaseAcquisitionClient,
   authority: CtxlaneAcquisitionAuthorityResolver,
   profiles: AsfIdentityProfiles = PROFILES,
+  productionMode = false,
 ) {
   const clock = new FakeClock(NOW);
   return createAsfCtxlaneIdentityController({
+    client,
+    lifecycleClient: new NoopLifecycle(),
+    authority,
+    clock,
+    ownershipFence: new Fence(),
+    profiles: { resolve: () => profiles },
+    requestedDurationMs: REQUEST.requested_ttl_seconds * 1_000,
+    renewalLeadMs: 60_000,
+    fenceCheckIntervalMs: 2_000,
+    scheduler: new NoopScheduler(),
+    onAuthorityLost: () => undefined,
+    ...(productionMode ? { productionMode: true } : {}),
+  });
+}
+
+function productionComposition(
+  client: CtxlaneIdentityLeaseAcquisitionClient,
+  authority: CtxlaneAcquisitionAuthorityResolver,
+  profiles: AsfIdentityProfiles = PROFILES,
+) {
+  const clock = new FakeClock(NOW);
+  return createAsfCtxlaneIdentityProductionController({
     client,
     lifecycleClient: new NoopLifecycle(),
     authority,
@@ -355,5 +385,90 @@ describe("ASF ctxlane identity composition", () => {
       prReviewer: "claude:wrong-profile",
     }))).rejects.toBeInstanceOf(AsfIdentityLifecycleRefusalError);
     expect(client.requests).toHaveLength(0);
+  });
+
+  it("keeps fake/test clients compatible when production mode is not requested", () => {
+    const client = new RecordingClient((request) => activeFor(request));
+    const authority = {
+      resolveAcquisitionAuthority: (request: IdentityLeaseRequest) => {
+        const role = ctxlaneRole(request.role);
+        return authorityFor(requestFor(request, role, profileForRole(role)));
+      },
+    };
+
+    expect(() => composition(client, authority)).not.toThrow();
+  });
+
+  it("refuses an omitted or unqualified transport in explicit production mode", () => {
+    const authority = {
+      resolveAcquisitionAuthority: (request: IdentityLeaseRequest) => {
+        const role = ctxlaneRole(request.role);
+        return authorityFor(requestFor(request, role, profileForRole(role)));
+      },
+    };
+
+    for (const client of [
+      new RecordingClient((request) => activeFor(request)),
+      new RecordingClient(
+        (request) => activeFor(request),
+        "native-seqpacket-unqualified",
+      ),
+      new RecordingClient((request) => activeFor(request), "unknown-status"),
+    ]) {
+      expect(() => composition(client, authority, PROFILES, true)).toThrow(
+        expect.objectContaining({ reason: "transport-unqualified" }),
+      );
+    }
+  });
+
+  it("accepts only the known authenticated native transport status in production mode", () => {
+    const client = new RecordingClient(
+      (request) => activeFor(request),
+      CTXLANE_NATIVE_SEQPACKET_AUTHENTICATED_TRANSPORT_QUALIFICATION,
+    );
+    const authority = {
+      resolveAcquisitionAuthority: (request: IdentityLeaseRequest) => {
+        const role = ctxlaneRole(request.role);
+        return authorityFor(requestFor(request, role, profileForRole(role)));
+      },
+    };
+
+    expect(() => composition(client, authority, PROFILES, true)).not.toThrow();
+  });
+
+  it("uses a sealed production entrypoint that always enables the qualification gate", () => {
+    const authority = {
+      resolveAcquisitionAuthority: (request: IdentityLeaseRequest) => {
+        const role = ctxlaneRole(request.role);
+        return authorityFor(requestFor(request, role, profileForRole(role)));
+      },
+    };
+
+    expect(() =>
+      productionComposition(
+        new RecordingClient((request) => activeFor(request)),
+        authority,
+      ),
+    ).toThrow(expect.objectContaining({ reason: "transport-unqualified" }));
+
+    expect(() =>
+      productionComposition(
+        new RecordingClient(
+          (request) => activeFor(request),
+          CTXLANE_NATIVE_SEQPACKET_AUTHENTICATED_TRANSPORT_QUALIFICATION,
+        ),
+        authority,
+      ),
+    ).not.toThrow();
+  });
+
+  it("refuses incomplete dependencies through the production entrypoint", () => {
+    expect(() =>
+      createAsfCtxlaneIdentityProductionController(
+        {} as Parameters<
+          typeof createAsfCtxlaneIdentityProductionController
+        >[0],
+      ),
+    ).toThrow(expect.objectContaining({ reason: "dependencies-incomplete" }));
   });
 });

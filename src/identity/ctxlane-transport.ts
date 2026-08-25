@@ -30,6 +30,13 @@ export const CTXLANE_UNIX_AUTOMATION_TRANSPORT_QUALIFICATION =
  */
 export const CTXLANE_NATIVE_SEQPACKET_TRANSPORT_QUALIFICATION =
   "native-seqpacket-unqualified" as const;
+/**
+ * Reserved status for the operator-installed native transport after the
+ * authenticated Linux deployment has passed its live qualification gates.
+ * The shipped native client intentionally does not report this value.
+ */
+export const CTXLANE_NATIVE_SEQPACKET_AUTHENTICATED_TRANSPORT_QUALIFICATION =
+  "native-seqpacket-authenticated" as const;
 export const CTXLANE_NATIVE_SEQPACKET_TRANSPORT_STATUS =
   "implemented-unqualified" as const;
 
@@ -350,6 +357,12 @@ export function strictJsonDecode(text: string): unknown {
 }
 
 export interface CtxlaneIdentityLeaseAcquisitionClient {
+  /**
+   * Operator-supplied transport qualification status.  Test seams may omit
+   * this field; production composition requires the known authenticated
+   * native status below.
+   */
+  readonly qualification?: string | undefined;
   acquire(
     request: CtxlaneIdentityLeaseRequest,
     signal?: AbortSignal,
