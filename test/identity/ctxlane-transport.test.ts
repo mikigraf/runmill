@@ -130,6 +130,8 @@ describe("CtxlaneTransport", () => {
   it("native transport refuses unsupported hosts or an unbuilt addon", async () => {
     const client = new CtxlaneNativeSeqpacketAutomationClient({
       endpoint: "unix:///private/fixture.sock",
+      expectedPeerExecutable: "/usr/bin/ctxlane",
+      expectedPeerCgroup: "0::/run/ctxlane",
     });
     await expect(client.acquire(fixtureRequest)).rejects.toThrow(
       process.platform === "linux"

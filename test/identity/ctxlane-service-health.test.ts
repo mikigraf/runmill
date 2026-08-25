@@ -2,11 +2,9 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
-  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -39,8 +37,8 @@ afterEach(() => {
 });
 
 function fixture(output: string, source = "") {
-  directory = mkdtempSync(join(tmpdir(), "runmill-ctxlane-health-"));
-  const privateDirectory = realpathSync(directory);
+  directory = mkdtempSync(join(process.cwd(), "node_modules", ".runmill-ctxlane-health-"));
+  const privateDirectory = directory;
   const executable = join(privateDirectory, "ctxlane-fake");
   const root = join(privateDirectory, "ctxlane-root");
   // The root must be a private directory, while the fake executable remains a

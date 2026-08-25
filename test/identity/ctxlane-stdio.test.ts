@@ -3,12 +3,10 @@ import {
   chmodSync,
   mkdtempSync,
   readFileSync,
-  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -39,9 +37,7 @@ afterEach(() => {
 });
 
 function executable(script: string): { path: string; digest: string } {
-  const directory = mkdtempSync(
-    join(realpathSync(tmpdir()), "runmill-ctxlane-stdio-"),
-  );
+  const directory = mkdtempSync(join(process.cwd(), "node_modules", ".runmill-ctxlane-stdio-"));
   const path = join(directory, "ctxlane");
   writeFileSync(path, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
   chmodSync(path, 0o755);
