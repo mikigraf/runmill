@@ -17,6 +17,9 @@ import {
   type AsfIdentityProfileResolver,
 } from "./identity-lifecycle.js";
 import type { ProtectedIdentityLeaseRegistry } from "../identity/protected-lease-registry.js";
+import {
+  CTXLANE_NATIVE_SEQPACKET_AUTHENTICATED_TRANSPORT_QUALIFICATION,
+} from "../identity/ctxlane-transport.js";
 
 /**
  * Explicit operator-owned dependencies for the ASF/ctxlane identity seam.
@@ -46,21 +49,54 @@ export interface AsfCtxlaneIdentityCompositionOptions {
   ) => void | Promise<void>;
   readonly maximumClockSkewMs?: number | undefined;
   readonly requestTimeoutMs?: number | undefined;
+  /**
+   * Require the operator-qualified transport status before constructing an
+   * ASF production composition.  The default remains false so deterministic
+   * test and embedding seams retain their existing behavior.
+   */
+  readonly productionMode?: boolean | undefined;
 }
+
+/**
+ * Options accepted by the sealed production composition entrypoint.
+ *
+ * `productionMode` is deliberately not part of this type: callers cannot
+ * construct a production composition while leaving the gate unspecified or
+ * setting it to false.  The entrypoint below supplies the gate internally.
+ */
+export type AsfCtxlaneIdentityProductionCompositionOptions = Omit<
+  AsfCtxlaneIdentityCompositionOptions,
+  "productionMode"
+>;
 
 export class AsfCtxlaneIdentityCompositionError extends Error {
   readonly reason:
     | "dependencies-incomplete"
+    | "transport-unqualified"
     | "dependency-construction-failed";
 
   constructor(
     reason:
       | "dependencies-incomplete"
+      | "transport-unqualified"
       | "dependency-construction-failed",
   ) {
     super(`ASF ctxlane identity composition refused: ${reason}`);
     this.name = "AsfCtxlaneIdentityCompositionError";
     this.reason = reason;
+  }
+}
+
+function hasProductionQualifiedTransport(
+  client: CtxlaneIdentityLeaseAcquisitionClient,
+): boolean {
+  try {
+    return (
+      client.qualification ===
+      CTXLANE_NATIVE_SEQPACKET_AUTHENTICATED_TRANSPORT_QUALIFICATION
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -111,6 +147,13 @@ export function createAsfCtxlaneIdentityController(
     throw new AsfCtxlaneIdentityCompositionError("dependencies-incomplete");
   }
 
+  if (
+    options.productionMode === true &&
+    !hasProductionQualifiedTransport(options.client)
+  ) {
+    throw new AsfCtxlaneIdentityCompositionError("transport-unqualified");
+  }
+
   try {
     const brokerOptions = {
       client: options.client,
@@ -149,6 +192,30 @@ export function createAsfCtxlaneIdentityController(
       "dependency-construction-failed",
     );
   }
+}
+
+/**
+ * Construct an ASF ctxlane controller for an operator-qualified production
+ * deployment.
+ *
+ * This is the only production entrypoint.  Its options intentionally omit
+ * `productionMode`, and the implementation always sets it to true before
+ * crossing the generic composition boundary.  Therefore a missing,
+ * development-only, or otherwise unqualified transport is refused before a
+ * broker can be constructed, while existing test/embedding callers may keep
+ * using the generic factory.
+ */
+export function createAsfCtxlaneIdentityProductionController(
+  options: AsfCtxlaneIdentityProductionCompositionOptions,
+): AsfIdentityLifecycleController {
+  if (options === null || typeof options !== "object") {
+    throw new AsfCtxlaneIdentityCompositionError("dependencies-incomplete");
+  }
+
+  return createAsfCtxlaneIdentityController({
+    ...options,
+    productionMode: true,
+  });
 }
 
 export const createAsfCtxlaneIdentityLifecycleController =
