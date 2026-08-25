@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.identity-lease-lifecycle-private-request.v1.schema.json",
+  "title": "ctxlane private identity lease lifecycle request v1",
+  "description": "Authenticated-channel-only lifecycle request. The nested lease is never a public MCP capability.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "operation", "client_request_id", "lease"],
+  "properties": {
+    "schema": { "const": "ctxlane.identity-lease-lifecycle-private/v1" },
+    "operation": { "enum": ["renew", "revoke", "close"] },
+    "client_request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@+\\-]*$"
+    },
+    "lease": {
+      "$ref": "https://raw.githubusercontent.com/mikigraf/ctxlane/main/schemas/ctxlane.identity-lease.v1.schema.json"
+    },
+    "requested_ttl_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 86400
+    },
+    "reason": {
+      "enum": [
+        "completed",
+        "worker-failed",
+        "operator-revoked",
+        "policy-revoked",
+        "principal-mismatch",
+        "heartbeat-lost",
+        "process-unverifiable",
+        "generation-superseded",
+        "renewal-acknowledgement-failed",
+        "service-recovery",
+        "internal-error"
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "operation": { "const": "renew" } } },
+      "then": {
+        "required": ["requested_ttl_seconds"],
+        "not": { "required": ["reason"] }
+      }
+    },
+    {
+      "if": { "properties": { "operation": { "enum": ["revoke", "close"] } } },
+      "then": {
+        "required": ["reason"],
+        "not": { "required": ["requested_ttl_seconds"] }
+      }
+    },
+    {
+      "if": { "properties": { "operation": { "const": "close" } } },
+      "then": {
+        "properties": {
+          "reason": { "enum": ["completed", "worker-failed"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "operation": { "const": "revoke" } } },
+      "then": {
+        "properties": {
+          "reason": {
+            "enum": [
+              "operator-revoked",
+              "policy-revoked",
+              "principal-mismatch",
+              "heartbeat-lost",
+              "process-unverifiable",
+              "generation-superseded",
+              "renewal-acknowledgement-failed",
+              "service-recovery",
+              "internal-error"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
