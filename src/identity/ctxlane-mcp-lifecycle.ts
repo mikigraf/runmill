@@ -2,9 +2,12 @@ import {
   CTXLANE_IDENTITY_LEASE_LIFECYCLE_PRIVATE_SCHEMA,
   ctxlaneIdentityLeaseInspectSchema,
   ctxlaneIdentityLeaseSchema,
+  ctxlaneLeaseViewSchema,
+  parseCtxlaneIdentityLeaseLifecyclePrivateRequest,
   type CtxlaneAutomationError,
   type CtxlaneIdentityLease,
   type CtxlaneIdentityLeaseInspect,
+  type CtxlaneIdentityLeaseLifecyclePrivateRequest,
   type CtxlaneIdentityLeaseLifecyclePrivateResponse,
   type CtxlaneLeaseView,
 } from "./ctxlane-contracts.js";
@@ -19,7 +22,11 @@ import {
   CtxlanePrivateLifecycleClient,
   type CtxlanePrivateLifecycleExchange,
 } from "./ctxlane-private-lifecycle.js";
-import { CtxlaneIdentityProtocolError } from "./ctxlane-transport.js";
+import {
+  CtxlaneIdentityProtocolError,
+  type CtxlaneNativeSeqpacketRecordExchange,
+} from "./ctxlane-transport.js";
+import { z } from "zod";
 
 /**
  * Authenticated lifecycle exchange supplied by a local ctxlane deployment.
@@ -33,6 +40,87 @@ import { CtxlaneIdentityProtocolError } from "./ctxlane-transport.js";
  */
 export type CtxlaneAuthenticatedLifecycleExchange =
   CtxlanePrivateLifecycleExchange;
+
+const mcpInspectionResponseSchema = z
+  .object({
+    jsonrpc: z.literal("2.0"),
+    id: z.union([z.string(), z.number().int()]),
+    result: z.unknown(),
+  })
+  .strict();
+
+/**
+ * Native record-level lifecycle exchange for a configured ctxlane endpoint.
+ *
+ * The transport is deliberately injected rather than constructed here: the
+ * native client owns Linux peer attestation and remains explicitly marked
+ * unqualified until deployment evidence is available. This adapter only
+ * supplies exact private lifecycle bytes and unwraps the capability-free MCP
+ * inspection result; it never falls back to public MCP for mutations.
+ */
+export class CtxlaneNativeSeqpacketLifecycleExchange
+  implements CtxlanePrivateLifecycleExchange
+{
+  readonly #transport: CtxlaneNativeSeqpacketRecordExchange;
+
+  constructor(transport: CtxlaneNativeSeqpacketRecordExchange) {
+    if (
+      transport === null ||
+      typeof transport !== "object" ||
+      typeof transport.exchangeRecord !== "function"
+    ) {
+      throw protocolFailure("native lifecycle transport is incomplete");
+    }
+    this.#transport = transport;
+  }
+
+  async privateLifecycle(
+    request: CtxlaneIdentityLeaseLifecyclePrivateRequest,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    let parsed: CtxlaneIdentityLeaseLifecyclePrivateRequest;
+    try {
+      parsed = parseCtxlaneIdentityLeaseLifecyclePrivateRequest(request);
+    } catch {
+      throw protocolFailure("private lifecycle request failed contract validation");
+    }
+    return this.#transport.exchangeRecord(
+      Buffer.from(JSON.stringify(parsed), "utf8"),
+      signal,
+    );
+  }
+
+  async inspect(
+    request: CtxlaneIdentityLeaseInspect,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const parsed = ctxlaneIdentityLeaseInspectSchema.safeParse(request);
+    if (!parsed.success) throw protocolFailure("inspect request failed contract validation");
+
+    const raw = await this.#transport.exchangeRecord(
+      Buffer.from(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: parsed.data.client_request_id,
+          method: "ctxlane_get_identity_lease",
+          params: parsed.data,
+        }),
+        "utf8",
+      ),
+      signal,
+    );
+    const response = mcpInspectionResponseSchema.safeParse(raw);
+    if (
+      !response.success ||
+      response.data.id !== parsed.data.client_request_id
+    ) {
+      throw protocolFailure("inspect response correlation failed");
+    }
+    const view = ctxlaneLeaseViewSchema.safeParse(response.data.result);
+    if (!view.success) throw protocolFailure("inspect response is not a lease view");
+    return view.data;
+  }
+}
 
 const PRIVATE_REVOCATION_REASONS = new Set([
   "operator-revoked",

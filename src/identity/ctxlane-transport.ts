@@ -80,6 +80,54 @@ const CTXLANE_STDIO_OBSERVATION_METHODS = new Set([
   "ctxlane_check_profile",
 ]);
 
+/**
+ * Keys which must never cross the observation-only stdio boundary.  The
+ * published health/readiness projections do not define any of these fields,
+ * but checking the complete decoded response here is deliberate
+ * defense-in-depth: a future schema change or an error envelope must not
+ * accidentally turn this bridge into a capability or controller channel.
+ */
+const CTXLANE_STDIO_FORBIDDEN_RESPONSE_KEYS = new Set([
+  "access_token",
+  "api_key",
+  "capabilities",
+  "capability",
+  "credential",
+  "credentials",
+  "execution_handle",
+  "expected_row_version",
+  "fencing_generation",
+  "lease",
+  "lease_id",
+  "private_key",
+  "refresh_token",
+  "row_version",
+  "secret",
+  "secrets",
+  "session_token",
+  "token",
+  "tokens",
+]);
+
+/** Reject capability/control-bearing keys at any depth of a stdio response. */
+function assertCapabilityFreeStdioResponse(value: unknown): void {
+  const pending: unknown[] = [value];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === null || typeof current !== "object") continue;
+    if (Array.isArray(current)) {
+      pending.push(...current);
+      continue;
+    }
+    for (const [key, child] of Object.entries(current)) {
+      if (CTXLANE_STDIO_FORBIDDEN_RESPONSE_KEYS.has(key)) {
+        throw new Error("capability or control field");
+      }
+      pending.push(child);
+    }
+  }
+}
+
 const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/u;
 const MAX_EXECUTABLE_PATH_BYTES = 4_096;
 // The native addon passes these values through fixed-size C buffers. Keep the
@@ -474,6 +522,17 @@ export interface CtxlaneNativeSeqpacketAutomationClientOptions {
 }
 
 /**
+ * The authenticated native transport's record-level seam.
+ *
+ * Acquisition is only one consumer of this channel. Private lease lifecycle
+ * and execution-admission records use the same peer-attested, bounded
+ * exchange, so they must not grow a second socket or framing implementation.
+ */
+export interface CtxlaneNativeSeqpacketRecordExchange {
+  exchangeRecord(payload: Uint8Array, signal?: AbortSignal): Promise<unknown>;
+}
+
+/**
  * Direct Linux AF_UNIX/SOCK_SEQPACKET ctxlane client.
  *
  * The addon is optional at source-install time and unavailable on unsupported
@@ -482,7 +541,7 @@ export interface CtxlaneNativeSeqpacketAutomationClientOptions {
  * cgroup values before the native boundary can be reached.
  */
 export class CtxlaneNativeSeqpacketAutomationClient
-  implements CtxlaneIdentityLeaseAcquisitionClient
+  implements CtxlaneIdentityLeaseAcquisitionClient, CtxlaneNativeSeqpacketRecordExchange
 {
   readonly qualification = CTXLANE_NATIVE_SEQPACKET_TRANSPORT_QUALIFICATION;
   readonly #socketPath: string;
@@ -562,6 +621,26 @@ export class CtxlaneNativeSeqpacketAutomationClient
         "ctxlane request is malformed or unbound",
       );
     }
+    return this.exchangeRecord(
+      Buffer.from(JSON.stringify(validated), "utf8"),
+      signal,
+    );
+  }
+
+  /**
+   * Exchange one already-serialized record over the authenticated channel.
+   * Callers own schema validation; this method owns only transport framing,
+   * peer policy, size limits, cancellation, and response decoding.
+   */
+  async exchangeRecord(
+    payload: Uint8Array,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    if (process.platform !== "linux") {
+      throw new CtxlaneIdentityProtocolError(
+        "ctxlane native SOCK_SEQPACKET transport is Linux-only",
+      );
+    }
     if (this.#expectedPeerExecutable.length === 0 || this.#expectedPeerCgroup.length === 0) {
       throw new CtxlaneIdentityProtocolError(
         "ctxlane native peer executable and cgroup policy are required",
@@ -575,7 +654,10 @@ export class CtxlaneNativeSeqpacketAutomationClient
     if (signal?.aborted) {
       throw new CtxlaneIdentityProtocolError("ctxlane request was cancelled");
     }
-    const requestBytes = Buffer.from(JSON.stringify(validated), "utf8");
+    const requestBytes = Buffer.from(payload);
+    if (requestBytes.byteLength === 0) {
+      throw new CtxlaneIdentityProtocolError("ctxlane request is empty");
+    }
     if (requestBytes.byteLength > this.#maxMessageBytes) {
       throw new CtxlaneIdentityProtocolError(
         "ctxlane request exceeds the control limit",
@@ -1185,6 +1267,7 @@ export class CtxlaneStdioAutomationClient {
           ) {
             throw new Error("response envelope");
           }
+          assertCapabilityFreeStdioResponse(response);
           finish(undefined, response);
         } catch {
           fail("ctxlane returned invalid JSON");
