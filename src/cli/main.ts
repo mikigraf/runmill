@@ -476,6 +476,15 @@ async function launchTui(registry: string | undefined): Promise<number> {
 
 export function buildProgram(): Command {
   const program = new Command();
+  let configurationSandbox: SandboxBackend;
+  try {
+    configurationSandbox = createNativeSandboxBackend("native");
+  } catch {
+    // Configuration discovery may continue without executing a provider. The
+    // written native policy remains fail-closed, and doctor reports that the
+    // current platform has no production lifecycle-owning backend.
+    configurationSandbox = createNativeSandboxBackend("none");
+  }
 
   // First invocation of anything starts the clock. Local only.
   program.hook("preAction", (_rootCommand, actionCommand) => {
@@ -1771,7 +1780,7 @@ export function buildProgram(): Command {
           path,
           force: cmdOpts.force,
           defaults: cmdOpts.defaults,
-          sandbox: createNativeSandboxBackend("native"),
+          sandbox: configurationSandbox,
         });
         emit(
           opts,
@@ -1926,6 +1935,7 @@ export function buildProgram(): Command {
       findConfigPath(program.opts<GlobalOpts>().config, process.cwd()),
     repoRoot: () => findRepositoryRoot(process.cwd()),
     exitCodes: EXIT,
+    sandbox: configurationSandbox,
   };
   registerExtraCommands(program, commandContext);
   registerEvalCommands(program, commandContext);

@@ -140,10 +140,8 @@ export class Orchestrator {
 
   #codingToolInventory(): readonly string[] {
     const core = ["git", "rg", "node", "npm", "npx"];
-    const configured = [
-      ...this.#d.config.verification.commands.map((check) => check.run),
-      ...this.#d.checks.map((check) => check.run),
-    ].flatMap((command) => {
+    const configured = this.#d.config.verification.commands.flatMap((check) => {
+      const command = check.run;
       const executable = command.trim().split(/\s+/, 1)[0];
       if (executable === undefined || executable === "") return [];
       // A relative path lives in the writable candidate tree. Granting it for

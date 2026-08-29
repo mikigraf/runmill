@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { VerificationEngine, type CheckSpec } from "../../src/verification/engine.js";
 import { validateReportContent } from "../../src/verification/report.js";
 import {
-  createNativeSandboxBackend,
+  createTestSandboxBackend,
   type SandboxBackend,
   type SandboxResult,
   type SandboxRunInput,
@@ -53,7 +53,7 @@ function workspaces(): WorkspaceManager {
 }
 
 function sandbox(afterRun?: (cwd: string) => void): SandboxBackend {
-  const native = createNativeSandboxBackend("native");
+  const native = createTestSandboxBackend();
   return {
     mechanism: native.mechanism,
     runtime: native.runtime,
@@ -522,7 +522,7 @@ describe("base-to-candidate test identity proof", () => {
     expect(outcome.results[0]?.notes.join(" ")).toMatch(/baseline inventory: 1 passed/i);
   });
 
-  it.runIf(createNativeSandboxBackend("native").mechanism !== "none")(
+  it.runIf(createTestSandboxBackend().mechanism !== "none")(
     "starts real npm test and npm run typecheck workflows through VerificationEngine",
     async () => {
       const manager = {
@@ -540,7 +540,7 @@ describe("base-to-candidate test identity proof", () => {
         destroyVerificationCheckout: async () => undefined,
         treeHash: async () => "same-tree",
       } as unknown as WorkspaceManager;
-      const outcome = await new VerificationEngine(createNativeSandboxBackend("native")).run({
+      const outcome = await new VerificationEngine(createTestSandboxBackend()).run({
         workspace,
         workspaces: manager,
         manifest: [
@@ -559,7 +559,7 @@ describe("base-to-candidate test identity proof", () => {
     30_000,
   );
 
-  it.runIf(createNativeSandboxBackend("native").mechanism !== "none")(
+  it.runIf(createTestSandboxBackend().mechanism !== "none")(
     "denies an undeclared npm script tool instead of widening process execution",
     async () => {
       const manager = {
@@ -574,7 +574,7 @@ describe("base-to-candidate test identity proof", () => {
         destroyVerificationCheckout: async () => undefined,
         treeHash: async () => "same-tree",
       } as unknown as WorkspaceManager;
-      const outcome = await new VerificationEngine(createNativeSandboxBackend("native")).run({
+      const outcome = await new VerificationEngine(createTestSandboxBackend()).run({
         workspace,
         workspaces: manager,
         manifest: [{ ...check(), run: "npm test" }],
@@ -588,7 +588,7 @@ describe("base-to-candidate test identity proof", () => {
     30_000,
   );
 
-  it.runIf(createNativeSandboxBackend("native").mechanism !== "none")(
+  it.runIf(createTestSandboxBackend().mechanism !== "none")(
     "denies a malicious source mutate-and-restore attempt instead of trusting only hashes",
     async () => {
       const manager = {
@@ -618,7 +618,7 @@ describe("base-to-candidate test identity proof", () => {
         treeHash: async (checkout: Workspace) => readFileSync(join(checkout.path, "source.txt"), "utf8"),
       } as unknown as WorkspaceManager;
 
-      const outcome = await new VerificationEngine(createNativeSandboxBackend("native")).run({
+      const outcome = await new VerificationEngine(createTestSandboxBackend()).run({
         workspace,
         workspaces: manager,
         manifest: [

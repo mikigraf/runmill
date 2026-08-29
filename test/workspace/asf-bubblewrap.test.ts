@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CredentialFreeSandboxExecution } from "../../src/agent/tool-gateway.js";
 import { runControlledProcess } from "../../src/platform/process.js";
 import { FakeClock } from "../../src/testing/fake-clock.js";
@@ -250,6 +250,29 @@ describe("proveAsfWorkspaceCandidate", () => {
 });
 
 describe("runControlledProcess", () => {
+  it("does not leave a delayed SIGKILL armed after awaited timeout quiescence", async () => {
+    const originalKill = process.kill.bind(process);
+    const kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) =>
+      originalKill(pid, signal));
+    try {
+      const result = await runControlledProcess({
+        command: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        cwd: temporaryDirectory("runmill-process-timer-"),
+        env: { PATH: process.env["PATH"] ?? "" },
+        timeoutMs: 20,
+        maxOutputBytes: 4_096,
+        signal: new AbortController().signal,
+      });
+      expect(result.outcome).toBe("timeout");
+      const callsAtCompletion = kill.mock.calls.length;
+      await new Promise((resolve) => setTimeout(resolve, 2_100));
+      expect(kill.mock.calls).toHaveLength(callsAtCompletion);
+    } finally {
+      kill.mockRestore();
+    }
+  }, 5_000);
+
   it("does not resolve after a normal direct-child exit until background descendants are gone", async () => {
     const directory = temporaryDirectory("runmill-process-normal-exit-");
     const pidFile = join(directory, "grandchild.pid");

@@ -159,6 +159,22 @@ describe("runmill config validate", () => {
   });
 });
 
+describe("runmill init --defaults", () => {
+  it("runs real configuration discovery through the composition-root sandbox", async () => {
+    rmSync(join(dir, "runmill.yaml"));
+    const initialized = await run("git", ["init", "-q", "-b", "main", "."], { cwd: dir });
+    expect(initialized.ok).toBe(true);
+
+    const result = await cli(["init", "--defaults"]);
+
+    expect(result.code).toBe(3);
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain(
+      "configuration discovery requires an injected sandbox backend",
+    );
+    expect(readFileSync(join(dir, "runmill.yaml"), "utf8")).toContain("version: 1");
+  });
+});
+
 describe("runmill auth login", () => {
   it.each([
     ["a separate value", ["--token", "lin_api_must_not_reach_diagnostics"]],

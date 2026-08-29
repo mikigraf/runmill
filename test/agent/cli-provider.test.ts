@@ -17,7 +17,7 @@ import {
   existsSync,
   realpathSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CliProviderAdapter,
@@ -32,13 +32,13 @@ import { UnknownEventError } from "../../src/agent/events.js";
 import { outputPathFor } from "../../src/agent/output-contract.js";
 import type { AgentRunRequest } from "../../src/agent/adapter.js";
 import {
-  createNativeSandboxBackend,
+  createTestSandboxBackend,
   detectMechanism,
   type SandboxBackend,
 } from "../../src/workspace/sandbox.js";
 
 function nativeSandbox(): SandboxBackend {
-  return createNativeSandboxBackend("native");
+  return createTestSandboxBackend();
 }
 
 function backend(overrides: Partial<SandboxBackend> = {}): SandboxBackend {
@@ -85,7 +85,7 @@ function request(overrides: Partial<AgentRunRequest> = {}): AgentRunRequest {
   return built;
 }
 
-const hasSandbox = detectMechanism() !== "none";
+const hasSandbox = platform() === "darwin" || detectMechanism() !== "none";
 
 describe("dialect definitions", () => {
   it("declares capabilities per dialect rather than switching on a name", () => {
@@ -393,6 +393,32 @@ describe("CliProviderAdapter", () => {
       else process.env["OPENAI_API_KEY"] = previous;
     }
   });
+
+  it.each([
+    ["sandbox-denied", "DENIED"],
+    ["aborted", "ABORT"],
+    ["sandbox-denied", "OUTPUT_LIMIT"],
+  ] as const)(
+    "rejects login-looking auth output from a non-exited %s outcome (%s)",
+    async (outcome, signal) => {
+      const status = await providerAdapter({
+        dialect: CODEX_DIALECT,
+        sandbox: backend({
+          run: async () => ({
+            outcome,
+            exitCode: 0,
+            signal,
+            stdout: "Logged in as planted@example.test",
+            stderr: "",
+            durationMs: 1,
+          }),
+        }),
+      }).sandboxAuthStatus();
+
+      expect(status.authenticated).toBe(false);
+      expect(status.detail).toContain("Logged in as planted@example.test");
+    },
+  );
 
   it.runIf(hasSandbox)(
     "proves readiness with a minimal fake provider request inside the real Runmill sandbox",

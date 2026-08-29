@@ -9,9 +9,20 @@ import {
   existsSync,
   lstatSync,
   readFileSync,
-  readdirSync,
   statSync,
   symlinkSync,
+  openSync,
+  closeSync,
+  fstatSync,
+  readSync,
+  opendirSync,
+  mkdirSync,
+  chmodSync,
+  writeSync,
+  fsyncSync,
+  fchmodSync,
+  renameSync,
+  type Stats,
 } from "node:fs";
 import { arch, tmpdir, platform } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -81,6 +92,8 @@ export interface SandboxExecutableIdentity {
   readonly device: number;
   readonly inode: number;
   readonly size: number;
+  readonly uid: number;
+  readonly mode: number;
 }
 
 export interface SandboxQualification {
@@ -279,7 +292,6 @@ function realPath(p: string): string {
 
 export function detectMechanism(): SandboxMechanism {
   const os = platform();
-  if (os === "darwin") return "seatbelt";
   if (os === "linux") return "bubblewrap";
   return "none";
 }
@@ -334,29 +346,129 @@ function findOnPath(command: string, entries: readonly string[]): string[] {
 
 const MAX_SHEBANG_DEPTH = 4;
 const MAX_PACKAGE_EXECUTABLES = 512;
+const MAX_PACKAGE_TRAVERSAL_ENTRIES = 1_024;
+const MAX_EXECUTABLE_INSPECTION_BYTES = 512 * 1024 * 1024;
+const MAX_PACKAGE_MANIFEST_BYTES = 1024 * 1024;
+const MAX_RUNTIME_SNAPSHOT_ENTRIES = 10_000;
+const MAX_RUNTIME_SNAPSHOT_BYTES = 1024 * 1024 * 1024;
 const LOGICAL_SANITIZED_PATH = "/runmill/runtime/bin";
 
 function sandboxFailure(detail: string): RunmillError {
   return RunmillError.fromCatalog("RM-SANDBOX-001", { whatHappened: detail });
 }
 
-function sha256File(path: string): string {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
+interface InspectedFile {
+  readonly canonical: string;
+  readonly descriptor: number;
+  readonly info: Stats;
+}
+
+function openInspectedFile(
+  path: string,
+  label: string,
+  maximumBytes: number,
+  requireExecutable = false,
+  followFinalSymlink = true,
+): InspectedFile {
+  const openPath = followFinalSymlink ? realpathSync(path) : path;
+  const before = lstatSync(openPath);
+  if (before.isSymbolicLink()) throw sandboxFailure(`${label} is a symbolic link: ${openPath}.`);
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(openPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const info = fstatSync(descriptor);
+    if (info.dev !== before.dev || info.ino !== before.ino) {
+      throw sandboxFailure(`${label} changed before its no-follow descriptor was opened: ${openPath}.`);
+    }
+    const canonical = realpathSync(openPath);
+    const current = lstatSync(canonical);
+    if (current.isSymbolicLink() || current.dev !== info.dev || current.ino !== info.ino) {
+      throw sandboxFailure(`${label} pathname changed during no-follow inspection: ${openPath}.`);
+    }
+    if (!info.isFile()) throw sandboxFailure(`${label} is not a regular file: ${canonical}.`);
+    if (requireExecutable && (info.mode & 0o111) === 0) {
+      throw sandboxFailure(`${label} is not executable: ${canonical}.`);
+    }
+    if (!Number.isSafeInteger(info.size) || info.size > maximumBytes) {
+      throw sandboxFailure(
+        `${label} exceeds its inspection byte limit of ${String(maximumBytes)}: ${canonical}.`,
+      );
+    }
+    return { canonical, descriptor, info };
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    throw error;
+  }
+}
+
+function sha256Descriptor(descriptor: number, size: number): string {
+  const digest = createHash("sha256");
+  const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, size)));
+  let offset = 0;
+  while (offset < size) {
+    const count = readSync(descriptor, chunk, 0, Math.min(chunk.length, size - offset), offset);
+    if (count <= 0) throw sandboxFailure("Executable changed while its bytes were inspected.");
+    digest.update(chunk.subarray(0, count));
+    offset += count;
+  }
+  return digest.digest("hex");
+}
+
+function inspectExecutable(path: string): {
+  readonly identity: SandboxExecutableIdentity;
+  readonly declaration: readonly string[] | undefined;
+} {
+  const opened = openInspectedFile(
+    path,
+    "Sandbox executable inspection byte limit",
+    MAX_EXECUTABLE_INSPECTION_BYTES,
+    true,
+  );
+  try {
+    const sha256 = sha256Descriptor(opened.descriptor, opened.info.size);
+    const prefix = Buffer.alloc(Math.min(4096, opened.info.size));
+    const prefixCount = prefix.length === 0
+      ? 0
+      : readSync(opened.descriptor, prefix, 0, prefix.length, 0);
+    const bytes = prefix.subarray(0, prefixCount).toString("utf8");
+    let declaration: readonly string[] | undefined;
+    if (bytes.startsWith("#!")) {
+      const line = bytes.slice(2).split(/\r?\n/, 1)[0]?.trim() ?? "";
+      const parts = line.split(/\s+/).filter((part) => part !== "");
+      if (parts.length === 0 || !isAbsolute(parts[0] ?? "")) {
+        throw sandboxFailure(`Executable ${opened.canonical} has an unprovable shebang.`);
+      }
+      declaration = parts;
+    }
+    const after = fstatSync(opened.descriptor);
+    if (
+      after.dev !== opened.info.dev ||
+      after.ino !== opened.info.ino ||
+      after.size !== opened.info.size ||
+      after.mtimeMs !== opened.info.mtimeMs ||
+      after.ctimeMs !== opened.info.ctimeMs
+    ) {
+      throw sandboxFailure(`Sandbox executable changed during inspection: ${opened.canonical}.`);
+    }
+    return {
+      identity: {
+        path: opened.canonical,
+        sha256,
+        device: after.dev,
+        inode: after.ino,
+        size: after.size,
+        uid: after.uid,
+        mode: after.mode & 0o7777,
+      },
+      declaration,
+    };
+  } finally {
+    closeSync(opened.descriptor);
+  }
 }
 
 function executableIdentity(path: string): SandboxExecutableIdentity {
-  const canonical = realpathSync(path);
-  const info = statSync(canonical);
-  if (!info.isFile() || (info.mode & 0o111) === 0) {
-    throw sandboxFailure(`Sandbox executable is not a regular executable file: ${canonical}`);
-  }
-  return {
-    path: canonical,
-    sha256: sha256File(canonical),
-    device: info.dev,
-    inode: info.ino,
-    size: info.size,
-  };
+  return inspectExecutable(path).identity;
 }
 
 function exactExecutable(command: string, searchPath: string, cwd = process.cwd()): string {
@@ -375,17 +487,6 @@ function exactExecutable(command: string, searchPath: string, cwd = process.cwd(
       `Cannot prove exact sandbox executable ${JSON.stringify(command)}: ${errorMessage(error)}`,
     );
   }
-}
-
-function shebang(path: string): readonly string[] | undefined {
-  const bytes = readFileSync(path).subarray(0, 4096).toString("utf8");
-  if (!bytes.startsWith("#!")) return undefined;
-  const line = bytes.slice(2).split(/\r?\n/, 1)[0]?.trim() ?? "";
-  const parts = line.split(/\s+/).filter((part) => part !== "");
-  if (parts.length === 0 || !isAbsolute(parts[0] ?? "")) {
-    throw sandboxFailure(`Executable ${path} has an unprovable shebang.`);
-  }
-  return parts;
 }
 
 function nearestPackageRoot(entrypoint: string): string | undefined {
@@ -413,8 +514,28 @@ function owningNodeModules(packageRoot: string): string | undefined {
 function installedOptionalPackageRoots(packageRoot: string): string[] {
   let manifest: { readonly optionalDependencies?: Readonly<Record<string, string>> };
   try {
-    manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as typeof manifest;
+    const opened = openInspectedFile(
+      join(packageRoot, "package.json"),
+      "Provider package manifest byte limit",
+      MAX_PACKAGE_MANIFEST_BYTES,
+      false,
+      false,
+    );
+    try {
+      manifest = JSON.parse(readFileSync(opened.descriptor, "utf8")) as typeof manifest;
+      const after = fstatSync(opened.descriptor);
+      if (
+        after.dev !== opened.info.dev || after.ino !== opened.info.ino ||
+        after.size !== opened.info.size || after.mtimeMs !== opened.info.mtimeMs ||
+        after.ctimeMs !== opened.info.ctimeMs
+      ) {
+        throw sandboxFailure(`Provider package manifest changed during inspection: ${opened.canonical}.`);
+      }
+    } finally {
+      closeSync(opened.descriptor);
+    }
   } catch (error) {
+    if (error instanceof RunmillError) throw error;
     throw sandboxFailure(`Cannot prove provider package manifest at ${packageRoot}: ${errorMessage(error)}`);
   }
   const modules = owningNodeModules(packageRoot);
@@ -435,7 +556,12 @@ function installedOptionalPackageRoots(packageRoot: string): string[] {
 
 function packageExecutables(root: string): string[] {
   const executables: string[] = [];
+  let entries = 0;
   const visit = (path: string, depth: number): void => {
+    entries += 1;
+    if (entries > MAX_PACKAGE_TRAVERSAL_ENTRIES) {
+      throw sandboxFailure(`Provider package traversal entry limit exceeded: ${root}`);
+    }
     if (depth > 16 || executables.length > MAX_PACKAGE_EXECUTABLES) {
       throw sandboxFailure(`Provider package executable closure is too large: ${root}`);
     }
@@ -449,7 +575,19 @@ function packageExecutables(root: string): string[] {
       return;
     }
     if (info.isDirectory()) {
-      for (const name of readdirSync(path).sort()) visit(join(path, name), depth + 1);
+      const directory = opendirSync(path);
+      const names: string[] = [];
+      try {
+        for (let entry = directory.readSync(); entry !== null; entry = directory.readSync()) {
+          names.push(entry.name);
+          if (entries + names.length > MAX_PACKAGE_TRAVERSAL_ENTRIES) {
+            throw sandboxFailure(`Provider package traversal entry limit exceeded: ${root}`);
+          }
+        }
+      } finally {
+        directory.closeSync();
+      }
+      for (const name of names.sort()) visit(join(path, name), depth + 1);
       return;
     }
     if (info.isFile() && (info.mode & 0o111) !== 0) executables.push(realpathSync(path));
@@ -487,80 +625,160 @@ interface ElfMetadata {
 }
 
 function parseElfMetadata(path: string): ElfMetadata | undefined {
-  const source = readFileSync(path);
-  if (!source.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) return undefined;
-  const elfClass = source[4];
-  const encoding = source[5];
-  if ((elfClass !== 1 && elfClass !== 2) || (encoding !== 1 && encoding !== 2)) {
-    throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
-  }
-  const little = encoding === 1;
-  const number = (offset: number, width: 2 | 4 | 8): number => {
-    if (offset < 0 || offset + width > source.length) {
-      throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
-    }
-    const value = width === 2
-      ? little ? source.readUInt16LE(offset) : source.readUInt16BE(offset)
-      : width === 4
-        ? little ? source.readUInt32LE(offset) : source.readUInt32BE(offset)
-        : Number(little ? source.readBigUInt64LE(offset) : source.readBigUInt64BE(offset));
-    if (!Number.isSafeInteger(value)) throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
-    return value;
-  };
-  const phoff = number(elfClass === 1 ? 28 : 32, elfClass === 1 ? 4 : 8);
-  const phentsize = number(elfClass === 1 ? 42 : 54, 2);
-  const phnum = number(elfClass === 1 ? 44 : 56, 2);
-  if (phnum > 4096 || phentsize < (elfClass === 1 ? 32 : 56)) {
-    throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
-  }
-  const segments: Array<{ type: number; offset: number; address: number; size: number }> = [];
-  for (let index = 0; index < phnum; index += 1) {
-    const base = phoff + index * phentsize;
-    const type = number(base, 4);
-    segments.push({
-      type,
-      offset: number(base + (elfClass === 1 ? 4 : 8), elfClass === 1 ? 4 : 8),
-      address: number(base + (elfClass === 1 ? 8 : 16), elfClass === 1 ? 4 : 8),
-      size: number(base + (elfClass === 1 ? 16 : 32), elfClass === 1 ? 4 : 8),
-    });
-  }
-  const readCString = (offset: number): string => {
-    if (offset < 0 || offset >= source.length) throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
-    const end = source.indexOf(0, offset);
-    if (end < 0 || end - offset > 64 * 1024) throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
-    return source.subarray(offset, end).toString("utf8");
-  };
-  const interpreterSegment = segments.find((segment) => segment.type === 3);
-  const interpreter = interpreterSegment === undefined ? undefined : readCString(interpreterSegment.offset);
-  const dynamic = segments.find((segment) => segment.type === 2);
-  if (dynamic === undefined) return { interpreter, needed: [], searchPaths: [] };
-  const word = elfClass === 1 ? 4 : 8;
-  const entryWidth = word * 2;
-  const neededOffsets: number[] = [];
-  const searchOffsets: number[] = [];
-  let stringAddress: number | undefined;
-  for (let offset = dynamic.offset; offset + entryWidth <= dynamic.offset + dynamic.size; offset += entryWidth) {
-    const tag = number(offset, word);
-    const value = number(offset + word, word);
-    if (tag === 0) break;
-    if (tag === 1) neededOffsets.push(value);
-    else if (tag === 5) stringAddress = value;
-    else if (tag === 15 || tag === 29) searchOffsets.push(value);
-  }
-  if (neededOffsets.length === 0 && searchOffsets.length === 0) {
-    return { interpreter, needed: [], searchPaths: [] };
-  }
-  if (stringAddress === undefined) throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
-  const load = segments.find(
-    (segment) => segment.type === 1 && stringAddress >= segment.address && stringAddress < segment.address + segment.size,
+  const opened = openInspectedFile(
+    path,
+    "ELF inspection byte limit",
+    MAX_EXECUTABLE_INSPECTION_BYTES,
   );
-  if (load === undefined) throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
-  const stringOffset = load.offset + stringAddress - load.address;
-  return {
-    interpreter,
-    needed: neededOffsets.map((offset) => readCString(stringOffset + offset)),
-    searchPaths: searchOffsets.flatMap((offset) => readCString(stringOffset + offset).split(":")),
-  };
+  try {
+    const finish = <T>(value: T): T => {
+      const after = fstatSync(opened.descriptor);
+      if (
+        after.dev !== opened.info.dev || after.ino !== opened.info.ino ||
+        after.size !== opened.info.size || after.mtimeMs !== opened.info.mtimeMs ||
+        after.ctimeMs !== opened.info.ctimeMs
+      ) {
+        throw sandboxFailure(`ELF runtime input changed during inspection: ${opened.canonical}.`);
+      }
+      return value;
+    };
+    const malformed = (): never => {
+      throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
+    };
+    const readAt = (offset: number, length: number, maximum: number): Buffer => {
+      if (
+        !Number.isSafeInteger(offset) || offset < 0 ||
+        !Number.isSafeInteger(length) || length < 0 || length > maximum ||
+        offset > opened.info.size || length > opened.info.size - offset
+      ) {
+        return malformed();
+      }
+      const result = Buffer.allocUnsafe(length);
+      let received = 0;
+      while (received < length) {
+        const count = readSync(
+          opened.descriptor,
+          result,
+          received,
+          length - received,
+          offset + received,
+        );
+        if (count <= 0) return malformed();
+        received += count;
+      }
+      return result;
+    };
+    if (opened.info.size < 4) return finish(undefined);
+    const prefix = readAt(0, Math.min(64, opened.info.size), 64);
+    if (!prefix.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
+      return finish(undefined);
+    }
+    const elfClass = prefix[4];
+    const encoding = prefix[5];
+    if ((elfClass !== 1 && elfClass !== 2) || (encoding !== 1 && encoding !== 2)) malformed();
+    const minimumHeader = elfClass === 1 ? 52 : 64;
+    if (prefix.length < minimumHeader) malformed();
+    const little = encoding === 1;
+    const numberFrom = (source: Buffer, offset: number, width: 2 | 4 | 8): number => {
+      if (offset < 0 || offset + width > source.length) malformed();
+      const value = width === 2
+        ? little ? source.readUInt16LE(offset) : source.readUInt16BE(offset)
+        : width === 4
+          ? little ? source.readUInt32LE(offset) : source.readUInt32BE(offset)
+          : Number(little ? source.readBigUInt64LE(offset) : source.readBigUInt64BE(offset));
+      if (!Number.isSafeInteger(value)) malformed();
+      return value;
+    };
+    const phoff = numberFrom(prefix, elfClass === 1 ? 28 : 32, elfClass === 1 ? 4 : 8);
+    const phentsize = numberFrom(prefix, elfClass === 1 ? 42 : 54, 2);
+    const phnum = numberFrom(prefix, elfClass === 1 ? 44 : 56, 2);
+    const minimumProgramHeader = elfClass === 1 ? 32 : 56;
+    if (phnum > 4096 || phentsize < minimumProgramHeader || phentsize > 256) malformed();
+    const tableLength = phnum * phentsize;
+    if (!Number.isSafeInteger(tableLength) || tableLength > 1024 * 1024) malformed();
+    const table = readAt(phoff, tableLength, 1024 * 1024);
+    const segments: Array<{
+      type: number;
+      offset: number;
+      address: number;
+      fileSize: number;
+      memorySize: number;
+    }> = [];
+    for (let index = 0; index < phnum; index += 1) {
+      const base = index * phentsize;
+      segments.push({
+        type: numberFrom(table, base, 4),
+        offset: numberFrom(table, base + (elfClass === 1 ? 4 : 8), elfClass === 1 ? 4 : 8),
+        address: numberFrom(table, base + (elfClass === 1 ? 8 : 16), elfClass === 1 ? 4 : 8),
+        fileSize: numberFrom(table, base + (elfClass === 1 ? 16 : 32), elfClass === 1 ? 4 : 8),
+        memorySize: numberFrom(table, base + (elfClass === 1 ? 20 : 40), elfClass === 1 ? 4 : 8),
+      });
+    }
+    const readCString = (offset: number, boundary = opened.info.size): string => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      while (total <= 64 * 1024) {
+        const available = Math.min(opened.info.size, boundary) - (offset + total);
+        if (available <= 0) malformed();
+        const chunk = readAt(offset + total, Math.min(4096, available), 4096);
+        const end = chunk.indexOf(0);
+        if (end >= 0) {
+          if (total + end > 64 * 1024) malformed();
+          chunks.push(chunk.subarray(0, end));
+          return Buffer.concat(chunks, total + end).toString("utf8");
+        }
+        chunks.push(chunk);
+        total += chunk.length;
+      }
+      return malformed();
+    };
+    const interpreterSegment = segments.find((segment) => segment.type === 3);
+    if (interpreterSegment !== undefined && interpreterSegment.fileSize > 64 * 1024) malformed();
+    const interpreter = interpreterSegment === undefined
+      ? undefined
+      : readCString(interpreterSegment.offset, interpreterSegment.offset + interpreterSegment.fileSize);
+    const dynamic = segments.find((segment) => segment.type === 2);
+    if (dynamic === undefined) return finish({ interpreter, needed: [], searchPaths: [] });
+    if (dynamic.fileSize > 1024 * 1024) malformed();
+    const dynamicBytes = readAt(dynamic.offset, dynamic.fileSize, 1024 * 1024);
+    const word = elfClass === 1 ? 4 : 8;
+    const entryWidth = word * 2;
+    const neededOffsets: number[] = [];
+    const searchOffsets: number[] = [];
+    let stringAddress: number | undefined;
+    for (let offset = 0; offset + entryWidth <= dynamicBytes.length; offset += entryWidth) {
+      const tag = numberFrom(dynamicBytes, offset, word);
+      const value = numberFrom(dynamicBytes, offset + word, word);
+      if (tag === 0) break;
+      if (tag === 1) neededOffsets.push(value);
+      else if (tag === 5) stringAddress = value;
+      else if (tag === 15 || tag === 29) searchOffsets.push(value);
+      if (neededOffsets.length + searchOffsets.length > MAX_PACKAGE_TRAVERSAL_ENTRIES) malformed();
+    }
+    if (neededOffsets.length === 0 && searchOffsets.length === 0) {
+      return finish({ interpreter, needed: [], searchPaths: [] });
+    }
+    if (stringAddress === undefined) return malformed();
+    const provenStringAddress = stringAddress;
+    const load = segments.find(
+      (segment) => segment.type === 1 &&
+        provenStringAddress >= segment.address &&
+        provenStringAddress < segment.address + segment.memorySize,
+    );
+    if (load === undefined) return malformed();
+    const stringOffset = load.offset + provenStringAddress - load.address;
+    const stringBoundary = load.offset + load.fileSize;
+    const offsets = [...neededOffsets, ...searchOffsets];
+    if (offsets.some((offset) => offset < 0 || stringOffset + offset >= stringBoundary)) malformed();
+    return finish({
+      interpreter,
+      needed: neededOffsets.map((offset) => readCString(stringOffset + offset, stringBoundary)),
+      searchPaths: searchOffsets.flatMap((offset) =>
+        readCString(stringOffset + offset, stringBoundary).split(":")),
+    });
+  } finally {
+    closeSync(opened.descriptor);
+  }
 }
 
 /** Pure ELF metadata inspection: reads bytes and never executes the inspected target. */
@@ -880,8 +1098,211 @@ export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string
 interface ResolvedRuntimeClosure {
   readonly qualification: SandboxQualification;
   readonly executable: string;
+  readonly launcherExecutable: string;
+  readonly snapshotExecutableIdentities: readonly SandboxExecutableIdentity[];
   readonly readablePaths: readonly string[];
   readonly shimTargets: ReadonlyMap<string, string>;
+}
+
+interface SnapshotBudget {
+  entries: number;
+  bytes: number;
+}
+
+function runtimeSnapshotPath(root: string, source: string): string {
+  const absolute = resolve(source);
+  if (!isAbsolute(absolute) || absolute === resolve(sep)) {
+    throw sandboxFailure(`Runtime snapshot source is not a bounded absolute path: ${source}.`);
+  }
+  return join(root, "root", absolute.slice(1));
+}
+
+function chargeSnapshot(budget: SnapshotBudget, size: number, source: string): void {
+  budget.entries += 1;
+  budget.bytes += size;
+  if (budget.entries > MAX_RUNTIME_SNAPSHOT_ENTRIES) {
+    throw sandboxFailure(`Runtime snapshot entry limit exceeded at ${source}.`);
+  }
+  if (!Number.isSafeInteger(budget.bytes) || budget.bytes > MAX_RUNTIME_SNAPSHOT_BYTES) {
+    throw sandboxFailure(`Runtime snapshot byte limit exceeded at ${source}.`);
+  }
+}
+
+function copySnapshotFile(
+  source: string,
+  target: string,
+  budget: SnapshotBudget,
+  expectedSha256?: string,
+): string {
+  const opened = openInspectedFile(
+    source,
+    "Runtime snapshot file",
+    MAX_EXECUTABLE_INSPECTION_BYTES,
+    false,
+    false,
+  );
+  chargeSnapshot(budget, opened.info.size, source);
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+  let destination: number | undefined;
+  try {
+    destination = openSync(
+      target,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    const digest = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, opened.info.size)));
+    let offset = 0;
+    while (offset < opened.info.size) {
+      const count = readSync(
+        opened.descriptor,
+        chunk,
+        0,
+        Math.min(chunk.length, opened.info.size - offset),
+        offset,
+      );
+      if (count <= 0) {
+        throw sandboxFailure(`Runtime snapshot source changed while it was copied: ${source}.`);
+      }
+      digest.update(chunk.subarray(0, count));
+      let written = 0;
+      while (written < count) {
+        const countWritten = writeSync(destination, chunk, written, count - written, offset + written);
+        if (countWritten <= 0) throw sandboxFailure(`Runtime snapshot write failed: ${target}.`);
+        written += countWritten;
+      }
+      offset += count;
+    }
+    const sourceAfter = fstatSync(opened.descriptor);
+    const destinationAfter = fstatSync(destination);
+    if (
+      sourceAfter.dev !== opened.info.dev || sourceAfter.ino !== opened.info.ino ||
+      sourceAfter.size !== opened.info.size || sourceAfter.mtimeMs !== opened.info.mtimeMs ||
+      sourceAfter.ctimeMs !== opened.info.ctimeMs || !destinationAfter.isFile() ||
+      destinationAfter.size !== opened.info.size
+    ) {
+      throw sandboxFailure(`Runtime snapshot source changed while it was copied: ${source}.`);
+    }
+    const sha256 = digest.digest("hex");
+    if (expectedSha256 !== undefined && sha256 !== expectedSha256) {
+      throw sandboxFailure(`Qualified executable bytes changed before snapshot: ${source}.`);
+    }
+    fchmodSync(destination, (opened.info.mode & 0o111) === 0 ? 0o400 : 0o500);
+    fsyncSync(destination);
+    return sha256;
+  } catch (error) {
+    if (destination !== undefined) closeSync(destination);
+    destination = undefined;
+    rmSync(target, { force: true });
+    throw error;
+  } finally {
+    if (destination !== undefined) closeSync(destination);
+    closeSync(opened.descriptor);
+  }
+}
+
+function copySnapshotTree(source: string, target: string, budget: SnapshotBudget, depth = 0): void {
+  if (depth > 32) throw sandboxFailure(`Runtime snapshot depth limit exceeded: ${source}.`);
+  const info = lstatSync(source);
+  if (info.isSymbolicLink()) {
+    throw sandboxFailure(`Runtime snapshot refuses symbolic links inside a qualified tree: ${source}.`);
+  }
+  if (info.isFile()) {
+    copySnapshotFile(source, target, budget);
+    return;
+  }
+  if (!info.isDirectory()) {
+    throw sandboxFailure(`Runtime snapshot refuses a special filesystem object: ${source}.`);
+  }
+  chargeSnapshot(budget, 0, source);
+  mkdirSync(target, { recursive: true, mode: 0o700 });
+  const directory = opendirSync(source);
+  const names: string[] = [];
+  try {
+    for (let entry = directory.readSync(); entry !== null; entry = directory.readSync()) {
+      names.push(entry.name);
+      if (budget.entries + names.length > MAX_RUNTIME_SNAPSHOT_ENTRIES) {
+        throw sandboxFailure(`Runtime snapshot entry limit exceeded at ${source}.`);
+      }
+    }
+  } finally {
+    directory.closeSync();
+  }
+  for (const name of names.sort()) {
+    copySnapshotTree(join(source, name), join(target, name), budget, depth + 1);
+  }
+  chmodSync(target, 0o500);
+}
+
+function replaceSnapshotShebang(path: string, interpreter: string, budget: SnapshotBudget): void {
+  const opened = openInspectedFile(path, "Snapshot executable", MAX_EXECUTABLE_INSPECTION_BYTES, true);
+  const temporary = `${path}.runmill-shebang`;
+  let destination: number | undefined;
+  try {
+    const prefix = Buffer.alloc(Math.min(4096, opened.info.size));
+    const prefixCount = prefix.length === 0
+      ? 0
+      : readSync(opened.descriptor, prefix, 0, prefix.length, 0);
+    const newline = prefix.subarray(0, prefixCount).indexOf(0x0a);
+    if (newline < 0) throw sandboxFailure(`Snapshot executable has no complete shebang line: ${path}.`);
+    const replacement = Buffer.from(`#!${interpreter}\n`, "utf8");
+    const updatedSize = replacement.length + opened.info.size - newline - 1;
+    if (!Number.isSafeInteger(updatedSize) || updatedSize > MAX_EXECUTABLE_INSPECTION_BYTES) {
+      throw sandboxFailure(`Snapshot executable exceeds its byte limit after shebang binding: ${path}.`);
+    }
+    chargeSnapshot(budget, Math.max(0, updatedSize - opened.info.size), path);
+    destination = openSync(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    writeSync(destination, replacement, 0, replacement.length, 0);
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let sourceOffset = newline + 1;
+    let targetOffset = replacement.length;
+    while (sourceOffset < opened.info.size) {
+      const count = readSync(
+        opened.descriptor,
+        chunk,
+        0,
+        Math.min(chunk.length, opened.info.size - sourceOffset),
+        sourceOffset,
+      );
+      if (count <= 0) throw sandboxFailure(`Snapshot executable changed during rewrite: ${path}.`);
+      let written = 0;
+      while (written < count) {
+        const countWritten = writeSync(
+          destination,
+          chunk,
+          written,
+          count - written,
+          targetOffset + written,
+        );
+        if (countWritten <= 0) throw sandboxFailure(`Snapshot shebang write failed: ${temporary}.`);
+        written += countWritten;
+      }
+      sourceOffset += count;
+      targetOffset += count;
+    }
+    const after = fstatSync(opened.descriptor);
+    if (
+      after.dev !== opened.info.dev || after.ino !== opened.info.ino || after.size !== opened.info.size ||
+      after.mtimeMs !== opened.info.mtimeMs || after.ctimeMs !== opened.info.ctimeMs
+    ) {
+      throw sandboxFailure(`Snapshot executable changed during rewrite: ${path}.`);
+    }
+    fchmodSync(destination, 0o500);
+    fsyncSync(destination);
+    closeSync(destination);
+    destination = undefined;
+    renameSync(temporary, path);
+  } catch (error) {
+    if (destination !== undefined) closeSync(destination);
+    rmSync(temporary, { force: true });
+    throw error;
+  } finally {
+    closeSync(opened.descriptor);
+  }
 }
 
 function sameExecutableIdentity(
@@ -892,7 +1313,9 @@ function sameExecutableIdentity(
     expected.sha256 === actual.sha256 &&
     expected.device === actual.device &&
     expected.inode === actual.inode &&
-    expected.size === actual.size;
+    expected.size === actual.size &&
+    expected.uid === actual.uid &&
+    expected.mode === actual.mode;
 }
 
 function assertExecutableIdentityCurrent(identity: SandboxExecutableIdentity, label: string): void {
@@ -905,6 +1328,16 @@ function assertExecutableIdentityCurrent(identity: SandboxExecutableIdentity, la
   if (!sameExecutableIdentity(identity, current)) {
     throw sandboxFailure(`${label} changed after qualification: ${identity.path}.`);
   }
+}
+
+function isTrustedImmutableSystemExecutable(identity: SandboxExecutableIdentity): boolean {
+  return identity.uid === 0 && (identity.mode & 0o022) === 0 && [
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/System",
+  ].some((root) => identity.path === root || within(root, identity.path));
 }
 
 /**
@@ -925,13 +1358,22 @@ class NativeSandboxBackend implements SandboxBackend {
   }
 
   #launcherIdentity(): SandboxExecutableIdentity {
+    let identity: SandboxExecutableIdentity;
     if (this.mechanism === "seatbelt") {
-      return executableIdentity("/usr/bin/sandbox-exec");
+      identity = executableIdentity("/usr/bin/sandbox-exec");
+    } else {
+      const candidate = ["/usr/bin/bwrap", "/bin/bwrap"].find((path) => existsSync(path));
+      if (candidate === undefined) {
+        throw sandboxFailure("No trusted bubblewrap launcher exists at /usr/bin/bwrap or /bin/bwrap.");
+      }
+      identity = executableIdentity(candidate);
     }
-    for (const candidate of ["/usr/bin/bwrap", "/bin/bwrap"] as const) {
-      if (existsSync(candidate)) return executableIdentity(candidate);
+    if (identity.uid !== 0 || (identity.mode & 0o022) !== 0) {
+      throw sandboxFailure(
+        `Sandbox launcher must be root-owned and not group/other writable: ${identity.path}.`,
+      );
     }
-    throw sandboxFailure("No trusted bubblewrap launcher exists at /usr/bin/bwrap or /bin/bwrap.");
+    return identity;
   }
 
   async qualify(input: {
@@ -969,15 +1411,20 @@ class NativeSandboxBackend implements SandboxBackend {
     readonly command: string;
     readonly cwd?: string | undefined;
     readonly subprocesses?: readonly string[] | undefined;
-  }): Promise<ResolvedRuntimeClosure> {
+  }, snapshotRoot?: string): Promise<ResolvedRuntimeClosure> {
     const executable = exactExecutable(input.command, this.#searchPath, input.cwd);
     const identities = new Map<string, SandboxExecutableIdentity>();
     const readable = new Set<string>();
+    const snapshotTrees = new Set<string>();
     const shims = new Map<string, string>();
+    const declarations = new Map<string, readonly string[] | undefined>();
+    const snapshotInterpreters = new Map<string, string>();
 
     const addExecutable = (path: string, shimName?: string): string => {
-      const identity = executableIdentity(path);
+      const inspected = inspectExecutable(path);
+      const identity = inspected.identity;
       identities.set(identity.path, identity);
+      declarations.set(identity.path, inspected.declaration);
       if (shimName !== undefined && shimName !== "") {
         const previous = shims.get(shimName);
         if (previous !== undefined && previous !== identity.path) {
@@ -1003,20 +1450,21 @@ class NativeSandboxBackend implements SandboxBackend {
         if (visited.has(current)) throw sandboxFailure(`Executable shebang cycle at ${current}.`);
         visited.add(current);
         addMacShellVariant(current);
-        const declaration = shebang(current);
+        const declaration = declarations.get(current);
         if (declaration === undefined) break;
-        const interpreter = addExecutable(declaration[0] ?? "");
+        let interpreter = addExecutable(declaration[0] ?? "");
         if (interpreter === "/usr/bin/env") {
           const name = declaration[1];
           if (name === undefined || name.startsWith("-")) {
             throw sandboxFailure(`Executable ${current} uses an unprovable env shebang.`);
           }
-          current = addExecutable(exactExecutable(name, this.#searchPath, input.cwd), name);
+          interpreter = addExecutable(exactExecutable(name, this.#searchPath, input.cwd), name);
         } else {
-          current = interpreter;
           shims.set(basename(interpreter), interpreter);
         }
-        if (depth === MAX_SHEBANG_DEPTH - 1 && shebang(current) !== undefined) {
+        snapshotInterpreters.set(current, interpreter);
+        current = interpreter;
+        if (depth === MAX_SHEBANG_DEPTH - 1 && declarations.get(current) !== undefined) {
           throw sandboxFailure(`Executable shebang chain exceeds ${MAX_SHEBANG_DEPTH} entries.`);
         }
       }
@@ -1028,8 +1476,10 @@ class NativeSandboxBackend implements SandboxBackend {
     const packageRoot = nearestPackageRoot(executable);
     if (packageRoot !== undefined && packageRoot.split(sep).includes("node_modules")) {
       readable.add(packageRoot);
+      snapshotTrees.add(packageRoot);
       for (const dependencyRoot of installedOptionalPackageRoots(packageRoot)) {
         readable.add(dependencyRoot);
+        snapshotTrees.add(dependencyRoot);
         for (const path of packageExecutables(dependencyRoot)) addExecutable(path);
       }
     } else {
@@ -1049,7 +1499,12 @@ class NativeSandboxBackend implements SandboxBackend {
       // instead of widening process-exec to a directory or arbitrary process.
       addMacShellVariant(path);
       const root = nearestPackageRoot(path);
-      readable.add(root?.split(sep).includes("node_modules") === true ? root : path);
+      if (root?.split(sep).includes("node_modules") === true) {
+        readable.add(root);
+        snapshotTrees.add(root);
+      } else {
+        readable.add(path);
+      }
     }
 
     const orderedIdentities = [...identities.values()].sort((a, b) => a.path.localeCompare(b.path));
@@ -1076,22 +1531,99 @@ class NativeSandboxBackend implements SandboxBackend {
           runtime: this.runtime,
           identities: orderedIdentities,
           readable: [...readable].sort(),
+          launcher,
         }),
       )
       .digest("hex");
+    const qualification: SandboxQualification = {
+      mechanism: this.mechanism,
+      runtime: this.runtime,
+      executable: identities.get(executable) ?? executableIdentity(executable),
+      executableIdentities: orderedIdentities,
+      sanitizedPath: LOGICAL_SANITIZED_PATH,
+      runtimeDigest,
+      launcher,
+    };
+    if (snapshotRoot === undefined) {
+      return {
+        executable,
+        launcherExecutable: launcher.path,
+        snapshotExecutableIdentities: orderedIdentities,
+        readablePaths: [...readable].sort(),
+        shimTargets: shims,
+        qualification,
+      };
+    }
+
+    const budget: SnapshotBudget = { entries: 0, bytes: 0 };
+    const mappedReadable = new Set<string>();
+    const snapshotPaths = new Map(
+      orderedIdentities.map((identity) => [
+        identity.path,
+        isTrustedImmutableSystemExecutable(identity)
+          ? identity.path
+          : runtimeSnapshotPath(snapshotRoot, identity.path),
+      ]),
+    );
+    const copiedTrees = [...snapshotTrees].sort((a, b) => a.length - b.length);
+    for (const source of [...readable].sort()) {
+      const immutableExecutable = snapshotPaths.get(source);
+      if (immutableExecutable === source) {
+        mappedReadable.add(source);
+        continue;
+      }
+      const coveredTree = copiedTrees.find((root) => source === root || within(root, source));
+      if (coveredTree !== undefined && source !== coveredTree) continue;
+      const target = runtimeSnapshotPath(snapshotRoot, source);
+      if (snapshotTrees.has(source) || !lstatSync(source).isDirectory()) {
+        copySnapshotTree(source, target, budget);
+        mappedReadable.add(target);
+      } else {
+        // Runtime data directories (timezone/cert stores) are not executable
+        // objects. They remain exact read-only mounts; executable and library
+        // bytes are always snapshotted below.
+        mappedReadable.add(source);
+      }
+    }
+    for (const tree of copiedTrees) mappedReadable.add(runtimeSnapshotPath(snapshotRoot, tree));
+
+    for (const identity of orderedIdentities) {
+      const target = snapshotPaths.get(identity.path);
+      if (target === undefined) throw sandboxFailure(`Runtime snapshot mapping is incomplete: ${identity.path}.`);
+      if (target === identity.path) continue;
+      if (!existsSync(target)) copySnapshotFile(identity.path, target, budget, identity.sha256);
+      const copied = executableIdentity(target);
+      if (copied.sha256 !== identity.sha256) {
+        throw sandboxFailure(`Qualified executable bytes changed before snapshot: ${identity.path}.`);
+      }
+    }
+    for (const [source, interpreterSource] of snapshotInterpreters) {
+      const sourceTarget = snapshotPaths.get(source);
+      const interpreterTarget = snapshotPaths.get(interpreterSource);
+      if (sourceTarget === undefined || interpreterTarget === undefined) {
+        throw sandboxFailure(`Executable snapshot shebang mapping is incomplete: ${source}.`);
+      }
+      if (sourceTarget === source || interpreterTarget === interpreterSource) continue;
+      replaceSnapshotShebang(
+        sourceTarget,
+        interpreterTarget,
+        budget,
+      );
+    }
+
+    const snapshotExecutableIdentities = orderedIdentities
+      .map((identity) => executableIdentity(snapshotPaths.get(identity.path) ?? identity.path))
+      .sort((a, b) => a.path.localeCompare(b.path));
+    const mappedShims = new Map(
+      [...shims].map(([name, source]) => [name, snapshotPaths.get(source) ?? source]),
+    );
     return {
-      executable,
-      readablePaths: [...readable].sort(),
-      shimTargets: shims,
-      qualification: {
-        mechanism: this.mechanism,
-        runtime: this.runtime,
-        executable: executableIdentity(executable),
-        executableIdentities: orderedIdentities,
-        sanitizedPath: LOGICAL_SANITIZED_PATH,
-        runtimeDigest,
-        launcher,
-      },
+      executable: snapshotPaths.get(executable) ?? executable,
+      launcherExecutable: launcher.path,
+      snapshotExecutableIdentities,
+      readablePaths: [...mappedReadable].sort(),
+      shimTargets: mappedShims,
+      qualification,
     };
   }
 
@@ -1104,11 +1636,18 @@ class NativeSandboxBackend implements SandboxBackend {
       throw sandboxFailure("Sandbox output limit must be a positive safe integer.");
     }
 
-    const closure = await this.#resolveClosure({
-      command: input.command,
-      cwd: input.cwd,
-      subprocesses: input.subprocesses,
-    });
+    const runtimeSnapshot = realpathSync(mkdtempSync(join(tmpdir(), "runmill-runtime-snapshot-")));
+    let closure: ResolvedRuntimeClosure;
+    try {
+      closure = await this.#resolveClosure({
+        command: input.command,
+        cwd: input.cwd,
+        subprocesses: input.subprocesses,
+      }, this.runtime.os === "linux" ? runtimeSnapshot : undefined);
+    } catch (error) {
+      rmSync(runtimeSnapshot, { recursive: true, force: true });
+      throw error;
+    }
     const childTmp = createPrivateTempDir();
     const shimDir = realpathSync(mkdtempSync(join(tmpdir(), "runmill-runtime-bin-")));
     for (const [name, target] of closure.shimTargets) symlinkSync(target, join(shimDir, name));
@@ -1120,6 +1659,7 @@ class NativeSandboxBackend implements SandboxBackend {
       if (profileDir !== undefined) rmSync(profileDir, { recursive: true, force: true });
       rmSync(shimDir, { recursive: true, force: true });
       rmSync(childTmp, { recursive: true, force: true });
+      rmSync(runtimeSnapshot, { recursive: true, force: true });
     };
 
     let normalized: NormalizedPolicy;
@@ -1155,7 +1695,7 @@ class NativeSandboxBackend implements SandboxBackend {
       readablePaths: [...normalized.readablePaths, ...runtimeReadable],
       protectedPaths: normalized.protectedPaths,
       allowNetwork: normalized.allowNetwork,
-      executablePaths: closure.qualification.executableIdentities.map((entry) => entry.path),
+      executablePaths: closure.snapshotExecutableIdentities.map((entry) => entry.path),
       executableSubpaths: normalized.preparedDependencyPaths,
     };
     const env = {
@@ -1211,6 +1751,7 @@ class NativeSandboxBackend implements SandboxBackend {
       runtime: this.runtime,
       runtimeDigest: closure.qualification.runtimeDigest,
       launcher,
+      snapshotExecutableIdentities: closure.snapshotExecutableIdentities,
       layout,
       protectedPaths: normalized.protectedPaths,
       preparedDependencyPaths: normalized.preparedDependencyPaths,
@@ -1219,6 +1760,10 @@ class NativeSandboxBackend implements SandboxBackend {
     })).digest("hex");
     const qualification: SandboxQualification = {
       ...closure.qualification,
+      executable: closure.snapshotExecutableIdentities.find(
+        (identity) => identity.path === closure.executable,
+      ) ?? closure.qualification.executable,
+      executableIdentities: closure.snapshotExecutableIdentities,
       policyDigest,
     };
 
@@ -1229,10 +1774,10 @@ class NativeSandboxBackend implements SandboxBackend {
         profileDir = mkdtempSync(join(tmpdir(), "runmill-sb-"));
         const profile = join(profileDir, "policy.sb");
         writeFileSync(profile, buildSeatbeltProfile(policy, process.env["HOME"] ?? tmpdir()));
-        command = launcher.path;
+        command = closure.launcherExecutable;
         args = ["-f", profile, closure.executable, ...input.args];
       } else {
-        command = launcher.path;
+        command = closure.launcherExecutable;
         args = [
           ...buildBubblewrapArgs(policy, process.env["HOME"] ?? tmpdir()),
           "--ro-bind", shimDir, LOGICAL_SANITIZED_PATH,
@@ -1245,8 +1790,8 @@ class NativeSandboxBackend implements SandboxBackend {
       throw error;
     }
 
-    for (const identity of closure.qualification.executableIdentities) {
-      assertExecutableIdentityCurrent(identity, "Sandbox executable");
+    for (const identity of closure.snapshotExecutableIdentities) {
+      assertExecutableIdentityCurrent(identity, "Sandbox executable snapshot");
     }
     assertExecutableIdentityCurrent(launcher, "Sandbox launcher");
 
@@ -1356,8 +1901,37 @@ export function createNativeSandboxBackend(
     );
   }
   const os = options.platform ?? platform();
-  if (os !== "darwin" && os !== "linux") {
+  if (os === "darwin") {
+    throw sandboxFailure(
+      "The macOS Seatbelt mechanism cannot contain descendants that create a new session; " +
+        "no lifecycle-owning native sandbox backend is available on Darwin.",
+    );
+  }
+  if (os !== "linux") {
     throw sandboxFailure(`The native sandbox backend is not implemented for ${os}.`);
   }
   return new NativeSandboxBackend(os, options.path ?? process.env["PATH"] ?? "");
+}
+
+/**
+ * Test-only Seatbelt mechanism harness.
+ *
+ * Seatbelt policy tests remain valuable, but this object must never be wired
+ * into production composition: a child can create a new session and escape
+ * process-group lifecycle ownership on Darwin.
+ */
+export function createTestSeatbeltSandboxBackend(
+  options: Omit<NativeSandboxOptions, "platform"> = {},
+): SandboxBackend {
+  if (platform() !== "darwin") {
+    throw sandboxFailure("The Seatbelt mechanism test harness requires Darwin.");
+  }
+  return new NativeSandboxBackend("darwin", options.path ?? process.env["PATH"] ?? "");
+}
+
+/** Test-only current-host mechanism selection; never use in production composition. */
+export function createTestSandboxBackend(options: NativeSandboxOptions = {}): SandboxBackend {
+  return platform() === "darwin"
+    ? createTestSeatbeltSandboxBackend(options.path === undefined ? {} : { path: options.path })
+    : createNativeSandboxBackend("native", options);
 }

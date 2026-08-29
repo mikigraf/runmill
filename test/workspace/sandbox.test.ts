@@ -9,6 +9,8 @@ import {
   readdirSync,
   realpathSync,
   symlinkSync,
+  truncateSync,
+  renameSync,
 } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
@@ -19,7 +21,9 @@ import {
   detectMechanism,
   trustStoreReadPaths,
   createNativeSandboxBackend,
+  createTestSeatbeltSandboxBackend,
   inspectElfRuntimePaths,
+  type NativeSandboxOptions,
 } from "../../src/workspace/sandbox.js";
 
 let dir: string;
@@ -38,8 +42,14 @@ afterEach(() => {
  * assertions below are about behavior every mechanism must provide, so they run
  * wherever a mechanism exists.
  */
-const hasSandbox = detectMechanism() !== "none";
 const onMac = platform() === "darwin";
+const hasSandbox = onMac || detectMechanism() !== "none";
+
+function mechanismSandbox(options: NativeSandboxOptions = {}) {
+  return onMac
+    ? createTestSeatbeltSandboxBackend(options.path === undefined ? {} : { path: options.path })
+    : createNativeSandboxBackend("native", options);
+}
 
 describe("buildEnvironment", () => {
   it("builds from empty rather than filtering the parent", () => {
@@ -149,6 +159,16 @@ describe("buildEnvironment", () => {
 });
 
 describe("explicit backend selection", () => {
+  it.runIf(onMac)("fails closed instead of selecting Seatbelt as a production backend", () => {
+    expect(detectMechanism()).toBe("none");
+    expect(() => createNativeSandboxBackend("native")).toThrowError(
+      expect.objectContaining({
+        code: "RM-SANDBOX-001",
+        whatHappened: expect.stringMatching(/cannot contain descendants/i),
+      }),
+    );
+  });
+
   it("represents none as a non-executing backend instead of falling back", async () => {
     const backend = createNativeSandboxBackend("none");
     expect(backend.mechanism).toBe("none");
@@ -174,7 +194,7 @@ describe("explicit backend selection", () => {
       writeFileSync(secret, "planted-secret\n");
       expect(readFileSync(secret, "utf8")).toContain("planted-secret");
       try {
-        const backend = createNativeSandboxBackend("native");
+        const backend = mechanismSandbox();
         expect(backend.mechanism).toBe("bubblewrap");
         const permitted = await backend.run({
           command: "/bin/cat",
@@ -414,6 +434,81 @@ describe("trustStoreReadPaths", () => {
 });
 
 describe("Sandbox.run", () => {
+  it("refuses an oversized sparse executable before allocating or executing it", async () => {
+    const marker = join(dir, "oversized-executed");
+    const executable = join(dir, "oversized-tool");
+    writeFileSync(executable, `#!/bin/sh\nprintf executed > ${marker}\n`, { mode: 0o755 });
+    truncateSync(executable, 513 * 1024 * 1024);
+    const backend = mechanismSandbox( {
+      platform: platform(),
+      path: `${dir}:/bin:/usr/bin`,
+    });
+
+    await expect(backend.qualify({ command: executable })).rejects.toMatchObject({
+      whatHappened: expect.stringMatching(/executable inspection byte limit/i),
+    });
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("refuses oversized sparse ELF input before allocating its declared size", () => {
+    const executable = join(dir, "oversized-elf");
+    writeFileSync(executable, Buffer.from([0x7f, 0x45, 0x4c, 0x46]), { mode: 0o755 });
+    truncateSync(executable, 513 * 1024 * 1024);
+
+    expect(() => inspectElfRuntimePaths([executable])).toThrow();
+    try {
+      inspectElfRuntimePaths([executable]);
+    } catch (error) {
+      expect(error).toMatchObject({
+        whatHappened: expect.stringMatching(/ELF inspection byte limit/i),
+      });
+    }
+  });
+
+  it("bounds provider package manifests before parsing", async () => {
+    const packageRoot = join(dir, "node_modules", "provider");
+    const executable = join(packageRoot, "bin", "provider");
+    mkdirSync(join(packageRoot, "bin"), { recursive: true });
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(
+      join(packageRoot, "package.json"),
+      `${JSON.stringify({ name: "provider", optionalDependencies: {} })}${" ".repeat(1024 * 1024)}`,
+    );
+    const backend = mechanismSandbox( {
+      platform: platform(),
+      path: `${dirname(process.execPath)}:/bin:/usr/bin`,
+    });
+
+    await expect(backend.qualify({ command: executable })).rejects.toMatchObject({
+      whatHappened: expect.stringMatching(/package manifest byte limit/i),
+    });
+  });
+
+  it("bounds total optional-package traversal entries, including non-executables", async () => {
+    const modules = join(dir, "node_modules");
+    const packageRoot = join(modules, "provider");
+    const dependencyRoot = join(modules, "platform-runtime");
+    const executable = join(packageRoot, "bin", "provider");
+    mkdirSync(join(packageRoot, "bin"), { recursive: true });
+    mkdirSync(dependencyRoot, { recursive: true });
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ name: "provider", optionalDependencies: { "platform-runtime": "1" } }),
+    );
+    for (let index = 0; index < 1_025; index += 1) {
+      writeFileSync(join(dependencyRoot, `entry-${String(index)}`), "x");
+    }
+    const backend = mechanismSandbox( {
+      platform: platform(),
+      path: `${dirname(process.execPath)}:/bin:/usr/bin`,
+    });
+
+    await expect(backend.qualify({ command: executable })).rejects.toMatchObject({
+      whatHappened: expect.stringMatching(/package traversal entry limit/i),
+    });
+  });
+
   it("inspects ELF metadata without executing a planted target", () => {
     const marker = join(dir, "elf-executed");
     const planted = join(dir, "malicious-elf");
@@ -445,7 +540,7 @@ describe("Sandbox.run", () => {
   it.runIf(onMac)("binds qualification evidence to the effective policy and launcher", async () => {
     const workspace = join(dir, "policy-digest-workspace");
     mkdirSync(workspace);
-    const backend = createNativeSandboxBackend("native");
+    const backend = mechanismSandbox();
     const first = await backend.start({
       command: "/usr/bin/true",
       args: [],
@@ -479,7 +574,7 @@ describe("Sandbox.run", () => {
       mode: 0o755,
     });
 
-    const backend = createNativeSandboxBackend("native", {
+    const backend = mechanismSandbox( {
       platform: platform(),
       path: `${firstBin}${delimiter}${secondBin}:/bin:/usr/bin`,
     });
@@ -494,10 +589,47 @@ describe("Sandbox.run", () => {
     expect(qualification.sanitizedPath.split(delimiter)).not.toContain(secondBin);
   });
 
+  it.runIf(platform() === "linux")(
+    "executes the immutable qualified snapshot when the source pathname is swapped",
+    async () => {
+    const workspace = join(dir, "snapshot-workspace");
+    const bin = join(dir, "snapshot-bin");
+    const executable = join(bin, "tool");
+    const original = join(bin, "qualified-original");
+    const marker = join(dir, "replacement-executed");
+    mkdirSync(workspace);
+    mkdirSync(bin);
+    writeFileSync(executable, "#!/bin/sh\nprintf QUALIFIED\n", { mode: 0o755 });
+    const backend = mechanismSandbox( {
+      platform: "darwin",
+      path: `${bin}:/bin:/usr/bin`,
+    });
+
+    const pending = backend.start({
+      command: "tool",
+      args: [],
+      cwd: workspace,
+      policy: { writablePaths: [workspace], allowNetwork: false },
+      timeoutMs: 2_000,
+    });
+    renameSync(executable, original);
+    writeFileSync(executable, `#!/bin/sh\nprintf REPLACED\nprintf ran > ${marker}\n`, {
+      mode: 0o755,
+    });
+
+    const execution = await pending;
+    const result = await execution.result;
+    expect(result).toMatchObject({ outcome: "exited", exitCode: 0 });
+    expect(result.stdout).toContain("QUALIFIED");
+    expect(result.stdout).not.toContain("REPLACED");
+    expect(existsSync(marker)).toBe(false);
+    },
+  );
+
   it("refuses root, home, and workspace-ancestor grants before spawning", async () => {
     const workspace = join(dir, "workspace", "nested");
     mkdirSync(workspace, { recursive: true });
-    const backend = createNativeSandboxBackend("native", {
+    const backend = mechanismSandbox( {
       platform: platform(),
       path: "/bin:/usr/bin",
     });
@@ -520,7 +652,7 @@ describe("Sandbox.run", () => {
   it("rejects duplicate and conflicting guest mounts", async () => {
     const workspace = join(dir, "workspace");
     mkdirSync(workspace);
-    const backend = createNativeSandboxBackend("native", {
+    const backend = mechanismSandbox( {
       platform: platform(),
       path: "/bin:/usr/bin",
     });
@@ -562,7 +694,7 @@ describe("Sandbox.run", () => {
     mkdirSync(workspace);
     mkdirSync(dependency);
     writeFileSync(file, "x");
-    const backend = createNativeSandboxBackend("native", {
+    const backend = mechanismSandbox( {
       platform: platform(),
       path: "/bin:/usr/bin",
     });
@@ -599,7 +731,7 @@ describe("Sandbox.run", () => {
   it("refuses an over-broad configured trust root", async () => {
     const workspace = join(dir, "trust-workspace");
     mkdirSync(workspace);
-    const backend = createNativeSandboxBackend("native");
+    const backend = mechanismSandbox();
     await expect(
       backend.run({
         command: "/usr/bin/true",
@@ -647,7 +779,7 @@ describe("Sandbox.run", () => {
       expect(readFileSync(join(packageRoot, "payload.txt"), "utf8")).toContain("PACKAGE_OK");
       expect(readFileSync(secret, "utf8")).toContain("PACKAGE_SECRET");
 
-      const backend = createNativeSandboxBackend("native", {
+      const backend = mechanismSandbox( {
         platform: "darwin",
         path: `${bin}${delimiter}${dirname(process.execPath)}:/usr/bin:/bin`,
       });
@@ -677,7 +809,7 @@ describe("Sandbox.run", () => {
         scripts: { verify: "node -e \"process.stdout.write('NPM_VERIFY_OK')\"" },
       }),
     );
-    const backend = createNativeSandboxBackend("native");
+    const backend = mechanismSandbox();
     const result = await backend.run({
       command: "npm",
       args: ["run", "verify"],
@@ -694,7 +826,7 @@ describe("Sandbox.run", () => {
   it.runIf(onMac)("awaits an idempotent abort through the backend lifecycle", async () => {
     const workspace = join(dir, "abort-workspace");
     mkdirSync(workspace);
-    const backend = createNativeSandboxBackend("native", {
+    const backend = mechanismSandbox( {
       platform: "darwin",
       path: "/bin:/usr/bin",
     });
@@ -721,7 +853,7 @@ describe("Sandbox.run", () => {
     const previousTmp = process.env["TMPDIR"];
     process.env["TMPDIR"] = isolatedTmp;
     try {
-      const backend = createNativeSandboxBackend("native", {
+      const backend = mechanismSandbox( {
         platform: "linux",
         path: workspace,
       });
@@ -757,7 +889,7 @@ describe("Sandbox.run", () => {
   });
 
   it("refuses a missing writable file instead of granting its parent directory", async () => {
-    const sandbox = createNativeSandboxBackend("native");
+    const sandbox = mechanismSandbox();
     await expect(sandbox.start({
         command: "/usr/bin/true",
         args: [],
@@ -774,7 +906,7 @@ describe("Sandbox.run", () => {
   it.runIf(hasSandbox)("does not expose a provider API key to tool subprocesses", async () => {
     const ws = mkdtempSync(join(tmpdir(), "runmill-cred-"));
     try {
-      const result = await createNativeSandboxBackend("native").run({
+      const result = await mechanismSandbox().run({
         command: "/bin/sh",
         args: ["-c", 'printf "%s" "${ANTHROPIC_API_KEY:-absent}"'],
         cwd: ws,
@@ -793,7 +925,7 @@ describe("Sandbox.run", () => {
     // an explicit hand-off survives.
     const ws = mkdtempSync(join(tmpdir(), "runmill-cred2-"));
     try {
-      const result = await createNativeSandboxBackend("native").run({
+      const result = await mechanismSandbox().run({
         command: "/bin/sh",
         args: ["-c", 'printf "%s" "${ANTHROPIC_API_KEY:-absent}"'],
         cwd: ws,
@@ -813,7 +945,7 @@ describe("Sandbox.run", () => {
     // and the agent CLIs all write there; the Claude CLI could not start at all.
     const ws = mkdtempSync(join(tmpdir(), "runmill-tmp-"));
     try {
-      const result = await createNativeSandboxBackend("native").run({
+      const result = await mechanismSandbox().run({
         command: "/bin/sh",
         args: ["-c", 'printf ok > "$TMPDIR/runmill-probe" && cat "$TMPDIR/runmill-probe"'],
         subprocesses: ["/bin/cat"],
@@ -831,7 +963,7 @@ describe("Sandbox.run", () => {
   it.runIf(hasSandbox)("can read the local timezone", async () => {
     const ws = mkdtempSync(join(tmpdir(), "runmill-tz-"));
     try {
-      const result = await createNativeSandboxBackend("native").run({
+      const result = await mechanismSandbox().run({
         command: "/bin/sh",
         args: ["-c", "date +%Z"],
         subprocesses: ["/bin/date"],
@@ -853,7 +985,7 @@ describe("Sandbox.run", () => {
     // "invalid peer certificate: UnknownIssuer".
     const ws = mkdtempSync(join(tmpdir(), "runmill-ca-"));
     try {
-      const result = await createNativeSandboxBackend("native").run({
+      const result = await mechanismSandbox().run({
         command: "/bin/cat",
         args: ["/etc/ssl/cert.pem"],
         cwd: ws,
@@ -884,7 +1016,7 @@ describe("Sandbox.run", () => {
       const tool = join(toolDir, "hello-tool");
       writeFileSync(tool, "#!/bin/sh\necho toolchain-ran\n", { mode: 0o755 });
 
-      const sandbox = createNativeSandboxBackend("native");
+      const sandbox = mechanismSandbox();
       let result;
       try {
         result = await sandbox.run({
@@ -908,7 +1040,7 @@ describe("Sandbox.run", () => {
 
   it.runIf(hasSandbox)("runs a permitted command and captures output", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
-    const sandbox = createNativeSandboxBackend("native");
+    const sandbox = mechanismSandbox();
     const result = await sandbox.run({
       command: "/bin/echo",
       args: ["hello"],
@@ -928,7 +1060,7 @@ describe("Sandbox.run", () => {
       const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-descendant-"));
       const pidFile = join(dir, "descendant.pid");
       try {
-        const result = await createNativeSandboxBackend("native").run({
+        const result = await mechanismSandbox().run({
           command: "/bin/sh",
           args: ["-c", `sleep 30 </dev/null >/dev/null 2>&1 & echo $! > ${JSON.stringify(pidFile)}`],
           subprocesses: ["/bin/sleep"],
@@ -948,7 +1080,7 @@ describe("Sandbox.run", () => {
 
   it.runIf(hasSandbox)("permits writes inside the workspace", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
-    const sandbox = createNativeSandboxBackend("native");
+    const sandbox = mechanismSandbox();
     const target = join(dir, "written.txt");
     const result = await sandbox.run({
       command: "/usr/bin/tee",
@@ -980,7 +1112,7 @@ describe("Sandbox.run", () => {
         expect(readFileSync(config, "utf8")).toContain("outside-write-worked");
         writeFileSync(config, originalConfig);
 
-        const result = await createNativeSandboxBackend("native").run({
+        const result = await mechanismSandbox().run({
           command: "/bin/sh",
           args: [
             "-c",
@@ -1018,7 +1150,7 @@ describe("Sandbox.run", () => {
       expect(readFileSync(dotGit, "utf8")).toContain("outside-write-worked");
       writeFileSync(dotGit, original);
 
-      const result = await createNativeSandboxBackend("native").run({
+      const result = await mechanismSandbox().run({
         command: "/bin/sh",
         args: ["-c", "printf normal > normal.txt; printf pwn >> .git"],
         cwd: workspace,
@@ -1042,7 +1174,7 @@ describe("Sandbox.run", () => {
     const workspace = mkdtempSync(join(tmpdir(), "runmill-missing-protection-"));
     try {
       await expect(
-        createNativeSandboxBackend("native").start({
+        mechanismSandbox().start({
           command: "/usr/bin/true",
           args: [],
           cwd: workspace,
@@ -1087,7 +1219,7 @@ describe("Sandbox.run", () => {
       // Non-vacuity: unsandboxed, this read succeeds.
       expect(readFileSync(secret, "utf8")).toContain("PRIVATE-KEY-MATERIAL");
 
-      const sandbox = createNativeSandboxBackend("native");
+      const sandbox = mechanismSandbox();
       const result = await sandbox.run({
         command: "/bin/cat",
         args: [secret],
@@ -1109,7 +1241,7 @@ describe("Sandbox.run", () => {
   it.runIf(hasSandbox)("DENIES writing outside the declared workspace", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
     const outside = mkdtempSync(join(tmpdir(), "runmill-outside-"));
-    const sandbox = createNativeSandboxBackend("native");
+    const sandbox = mechanismSandbox();
     const result = await sandbox.run({
       command: "/usr/bin/tee",
       args: [join(outside, "escaped.txt")],
@@ -1126,7 +1258,7 @@ describe("Sandbox.run", () => {
   it.runIf(hasSandbox)("kills the whole process group on timeout", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
     writeFileSync(join(dir, "slow.sh"), "#!/bin/sh\nsleep 30\n");
-    const sandbox = createNativeSandboxBackend("native");
+    const sandbox = mechanismSandbox();
     const result = await sandbox.run({
       command: "/bin/sh",
       args: [join(dir, "slow.sh")],

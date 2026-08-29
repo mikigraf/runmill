@@ -18,16 +18,16 @@ credentials, GitHub and Linear tokens, API-key environment variables, and the
 macOS keychain are denied. Provider subscription config is a known exception
 inside the boundary until a credential broker exists.
 
-  macOS   Seatbelt (sandbox-exec) with a generated deny-by-default profile
+  macOS   no production backend; Seatbelt cannot contain new-session descendants
   Linux   bubblewrap with mount and user namespaces
 
 What each platform can enforce differs, and runmill does not pretend otherwise:
 
   control              macOS        Linux
-  file scoping         yes          yes
-  credential denial    yes          yes
-  network scoping      NO           yes (--unshare-net)
-  resource limits      NO           with cgroup v2
+  file scoping         unavailable  yes
+  credential denial    unavailable  yes
+  network scoping      unavailable  yes (--unshare-net)
+  resource limits      unavailable  with cgroup v2
 
 The \`proxy\` value currently permits provider network access; the
 hostname-filtering proxy is not implemented yet. \`network_allowlist\` is

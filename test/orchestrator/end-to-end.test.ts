@@ -21,7 +21,7 @@ import { FakeClock } from "../../src/testing/fake-clock.js";
 import { GitRefLease } from "../../src/queue/git-lease.js";
 import { parseConfig } from "../../src/config/load.js";
 import { VerificationEngine, type CheckSpec } from "../../src/verification/engine.js";
-import { createNativeSandboxBackend } from "../../src/workspace/sandbox.js";
+import { createTestSandboxBackend } from "../../src/workspace/sandbox.js";
 import type { BacklogIssue } from "../../src/domain/types.js";
 import { BacklogMutationNotStartedError } from "../../src/backlog/adapter.js";
 import { selectNext } from "../../src/queue/selector.js";
@@ -169,7 +169,7 @@ function makeOrchestrator(opts: {
       sourceRepoPath: source,
       sourceRepository: "acme/platform",
       workspaceRoot: join(root, "runs"),
-      verification: new VerificationEngine(createNativeSandboxBackend("native")),
+      verification: new VerificationEngine(createTestSandboxBackend()),
       checks: opts.checks ?? [PASSING_CHECK],
       onEvent: (m) => opts.log?.push(m),
       ciPollIntervalMs: 1,
@@ -519,15 +519,37 @@ describe("end-to-end: issue to governed pull request", () => {
     expect(packet.constraints.forbidden_paths).toContain(".github/**");
   }, 60_000);
 
-  it("passes every role a bounded coding-tool inventory including verification executables", async () => {
+  it("passes every role only operator-owned verification tools, never repository manifest executables", async () => {
     const provider = defaultProvider();
-    const { orchestrator } = makeOrchestrator({ provider });
+    const cfg = config(`
+verification:
+  commands:
+    - id: operator-health
+      run: /usr/bin/true
+`);
+    const repositorySsh: CheckSpec = {
+      id: "repository-ssh",
+      run: "/usr/bin/ssh -V",
+      required: false,
+      source: "repository-policy",
+    };
+    const { orchestrator } = makeOrchestrator({
+      provider,
+      cfg,
+      checks: [PASSING_CHECK, repositorySsh],
+    });
     await orchestrator.run({ runId: "run_tools", issue: ISSUE, target: TARGET, lease: lease("run_tools") });
 
     expect(provider.startedRequests.length).toBeGreaterThan(0);
     for (const started of provider.startedRequests) {
-      expect(started.allowedCommands).toEqual(expect.arrayContaining(["git", "rg", "node", "npm", "npx", "/bin/cp"]));
+      expect(started.allowedCommands).toEqual(
+        expect.arrayContaining(["git", "rg", "node", "npm", "npx", "/usr/bin/true"]),
+      );
+      expect(started.allowedCommands).not.toContain("/usr/bin/ssh");
     }
+    expect(provider.startedRequests.map((request) => request.role)).toEqual(
+      expect.arrayContaining(["implementer", "local-reviewer", "pr-reviewer"]),
+    );
   }, 60_000);
 
   it("records a delivered issue once in the markdown activity log", async () => {

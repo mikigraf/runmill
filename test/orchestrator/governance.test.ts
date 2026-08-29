@@ -19,7 +19,7 @@ import { GitRefLease } from "../../src/queue/git-lease.js";
 import { parseConfig } from "../../src/config/load.js";
 import type { BacklogIssue } from "../../src/domain/types.js";
 import { VerificationEngine, type CheckSpec } from "../../src/verification/engine.js";
-import { createNativeSandboxBackend } from "../../src/workspace/sandbox.js";
+import { createTestSandboxBackend } from "../../src/workspace/sandbox.js";
 
 let root: string;
 let source: string;
@@ -123,7 +123,7 @@ function build(
       sourceRepoPath: source,
       sourceRepository: "acme/platform",
       workspaceRoot: join(root, "runs"),
-      verification: new VerificationEngine(createNativeSandboxBackend("native")),
+      verification: new VerificationEngine(createTestSandboxBackend()),
       checks,
     }),
   };

@@ -351,6 +351,7 @@ export class CliProviderAdapter implements CodingAgentAdapter {
         env: { HOME: providerHome.path },
       });
       const authenticated =
+        result.outcome === "exited" &&
         result.exitCode === 0 &&
         this.#dialect.isAuthenticated(result.stdout, result.stderr, result.exitCode);
       if (authenticated) return { authenticated: true, detail: "authenticated inside sandbox" };

@@ -54,6 +54,8 @@ export interface CommandContext {
     configInvalid: number;
     blocked: number;
   };
+  /** One composition-root backend shared by setup discovery and its probes. */
+  readonly sandbox: SandboxBackend;
   /** Injectable so init's file semantics can be tested without probing host CLIs or accounts. */
   readonly createConfiguration?: typeof createConfiguration | undefined;
   /** Tests inject readiness results; production runs the complete doctor suite. */
@@ -441,6 +443,7 @@ function registerInit(program: Command, ctx: CommandContext): void {
               // Piped and CI invocations cannot answer questions. Interactive
               // terminals get discovery with preselected answers by default.
               defaults: opts.defaults === true || process.stdin.isTTY !== true,
+              sandbox: ctx.sandbox,
             },
           );
           discovered = result.discovered;

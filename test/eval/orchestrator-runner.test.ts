@@ -24,7 +24,7 @@ import type { ForgeAdapter } from "../../src/pr/adapter.js";
 import { FakeBacklogAdapter } from "../../src/testing/fake-backlog.js";
 import { FakeProviderAdapter } from "../../src/testing/fake-provider.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
-import { createNativeSandboxBackend } from "../../src/workspace/sandbox.js";
+import { createTestSandboxBackend } from "../../src/workspace/sandbox.js";
 
 let root: string;
 
@@ -378,7 +378,7 @@ describe("live replay evidence", () => {
       provider,
       reviewProvider: provider,
       forge: forbiddenLiveForge,
-      sandbox: createNativeSandboxBackend("native"),
+      sandbox: createTestSandboxBackend(),
       live: { backlog: true, provider: true, reviewProvider: true, forge: true },
     }));
 

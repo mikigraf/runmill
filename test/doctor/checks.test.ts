@@ -38,9 +38,12 @@ import {
   worstStatus,
 } from "../../src/doctor/checks.js";
 import type { ProviderDoctorAdapter } from "../../src/doctor/checks.js";
-import { createNativeSandboxBackend } from "../../src/workspace/sandbox.js";
+import {
+  createNativeSandboxBackend,
+  createTestSandboxBackend,
+} from "../../src/workspace/sandbox.js";
 
-const nativeSandbox = () => createNativeSandboxBackend("native");
+const nativeSandbox = () => createTestSandboxBackend();
 
 let dir: string;
 
@@ -848,6 +851,23 @@ describe("checkCiEnvironment", () => {
 });
 
 describe("checkSandbox", () => {
+  it.runIf(platform() === "darwin")(
+    "reports the production Darwin lifecycle refusal with actionable remediation",
+    async () => {
+      const results = await runAllChecks(
+        { repoRoot: dir, checkPrefix: "sandbox", sandbox: undefined },
+        [],
+      );
+      expect(results).toContainEqual(expect.objectContaining({
+        id: "sandbox:mechanism",
+        status: "fail",
+        code: "RM-SANDBOX-001",
+        observed: expect.stringMatching(/Seatbelt cannot contain/i),
+        remediation: expect.stringMatching(/Linux.*bubblewrap/i),
+      }));
+    },
+  );
+
   it("does not execute an ambient PATH bwrap while checking the configured backend", async () => {
     const fakeBin = join(dir, "fake-bwrap-bin");
     const marker = join(dir, "ambient-bwrap-ran");

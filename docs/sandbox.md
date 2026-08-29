@@ -18,7 +18,7 @@ containment, and instructions in a system prompt are not containment.
 
 | Platform | Mechanism |
 |---|---|
-| macOS | Seatbelt (`sandbox-exec`) with a generated deny-by-default profile |
+| macOS | No production execution backend. Seatbelt policy is tested, but cannot own escaped-session descendants. |
 | Linux | bubblewrap with mount, PID, IPC, and UTS namespaces |
 | Other | No execution backend — `doctor` says so and refuses to run rather than proceeding unprotected |
 
@@ -26,13 +26,16 @@ What each platform can enforce differs, and runmill does not pretend otherwise:
 
 | Control | macOS | Linux |
 |---|---|---|
-| File scoping | yes | yes |
-| Credential denial | yes | yes |
-| Network scoping | **no** | yes (`--unshare-net`) |
-| Resource limits | **no** | with cgroup v2 |
+| File scoping | no production execution | yes |
+| Credential denial | no production execution | yes |
+| Network scoping | no production execution | yes (`--unshare-net`) |
+| Resource limits | no production execution | with cgroup v2 |
 
-Seatbelt has no network namespace, and Runmill does not yet ship its planned hostname-filtering
-proxy. Today `workspace.network: proxy` permits unrestricted provider egress on both platforms;
+Seatbelt has no lifecycle container: a child can create a new session and survive process-group
+termination. Runmill therefore refuses production native execution on macOS. The Seatbelt profile
+remains an explicit test-only mechanism for file-policy regressions; it is not selected by the
+factory, config composition, or doctor. Runmill also does not yet ship its planned hostname-filtering
+proxy. Today `workspace.network: proxy` permits unrestricted provider egress on Linux;
 `none` disables it. A non-empty `network_allowlist` is rejected rather than silently accepted as a
 control that does not exist. `runmill doctor` reports unrestricted egress as a warning.
 
@@ -128,8 +131,9 @@ containing symlinks to the qualified executable closure (the fixed guest path
 that was qualified. A configured TLS trust root is canonicalized and rejected if it is root, the
 operator home, a workspace ancestor, or another over-broad grant.
 
-Qualification records two separate hashes: a runtime digest over the canonical executable and
-launcher identities, and an effective-policy digest over that runtime plus the host/guest layout,
+Qualification records two separate hashes: a runtime digest over the canonical executable,
+runtime-path, and launcher identities, and an effective-policy digest over that runtime plus the
+actual immutable executable snapshots, host/guest layout,
 mount access and purpose, protected and prepared paths, network mode, and limits. Executable and
 launcher identities are checked again immediately before each spawn. `doctor` reports the same
 launcher identity used by production execution.
@@ -184,7 +188,8 @@ broker is required to remove both forms of provider credential from the agent bo
 
 ## Everything runs inside it
 
-Both the agent **and** every verification check run through the same lifecycle-owning backend:
+On supported Linux hosts, both the agent **and** every verification check run through the same
+lifecycle-owning backend:
 
 ```ts
 const outcome = await this.#sandbox.run({
@@ -227,7 +232,7 @@ enforcement layer rather than two half-configured ones.
 from inside it, and fails if that succeeds:
 
 ```
-✓ sandbox:mechanism             sandbox-exec (Seatbelt)
+✓ sandbox:mechanism             bubblewrap /usr/bin/bwrap <identity>
 ✓ sandbox:deny-credential-read  read denied
 ! sandbox:network               provider egress is unrestricted in proxy mode
 ✓ provider:codex                authenticated inside sandbox
@@ -237,7 +242,9 @@ from inside it, and fails if that succeeds:
 There is no silent downgrade. If isolation cannot be constructed and verified, no run starts —
 [`RM-SANDBOX-001`](./errors.md#rm-sandbox-001).
 
-On Linux, `setting up uid map: Permission denied` means unprivileged user namespaces are disabled:
+On macOS, this check fails with `RM-SANDBOX-001`; run production execution on a Linux host with
+trusted bubblewrap. On Linux, `setting up uid map: Permission denied` means unprivileged user
+namespaces are disabled:
 
 ```bash
 sudo sysctl -w kernel.unprivileged_userns_clone=1

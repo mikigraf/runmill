@@ -484,10 +484,11 @@ export function runControlledProcess(
       spawnError = error;
     });
 
-    const cancelTimer = armKillTimer(child, input.timeoutMs, () => {
+    const timeoutTimer = setTimeout(() => {
       timedOut = true;
       void ensureQuiescence();
-    });
+    }, input.timeoutMs);
+    const cancelTimer = (): void => clearTimeout(timeoutTimer);
 
     // `close` can be delayed forever by a background descendant inheriting a
     // pipe, or arrive while a descendant with redirected stdio is still live.

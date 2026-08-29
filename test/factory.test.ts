@@ -14,7 +14,7 @@ import { buildAdapters, demoFixturePath, resolveReviewerAgent } from "../src/fac
 import { parseConfig } from "../src/config/load.js";
 import { CredentialStore } from "../src/credentials/store.js";
 import { RunmillError } from "../src/errors/runmill-error.js";
-import { createNativeSandboxBackend } from "../src/workspace/sandbox.js";
+import { createTestSandboxBackend } from "../src/workspace/sandbox.js";
 
 const CONFIG = parseConfig(`
 version: 1
@@ -157,7 +157,7 @@ describe("failing closed", () => {
 
 describe("scoping which boundaries resolve", () => {
   it("returns the one configured sandbox instance for every downstream composition path", async () => {
-    const sandbox = createNativeSandboxBackend("native");
+    const sandbox = createTestSandboxBackend();
     const adapters = await buildAdapters(CONFIG, {
       demo: true,
       credentials: NO_CREDENTIALS,

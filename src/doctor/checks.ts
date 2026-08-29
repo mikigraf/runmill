@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { run } from "../platform/process.js";
 import type { SandboxBackend } from "../workspace/sandbox.js";
@@ -1189,9 +1189,13 @@ export async function runAllChecks(
             id: "sandbox:mechanism",
             status: "fail" as const,
             code: "RM-SANDBOX-001",
-            observed: "no configured sandbox backend was injected",
+            observed: platform() === "darwin"
+              ? "Darwin native sandbox refused: Seatbelt cannot contain new-session descendants"
+              : "no configured sandbox backend was injected",
             expected: "one configured backend shared by every execution path",
-            remediation: "load a valid Runmill configuration and rerun doctor",
+            remediation: platform() === "darwin"
+              ? "Run Runmill on Linux with trusted bubblewrap; no lifecycle-owning local macOS backend is available"
+              : "load a valid Runmill configuration and rerun doctor",
           }])
         : checkSandbox(ctx.sandbox)
       : Promise.resolve([]),

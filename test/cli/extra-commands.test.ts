@@ -33,6 +33,7 @@ import { loadChecksManifest } from "../../src/verification/manifest.js";
 import { VerificationEngine } from "../../src/verification/engine.js";
 import {
   createNativeSandboxBackend,
+  createTestSandboxBackend,
   type SandboxBackend,
 } from "../../src/workspace/sandbox.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
@@ -52,6 +53,8 @@ interface Harness {
   readonly failures: unknown[];
   readonly doctorCalls: { repoRoot: string; configPath: string }[];
   readonly storedCredentials: { name: string; value: string }[];
+  readonly configurationSandboxes: unknown[];
+  readonly sandbox: SandboxBackend;
   run(argv: string[]): Promise<number>;
 }
 
@@ -95,6 +98,8 @@ function harness(options: {
   const doctorCalls: { repoRoot: string; configPath: string }[] = [];
   const storedCredentials: { name: string; value: string }[] = [];
 
+  const sandbox = createNativeSandboxBackend("none");
+  const configurationSandboxes: unknown[] = [];
   const ctx: CommandContext = {
     emit: (human, payload) => emitted.push({ human, data: payload }),
     fail: (err) => {
@@ -109,6 +114,7 @@ function harness(options: {
     configPath: () => policy,
     repoRoot: () => repo,
     exitCodes: { ok: 0, failed: 1, configInvalid: 2, blocked: 3 },
+    sandbox,
     credentialStore: {
       get: async () => undefined,
       set: async (name, value) => {
@@ -118,7 +124,8 @@ function harness(options: {
     },
     readStdin: () => options.credentialInput ?? "",
     stdinIsTTY: () => options.stdinTTY === true,
-    createConfiguration: async ({ path }) => {
+    createConfiguration: async ({ path, sandbox: receivedSandbox }) => {
+      configurationSandboxes.push(receivedSandbox);
       const config = renderCreatedConfig({
         autonomy: "pr-only",
         implementer: "codex",
@@ -166,6 +173,8 @@ function harness(options: {
     failures,
     doctorCalls,
     storedCredentials,
+    configurationSandboxes,
+    sandbox,
     async run(argv) {
       // A fresh Command per invocation: commander instances carry parse state,
       // so reusing one across two parseAsync calls is not supported.
@@ -242,6 +251,14 @@ function addInstalledNodeProject(): void {
 }
 
 describe("init", () => {
+  it("injects the composition root sandbox into configuration discovery", async () => {
+    initGitRepo();
+    const h = harness();
+
+    await h.run(["init", "--defaults"]);
+
+    expect(h.configurationSandboxes).toEqual([h.sandbox]);
+  });
   it("does not require ASF or ctxlane configuration for standalone setup", async () => {
     initGitRepo();
     addInstalledNodeProject();
@@ -411,7 +428,7 @@ describe("init", () => {
       root: join(data, "runs"),
       isolation: "clone",
     });
-    const native = createNativeSandboxBackend("native");
+    const native = createTestSandboxBackend();
     const sandbox: SandboxBackend = {
       mechanism: native.mechanism,
       runtime: native.runtime,

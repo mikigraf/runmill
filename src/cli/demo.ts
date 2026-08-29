@@ -161,7 +161,10 @@ verification:
       sourceRepoPath: source,
       sourceRepository: selected.target.repo,
       workspaceRoot: join(root, "runs"),
-      verification: new DemoVerificationEngine(createNativeSandboxBackend("native")),
+      // The demo verifier is a deterministic in-process evidence fixture and
+      // overrides run(); inject the explicit non-executing backend so demo
+      // never selects a host sandbox or gains process authority.
+      verification: new DemoVerificationEngine(createNativeSandboxBackend("none")),
       checks: [
         {
           id: "demo-candidate",

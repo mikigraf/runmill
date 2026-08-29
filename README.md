@@ -115,7 +115,7 @@ Deterministic code owns pushes, pull requests, issue transitions, and merges. St
 | Agent roles                       | Either provider can implement or review. The reviewer always starts with fresh context.                                                        |
 | Node.js                           | 22 or 24                                                                                                                                       |
 | Host                              | macOS on arm64/x64, Linux on arm64/x64                                                                                                         |
-| Sandbox                           | Seatbelt on macOS, bubblewrap on Linux                                                                                                         |
+| Sandbox                           | bubblewrap on Linux. macOS execution currently fails closed because Seatbelt cannot contain descendants that create a new session.             |
 | Provider network                  | `proxy` currently permits unrestricted egress; hostname filtering is not implemented. `network_allowlist` is rejected until it is enforceable. |
 | TUI                               | Bun, or Node 26.4+ with experimental FFI. The daemon and other commands run on Node 22 or 24.                                                  |
 | Windows                           | Unsupported                                                                                                                                    |
