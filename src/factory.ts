@@ -164,37 +164,36 @@ export async function buildAdapters(
   let provider: CodingAgentAdapter;
   let providerLive = false;
   const dialect = config.providers.implementer.implementation === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
-  const cli = new CliProviderAdapter({
-    dialect,
-    sandbox,
-    ...(config.providers.implementer.model === undefined ? {} : { model: config.providers.implementer.model }),
-  });
-  // Demo mode never uses the real provider, so probing for it is a subprocess
-  // spawn (and for one dialect an auth check) whose result is discarded.
-  const installation =
-    wants("provider") && !demo ? await cli.detect() : { installed: false };
-
   if (!wants("provider")) {
     provider = new FakeProviderAdapter();
-  } else if (installation.installed && !demo) {
-    const auth = await cli.sandboxAuthStatus();
-    if (!auth.authenticated) {
+  } else {
+    const cli = new CliProviderAdapter({
+      dialect,
+      sandbox,
+      ...(config.providers.implementer.model === undefined ? {} : { model: config.providers.implementer.model }),
+    });
+    // Demo mode never probes or constructs a live provider boundary.
+    const installation = !demo ? await cli.detect() : { installed: false };
+    if (installation.installed && !demo) {
+      const auth = await cli.sandboxAuthStatus();
+      if (!auth.authenticated) {
+        throw RunmillError.fromCatalog("RM-AUTH-003", {
+          whatHappened:
+            `${dialect.binary} is installed but not authenticated.` +
+            (auth.detail === undefined || auth.detail === "" ? "" : `\n  ${auth.detail}`),
+        });
+      }
+      provider = cli;
+      providerLive = true;
+    } else if (demo) {
+      provider = new FakeProviderAdapter();
+    } else {
       throw RunmillError.fromCatalog("RM-AUTH-003", {
         whatHappened:
-          `${dialect.binary} is installed but not authenticated.` +
-          (auth.detail === undefined || auth.detail === "" ? "" : `\n  ${auth.detail}`),
+          `${dialect.binary} is not installed.\n` +
+          `  Install it, or set RUNMILL_DEMO=1 to run with an in-memory provider.`,
       });
     }
-    provider = cli;
-    providerLive = true;
-  } else if (demo) {
-    provider = new FakeProviderAdapter();
-  } else {
-    throw RunmillError.fromCatalog("RM-AUTH-003", {
-      whatHappened:
-        `${dialect.binary} is not installed.\n` +
-        `  Install it, or set RUNMILL_DEMO=1 to run with an in-memory provider.`,
-    });
   }
 
   // -- reviewer ----------------------------------------------------------

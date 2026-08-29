@@ -393,7 +393,7 @@ async function runDoctorAfterInit(
     }).config;
     backlogProvider = config.backlog.provider;
     providers = [config.providers.implementer, resolveReviewerAgent(config)];
-    sandbox = assertSandboxSelection(config.workspace.sandbox, input.sandbox);
+    sandbox = input.sandbox;
   } catch {
     // checkConfiguration below owns the actionable parse error. Do not spend a
     // provider turn against a guessed default when the written policy cannot
@@ -408,6 +408,18 @@ async function runDoctorAfterInit(
     },
     providers,
   );
+}
+
+function assertInitDoctorSelection(input: InitDoctorInput): void {
+  try {
+    const config = loadConfig(input.configPath, { repoRoot: input.repoRoot }).config;
+    assertSandboxSelection(config.workspace.sandbox, input.sandbox);
+  } catch (error) {
+    // A malformed policy remains checkConfiguration's responsibility. A
+    // valid, contradictory backend selection is an ownership failure and may
+    // not be hidden by either the default or an injected doctor.
+    if (error instanceof RunmillError && error.code === "RM-SANDBOX-001") throw error;
+  }
 }
 
 function registerInit(program: Command, ctx: CommandContext): void {
@@ -472,11 +484,13 @@ function registerInit(program: Command, ctx: CommandContext): void {
         // Setup is not complete merely because files were written. Run the
         // same proof as `runmill doctor` now, including a one-turn request for
         // every distinct configured provider/model inside the real sandbox.
-        const probed = await (ctx.runDoctor ?? runDoctorAfterInit)({
+        const doctorInput: InitDoctorInput = {
           repoRoot: root,
           configPath,
           sandbox: ctx.sandbox,
-        });
+        };
+        assertInitDoctorSelection(doctorInput);
+        const probed = await (ctx.runDoctor ?? runDoctorAfterInit)(doctorInput);
         // Test seams and custom embedders may supply only host/provider
         // probes. Verification readiness is local, deterministic, and must
         // never disappear from init merely because those probes are injected.

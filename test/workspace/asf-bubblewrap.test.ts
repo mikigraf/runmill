@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -289,28 +289,35 @@ describe("runControlledProcess", () => {
   it.skip("does not resolve after a normal direct-child exit until background descendants are gone", async () => {
     const directory = temporaryDirectory("runmill-process-normal-exit-");
     const pidFile = join(directory, "grandchild.pid");
-    const result = await runControlledProcess({
-      command: process.execPath,
-      args: [
-        "-e",
-        [
-          "const {spawn}=require('node:child_process')",
-          "const fs=require('node:fs')",
-          "const child=spawn(process.execPath,['-e','setInterval(() => {}, 1000)'],{stdio:'ignore'})",
-          "child.unref()",
-          `fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))`,
-        ].join(";"),
-      ],
-      cwd: directory,
-      env: { PATH: process.env["PATH"] ?? "" },
-      timeoutMs: 10_000,
-      maxOutputBytes: 4_096,
-      signal: new AbortController().signal,
-    });
+    let grandchildPid: number | undefined;
+    try {
+      const result = await runControlledProcess({
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            "const {spawn}=require('node:child_process')",
+            "const fs=require('node:fs')",
+            "const child=spawn(process.execPath,['-e','setInterval(() => {}, 1000)'],{stdio:'ignore'})",
+            "child.unref()",
+            `fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))`,
+          ].join(";"),
+        ],
+        cwd: directory,
+        env: { PATH: process.env["PATH"] ?? "" },
+        timeoutMs: 10_000,
+        maxOutputBytes: 4_096,
+        signal: new AbortController().signal,
+      });
 
-    expect(result).toMatchObject({ outcome: "exited", exitCode: 0 });
-    const grandchildPid = Number(readFileSync(pidFile, "utf8"));
-    expect(() => process.kill(grandchildPid, 0)).toThrow();
+      expect(result).toMatchObject({ outcome: "exited", exitCode: 0 });
+      grandchildPid = Number(readFileSync(pidFile, "utf8"));
+      expect(() => process.kill(grandchildPid ?? 0, 0)).toThrow();
+    } finally {
+      if (grandchildPid !== undefined) {
+        try { process.kill(grandchildPid, "SIGKILL"); } catch { /* already contained */ }
+      }
+    }
   }, 15_000);
 
   it("terminates execution once observed output exceeds the trusted ceiling", async () => {
@@ -376,38 +383,6 @@ describe("runControlledProcess", () => {
   }, 15_000);
 });
 
-const directBwrapAvailable = (() => {
-  if (
-    platform() !== "linux" ||
-    process.getuid?.() === 0 ||
-    !existsSync("/usr/bin/bwrap") ||
-    !existsSync("/usr/bin/prlimit") ||
-    !existsSync("/usr/bin/git")
-  ) {
-    return false;
-  }
-  // Exercise bubblewrap itself. A Seatbelt result never enables this test and
-  // the probe does not infer availability merely from a Linux platform label.
-  return (
-    spawnSync(
-      "/usr/bin/bwrap",
-      [
-        "--unshare-user",
-        "--unshare-net",
-        "--unshare-pid",
-        "--die-with-parent",
-        "--proc",
-        "/proc",
-        "--ro-bind",
-        "/usr",
-        "/usr",
-        "/usr/bin/true",
-      ],
-      { encoding: "utf8", timeout: 5_000 },
-    ).status === 0
-  );
-})();
-
 describe("AsfBubblewrapProductionSandbox", () => {
   it.runIf(platform() !== "linux")("fails closed instead of downgrading on a non-Linux host", async () => {
     await expect(
@@ -418,7 +393,18 @@ describe("AsfBubblewrapProductionSandbox", () => {
     ).rejects.toThrow(/requires Linux/u);
   });
 
-  it.runIf(directBwrapAvailable)(
+  it.runIf(platform() === "linux")(
+    "refuses before qualification while PID-namespace sync acknowledgement is absent",
+    async () => {
+      await expect(AsfBubblewrapProductionSandbox.create({
+        clock: new FakeClock(),
+        workspaceParent: "/path/that/must/not/be-inspected",
+        bwrapPath: "/path/that/must/not/be-executed",
+      })).rejects.toThrow(/sync-fd acknowledgement/i);
+    },
+  );
+
+  it.skip(
     "plants a host resource that is accessible outside and denied inside the qualified bwrap",
     async () => {
       const parent = temporaryDirectory("runmill-asf-production-");

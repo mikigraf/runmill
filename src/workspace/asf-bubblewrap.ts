@@ -33,6 +33,9 @@ import type { SandboxResult } from "./sandbox.js";
 export const ASF_BUBBLEWRAP_QUALIFICATION_SCHEMA =
   "asf.bubblewrap-qualification/v1" as const;
 export const ASF_BUBBLEWRAP_EXECUTION_SCHEMA = "asf.bubblewrap-execution/v1" as const;
+// Production stays unreachable until the renderer and process boundary own a
+// dedicated bwrap --sync-fd pipe and await PID-init EOF.
+const ASF_BUBBLEWRAP_SYNC_FD_IMPLEMENTED = false;
 /**
  * Relative path used only by the planted qualification fixture.  It is not a
  * production ctxlane endpoint: the host-side probe creates a socket here and
@@ -958,9 +961,9 @@ async function qualify(context: QualificationContext): Promise<AsfBubblewrapQual
 /**
  * Production-only Linux bubblewrap executor.
  *
- * Construction is asynchronous because a type label is not qualification:
- * every instance first runs planted-resource, namespace, environment, and
- * resource-limit probes through the exact bwrap+prlimit chain it will use.
+ * Construction currently refuses on Linux before qualification allocation or
+ * process launch. PID-namespace init sync-fd acknowledgement is required
+ * before the planted-resource qualification below becomes reachable again.
  */
 export class AsfBubblewrapProductionSandbox implements CredentialFreeProductionSandbox {
   readonly mechanism = "bubblewrap" as const;
@@ -1000,6 +1003,12 @@ export class AsfBubblewrapProductionSandbox implements CredentialFreeProductionS
   ): Promise<AsfBubblewrapProductionSandbox> {
     if (platform() !== "linux") {
       refuse("unsupported-host", "production ASF sandboxing requires Linux");
+    }
+    if (!ASF_BUBBLEWRAP_SYNC_FD_IMPLEMENTED) {
+      refuse(
+        "qualification-failed",
+        "production ASF bubblewrap is disabled until PID-namespace init sync-fd acknowledgement is implemented",
+      );
     }
     const uid = process.getuid?.();
     if (uid === undefined || uid === 0) {

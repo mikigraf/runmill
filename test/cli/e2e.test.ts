@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { run, runWithInput } from "../../src/platform/process.js";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, cpSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, cpSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 
@@ -211,6 +211,40 @@ describe("runmill config show", () => {
 });
 
 describe("standalone mode without ASF", () => {
+  it("completes observe selection with sandbox none and never probes a provider", async () => {
+    const configPath = join(dir, "runmill.yaml");
+    writeFileSync(
+      configPath,
+      readFileSync(configPath, "utf8")
+        .replace("autonomy: pr-only", "autonomy: observe")
+        .concat("\nworkspace:\n  sandbox: none\n"),
+    );
+    const fakeBin = join(dir, "fake-provider-bin");
+    const marker = join(dir, "provider-probed");
+    mkdirSync(fakeBin);
+    writeFileSync(
+      join(fakeBin, "codex"),
+      `#!/bin/sh\nprintf probed > ${JSON.stringify(marker)}\nexit 99\n`,
+      { mode: 0o755 },
+    );
+
+    const result = await cli(["--json", "run"], {
+      RUNMILL_FAKE_BACKLOG: "issues.json",
+      PATH: `${fakeBin}${delimiter}${TEST_PATH}`,
+      GITHUB_TOKEN: "must-not-be-read-for-observe",
+    });
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ran: false,
+      issueId: "ENG-102",
+      finalState: "COMPLETED",
+      reason: "autonomy is observe",
+    });
+    expect(existsSync(marker)).toBe(false);
+    expect(result.stderr).toBe("");
+  });
+
   it("runs the ordinary one-shot command without ASF keys, ctxlane, or MCP", async () => {
     const emptyBacklog = join(dir, "empty-issues.json");
     writeFileSync(emptyBacklog, "[]\n");

@@ -19,28 +19,24 @@ macOS keychain are denied. Provider subscription config is a known exception
 inside the boundary until a credential broker exists.
 
   macOS   no production backend; Seatbelt cannot contain new-session descendants
-  Linux   bubblewrap with mount and user namespaces
+  Linux   no production backend; bubblewrap PID-init lifecycle proof is pending
 
 What each platform can enforce differs, and runmill does not pretend otherwise:
 
   control              macOS        Linux
-  file scoping         unavailable  yes
-  credential denial    unavailable  yes
-  network scoping      unavailable  yes (--unshare-net)
-  resource limits      unavailable  with cgroup v2
+  file scoping         unavailable  unavailable
+  credential denial    unavailable  unavailable
+  network scoping      unavailable  unavailable
+  resource limits      unavailable  unavailable
 
 The \`proxy\` value currently permits provider network access; the
 hostname-filtering proxy is not implemented yet. \`network_allowlist\` is
 therefore rejected rather than silently ignored, and doctor reports unrestricted
 provider egress as a warning on both platforms.
 
-doctor does not ask whether a sandbox exists. It builds one, tries to read
-~/.ssh from inside it, and fails if that succeeds.
-
-If the Linux probe fails with "setting up uid map: Permission denied", your
-kernel has unprivileged user namespaces disabled:
-
-    sudo sysctl -w kernel.unprivileged_userns_clone=1
+doctor currently refuses both unqualified harnesses before any planted-resource
+probe. A future qualified backend must deny a planted credential and prove its
+kernel-owned lifecycle resource is empty before doctor can certify it.
 
 There is no silent downgrade. If isolation cannot be constructed and verified,
 no run starts.

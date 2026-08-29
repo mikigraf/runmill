@@ -258,6 +258,10 @@ const PROXY_ENV_KEYS = new Set([
  * lines at the tail, so the tail is what is kept.
  */
 const MAX_CAPTURED_OUTPUT = 512 * 1024;
+// Execution stays unreachable until a kernel-owned backend-empty
+// acknowledgement is implemented and qualified. This module-private gate is
+// deliberately not part of the public backend object.
+const NATIVE_HARNESS_EXECUTION_ENABLED = false;
 
 /** Paths denied inside the sandbox regardless of policy. */
 const CREDENTIAL_PATHS = [
@@ -1534,22 +1538,23 @@ function isTrustedImmutableSystemExecutable(identity: SandboxExecutableIdentity)
   ].some((root) => identity.path === root || within(root, identity.path));
 }
 
-/**
- * Lifecycle-owning native backend used by production composition.
- *
- * Callers receive only lifecycle operations; no wrapper command is exposed,
- * so process ownership and cleanup cannot escape the backend.
- */
+/** Unqualified mechanism harness. Production factories never construct it. */
 class NativeSandboxBackend implements SandboxBackend {
   readonly mechanism: Exclude<SandboxMechanism, "none">;
   readonly runtime: SandboxRuntimeIdentity;
-  readonly productionQualified = false;
+  readonly productionQualified!: false;
   readonly #searchPath: string;
 
   constructor(os: "darwin" | "linux", searchPath: string) {
     this.mechanism = os === "darwin" ? "seatbelt" : "bubblewrap";
     this.runtime = runtimeIdentity(os);
     this.#searchPath = searchPath;
+    Object.defineProperty(this, "productionQualified", {
+      value: false,
+      writable: false,
+      configurable: false,
+      enumerable: true,
+    });
   }
 
   #launcherIdentity(): SandboxExecutableIdentity {
@@ -1850,7 +1855,7 @@ class NativeSandboxBackend implements SandboxBackend {
   }
 
   async start(input: SandboxRunInput): Promise<SandboxExecution> {
-    if (!this.productionQualified) {
+    if (!NATIVE_HARNESS_EXECUTION_ENABLED) {
       throw sandboxFailure(
         `${this.mechanism} is a policy-qualification test harness only; execution remains disabled ` +
           "until backend-empty lifecycle acknowledgement is implemented.",

@@ -92,13 +92,14 @@ function harness(options: {
   onDoctor?: (() => void) | undefined;
   credentialInput?: string | undefined;
   stdinTTY?: boolean | undefined;
+  sandbox?: SandboxBackend | undefined;
 } = {}): Harness {
   const emitted: { human: string; data: unknown }[] = [];
   const failures: unknown[] = [];
   const doctorCalls: { repoRoot: string; configPath: string; sandbox: SandboxBackend }[] = [];
   const storedCredentials: { name: string; value: string }[] = [];
 
-  const sandbox = createNativeSandboxBackend("none");
+  const sandbox = options.sandbox ?? createTestSandboxBackend();
   const configurationSandboxes: unknown[] = [];
   const ctx: CommandContext = {
     emit: (human, payload) => emitted.push({ human, data: payload }),
@@ -259,6 +260,16 @@ describe("init", () => {
 
     expect(h.configurationSandboxes).toEqual([h.sandbox]);
   });
+
+  it("rejects a config/backend mismatch before an injected doctor can run", async () => {
+    initGitRepo();
+    const h = harness({ sandbox: createNativeSandboxBackend("none") });
+
+    expect(await h.run(["init", "--defaults"])).toBe(1);
+    expect(h.doctorCalls).toEqual([]);
+    expect(h.failures).toContainEqual(expect.objectContaining({ code: "RM-SANDBOX-001" }));
+  });
+
   it("does not require ASF or ctxlane configuration for standalone setup", async () => {
     initGitRepo();
     addInstalledNodeProject();

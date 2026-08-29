@@ -1,5 +1,13 @@
-import { describe, expect, it } from "vitest";
-import { BoundedCapture, run, runOrThrow, runWithInput } from "../../src/platform/process.js";
+import { describe, expect, it, vi } from "vitest";
+import type { ChildProcess } from "node:child_process";
+import {
+  armKillTimer,
+  BoundedCapture,
+  run,
+  runOrThrow,
+  runWithInput,
+  terminateTree,
+} from "../../src/platform/process.js";
 
 describe("BoundedCapture", () => {
   it("returns everything when under the cap", () => {
@@ -139,5 +147,36 @@ describe("runWithInput", () => {
     const result = await pending;
     expect(result.ok).toBe(false);
     expect(result.stderr).toContain("command cancelled");
+  });
+
+  it("uses one cancellable hard signal and arms no delayed escalation", () => {
+    vi.useFakeTimers();
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    const child = {
+      pid: 987_654,
+      kill: vi.fn(() => true),
+    } as unknown as ChildProcess;
+    try {
+      terminateTree(child);
+      expect(kill).toHaveBeenCalledTimes(1);
+      expect(kill).toHaveBeenLastCalledWith(-987_654, "SIGKILL");
+      vi.advanceTimersByTime(10_000);
+      expect(kill).toHaveBeenCalledTimes(1);
+
+      const cancel = armKillTimer(child, 100);
+      vi.advanceTimersByTime(100);
+      expect(kill).toHaveBeenCalledTimes(2);
+      vi.advanceTimersByTime(10_000);
+      expect(kill).toHaveBeenCalledTimes(2);
+      cancel();
+
+      const cancelBeforeDeadline = armKillTimer(child, 100);
+      cancelBeforeDeadline();
+      vi.advanceTimersByTime(10_000);
+      expect(kill).toHaveBeenCalledTimes(2);
+    } finally {
+      kill.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

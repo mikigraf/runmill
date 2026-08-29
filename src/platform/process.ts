@@ -197,8 +197,9 @@ export async function runWithInput(
     let spawnError: Error | undefined;
     let timedOut = false;
     let cancelled = false;
+    let terminal = false;
     const abort = (): void => {
-      if (cancelled) return;
+      if (cancelled || terminal) return;
       cancelled = true;
       terminateTree(child);
     };
@@ -215,7 +216,13 @@ export async function runWithInput(
     child.on("error", (error) => {
       spawnError = error;
     });
+    child.on("exit", () => {
+      terminal = true;
+      cancelTimer();
+      options.signal?.removeEventListener("abort", abort);
+    });
     child.on("close", (code) => {
+      terminal = true;
       cancelTimer();
       options.signal?.removeEventListener("abort", abort);
       const failure = [
@@ -279,19 +286,15 @@ export function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
 
 const KILL_GRACE_MS = 2_000;
 
-/**
- * Ask a process tree to stop, then make it.
- *
- * The same escalation the timeout path uses. A single SIGTERM is a request,
- * and a provider that traps or ignores it stays alive with its stdio open,
- * which leaves the awaiting run pending forever rather than cancelled.
- */
+/** Immediately stop the still-owned child group without a delayed PGID signal. */
 export function terminateTree(child: ChildProcess): void {
-  killTree(child, "SIGTERM");
-  setTimeout(() => killTree(child, "SIGKILL"), KILL_GRACE_MS).unref();
+  // A delayed escalation cannot retain a safe identity for a reaped process
+  // group. Until a kernel-owned containment resource exists, terminate the
+  // still-owned child group immediately and arm no later numeric-PGID signal.
+  killTree(child, "SIGKILL");
 }
 
-/** SIGTERM, then SIGKILL after a grace period. Returns a cancel function. */
+/** One cancellable timeout; no secondary callback survives terminal close. */
 export function armKillTimer(
   child: ChildProcess,
   timeoutMs: number,
@@ -299,8 +302,7 @@ export function armKillTimer(
 ): () => void {
   const timer = setTimeout(() => {
     onTimeout?.();
-    killTree(child, "SIGTERM");
-    setTimeout(() => killTree(child, "SIGKILL"), KILL_GRACE_MS).unref();
+    killTree(child, "SIGKILL");
   }, timeoutMs);
   return () => clearTimeout(timer);
 }

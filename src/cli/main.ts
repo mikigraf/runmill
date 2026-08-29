@@ -710,7 +710,10 @@ export function buildProgram(): Command {
       const opts = program.opts<GlobalOpts>();
       try {
         const { config: cfg } = loadOrExit(opts, process.cwd());
-        const adapters = await buildAdapters(cfg);
+        const adapters = await buildAdapters(
+          cfg,
+          cfg.autonomy === "observe" ? { need: ["backlog"] } : {},
+        );
         const backlog = adapters.backlog;
         const store = StateStore.open(join(dataDir(), "runmill.db"));
 
@@ -750,6 +753,16 @@ export function buildProgram(): Command {
             emit(opts, `Nothing to run.\n${detail}`, {
               ran: false,
               reason: detail,
+            });
+            process.exit(EXIT.ok);
+          }
+
+          if (cfg.autonomy === "observe") {
+            emit(opts, `${candidate.issue.identifier} observed; no execution was authorized.`, {
+              ran: false,
+              issueId: candidate.issue.identifier,
+              finalState: "COMPLETED",
+              reason: "autonomy is observe",
             });
             process.exit(EXIT.ok);
           }

@@ -33,8 +33,8 @@ What each platform can enforce differs, and runmill does not pretend otherwise:
 
 Seatbelt has no lifecycle container: a child can create a new session and survive process-group
 termination. Runmill therefore refuses production native execution on macOS. The Seatbelt profile
-remains an explicit test-only mechanism for file-policy regressions; it is not selected by the
-factory, config composition, or doctor. Runmill also does not yet ship its planned hostname-filtering
+remains an explicit test-only policy renderer/qualification harness; execution regressions are
+pending until cleanup is lifecycle-safe. It is not selected by the factory, config composition, or doctor. Runmill also does not yet ship its planned hostname-filtering
 proxy. When an execution backend is qualified, `workspace.network: proxy` will initially permit
 unrestricted provider egress; `none` disables it. A non-empty `network_allowlist` is rejected rather than silently accepted as a
 control that does not exist. `runmill doctor` reports unrestricted egress as a warning.
@@ -224,8 +224,9 @@ enforcement layer rather than two half-configured ones.
 
 ## Proof, not assertion
 
-`doctor` does not check whether a sandbox mechanism exists. It builds one, tries to read `~/.ssh`
-from inside it, and fails if that succeeds:
+`doctor` currently refuses the unqualified backend before constructing a planted-resource probe.
+Once a lifecycle-owning backend exists, the planted denial probe becomes mandatory evidence rather
+than a mechanism-presence check:
 
 ```
 ✗ sandbox:mechanism             RM-SANDBOX-001 (no production-qualified local backend)
@@ -234,8 +235,9 @@ from inside it, and fails if that succeeds:
 There is no silent downgrade. If isolation cannot be constructed and verified, no run starts —
 [`RM-SANDBOX-001`](./errors.md#rm-sandbox-001).
 
-On macOS and Linux this check currently fails with `RM-SANDBOX-001`. Linux bubblewrap mechanism
-tests remain required in Linux CI, but they do not certify production selection.
+On macOS and Linux this check currently fails with `RM-SANDBOX-001`. Real Seatbelt and bubblewrap
+mechanism execution tests are retained as pending qualifications, not required-green CI checks,
+until backend-empty lifecycle acknowledgement makes their cleanup safe.
 
 ## Output capture
 

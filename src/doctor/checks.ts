@@ -910,140 +910,26 @@ export function checkProviderCredentialIsolation(implementation: string): CheckR
   };
 }
 
-/**
- * Positive AND negative sandbox probes.
- *
- * A capability check that only asks "is the mechanism present" proves nothing.
- * These attempt operations that MUST fail, and treat success as a failure of
- * the isolation guarantee.
- */
-export async function checkSandbox(backend: SandboxBackend): Promise<CheckResult[]> {
-  const os = backend.runtime.os;
-  const results: CheckResult[] = [];
-
-  if (backend.productionQualified !== true) {
-    return [{
-      id: "sandbox:mechanism",
-      status: "fail",
-      code: "RM-SANDBOX-001",
-      observed: `${backend.mechanism} is not a production-qualified lifecycle backend`,
-      expected: "a lifecycle-owning, production-qualified local execution backend",
-      remediation: "No local execution backend is qualified in this checkpoint; use observe-only workflows",
-    }];
-  }
-
-  if (backend.mechanism === "seatbelt") {
-    return [{
-      id: "sandbox:mechanism",
-      status: "fail",
-      code: "RM-SANDBOX-001",
-      observed: "Seatbelt cannot own descendants that create a new session",
-      expected: "a lifecycle-owning local execution backend",
-      remediation: "Use a Linux host with bubblewrap; native macOS execution is pending Task 12a",
-    }];
-  }
-
-  // -- is a mechanism there at all ---------------------------------------
-  if (os === "linux" && backend.mechanism === "bubblewrap") {
-    let qualification;
-    try {
-      qualification = await backend.qualify({ command: "/usr/bin/true" });
-    } catch {
-      return [
-        {
-          id: "sandbox:mechanism",
-          status: "fail",
-          code: "RM-SANDBOX-001",
-          observed: "trusted bwrap launcher could not be qualified",
-          expected: "bubblewrap installed",
-          remediation: "Install bubblewrap (apt install bubblewrap)",
-        },
-      ];
-    }
-    results.push({
-      id: "sandbox:mechanism",
-      status: "pass",
-      observed:
-        `bubblewrap ${qualification.launcher?.path ?? "identity missing"} ` +
-        `${qualification.launcher?.sha256 ?? "digest missing"}`,
-      expected: "bubblewrap available",
-    });
-
-    const probe = mkdtempSync(join(tmpdir(), "runmill-bwrap-userns-"));
-    let usernsOk = false;
-    let usernsObserved = "configured bubblewrap user namespace probe failed";
-    try {
-      const userns = await backend.run({
-        command: "/usr/bin/true",
-        args: [],
-        cwd: probe,
-        policy: { writablePaths: [probe], allowNetwork: false },
-        timeoutMs: 10_000,
-      });
-      usernsOk = userns.outcome === "exited" && userns.exitCode === 0;
-      usernsObserved = usernsOk
-        ? "user namespaces usable"
-        : userns.stderr.split("\n")[0] ?? "unavailable";
-    } finally {
-      rmSync(probe, { recursive: true, force: true });
-    }
-    results.push({
-      id: "sandbox:userns",
-      status: usernsOk ? "pass" : "fail",
-      code: usernsOk ? undefined : "RM-SANDBOX-001",
-      observed: usernsObserved,
-      expected: "unprivileged user namespaces enabled",
-      // Ubuntu 23.10 and later restrict unprivileged user namespaces through
-      // AppArmor rather than the old Debian sysctl, and on those hosts
-      // `kernel.unprivileged_userns_clone` does not exist at all — so the
-      // remediation runmill used to print failed with "cannot stat" and left
-      // the operator no better off. Name both knobs, newest first.
-      remediation: usernsOk
-        ? undefined
-        : "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 " +
-          "(Ubuntu 23.10+), or sudo sysctl -w kernel.unprivileged_userns_clone=1 (older Debian)",
-    });
-    if (!usernsOk) return results;
-  } else {
-    return [
-      {
-        id: "sandbox:mechanism",
-        status: "fail",
-        code: "RM-SANDBOX-001",
-        observed: `unsupported platform: ${os}`,
-        expected: "Linux with bubblewrap",
-        remediation: "Use Linux with bubblewrap; macOS and Windows execution are pending",
-      },
-    ];
-  }
-
-  results.push(await probeCredentialDenial(backend));
-
-  // The schema reserves a future proxy mode, but no hostname-filtering proxy
-  // ships yet. `allowNetwork: true` is unrestricted outbound on both
-  // mechanisms. Say so on every host rather than presenting a parsed but
-  // unused allowlist as enforcement.
-  results.push({
-    id: "sandbox:network",
-    status: "warn",
-    observed: "provider egress is unrestricted when workspace.network is proxy",
-    expected: "hostname-scoped provider egress",
-    remediation:
-      "Keep workspace.network_allowlist empty, use a dedicated provider session, and stay in pr-only until the network proxy ships",
-  });
-
-  return results;
+/** Refuse before probing until a backend can prove lifecycle containment. */
+export function checkSandbox(backend: SandboxBackend): Promise<CheckResult[]> {
+  return Promise.resolve([{
+    id: "sandbox:mechanism",
+    status: "fail",
+    code: "RM-SANDBOX-001",
+    observed: `${backend.mechanism} is not a production-qualified lifecycle backend`,
+    expected: "a lifecycle-owning, production-qualified local execution backend",
+    remediation: "No local execution backend is qualified in this checkpoint; use observe-only workflows",
+  }]);
 }
 
 /**
- * Try to read a credential from inside a real sandbox, and fail if it works.
+ * Future qualification probe: read a planted credential and fail if it works.
  *
  * Two things this deliberately does not do.
  *
- * It does not hand-roll a probe profile. It builds the sandbox through the same
- * `Sandbox` the orchestrator uses, so what is proven here is the configuration
- * that will actually confine the agent — a bespoke probe profile can pass while
- * the real one leaks, which is the only outcome that would matter.
+ * It does not hand-roll a probe profile. Once a production backend is enabled,
+ * this must receive that same composition-root instance; a bespoke profile can
+ * pass while the real one leaks.
  *
  * It does not read the developer's real `~/.ssh/id_rsa`. That file is often
  * absent, and then `cat` fails because there is nothing to read: the probe
@@ -1185,7 +1071,7 @@ export async function runAllChecks(
             status: "fail" as const,
             code: "RM-SANDBOX-001",
             observed: platform() === "darwin"
-              ? "Darwin native sandbox refused: Seatbelt cannot contain new-session descendants"
+              ? "Darwin native sandbox refused: no production-qualified lifecycle backend"
               : platform() === "linux"
                 ? "Linux native sandbox refused: descriptor-bound runtime/policy closure is incomplete"
                 : "no configured sandbox backend was injected",
