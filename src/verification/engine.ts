@@ -472,6 +472,8 @@ export class VerificationEngine {
       const preparedReport = prepareReport(verifyPath, spec.report);
       const parts = spec.run.split(/\s+/).filter((part) => part !== "");
       const [command, ...args] = parts;
+      const commandName = command?.split(/[\\/]/).pop();
+      const subprocesses = commandName === "npm" || commandName === "npx" ? ["/bin/sh"] : [];
       const dependencyLookup = workspaces as unknown as {
         verificationDependencyPath?: (checkoutPath: string) => string | undefined;
       };
@@ -501,6 +503,7 @@ export class VerificationEngine {
           allowNetwork: false,
         },
         timeoutMs: input.timeoutMs ?? 10 * 60_000,
+        subprocesses,
         ...(preparedDependency === undefined
           ? {}
           : { preparedDependencyPaths: [preparedDependency.path] }),
@@ -548,7 +551,8 @@ export class VerificationEngine {
       const execution = await this.#executeAt(input, spec, candidateSha);
       const { before, after, outcome, report, combined } = execution;
       const notes: string[] = [report.detail];
-      let status: CheckResult["status"] = outcome.exitCode === 0 ? "passed" : "failed";
+      let status: CheckResult["status"] =
+        outcome.outcome === "exited" && outcome.exitCode === 0 ? "passed" : "failed";
       let coverage: Coverage = report.proven ? "proven" : "unproven";
 
       // Freshness. The tree must be identical either side of the check;

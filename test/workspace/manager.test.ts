@@ -11,6 +11,7 @@ import {
   chmodSync,
   lstatSync,
   readdirSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -467,6 +468,17 @@ describe("tree identity and checkpoints", () => {
 });
 
 describe("verification checkout", () => {
+  it("materializes the exact prepared dependency tree for sandboxed provider tools", async () => {
+    addInstalledNodeProject();
+    const ws = await create();
+    const dependencyPath = mgr.agentDependencyPath(ws.path);
+
+    expect(dependencyPath).toBe(join(ws.path, "node_modules"));
+    expect(existsSync(join(dependencyPath ?? "", "tiny/check.js"))).toBe(true);
+    expect(lstatSync(join(dependencyPath ?? "", "tiny/check.js")).mode & 0o222).toBe(0);
+    expect(git(ws.path, "status", "--porcelain")).toBe("");
+  });
+
   it("materializes exact-lock npm dependencies without putting them in the candidate commit", async () => {
     addInstalledNodeProject();
     const ws = await create();
@@ -492,17 +504,16 @@ describe("verification checkout", () => {
     expect(existsSync(join(runs, "run_1"))).toBe(false);
   });
 
-  it("refuses to hide prepared dependencies inside the measured source tree", async () => {
+  it("refuses non-ignored prepared dependencies before creating an agent workspace", async () => {
     addInstalledNodeProject();
     git(source, "rm", "-q", ".gitignore");
     git(source, "commit", "-q", "-m", "stop ignoring dependencies");
-    const ws = await create();
 
-    await expect(
-      mgr.createVerificationCheckout(ws, await mgr.headSha(ws)),
-    ).rejects.toThrow(/RM-VERIFY-005|node_modules is not ignored/i);
-
-    await mgr.destroy(ws, source);
+    await expect(create()).rejects.toThrow(/RM-VERIFY-005|node_modules is not ignored/i);
+    // The boundary is now earlier than verification: no workspace exists to
+    // hand to a provider, and no materialized dependency tree survives.
+    expect(existsSync(join(runs, "run_1"))).toBe(false);
+    expect(existsSync(join(runs, "run_1", "node_modules"))).toBe(false);
     makeRemovable(join(root, "dependencies"));
   });
 
@@ -551,6 +562,40 @@ describe("task packet", () => {
     expect(existsSync(path)).toBe(true);
     expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ run_id: "run_1" });
   });
+
+  it.each(["writeTaskPacket", "writeIssueDocument"] as const)(
+    "refuses a symlinked runtime-input ancestor in %s without changing outside bytes",
+    async (method) => {
+      const ws = await create();
+      const outside = join(root, `outside-${method}`);
+      mkdirSync(outside);
+      writeFileSync(join(outside, "sentinel"), "trusted");
+      symlinkSync(outside, join(ws.path, ".runmill"));
+
+      expect(() => method === "writeTaskPacket"
+        ? mgr.writeTaskPacket(ws, { run_id: "run_1" })
+        : mgr.writeIssueDocument(ws, "issue")).toThrow(/symlink|runtime input|directory/i);
+      expect(readFileSync(join(outside, "sentinel"), "utf8")).toBe("trusted");
+      expect(readdirSync(outside)).toEqual(["sentinel"]);
+    },
+  );
+
+  it.each(["writeTaskPacket", "writeIssueDocument"] as const)(
+    "refuses an existing symlink output target in %s without changing the planted host file",
+    async (method) => {
+      const ws = await create();
+      const outside = join(root, `outside-file-${method}`);
+      const runDir = join(ws.path, ".runmill", "run");
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(outside, "trusted");
+      symlinkSync(outside, join(runDir, method === "writeTaskPacket" ? "task.json" : "issue.md"));
+
+      expect(() => method === "writeTaskPacket"
+        ? mgr.writeTaskPacket(ws, { run_id: "run_1" })
+        : mgr.writeIssueDocument(ws, "issue")).toThrow(/exists|symlink|runtime input/i);
+      expect(readFileSync(outside, "utf8")).toBe("trusted");
+    },
+  );
 });
 
 describe("cleanup", () => {

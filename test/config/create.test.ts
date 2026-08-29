@@ -9,6 +9,7 @@ import {
   type ConfigAnswers,
   type DiscoveredSetup,
 } from "../../src/config/create.js";
+import { createNativeSandboxBackend } from "../../src/workspace/sandbox.js";
 
 const ANSWERS: ConfigAnswers = {
   autonomy: "pr-only",
@@ -67,6 +68,27 @@ function scriptedPrompter(answers: readonly string[]): {
 }
 
 describe("configuration creator", () => {
+  it("passes the composition root's exact backend instance into discovery", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "runmill-config-sandbox-"));
+    const sandbox = createNativeSandboxBackend("native");
+    const discover = vi.fn(async (_root, _credentials, receivedSandbox) => {
+      expect(receivedSandbox).toBe(sandbox);
+      return DISCOVERED_WITHOUT_SERVICE_CREDENTIALS;
+    });
+    try {
+      await createConfiguration({
+        root: directory,
+        path: join(directory, "policy.yaml"),
+        defaults: true,
+        sandbox,
+        discover,
+      });
+      expect(discover).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("renders a valid configuration with conservative defaults", () => {
     const source = renderCreatedConfig(ANSWERS);
     const config = parseConfig(source);

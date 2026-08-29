@@ -1,4 +1,3 @@
-import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   mkdtempSync,
@@ -18,10 +17,7 @@ import { arch, tmpdir, platform } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { RunmillError, errorMessage } from "../errors/runmill-error.js";
 import {
-  armKillTimer,
-  BoundedCapture,
-  run as runProcess,
-  terminateTree,
+  runControlledProcess,
 } from "../platform/process.js";
 
 export type SandboxMechanism = "seatbelt" | "bubblewrap" | "none";
@@ -94,7 +90,12 @@ export interface SandboxQualification {
   readonly executableIdentities: readonly SandboxExecutableIdentity[];
   /** Logical guest PATH. Native execution materializes an equivalent private shim directory. */
   readonly sanitizedPath: string;
-  readonly digest: string;
+  /** Digest of executable/runtime identities only; it is not policy evidence. */
+  readonly runtimeDigest: string;
+  /** Present on start(): digest of the complete effective policy and layout. */
+  readonly policyDigest?: string | undefined;
+  /** Trusted sandbox launcher identity revalidated immediately before spawn. */
+  readonly launcher?: SandboxExecutableIdentity | undefined;
 }
 
 export interface SandboxPathMount {
@@ -479,37 +480,139 @@ const LINUX_RUNTIME_FILES = [
   "/usr/share/zoneinfo",
 ] as const;
 
-async function linuxRuntimeClosure(
-  executables: readonly SandboxExecutableIdentity[],
-): Promise<string[]> {
+interface ElfMetadata {
+  readonly interpreter?: string | undefined;
+  readonly needed: readonly string[];
+  readonly searchPaths: readonly string[];
+}
+
+function parseElfMetadata(path: string): ElfMetadata | undefined {
+  const source = readFileSync(path);
+  if (!source.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) return undefined;
+  const elfClass = source[4];
+  const encoding = source[5];
+  if ((elfClass !== 1 && elfClass !== 2) || (encoding !== 1 && encoding !== 2)) {
+    throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
+  }
+  const little = encoding === 1;
+  const number = (offset: number, width: 2 | 4 | 8): number => {
+    if (offset < 0 || offset + width > source.length) {
+      throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
+    }
+    const value = width === 2
+      ? little ? source.readUInt16LE(offset) : source.readUInt16BE(offset)
+      : width === 4
+        ? little ? source.readUInt32LE(offset) : source.readUInt32BE(offset)
+        : Number(little ? source.readBigUInt64LE(offset) : source.readBigUInt64BE(offset));
+    if (!Number.isSafeInteger(value)) throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
+    return value;
+  };
+  const phoff = number(elfClass === 1 ? 28 : 32, elfClass === 1 ? 4 : 8);
+  const phentsize = number(elfClass === 1 ? 42 : 54, 2);
+  const phnum = number(elfClass === 1 ? 44 : 56, 2);
+  if (phnum > 4096 || phentsize < (elfClass === 1 ? 32 : 56)) {
+    throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
+  }
+  const segments: Array<{ type: number; offset: number; address: number; size: number }> = [];
+  for (let index = 0; index < phnum; index += 1) {
+    const base = phoff + index * phentsize;
+    const type = number(base, 4);
+    segments.push({
+      type,
+      offset: number(base + (elfClass === 1 ? 4 : 8), elfClass === 1 ? 4 : 8),
+      address: number(base + (elfClass === 1 ? 8 : 16), elfClass === 1 ? 4 : 8),
+      size: number(base + (elfClass === 1 ? 16 : 32), elfClass === 1 ? 4 : 8),
+    });
+  }
+  const readCString = (offset: number): string => {
+    if (offset < 0 || offset >= source.length) throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
+    const end = source.indexOf(0, offset);
+    if (end < 0 || end - offset > 64 * 1024) throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
+    return source.subarray(offset, end).toString("utf8");
+  };
+  const interpreterSegment = segments.find((segment) => segment.type === 3);
+  const interpreter = interpreterSegment === undefined ? undefined : readCString(interpreterSegment.offset);
+  const dynamic = segments.find((segment) => segment.type === 2);
+  if (dynamic === undefined) return { interpreter, needed: [], searchPaths: [] };
+  const word = elfClass === 1 ? 4 : 8;
+  const entryWidth = word * 2;
+  const neededOffsets: number[] = [];
+  const searchOffsets: number[] = [];
+  let stringAddress: number | undefined;
+  for (let offset = dynamic.offset; offset + entryWidth <= dynamic.offset + dynamic.size; offset += entryWidth) {
+    const tag = number(offset, word);
+    const value = number(offset + word, word);
+    if (tag === 0) break;
+    if (tag === 1) neededOffsets.push(value);
+    else if (tag === 5) stringAddress = value;
+    else if (tag === 15 || tag === 29) searchOffsets.push(value);
+  }
+  if (neededOffsets.length === 0 && searchOffsets.length === 0) {
+    return { interpreter, needed: [], searchPaths: [] };
+  }
+  if (stringAddress === undefined) throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
+  const load = segments.find(
+    (segment) => segment.type === 1 && stringAddress >= segment.address && stringAddress < segment.address + segment.size,
+  );
+  if (load === undefined) throw sandboxFailure(`Malformed ELF runtime metadata in ${path}.`);
+  const stringOffset = load.offset + stringAddress - load.address;
+  return {
+    interpreter,
+    needed: neededOffsets.map((offset) => readCString(stringOffset + offset)),
+    searchPaths: searchOffsets.flatMap((offset) => readCString(stringOffset + offset).split(":")),
+  };
+}
+
+/** Pure ELF metadata inspection: reads bytes and never executes the inspected target. */
+export function inspectElfRuntimePaths(executablePaths: readonly string[]): string[] {
   const paths = new Set<string>();
   for (const candidate of LINUX_RUNTIME_FILES) {
     if (existsSync(candidate)) paths.add(realpathSync(candidate));
   }
-  for (const executable of executables) {
-    const header = readFileSync(executable.path).subarray(0, 4);
-    if (!header.equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) continue;
-    const observation = await runProcess("/usr/bin/ldd", [executable.path], {
-      timeoutMs: 10_000,
-      env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
-    });
-    if (/\bnot found\b/.test(`${observation.stdout}\n${observation.stderr}`)) {
-      throw sandboxFailure(`Dynamic library closure is incomplete for ${executable.path}.`);
-    }
-    if (!observation.ok && !/statically linked|not a dynamic executable/i.test(observation.stderr)) {
-      throw sandboxFailure(
-        `Cannot qualify dynamic libraries for ${executable.path}: ${observation.stderr.trim()}`,
-      );
-    }
-    for (const line of observation.stdout.split("\n")) {
-      const matches = line.match(/\/[^\s()]+/g) ?? [];
-      for (const match of matches) {
-        const value = match.replace(/:$/, "");
-        if (!existsSync(value)) {
-          throw sandboxFailure(`Qualified dynamic library disappeared: ${value}`);
-        }
-        paths.add(realpathSync(value));
+  const triplet = arch() === "x64" ? "x86_64-linux-gnu" : arch() === "arm64" ? "aarch64-linux-gnu" : undefined;
+  const pending = executablePaths.map((path) => realpathSync(path));
+  const visited = new Set<string>();
+  while (pending.length > 0) {
+    const executable = pending.shift();
+    if (executable === undefined || visited.has(executable)) continue;
+    visited.add(executable);
+    const metadata = parseElfMetadata(executable);
+    if (metadata === undefined) continue;
+    const interpreter = metadata.interpreter;
+    if (interpreter !== undefined) {
+      if (!isAbsolute(interpreter) || !existsSync(interpreter)) {
+        throw sandboxFailure(`ELF interpreter is not an exact existing path: ${interpreter}.`);
       }
+      const canonical = realpathSync(interpreter);
+      paths.add(canonical);
+      pending.push(canonical);
+    }
+    const declaredSearch = metadata.searchPaths.map((entry) => {
+      if (!isAbsolute(entry) || entry.includes("$")) {
+        throw sandboxFailure(`ELF runtime search path is not absolute and bounded: ${entry}.`);
+      }
+      return entry;
+    });
+    const search = [
+      ...declaredSearch,
+      ...(interpreter === undefined ? [] : [dirname(interpreter)]),
+      ...(triplet === undefined ? [] : [`/lib/${triplet}`, `/usr/lib/${triplet}`]),
+      "/lib64",
+      "/usr/lib64",
+      "/lib",
+      "/usr/lib",
+    ];
+    for (const needed of metadata.needed) {
+      const candidates = needed.includes("/")
+        ? [needed]
+        : search.map((directory) => join(directory, needed));
+      const found = candidates.find((candidate) => isAbsolute(candidate) && existsSync(candidate));
+      if (found === undefined) {
+        throw sandboxFailure(`Dynamic library closure is incomplete for ${executable}: ${needed}.`);
+      }
+      const canonical = realpathSync(found);
+      paths.add(canonical);
+      pending.push(canonical);
     }
   }
   return [...paths].sort();
@@ -547,6 +650,15 @@ function assertGrantIsBounded(grant: string, cwd: string, operatorHome: string |
   }
 }
 
+function assertRegularMountSource(path: string, label: string, directoryOnly: boolean): void {
+  const info = statSync(path);
+  if (directoryOnly ? !info.isDirectory() : !info.isDirectory() && !info.isFile()) {
+    throw sandboxFailure(
+      `${label} must be ${directoryOnly ? "a regular directory" : "a regular file or directory"}: ${path}.`,
+    );
+  }
+}
+
 interface NormalizedPolicy {
   readonly writablePaths: readonly string[];
   readonly writableFiles: readonly string[];
@@ -565,8 +677,21 @@ function normalizePolicy(input: SandboxRunInput, childTmp: string): NormalizedPo
   const preparedDependencyPaths = (input.preparedDependencyPaths ?? []).map((path) =>
     canonicalExisting(path, "Prepared dependency checkout"),
   );
-  for (const grant of [...writablePaths, ...writableFiles, ...readablePaths]) {
+  for (const grant of [
+    ...writablePaths,
+    ...writableFiles,
+    ...readablePaths,
+    ...protectedPaths,
+    ...preparedDependencyPaths,
+  ]) {
     assertGrantIsBounded(grant, cwd, process.env["HOME"]);
+  }
+  for (const path of protectedPaths) assertRegularMountSource(path, "Protected path", false);
+  for (const path of preparedDependencyPaths) {
+    assertRegularMountSource(path, "Prepared dependency checkout", true);
+    if (path === cwd) {
+      throw sandboxFailure(`Prepared dependency checkout cannot be the workspace itself: ${path}.`);
+    }
   }
   const modes = new Map<string, string>();
   for (const [mode, paths] of [
@@ -596,6 +721,8 @@ function normalizePolicy(input: SandboxRunInput, childTmp: string): NormalizedPo
   rejectOverlaps(writablePaths, "writable");
   rejectOverlaps(writableFiles, "writable-file");
   rejectOverlaps(readablePaths, "readable");
+  rejectOverlaps(protectedPaths, "protected");
+  rejectOverlaps(preparedDependencyPaths, "prepared dependency");
   for (const writable of writablePaths) {
     for (const readable of readablePaths) {
       if (within(writable, readable) || within(readable, writable)) {
@@ -757,6 +884,29 @@ interface ResolvedRuntimeClosure {
   readonly shimTargets: ReadonlyMap<string, string>;
 }
 
+function sameExecutableIdentity(
+  expected: SandboxExecutableIdentity,
+  actual: SandboxExecutableIdentity,
+): boolean {
+  return expected.path === actual.path &&
+    expected.sha256 === actual.sha256 &&
+    expected.device === actual.device &&
+    expected.inode === actual.inode &&
+    expected.size === actual.size;
+}
+
+function assertExecutableIdentityCurrent(identity: SandboxExecutableIdentity, label: string): void {
+  let current: SandboxExecutableIdentity;
+  try {
+    current = executableIdentity(identity.path);
+  } catch (error) {
+    throw sandboxFailure(`${label} disappeared before sandbox launch: ${errorMessage(error)}`);
+  }
+  if (!sameExecutableIdentity(identity, current)) {
+    throw sandboxFailure(`${label} changed after qualification: ${identity.path}.`);
+  }
+}
+
 /**
  * Lifecycle-owning native backend used by production composition.
  *
@@ -772,6 +922,16 @@ class NativeSandboxBackend implements SandboxBackend {
     this.mechanism = os === "darwin" ? "seatbelt" : "bubblewrap";
     this.runtime = runtimeIdentity(os);
     this.#searchPath = searchPath;
+  }
+
+  #launcherIdentity(): SandboxExecutableIdentity {
+    if (this.mechanism === "seatbelt") {
+      return executableIdentity("/usr/bin/sandbox-exec");
+    }
+    for (const candidate of ["/usr/bin/bwrap", "/bin/bwrap"] as const) {
+      if (existsSync(candidate)) return executableIdentity(candidate);
+    }
+    throw sandboxFailure("No trusted bubblewrap launcher exists at /usr/bin/bwrap or /bin/bwrap.");
   }
 
   async qualify(input: {
@@ -799,7 +959,10 @@ class NativeSandboxBackend implements SandboxBackend {
     readonly path: string;
     readonly runtime: SandboxRuntimeIdentity;
   } {
-    return { path: canonicalExisting(path, "Prepared dependency checkout"), runtime: this.runtime };
+    const canonical = canonicalExisting(path, "Prepared dependency checkout");
+    assertGrantIsBounded(canonical, resolve(sep, "runmill-unrelated-workspace"), process.env["HOME"]);
+    assertRegularMountSource(canonical, "Prepared dependency checkout", true);
+    return { path: canonical, runtime: this.runtime };
   }
 
   async #resolveClosure(input: {
@@ -827,39 +990,40 @@ class NativeSandboxBackend implements SandboxBackend {
       return identity.path;
     };
 
-    addExecutable(executable, basename(input.command));
-    if (this.runtime.os === "darwin" && executable === "/bin/sh") {
+    const addMacShellVariant = (path: string): void => {
+      if (this.runtime.os !== "darwin" || path !== "/bin/sh") return;
       const bash = exactExecutable("/bin/bash", this.#searchPath, input.cwd);
       addExecutable(bash);
       readable.add(bash);
-    }
-    let current = executable;
-    const visited = new Set<string>();
-    for (let depth = 0; depth < MAX_SHEBANG_DEPTH; depth += 1) {
-      if (visited.has(current)) throw sandboxFailure(`Executable shebang cycle at ${current}.`);
-      visited.add(current);
-      const declaration = shebang(current);
-      if (declaration === undefined) break;
-      const interpreter = addExecutable(declaration[0] ?? "");
-      if (interpreter === "/usr/bin/env") {
-        const name = declaration[1];
-        if (name === undefined || name.startsWith("-")) {
-          throw sandboxFailure(`Executable ${current} uses an unprovable env shebang.`);
+    };
+    const addShebangClosure = (entrypoint: string): void => {
+      let current = entrypoint;
+      const visited = new Set<string>();
+      for (let depth = 0; depth < MAX_SHEBANG_DEPTH; depth += 1) {
+        if (visited.has(current)) throw sandboxFailure(`Executable shebang cycle at ${current}.`);
+        visited.add(current);
+        addMacShellVariant(current);
+        const declaration = shebang(current);
+        if (declaration === undefined) break;
+        const interpreter = addExecutable(declaration[0] ?? "");
+        if (interpreter === "/usr/bin/env") {
+          const name = declaration[1];
+          if (name === undefined || name.startsWith("-")) {
+            throw sandboxFailure(`Executable ${current} uses an unprovable env shebang.`);
+          }
+          current = addExecutable(exactExecutable(name, this.#searchPath, input.cwd), name);
+        } else {
+          current = interpreter;
+          shims.set(basename(interpreter), interpreter);
         }
-        current = addExecutable(exactExecutable(name, this.#searchPath, input.cwd), name);
-      } else {
-        current = interpreter;
-        shims.set(basename(interpreter), interpreter);
-        if (this.runtime.os === "darwin" && interpreter === "/bin/sh") {
-          const bash = exactExecutable("/bin/bash", this.#searchPath, input.cwd);
-          addExecutable(bash);
-          readable.add(bash);
+        if (depth === MAX_SHEBANG_DEPTH - 1 && shebang(current) !== undefined) {
+          throw sandboxFailure(`Executable shebang chain exceeds ${MAX_SHEBANG_DEPTH} entries.`);
         }
       }
-      if (depth === MAX_SHEBANG_DEPTH - 1 && shebang(current) !== undefined) {
-        throw sandboxFailure(`Executable shebang chain exceeds ${MAX_SHEBANG_DEPTH} entries.`);
-      }
-    }
+    };
+
+    addExecutable(executable, basename(input.command));
+    addShebangClosure(executable);
 
     const packageRoot = nearestPackageRoot(executable);
     if (packageRoot !== undefined && packageRoot.split(sep).includes("node_modules")) {
@@ -878,24 +1042,34 @@ class NativeSandboxBackend implements SandboxBackend {
       }
       const path = exactExecutable(command, this.#searchPath, input.cwd);
       addExecutable(path, basename(command));
+      addShebangClosure(path);
       // On macOS, the kernel launches /bin/bash as the implementation variant
       // for a script whose declared interpreter is /bin/sh. Seatbelt checks
       // that variant separately, so qualify the one exact OS-owned executable
       // instead of widening process-exec to a directory or arbitrary process.
-      if (this.runtime.os === "darwin" && path === "/bin/sh") {
-        const bash = exactExecutable("/bin/bash", this.#searchPath, input.cwd);
-        addExecutable(bash);
-        readable.add(bash);
-      }
+      addMacShellVariant(path);
       const root = nearestPackageRoot(path);
       readable.add(root?.split(sep).includes("node_modules") === true ? root : path);
     }
 
     const orderedIdentities = [...identities.values()].sort((a, b) => a.path.localeCompare(b.path));
     if (this.runtime.os === "linux") {
-      for (const path of await linuxRuntimeClosure(orderedIdentities)) readable.add(path);
+      for (const identity of orderedIdentities) {
+        const alreadyCovered = [...readable].some((path) => {
+          try {
+            return statSync(path).isDirectory() && within(path, identity.path);
+          } catch {
+            return false;
+          }
+        });
+        if (!alreadyCovered) readable.add(identity.path);
+      }
+      for (const path of inspectElfRuntimePaths(orderedIdentities.map((identity) => identity.path))) {
+        readable.add(path);
+      }
     }
-    const digest = createHash("sha256")
+    const launcher = this.#launcherIdentity();
+    const runtimeDigest = createHash("sha256")
       .update(
         JSON.stringify({
           mechanism: this.mechanism,
@@ -915,7 +1089,8 @@ class NativeSandboxBackend implements SandboxBackend {
         executable: executableIdentity(executable),
         executableIdentities: orderedIdentities,
         sanitizedPath: LOGICAL_SANITIZED_PATH,
-        digest,
+        runtimeDigest,
+        launcher,
       },
     };
   }
@@ -1029,6 +1204,24 @@ class NativeSandboxBackend implements SandboxBackend {
       ],
     };
 
+    const launcher = closure.qualification.launcher;
+    if (launcher === undefined) throw sandboxFailure("Sandbox launcher identity is missing.");
+    const policyDigest = createHash("sha256").update(JSON.stringify({
+      mechanism: this.mechanism,
+      runtime: this.runtime,
+      runtimeDigest: closure.qualification.runtimeDigest,
+      launcher,
+      layout,
+      protectedPaths: normalized.protectedPaths,
+      preparedDependencyPaths: normalized.preparedDependencyPaths,
+      allowNetwork: normalized.allowNetwork,
+      limits: { timeoutMs: input.timeoutMs, maxOutputBytes },
+    })).digest("hex");
+    const qualification: SandboxQualification = {
+      ...closure.qualification,
+      policyDigest,
+    };
+
     let command: string;
     let args: string[];
     try {
@@ -1036,10 +1229,10 @@ class NativeSandboxBackend implements SandboxBackend {
         profileDir = mkdtempSync(join(tmpdir(), "runmill-sb-"));
         const profile = join(profileDir, "policy.sb");
         writeFileSync(profile, buildSeatbeltProfile(policy, process.env["HOME"] ?? tmpdir()));
-        command = "/usr/bin/sandbox-exec";
+        command = launcher.path;
         args = ["-f", profile, closure.executable, ...input.args];
       } else {
-        command = exactExecutable("bwrap", this.#searchPath, cwd);
+        command = launcher.path;
         args = [
           ...buildBubblewrapArgs(policy, process.env["HOME"] ?? tmpdir()),
           "--ro-bind", shimDir, LOGICAL_SANITIZED_PATH,
@@ -1052,87 +1245,57 @@ class NativeSandboxBackend implements SandboxBackend {
       throw error;
     }
 
-    const started = Date.now();
-    const stdout = new BoundedCapture(maxOutputBytes);
-    const stderr = new BoundedCapture(maxOutputBytes);
-    let observed = 0;
-    let timedOut = false;
-    let aborted = false;
-    let outputLimited = false;
-    let child: ChildProcess;
-    try {
-      child = spawn(command, args, {
-        cwd,
-        env,
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-    } catch (error) {
-      cleanup();
-      throw sandboxFailure(`Sandbox process could not start: ${errorMessage(error)}`);
+    for (const identity of closure.qualification.executableIdentities) {
+      assertExecutableIdentityCurrent(identity, "Sandbox executable");
     }
+    assertExecutableIdentityCurrent(launcher, "Sandbox launcher");
 
-    const observe = (
-      capture: BoundedCapture,
-      callback: ((chunk: Buffer) => void) | undefined,
-      chunk: Buffer,
-    ): void => {
-      observed += chunk.length;
-      capture.push(chunk);
-      if (observed <= maxOutputBytes) callback?.(chunk);
-      if (observed > maxOutputBytes && !outputLimited) {
-        outputLimited = true;
-        terminateTree(child);
-      }
-    };
-    child.stdout?.on("data", (chunk: Buffer) => observe(stdout, input.onStdout, chunk));
-    child.stderr?.on("data", (chunk: Buffer) => observe(stderr, input.onStderr, chunk));
-    const cancelTimer = armKillTimer(child, input.timeoutMs, () => {
-      timedOut = true;
+    const started = Date.now();
+    const controller = new AbortController();
+    const controlled = runControlledProcess({
+      command,
+      args,
+      cwd,
+      env,
+      timeoutMs: input.timeoutMs,
+      maxOutputBytes,
+      signal: controller.signal,
+      ...(input.onStdout === undefined ? {} : { onStdout: input.onStdout }),
+      ...(input.onStderr === undefined ? {} : { onStderr: input.onStderr }),
     });
-
-    const result = new Promise<SandboxResult>((resolveResult) => {
-      let spawnError: Error | undefined;
-      child.on("error", (error) => {
-        spawnError = error;
-      });
-      child.on("close", (code, signal) => {
-        cancelTimer();
-        const outcome: SandboxResult["outcome"] = aborted
-          ? "aborted"
-          : timedOut
-            ? "timeout"
-            : outputLimited || spawnError !== undefined
-              ? "sandbox-denied"
-              : signal !== null
-                ? "signaled"
-                : "exited";
-        const value: SandboxResult = {
-          outcome,
-          exitCode: code,
-          signal: aborted ? "ABORT" : signal,
-          stdout: stdout.text(),
-          stderr: [stderr.text(), spawnError?.message, outputLimited ? "sandbox output limit exceeded" : undefined]
-            .filter((part): part is string => part !== undefined && part !== "")
-            .join("\n"),
-          durationMs: Date.now() - started,
-        };
-        cleanup();
-        resolveResult(value);
-      });
+    const result = controlled.then((completed): SandboxResult => {
+      const outcome: SandboxResult["outcome"] =
+        completed.outcome === "output-limit" || completed.outcome === "spawn-error"
+          ? "sandbox-denied"
+          : completed.outcome;
+      const value: SandboxResult = {
+        outcome,
+        exitCode: completed.exitCode,
+        signal: completed.signal,
+        stdout: completed.stdout,
+        stderr: [
+          completed.stderr,
+          completed.outcome === "output-limit" ? "sandbox output limit exceeded" : undefined,
+        ].filter((part): part is string => part !== undefined && part !== "").join("\n"),
+        durationMs: Date.now() - started,
+      };
+      cleanup();
+      return value;
+    }, (error: unknown) => {
+      cleanup();
+      throw error;
     });
     let abortPromise: Promise<void> | undefined;
     const abort = (): Promise<void> => {
       if (abortPromise !== undefined) return abortPromise;
-      aborted = true;
-      terminateTree(child);
+      controller.abort();
       abortPromise = result.then(() => undefined);
       return abortPromise;
     };
 
     return {
       layout,
-      qualification: closure.qualification,
+      qualification,
       result,
       abort,
     };

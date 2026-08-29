@@ -15,6 +15,7 @@ import {
   readFileSync,
   mkdirSync,
   existsSync,
+  realpathSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -480,6 +481,24 @@ echo '{"type":"task_complete"}'
 });
 
 describe("detect against a real binary", () => {
+  it.runIf(hasSandbox)("never executes a provider PATH shim outside the selected backend", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-detect-marker-"));
+    const marker = join(dir, "host-marker");
+    const bin = join(dir, "fakeprovider");
+    writeFileSync(
+      bin,
+      `#!/bin/sh\nprintf unsandboxed > ${JSON.stringify(marker)} || exit 91\necho fake-provider\n`,
+      { mode: 0o755 },
+    );
+    try {
+      await expect(providerAdapter({ dialect: { ...CODEX_DIALECT, binary: bin } }).detect())
+        .resolves.toEqual({ installed: false });
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("does not expose orchestrator credentials to provider startup probes", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-fakebin-"));
     const bin = join(dir, "fakeprovider");
@@ -509,8 +528,12 @@ echo 'safe-provider 1.0.0'
       expect(await adapter.detect()).toEqual({
         installed: true,
         version: "safe-provider 1.0.0",
+        path: realpathSync(bin),
       });
-      expect(await adapter.authStatus()).toEqual({ authenticated: true });
+      expect(await adapter.authStatus()).toEqual({
+        authenticated: true,
+        detail: "authenticated inside sandbox",
+      });
     } finally {
       for (const key of keys) {
         const value = prior.get(key);
@@ -755,7 +778,7 @@ echo '{"type":"task_complete"}'
         );
         const result = await session.result;
 
-        expect(result.status).toBe("success");
+        expect(result.status, JSON.stringify(result)).toBe("success");
         expect(readFileSync(candidate, "utf8")).toBe("export const safe = true;\n");
         expect(result.outputRef).toBe(
           join(workspace, ".runmill", "run", "local-reviewer-output.json"),
@@ -815,6 +838,68 @@ describe("start — streaming from a real process", () => {
       ...overrides,
     };
   }
+
+  it.runIf(hasSandbox)(
+    "runs bounded rg and npm tool children while denying an ambient sibling",
+    async () => {
+      const { dir, bin } = fakeProvider(`#!/bin/sh
+rg --version >/dev/null || exit 21
+npm --version >/dev/null || exit 22
+if ambient-provider-sibling; then exit 23; fi
+echo '{"type":"task_started"}'
+echo '{"type":"task_complete"}'
+`);
+      const marker = join(dir, "ambient-marker");
+      writeFileSync(
+        join(dir, "ambient-provider-sibling"),
+        `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\n`,
+        { mode: 0o755 },
+      );
+      try {
+        const result = await (
+          await providerAdapter({ dialect: dialectFor(bin) }).start(
+            request({ workingDirectory: dir, allowedCommands: ["rg --version", "npm --version"] }),
+          )
+        ).result;
+        expect(result.status, JSON.stringify(result)).toBe("success");
+        expect(existsSync(marker)).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  it.runIf(hasSandbox)(
+    "runs an npm project check only through the declared immutable dependency tree",
+    async () => {
+      const { dir, bin } = fakeProvider(`#!/bin/sh
+npm test || exit 31
+echo '{"type":"task_started"}'
+echo '{"type":"task_complete"}'
+`);
+      const modules = join(dir, "node_modules");
+      const tool = join(modules, ".bin", "project-check");
+      mkdirSync(join(modules, ".bin"), { recursive: true });
+      writeFileSync(tool, "#!/bin/sh\necho '1 passed'\n", { mode: 0o555 });
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { test: "project-check" } }));
+      try {
+        const result = await (
+          await providerAdapter({ dialect: dialectFor(bin) }).start(
+            request({
+              workingDirectory: dir,
+              allowedCommands: ["npm test"],
+              ...({ preparedDependencyPaths: [modules] } as Partial<AgentRunRequest>),
+            }),
+          )
+        ).result;
+        expect(result.status, JSON.stringify(result)).toBe("success");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
 
   it.runIf(hasSandbox)(
     "lets tool children write disposable provider state without changing the real config",

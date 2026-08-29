@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { run } from "../platform/process.js";
@@ -923,13 +923,16 @@ export async function checkSandbox(backend: SandboxBackend): Promise<CheckResult
 
   // -- is a mechanism there at all ---------------------------------------
   if (os === "darwin") {
-    if (!existsSync("/usr/bin/sandbox-exec")) {
+    let qualification;
+    try {
+      qualification = await backend.qualify({ command: "/usr/bin/true" });
+    } catch {
       return [
         {
           id: "sandbox:mechanism",
           status: "fail",
           code: "RM-SANDBOX-001",
-          observed: "sandbox-exec not found",
+          observed: "configured Seatbelt launcher could not be qualified",
           expected: "Seatbelt (sandbox-exec) available",
           remediation: "runmill requires sandbox-exec on macOS",
         },
@@ -938,18 +941,22 @@ export async function checkSandbox(backend: SandboxBackend): Promise<CheckResult
     results.push({
       id: "sandbox:mechanism",
       status: "pass",
-      observed: "sandbox-exec (Seatbelt)",
+      observed:
+        `sandbox-exec (Seatbelt) ${qualification.launcher?.path ?? "identity missing"} ` +
+        `${qualification.launcher?.sha256 ?? "digest missing"}`,
       expected: "Seatbelt available",
     });
   } else if (os === "linux") {
-    const bwrap = await tryRun("bwrap", ["--version"]);
-    if (!bwrap.ok) {
+    let qualification;
+    try {
+      qualification = await backend.qualify({ command: "/usr/bin/true" });
+    } catch {
       return [
         {
           id: "sandbox:mechanism",
           status: "fail",
           code: "RM-SANDBOX-001",
-          observed: "bwrap not found",
+          observed: "trusted bwrap launcher could not be qualified",
           expected: "bubblewrap installed",
           remediation: "Install bubblewrap (apt install bubblewrap)",
         },
@@ -958,28 +965,47 @@ export async function checkSandbox(backend: SandboxBackend): Promise<CheckResult
     results.push({
       id: "sandbox:mechanism",
       status: "pass",
-      observed: bwrap.out,
+      observed:
+        `bubblewrap ${qualification.launcher?.path ?? "identity missing"} ` +
+        `${qualification.launcher?.sha256 ?? "digest missing"}`,
       expected: "bubblewrap available",
     });
 
-    const userns = await tryRun("bwrap", ["--dev-bind", "/", "/", "true"]);
+    const probe = mkdtempSync(join(tmpdir(), "runmill-bwrap-userns-"));
+    let usernsOk = false;
+    let usernsObserved = "configured bubblewrap user namespace probe failed";
+    try {
+      const userns = await backend.run({
+        command: "/usr/bin/true",
+        args: [],
+        cwd: probe,
+        policy: { writablePaths: [probe], allowNetwork: false },
+        timeoutMs: 10_000,
+      });
+      usernsOk = userns.outcome === "exited" && userns.exitCode === 0;
+      usernsObserved = usernsOk
+        ? "user namespaces usable"
+        : userns.stderr.split("\n")[0] ?? "unavailable";
+    } finally {
+      rmSync(probe, { recursive: true, force: true });
+    }
     results.push({
       id: "sandbox:userns",
-      status: userns.ok ? "pass" : "fail",
-      code: userns.ok ? undefined : "RM-SANDBOX-001",
-      observed: userns.ok ? "user namespaces usable" : userns.out.split("\n")[0] ?? "unavailable",
+      status: usernsOk ? "pass" : "fail",
+      code: usernsOk ? undefined : "RM-SANDBOX-001",
+      observed: usernsObserved,
       expected: "unprivileged user namespaces enabled",
       // Ubuntu 23.10 and later restrict unprivileged user namespaces through
       // AppArmor rather than the old Debian sysctl, and on those hosts
       // `kernel.unprivileged_userns_clone` does not exist at all — so the
       // remediation runmill used to print failed with "cannot stat" and left
       // the operator no better off. Name both knobs, newest first.
-      remediation: userns.ok
+      remediation: usernsOk
         ? undefined
         : "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 " +
           "(Ubuntu 23.10+), or sudo sysctl -w kernel.unprivileged_userns_clone=1 (older Debian)",
     });
-    if (!userns.ok) return results;
+    if (!usernsOk) return results;
   } else {
     return [
       {

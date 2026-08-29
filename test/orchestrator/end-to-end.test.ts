@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createServer } from "node:net";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
 import { StateStore } from "../../src/state/store.js";
@@ -519,6 +519,17 @@ describe("end-to-end: issue to governed pull request", () => {
     expect(packet.constraints.forbidden_paths).toContain(".github/**");
   }, 60_000);
 
+  it("passes every role a bounded coding-tool inventory including verification executables", async () => {
+    const provider = defaultProvider();
+    const { orchestrator } = makeOrchestrator({ provider });
+    await orchestrator.run({ runId: "run_tools", issue: ISSUE, target: TARGET, lease: lease("run_tools") });
+
+    expect(provider.startedRequests.length).toBeGreaterThan(0);
+    for (const started of provider.startedRequests) {
+      expect(started.allowedCommands).toEqual(expect.arrayContaining(["git", "rg", "node", "npm", "npx", "/bin/cp"]));
+    }
+  }, 60_000);
+
   it("records a delivered issue once in the markdown activity log", async () => {
     const { orchestrator } = makeOrchestrator({});
     await orchestrator.run({ runId: "run_log", issue: ISSUE, target: TARGET, lease: lease("run_log") });
@@ -540,6 +551,40 @@ describe("end-to-end: issue to governed pull request", () => {
 });
 
 describe("end-to-end: the loop refuses to proceed when it should", () => {
+  it.each(["ancestor", "target"] as const)(
+    "refuses a planted runtime-input %s symlink before any provider call",
+    async (kind) => {
+      const outside = join(root, `runtime-input-outside-${kind}`);
+      writeFileSync(outside, "trusted");
+      class PlantedWorkspaceManager extends WorkspaceManager {
+        override async create(input: Parameters<WorkspaceManager["create"]>[0]) {
+          const created = await super.create(input);
+          if (kind === "ancestor") {
+            symlinkSync(dirname(outside), join(created.path, ".runmill"));
+          } else {
+            const runDir = join(created.path, ".runmill", "run");
+            mkdirSync(runDir, { recursive: true });
+            symlinkSync(outside, join(runDir, "task.json"));
+          }
+          return created;
+        }
+      }
+      const provider = defaultProvider();
+      const { orchestrator } = makeOrchestrator({ provider, workspaces: new PlantedWorkspaceManager() });
+      const outcome = await orchestrator.run({
+        runId: `run_runtime_symlink_${kind}`,
+        issue: ISSUE,
+        target: TARGET,
+        lease: lease(`run_runtime_symlink_${kind}`),
+      });
+
+      expect(outcome.finalState).toBe("QUARANTINED");
+      expect(provider.startedRequests).toEqual([]);
+      expect(readFileSync(outside, "utf8")).toBe("trusted");
+    },
+    60_000,
+  );
+
   it("quarantines an always-forbidden diff before checkpointing or calling the forge", async () => {
     const provider = new FakeProviderAdapter({
       byRole: {

@@ -55,12 +55,17 @@ of a working one.
 
 There is no ambient executable-directory grant. Before starting a child, the backend resolves the
 first executable on the configured host PATH, records its canonical identity and SHA-256, follows a
-bounded shebang chain, and qualifies explicitly supported subprocesses. Installed Node provider
+bounded shebang chain, and qualifies explicitly supported subprocesses. The operator-owned coding
+tool inventory is deliberately small (`git`, `rg`, `node`, `npm`, and `npx`) and is extended only by
+the exact installed or absolute executables named by configured verification checks. Installed Node provider
 CLIs receive their exact package tree and declared platform package, not the containing global
 `node_modules` tree or sibling packages. Seatbelt permits `process-exec` only for this qualified
 closure. Linux constructs an empty bubblewrap root and binds the same exact executable, dynamic
 library, runtime-file, provider-package, workspace, and prepared-dependency closure with mandatory
-`--ro-bind`; a required path disappearing between qualification and launch refuses the run.
+`--ro-bind`; its launcher is an exact approved system path, never an ambient `PATH` result. Linux
+ELF dependencies are discovered by parsing executable bytes rather than running the target or
+`ldd` with host authority. A required path disappearing or changing identity between qualification
+and launch refuses the run.
 
 Writable paths are granted per policy. Then credential paths are denied **last**, so the denial
 wins over any broader grant:
@@ -123,6 +128,12 @@ containing symlinks to the qualified executable closure (the fixed guest path
 that was qualified. A configured TLS trust root is canonicalized and rejected if it is root, the
 operator home, a workspace ancestor, or another over-broad grant.
 
+Qualification records two separate hashes: a runtime digest over the canonical executable and
+launcher identities, and an effective-policy digest over that runtime plus the host/guest layout,
+mount access and purpose, protected and prepared paths, network mode, and limits. Executable and
+launcher identities are checked again immediately before each spawn. `doctor` reports the same
+launcher identity used by production execution.
+
 The TLS and proxy entries let a provider reach its API on managed hosts. Proxy URLs containing
 userinfo, such as `http://user:password@proxy`, are stripped because every provider tool would
 otherwise inherit the proxy credential. Use a credential-free proxy address until the host-side
@@ -153,6 +164,9 @@ files, and a nested link that escapes the provider config tree is rejected. The 
 `~/.codex` or `~/.claude` directory is never mounted. The provider and its tool children may write
 the temporary copy, but Runmill deletes it after an exit, spawn error, cancellation, or timeout.
 Changes and refreshed session state are not copied back to the operator's home.
+
+Provider discovery and authentication probes use this same sandbox; Runmill never executes an
+ambient provider binary merely to ask for its version or authentication status.
 
 This prevents persistent provider-config tampering, but sandbox-proven subscription authentication
 is still **not credential-isolated**. Seatbelt and bubblewrap cannot make the copied credential
@@ -191,12 +205,16 @@ declared report file writable. A test suite is arbitrary code from the same repo
 just modified; sandboxing the agent while
 running its tests unconfined would leave the boundary open at exactly the moment the agent's
 output gets executed. Prepared npm dependencies are content-keyed to the exact lockfile and
-hard-linked into the checkout before a check starts; their nested read-only overlay prevents the
-test process from unlinking, replacing, or patching its own toolchain.
+hard-linked into the checkout before a check starts. The exact prepared tree is also materialized
+read-only for provider sessions, allowing declared local npm scripts without granting sibling
+packages or an ambient package root. Its nested read-only overlay prevents the process from
+unlinking, replacing, or patching its own toolchain.
 
 `start()` owns the profile/namespace, process group, bounded streaming, timeout, and cleanup.
 Callers receive a completion promise plus an awaited, idempotent `abort()`; no API returns a wrapped
-command that callers could spawn outside backend lifecycle ownership. The selected backend object
+command that callers could spawn outside backend lifecycle ownership. Completion is reported only
+after the backend has terminated and confirmed quiescence of the process group, including descendants
+left behind after a normal direct-child exit. The selected backend object
 is constructed once at each composition root and shared by provider, reviewer, verification,
 doctor, evaluation, and orchestrator paths.
 

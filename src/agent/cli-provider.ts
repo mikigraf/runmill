@@ -16,7 +16,7 @@ import type { AgentEvent, AgentEventBody } from "./events.js";
 import { UnknownEventError } from "./events.js";
 import type { Clock } from "../platform/clock.js";
 import { SystemClock } from "../platform/clock.js";
-import { buildEnvironment, type SandboxBackend } from "../workspace/sandbox.js";
+import type { SandboxBackend } from "../workspace/sandbox.js";
 import { run } from "../platform/process.js";
 import { outputPathFor, outputContractFor } from "./output-contract.js";
 import { LOCAL_REVIEW_SKILL, PR_REVIEW_SKILL } from "../review/default-skills.js";
@@ -297,25 +297,32 @@ export class CliProviderAdapter implements CodingAgentAdapter {
   }
 
   async detect(): Promise<ProviderInstallation> {
-    const result = await run(this.#dialect.binary, this.#dialect.versionArgs, {
-      // Version probes execute the same third-party binary as a real agent.
-      // Never let a seemingly harmless `--version` inherit orchestrator-side
-      // GitHub, Linear, provider API, or host-process credentials.
-      env: buildEnvironment(),
-    });
-    if (!result.ok) return { installed: false };
-    const version = result.stdout.trim();
-    return { installed: true, version: version.split("\n")[0] ?? version };
+    const workspace = mkdtempSync(join(tmpdir(), "runmill-provider-detect-"));
+    try {
+      const execution = await this.#sandbox.start({
+        command: this.#dialect.binary,
+        args: this.#dialect.versionArgs,
+        cwd: workspace,
+        policy: { writablePaths: [workspace], allowNetwork: false },
+        timeoutMs: 20_000,
+      });
+      const result = await execution.result;
+      if (result.outcome !== "exited" || result.exitCode !== 0) return { installed: false };
+      const version = result.stdout.trim();
+      return {
+        installed: true,
+        version: version.split("\n")[0] ?? version,
+        path: execution.qualification.executable.path,
+      };
+    } catch {
+      return { installed: false };
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
   }
 
   async authStatus(): Promise<AuthStatus> {
-    const result = await run(this.#dialect.binary, this.#dialect.authArgs(), {
-      // Subscription auth is read from the provider's own files. API keys and
-      // every unrelated orchestrator credential remain outside the process.
-      env: buildEnvironment(),
-    });
-    const ok = this.#dialect.isAuthenticated(result.stdout, result.stderr, result.code);
-    return ok ? { authenticated: true } : { authenticated: false, detail: result.stderr.trim() };
+    return this.sandboxAuthStatus();
   }
 
   /** Prove auth in the same sandbox used for a real agent session. */
@@ -561,6 +568,9 @@ export class CliProviderAdapter implements CodingAgentAdapter {
 
     let execution: Awaited<ReturnType<SandboxBackend["start"]>>;
     try {
+      const preparedDependencies = (request.preparedDependencyPaths ?? []).map((path) =>
+        this.#sandbox.prepareDependencyCheckout(path),
+      );
       execution = await this.#sandbox.start({
         command: this.#dialect.binary,
         args,
@@ -581,10 +591,14 @@ export class CliProviderAdapter implements CodingAgentAdapter {
           readablePaths: readOnlyReviewer ? [request.workingDirectory] : [],
           // The tree is writable; the commit graph, index, config and hooks are
           // not. Sandbox construction fails if this mandatory overlay is absent.
-          protectedPaths: [join(request.workingDirectory, ".git")],
+          protectedPaths: [
+            join(request.workingDirectory, ".git"),
+            ...preparedDependencies.map((prepared) => prepared.path),
+          ],
           allowNetwork: request.network !== "none",
         },
         timeoutMs: request.timeoutMs,
+        preparedDependencyPaths: preparedDependencies.map((prepared) => prepared.path),
       });
     } catch (error) {
       try {

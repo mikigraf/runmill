@@ -107,6 +107,31 @@ async function run(
 }
 
 describe("VerificationEngine coverage proof", () => {
+  it.each(["sandbox-denied", "signaled", "aborted"] as const)(
+    "refuses a %s outcome even when the backend reports exit code zero",
+    async (sandboxOutcome) => {
+      const backend = sandboxWithRun(async (): Promise<SandboxResult> => ({
+        outcome: sandboxOutcome,
+        exitCode: 0,
+        signal: sandboxOutcome === "sandbox-denied" ? "OUTPUT_LIMIT" : "TERM",
+        stdout: "1 passed",
+        stderr: sandboxOutcome === "sandbox-denied" ? "sandbox output limit exceeded" : "",
+        durationMs: 1,
+      }));
+
+      const outcome = await new VerificationEngine(backend).run({
+        workspace,
+        workspaces: workspaces(),
+        manifest: [check()],
+        candidateSha: "candidate",
+        failOnSkippedCheck: false,
+      });
+
+      expect(outcome.results[0]).toMatchObject({ outcome: sandboxOutcome, status: "failed" });
+      expect(outcome.mergeReady).toBe(false);
+    },
+  );
+
   it("refuses an empty effective manifest instead of treating zero checks as a pass", async () => {
     let executed = false;
     const neverRun = sandboxWithRun(
@@ -496,6 +521,72 @@ describe("base-to-candidate test identity proof", () => {
     expect(outcome.mergeReady).toBe(true);
     expect(outcome.results[0]?.notes.join(" ")).toMatch(/baseline inventory: 1 passed/i);
   });
+
+  it.runIf(createNativeSandboxBackend("native").mechanism !== "none")(
+    "starts real npm test and npm run typecheck workflows through VerificationEngine",
+    async () => {
+      const manager = {
+        createVerificationCheckout: async (_workspace: Workspace, sha: string) => {
+          const path = join(dir, sha);
+          mkdirSync(join(path, ".git"), { recursive: true });
+          writeFileSync(join(path, "package.json"), JSON.stringify({
+            scripts: {
+              test: "node -e \"console.log('1 passed')\"",
+              typecheck: "node -e \"console.log('typecheck passed')\"",
+            },
+          }));
+          return path;
+        },
+        destroyVerificationCheckout: async () => undefined,
+        treeHash: async () => "same-tree",
+      } as unknown as WorkspaceManager;
+      const outcome = await new VerificationEngine(createNativeSandboxBackend("native")).run({
+        workspace,
+        workspaces: manager,
+        manifest: [
+          { ...check(), id: "test", run: "npm test" },
+          { ...check(), id: "typecheck", run: "npm run typecheck" },
+        ],
+        candidateSha: "candidate",
+        failOnSkippedCheck: false,
+      });
+
+      expect(outcome.results).toEqual([
+        expect.objectContaining({ checkId: "test", outcome: "exited", exitCode: 0, status: "passed" }),
+        expect.objectContaining({ checkId: "typecheck", outcome: "exited", exitCode: 0, status: "passed" }),
+      ]);
+    },
+    30_000,
+  );
+
+  it.runIf(createNativeSandboxBackend("native").mechanism !== "none")(
+    "denies an undeclared npm script tool instead of widening process execution",
+    async () => {
+      const manager = {
+        createVerificationCheckout: async (_workspace: Workspace, sha: string) => {
+          const path = join(dir, sha);
+          mkdirSync(join(path, ".git"), { recursive: true });
+          writeFileSync(join(path, "package.json"), JSON.stringify({
+            scripts: { test: "/usr/bin/whoami && echo '1 passed'" },
+          }));
+          return path;
+        },
+        destroyVerificationCheckout: async () => undefined,
+        treeHash: async () => "same-tree",
+      } as unknown as WorkspaceManager;
+      const outcome = await new VerificationEngine(createNativeSandboxBackend("native")).run({
+        workspace,
+        workspaces: manager,
+        manifest: [{ ...check(), run: "npm test" }],
+        candidateSha: "candidate",
+        failOnSkippedCheck: false,
+      });
+
+      expect(outcome.mergeReady).toBe(false);
+      expect(outcome.results[0]).toMatchObject({ status: "failed" });
+    },
+    30_000,
+  );
 
   it.runIf(createNativeSandboxBackend("native").mechanism !== "none")(
     "denies a malicious source mutate-and-restore attempt instead of trusting only hashes",

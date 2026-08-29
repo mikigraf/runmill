@@ -16,7 +16,7 @@ import { writeSchemaBeside } from "./schema-asset.js";
 import { tryGit } from "../platform/git.js";
 import { parseGitHubRepository as parseGitRemote } from "../workspace/repository-identity.js";
 import { parseConfig, validateConfig } from "./load.js";
-import { createNativeSandboxBackend, type SandboxBackend } from "../workspace/sandbox.js";
+import type { SandboxBackend } from "../workspace/sandbox.js";
 
 export interface DiscoveredSetup {
   readonly repository: string;
@@ -97,8 +97,8 @@ function parseGhRepositoryJson(
 
 export async function discoverSetup(
   root: string,
-  credentials: CredentialReader = new CredentialStore(),
-  sandbox: SandboxBackend = createNativeSandboxBackend("native"),
+  credentials: CredentialReader,
+  sandbox: SandboxBackend,
 ): Promise<DiscoveredSetup> {
   const remote = await tryGit(root, ["remote", "get-url", "origin"]);
   const localRepo = remote.ok
@@ -430,6 +430,7 @@ export async function createConfiguration(inputOptions: {
   writeOutput?: ((message: string) => void) | undefined;
   runInteractive?: InteractiveCommand | undefined;
   discover?: typeof discoverSetup | undefined;
+  sandbox?: SandboxBackend | undefined;
 }): Promise<{ path: string; config: string; discovered: DiscoveredSetup }> {
   if (existsSync(inputOptions.path) && inputOptions.force !== true) {
     throw new Error(
@@ -438,7 +439,11 @@ export async function createConfiguration(inputOptions: {
   }
   const credentials = inputOptions.credentials ?? new CredentialStore();
   const discover = inputOptions.discover ?? discoverSetup;
-  let discovered = await discover(inputOptions.root, credentials);
+  if (inputOptions.sandbox === undefined && inputOptions.discover === undefined) {
+    throw new Error("configuration discovery requires an injected sandbox backend");
+  }
+  const sandbox = inputOptions.sandbox;
+  let discovered = await discover(inputOptions.root, credentials, sandbox as SandboxBackend);
   let answers = defaultAnswers(discovered);
 
   if (inputOptions.defaults !== true) {
@@ -477,7 +482,7 @@ export async function createConfiguration(inputOptions: {
                 (result.error === undefined ? "" : `: ${result.error.message}`),
             );
           }
-          discovered = await discover(inputOptions.root, credentials);
+          discovered = await discover(inputOptions.root, credentials, sandbox as SandboxBackend);
           if (!discovered.githubAuthenticated) {
             throw new Error(
               "gh auth login completed, but no GitHub credential resolved; run `gh auth status` " +
@@ -538,7 +543,7 @@ export async function createConfiguration(inputOptions: {
         answers.implementer,
         discovered,
       );
-      discovered = await discover(inputOptions.root, credentials);
+      discovered = await discover(inputOptions.root, credentials, sandbox as SandboxBackend);
       const implementerModel = (
         await rl.question("Implementer model (blank uses CLI default): ")
       ).trim();
@@ -559,7 +564,7 @@ export async function createConfiguration(inputOptions: {
           reviewer,
           discovered,
         );
-        discovered = await discover(inputOptions.root, credentials);
+        discovered = await discover(inputOptions.root, credentials, sandbox as SandboxBackend);
       }
       const reviewerModel = (
         await rl.question("Reviewer model (blank inherits/defaults): ")

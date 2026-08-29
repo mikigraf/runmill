@@ -19,6 +19,7 @@ import {
   detectMechanism,
   trustStoreReadPaths,
   createNativeSandboxBackend,
+  inspectElfRuntimePaths,
 } from "../../src/workspace/sandbox.js";
 
 let dir: string;
@@ -413,6 +414,60 @@ describe("trustStoreReadPaths", () => {
 });
 
 describe("Sandbox.run", () => {
+  it("inspects ELF metadata without executing a planted target", () => {
+    const marker = join(dir, "elf-executed");
+    const planted = join(dir, "malicious-elf");
+    writeFileSync(planted, `\u007fELF#!/bin/sh\nprintf executed > ${marker}\n`, { mode: 0o755 });
+
+    expect(() => inspectElfRuntimePaths([planted])).toThrow(/RM-SANDBOX-001/);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("does not select a bubblewrap launcher from ambient PATH", async () => {
+    const workspace = join(dir, "bwrap-workspace");
+    const fakeBin = join(dir, "fake-bin");
+    const marker = join(dir, "fake-bwrap-ran");
+    mkdirSync(workspace);
+    mkdirSync(fakeBin);
+    writeFileSync(join(fakeBin, "bwrap"), `#!/bin/sh\nprintf ran > ${marker}\n`, { mode: 0o755 });
+    const backend = createNativeSandboxBackend("native", { platform: "linux", path: fakeBin });
+
+    await expect(backend.run({
+      command: join(fakeBin, "bwrap"),
+      args: [],
+      cwd: workspace,
+      policy: { writablePaths: [workspace], allowNetwork: false },
+      timeoutMs: 1_000,
+    })).rejects.toThrow(/trusted bubblewrap|bwrap|RM-SANDBOX-001/i);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it.runIf(onMac)("binds qualification evidence to the effective policy and launcher", async () => {
+    const workspace = join(dir, "policy-digest-workspace");
+    mkdirSync(workspace);
+    const backend = createNativeSandboxBackend("native");
+    const first = await backend.start({
+      command: "/usr/bin/true",
+      args: [],
+      cwd: workspace,
+      policy: { writablePaths: [workspace], allowNetwork: false },
+      timeoutMs: 1_000,
+    });
+    const second = await backend.start({
+      command: "/usr/bin/true",
+      args: [],
+      cwd: workspace,
+      policy: { writablePaths: [workspace], allowNetwork: true },
+      timeoutMs: 1_000,
+    });
+    await Promise.all([first.result, second.result]);
+
+    expect(first.qualification.runtimeDigest).toBe(second.qualification.runtimeDigest);
+    expect(first.qualification.policyDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect(first.qualification.policyDigest).not.toBe(second.qualification.policyDigest);
+    expect(first.qualification.launcher?.path).toBe("/usr/bin/sandbox-exec");
+  });
+
   it("resolves one exact PATH executable and sanitizes PATH to closure shims", async () => {
     const firstBin = join(dir, "first-bin");
     const secondBin = join(dir, "second-bin");
@@ -498,6 +553,47 @@ describe("Sandbox.run", () => {
         timeoutMs: 1_000,
       }),
     ).rejects.toThrow(/overlap|RM-SANDBOX-001/i);
+  });
+
+  it("refuses root, home, non-directory, and overlapping prepared or protected paths", async () => {
+    const workspace = join(dir, "prepared-workspace");
+    const dependency = join(dir, "prepared-dependency");
+    const file = join(dir, "not-a-directory");
+    mkdirSync(workspace);
+    mkdirSync(dependency);
+    writeFileSync(file, "x");
+    const backend = createNativeSandboxBackend("native", {
+      platform: platform(),
+      path: "/bin:/usr/bin",
+    });
+
+    expect(() => backend.prepareDependencyCheckout("/")).toThrow(/over-broad|root|RM-SANDBOX-001/i);
+    const operatorHome = process.env["HOME"];
+    if (operatorHome !== undefined) {
+      expect(() => backend.prepareDependencyCheckout(operatorHome)).toThrow(/home|RM-SANDBOX-001/i);
+    }
+    expect(() => backend.prepareDependencyCheckout(file)).toThrow(/directory|RM-SANDBOX-001/i);
+
+    await expect(backend.run({
+      command: "/usr/bin/true",
+      args: [],
+      cwd: workspace,
+      policy: { writablePaths: [workspace], protectedPaths: ["/"], allowNetwork: false },
+      timeoutMs: 1_000,
+    })).rejects.toThrow(/over-broad|root|RM-SANDBOX-001/i);
+
+    await expect(backend.run({
+      command: "/usr/bin/true",
+      args: [],
+      cwd: workspace,
+      preparedDependencyPaths: [dependency],
+      policy: {
+        writablePaths: [workspace],
+        protectedPaths: [dependency, join(dependency, "nested")],
+        allowNetwork: false,
+      },
+      timeoutMs: 1_000,
+    })).rejects.toThrow(/overlap|exist|RM-SANDBOX-001/i);
   });
 
   it("refuses an over-broad configured trust root", async () => {
@@ -825,6 +921,30 @@ describe("Sandbox.run", () => {
     expect(result.stdout.trim()).toBe("hello");
     rmSync(dir, { recursive: true, force: true });
   });
+
+  it.runIf(hasSandbox)(
+    "does not resolve or clean runtime state while a normal-exit background descendant survives",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-descendant-"));
+      const pidFile = join(dir, "descendant.pid");
+      try {
+        const result = await createNativeSandboxBackend("native").run({
+          command: "/bin/sh",
+          args: ["-c", `sleep 30 </dev/null >/dev/null 2>&1 & echo $! > ${JSON.stringify(pidFile)}`],
+          subprocesses: ["/bin/sleep"],
+          cwd: dir,
+          policy: { writablePaths: [dir], allowNetwork: false },
+          timeoutMs: 10_000,
+        });
+        expect(result).toMatchObject({ outcome: "exited", exitCode: 0 });
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        expect(() => process.kill(pid, 0)).toThrow();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
 
   it.runIf(hasSandbox)("permits writes inside the workspace", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));

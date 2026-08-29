@@ -1771,6 +1771,7 @@ export function buildProgram(): Command {
           path,
           force: cmdOpts.force,
           defaults: cmdOpts.defaults,
+          sandbox: createNativeSandboxBackend("native"),
         });
         emit(
           opts,

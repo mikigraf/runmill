@@ -14,6 +14,7 @@ import {
   readFileSync,
   readdirSync,
   writeFileSync,
+  existsSync,
 } from "node:fs";
 import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
@@ -847,6 +848,30 @@ describe("checkCiEnvironment", () => {
 });
 
 describe("checkSandbox", () => {
+  it("does not execute an ambient PATH bwrap while checking the configured backend", async () => {
+    const fakeBin = join(dir, "fake-bwrap-bin");
+    const marker = join(dir, "ambient-bwrap-ran");
+    mkdirSync(fakeBin);
+    writeFileSync(
+      join(fakeBin, "bwrap"),
+      `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\necho fake-bwrap\n`,
+      { mode: 0o755 },
+    );
+    const previousPath = process.env["PATH"];
+    process.env["PATH"] = fakeBin;
+    try {
+      const results = await checkSandbox(createNativeSandboxBackend("native", {
+        platform: "linux",
+        path: fakeBin,
+      }));
+      expect(results[0]).toMatchObject({ id: "sandbox:mechanism", status: "fail" });
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      if (previousPath === undefined) delete process.env["PATH"];
+      else process.env["PATH"] = previousPath;
+    }
+  });
+
   it("reports a mechanism appropriate to this platform", async () => {
     const results = await checkSandbox(nativeSandbox());
     const mechanism = results.find((r) => r.id === "sandbox:mechanism");

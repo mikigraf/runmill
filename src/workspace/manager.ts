@@ -8,8 +8,12 @@ import {
   rmSync,
   existsSync,
   writeFileSync,
+  openSync,
+  closeSync,
+  realpathSync,
+  constants,
 } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import {
   createCandidateCommit,
@@ -62,6 +66,55 @@ export interface CreateWorkspaceInput {
   readonly dependencySourceRepo?: string | undefined;
   readonly root: string;
   readonly isolation?: GitIsolation | undefined;
+}
+
+function runtimeInputDirectory(workspacePath: string): string {
+  const workspace = resolve(workspacePath);
+  const rootInfo = lstatSync(workspace);
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+    throw new Error(`workspace runtime input root is not a proven canonical directory: ${workspace}`);
+  }
+  const canonicalWorkspace = realpathSync(workspace);
+  let current = workspace;
+  for (const component of [".runmill", "run"]) {
+    current = join(current, component);
+    if (!existsSync(current)) mkdirSync(current, { mode: 0o700 });
+    const info = lstatSync(current);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error(`workspace runtime input ancestor is not a regular directory: ${current}`);
+    }
+    const canonical = realpathSync(current);
+    const rel = relative(canonicalWorkspace, canonical);
+    if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+      throw new Error(`workspace runtime input ancestor escapes the workspace: ${current}`);
+    }
+  }
+  return current;
+}
+
+function createRuntimeInput(workspacePath: string, name: string, content: string): string {
+  const path = join(runtimeInputDirectory(workspacePath), name);
+  let descriptor: number;
+  try {
+    descriptor = openSync(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+  } catch (error) {
+    throw new Error(`workspace runtime input target already exists or is unsafe: ${path}`, {
+      cause: error,
+    });
+  }
+  try {
+    writeFileSync(descriptor, content);
+  } catch (error) {
+    closeSync(descriptor);
+    rmSync(path, { force: true });
+    throw error;
+  }
+  closeSync(descriptor);
+  return path;
 }
 
 export interface TrustedBase {
@@ -334,7 +387,18 @@ export class WorkspaceManager {
           installedSource: dependencySource.installedSource,
           cacheRoot: dependencySource.cacheRoot,
         });
-        if (prepared !== undefined) this.#preparedDependencies.set(path, prepared);
+        if (prepared !== undefined) {
+          const ignored = await tryGit(path, ["check-ignore", "--quiet", "--", "node_modules/"]);
+          if (!ignored.ok) {
+            throw RunmillError.fromCatalog("RM-VERIFY-005", {
+              whatHappened:
+                "node_modules is not ignored in the run workspace; refusing to add " +
+                "orchestrator-prepared dependencies for provider tools",
+            });
+          }
+          materializeDependencies(prepared, path);
+          this.#preparedDependencies.set(path, prepared);
+        }
       }
     } catch (error) {
       this.#trustedGit.delete(path);
@@ -342,6 +406,7 @@ export class WorkspaceManager {
       this.#commitProvenance.delete(path);
       this.#dependencySources.delete(path);
       this.#preparedDependencies.delete(path);
+      releaseMaterializedDependencies(path);
       rmSync(path, { recursive: true, force: true });
       throw error;
     }
@@ -628,6 +693,13 @@ export class WorkspaceManager {
       : undefined;
   }
 
+  /** Immutable prepared dependency tree available to sandboxed coding tools. */
+  agentDependencyPath(workspacePath: string): string | undefined {
+    return this.#preparedDependencies.has(workspacePath)
+      ? join(workspacePath, "node_modules")
+      : undefined;
+  }
+
   /**
    * Write the task packet into the workspace.
    *
@@ -635,19 +707,17 @@ export class WorkspaceManager {
    * an input to the agent, never something it may edit to widen its authority.
    */
   writeTaskPacket(workspace: Workspace, packet: unknown): string {
-    const dir = join(workspace.path, ".runmill", "run");
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, "task.json");
-    writeFileSync(path, `${JSON.stringify(packet, null, 2)}\n`);
+    const path = createRuntimeInput(
+      workspace.path,
+      "task.json",
+      `${JSON.stringify(packet, null, 2)}\n`,
+    );
     this.#recordRunInput(workspace, path);
     return path;
   }
 
   writeIssueDocument(workspace: Workspace, content: string): string {
-    const dir = join(workspace.path, ".runmill", "run");
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, "issue.md");
-    writeFileSync(path, content);
+    const path = createRuntimeInput(workspace.path, "issue.md", content);
     this.#recordRunInput(workspace, path);
     return path;
   }
@@ -665,6 +735,7 @@ export class WorkspaceManager {
     this.#commitProvenance.delete(workspace.path);
     this.#dependencySources.delete(workspace.path);
     this.#preparedDependencies.delete(workspace.path);
+    releaseMaterializedDependencies(workspace.path);
     if (workspace.isolation === "separate-git-dir" && sourceRepo !== undefined) {
       const removed = await tryGit(sourceRepo, ["worktree", "remove", "--force", workspace.path]);
       if (removed.ok) return;

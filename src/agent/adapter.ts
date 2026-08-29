@@ -39,6 +39,8 @@ export interface AgentRunRequest {
   readonly allowedPaths: readonly string[];
   readonly forbiddenPaths: readonly string[];
   readonly allowedCommands: readonly string[];
+  /** Immutable dependency trees prepared by the orchestrator for project tools. */
+  readonly preparedDependencyPaths?: readonly string[] | undefined;
   readonly network: "proxy" | "none";
   readonly maxTurns: number;
   readonly timeoutMs: number;

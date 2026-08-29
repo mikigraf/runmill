@@ -321,6 +321,37 @@ export interface ControlledProcessInput {
   readonly timeoutMs: number;
   readonly maxOutputBytes: number;
   readonly signal: AbortSignal;
+  readonly onStdout?: ((chunk: Buffer) => void) | undefined;
+  readonly onStderr?: ((chunk: Buffer) => void) | undefined;
+}
+
+function processGroupExists(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function waitForProcessGroupExit(pid: number, maximumMs: number): Promise<boolean> {
+  const deadline = Date.now() + maximumMs;
+  while (processGroupExists(pid) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  }
+  return !processGroupExists(pid);
+}
+
+/** Terminate and prove the detached process group is gone before cleanup may begin. */
+async function terminateAndConfirmTree(child: ChildProcess): Promise<void> {
+  const pid = child.pid;
+  if (pid === undefined) return;
+  killTree(child, "SIGTERM");
+  if (await waitForProcessGroupExit(pid, KILL_GRACE_MS)) return;
+  killTree(child, "SIGKILL");
+  if (!(await waitForProcessGroupExit(pid, KILL_GRACE_MS))) {
+    throw new Error(`process group ${String(pid)} did not quiesce after SIGKILL`);
+  }
 }
 
 export interface ControlledProcessResult {
@@ -375,6 +406,12 @@ export function runControlledProcess(
     let outputLimited = false;
     let observedBytes = 0;
     let spawnError: Error | undefined;
+    let quiescence: Promise<void> | undefined;
+
+    const ensureQuiescence = (): Promise<void> => {
+      quiescence ??= terminateAndConfirmTree(child);
+      return quiescence;
+    };
 
     const finish = (result: ControlledProcessResult): void => {
       if (settled) return;
@@ -385,7 +422,7 @@ export function runControlledProcess(
 
     const onAbort = (): void => {
       aborted = true;
-      if (child !== undefined) terminateTree(child);
+      if (child !== undefined) void ensureQuiescence();
     };
 
     if (aborted) {
@@ -423,58 +460,89 @@ export function runControlledProcess(
     // EventTarget does not replay an abort that raced addEventListener().
     if (input.signal.aborted) onAbort();
 
-    const observe = (capture: BoundedCapture, chunk: Buffer): void => {
+    const observe = (
+      capture: BoundedCapture,
+      callback: ((chunk: Buffer) => void) | undefined,
+      chunk: Buffer,
+    ): void => {
       observedBytes += chunk.length;
       capture.push(chunk);
+      if (observedBytes <= input.maxOutputBytes) callback?.(chunk);
       if (observedBytes > input.maxOutputBytes && !outputLimited) {
         outputLimited = true;
-        terminateTree(child);
+        void ensureQuiescence();
       }
     };
 
-    child.stdout?.on("data", (chunk: Buffer) => observe(stdout, chunk));
-    child.stderr?.on("data", (chunk: Buffer) => observe(stderr, chunk));
+    child.stdout?.on("data", (chunk: Buffer) => {
+      observe(stdout, input.onStdout, chunk);
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      observe(stderr, input.onStderr, chunk);
+    });
     child.on("error", (error) => {
       spawnError = error;
     });
 
     const cancelTimer = armKillTimer(child, input.timeoutMs, () => {
       timedOut = true;
+      void ensureQuiescence();
+    });
+
+    // `close` can be delayed forever by a background descendant inheriting a
+    // pipe, or arrive while a descendant with redirected stdio is still live.
+    // A direct-child exit therefore always initiates group quiescence.
+    child.on("exit", () => {
+      void ensureQuiescence();
     });
 
     child.on("close", (code, signal) => {
       cancelTimer();
-      const outcome: ControlledProcessOutcome = aborted
-        ? "aborted"
-        : timedOut
-          ? "timeout"
-          : outputLimited
-            ? "output-limit"
-            : spawnError !== undefined
-              ? "spawn-error"
-              : signal !== null
-                ? "signaled"
-                : "exited";
-      const rawErrors = [stderr.text(), ...(spawnError === undefined ? [] : [spawnError.message])]
-        .filter((part) => part !== "")
-        .join("\n");
-      const stdoutBudget = Math.floor(input.maxOutputBytes / 2);
-      const safeStdout = utf8Suffix(stdout.text(), stdoutBudget);
-      const stderrBudget = input.maxOutputBytes - Buffer.byteLength(safeStdout, "utf8");
-      const safeStderr = utf8Suffix(rawErrors, stderrBudget);
-      finish({
-        outcome,
-        exitCode: code,
-        signal:
-          outcome === "aborted"
-            ? "ABORT"
-            : outcome === "output-limit"
-              ? "OUTPUT_LIMIT"
-              : signal,
-        stdout: safeStdout,
-        stderr: safeStderr,
-        outputBytesObserved: observedBytes,
-      });
+      void ensureQuiescence().then(
+        () => {
+          const outcome: ControlledProcessOutcome = aborted
+            ? "aborted"
+            : timedOut
+              ? "timeout"
+              : outputLimited
+                ? "output-limit"
+                : spawnError !== undefined
+                  ? "spawn-error"
+                  : signal !== null
+                    ? "signaled"
+                    : "exited";
+          const rawErrors = [stderr.text(), ...(spawnError === undefined ? [] : [spawnError.message])]
+            .filter((part) => part !== "")
+            .join("\n");
+          const stdoutBudget = Math.floor(input.maxOutputBytes / 2);
+          const safeStdout = utf8Suffix(stdout.text(), stdoutBudget);
+          const stderrBudget = input.maxOutputBytes - Buffer.byteLength(safeStdout, "utf8");
+          const safeStderr = utf8Suffix(rawErrors, stderrBudget);
+          finish({
+            outcome,
+            exitCode: code,
+            signal:
+              outcome === "aborted"
+                ? "ABORT"
+                : outcome === "output-limit"
+                  ? "OUTPUT_LIMIT"
+                  : signal,
+            stdout: safeStdout,
+            stderr: safeStderr,
+            outputBytesObserved: observedBytes,
+          });
+        },
+        (error: unknown) => {
+          finish({
+            outcome: "spawn-error",
+            exitCode: code,
+            signal,
+            stdout: stdout.text(),
+            stderr: error instanceof Error ? error.message : String(error),
+            outputBytesObserved: observedBytes,
+          });
+        },
+      );
     });
 
     if (input.stdin !== undefined) {

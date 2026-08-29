@@ -138,6 +138,32 @@ export class Orchestrator {
     this.#runLog = new RunLog(deps.runLogPath ?? join(deps.workspaceRoot, "..", "log.md"));
   }
 
+  #codingToolInventory(): readonly string[] {
+    const core = ["git", "rg", "node", "npm", "npx"];
+    const configured = [
+      ...this.#d.config.verification.commands.map((check) => check.run),
+      ...this.#d.checks.map((check) => check.run),
+    ].flatMap((command) => {
+      const executable = command.trim().split(/\s+/, 1)[0];
+      if (executable === undefined || executable === "") return [];
+      // A relative path lives in the writable candidate tree. Granting it for
+      // the whole provider session would let the agent replace bytes after
+      // qualification. Relative checks run later in the read-only verification
+      // checkout; provider tools are bare installed names or absolute operator paths.
+      if (executable.includes("/") && !executable.startsWith("/")) return [];
+      return [executable];
+    });
+    return [...new Set([...core, ...configured])];
+  }
+
+  #preparedDependencyPaths(workspacePath: string): readonly string[] {
+    const lookup = this.#workspaces as WorkspaceManager & {
+      agentDependencyPath?: (path: string) => string | undefined;
+    };
+    const path = lookup.agentDependencyPath?.(workspacePath);
+    return path === undefined ? [] : [path];
+  }
+
   /** The adapter that runs review roles. Falls back to the implementer's. */
   get #reviewer(): CodingAgentAdapter {
     return this.#d.reviewProvider ?? this.#d.provider;
@@ -663,7 +689,8 @@ export class Orchestrator {
           taskPacketPath: packetPath,
           allowedPaths: packet.constraints.allowed_paths,
           forbiddenPaths: packet.constraints.forbidden_paths,
-          allowedCommands: [],
+          allowedCommands: this.#codingToolInventory(),
+          preparedDependencyPaths: this.#preparedDependencyPaths(workspace.path),
           network: cfg.workspace.network,
           maxTurns: cfg.providers.maxTurns,
           timeoutMs: providerTimeout(role),
@@ -738,7 +765,8 @@ export class Orchestrator {
           taskPacketPath: packetPath,
           allowedPaths: [],
           forbiddenPaths: packet.constraints.forbidden_paths,
-          allowedCommands: [],
+          allowedCommands: this.#codingToolInventory(),
+          preparedDependencyPaths: this.#preparedDependencyPaths(workspace.path),
           network: cfg.workspace.network,
           maxTurns: cfg.providers.maxTurns,
           timeoutMs: providerTimeout("localReview"),
@@ -1180,7 +1208,8 @@ export class Orchestrator {
         // to form an opinion is how a review starts editing the thing it judges.
         allowedPaths: [],
         forbiddenPaths: packet.constraints.forbidden_paths,
-        allowedCommands: [],
+        allowedCommands: this.#codingToolInventory(),
+        preparedDependencyPaths: this.#preparedDependencyPaths(workspace.path),
         network: cfg.workspace.network,
         maxTurns: cfg.providers.maxTurns,
         timeoutMs: input.budget.beginInvocation(
@@ -1263,7 +1292,8 @@ export class Orchestrator {
         taskPacketPath: packetPath,
         allowedPaths: packet.constraints.allowed_paths,
         forbiddenPaths: packet.constraints.forbidden_paths,
-        allowedCommands: [],
+        allowedCommands: this.#codingToolInventory(),
+        preparedDependencyPaths: this.#preparedDependencyPaths(workspace.path),
         network: cfg.workspace.network,
         maxTurns: cfg.providers.maxTurns,
         timeoutMs: input.budget.beginInvocation(

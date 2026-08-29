@@ -250,6 +250,33 @@ describe("proveAsfWorkspaceCandidate", () => {
 });
 
 describe("runControlledProcess", () => {
+  it("does not resolve after a normal direct-child exit until background descendants are gone", async () => {
+    const directory = temporaryDirectory("runmill-process-normal-exit-");
+    const pidFile = join(directory, "grandchild.pid");
+    const result = await runControlledProcess({
+      command: process.execPath,
+      args: [
+        "-e",
+        [
+          "const {spawn}=require('node:child_process')",
+          "const fs=require('node:fs')",
+          "const child=spawn(process.execPath,['-e','setInterval(() => {}, 1000)'],{stdio:'ignore'})",
+          "child.unref()",
+          `fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))`,
+        ].join(";"),
+      ],
+      cwd: directory,
+      env: { PATH: process.env["PATH"] ?? "" },
+      timeoutMs: 10_000,
+      maxOutputBytes: 4_096,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({ outcome: "exited", exitCode: 0 });
+    const grandchildPid = Number(readFileSync(pidFile, "utf8"));
+    expect(() => process.kill(grandchildPid, 0)).toThrow();
+  }, 15_000);
+
   it("terminates execution once observed output exceeds the trusted ceiling", async () => {
     const result = await runControlledProcess({
       command: process.execPath,
