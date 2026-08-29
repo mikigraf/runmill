@@ -572,7 +572,7 @@ verification:
   }, 60_000);
 });
 
-describe.skip("end-to-end refusals requiring qualified sandbox execution", () => {
+describe("end-to-end refusal boundaries", () => {
   it.each(["ancestor", "target"] as const)(
     "refuses a planted runtime-input %s symlink before any provider call",
     async (kind) => {
@@ -632,7 +632,7 @@ describe.skip("end-to-end refusals requiring qualified sandbox execution", () =>
     expect(forge.calls).toHaveLength(0);
   }, 60_000);
 
-  it("escalates rather than delivering when a check fails", async () => {
+  it.skip("escalates rather than delivering when a check fails (pending qualified sandbox execution)", async () => {
     const failing: CheckSpec = {
       id: "unit",
       run: "/bin/cat does-not-exist.ts",
@@ -654,7 +654,7 @@ describe.skip("end-to-end refusals requiring qualified sandbox execution", () =>
     expect(outcome.reason).toMatch(/verification failed/i);
   }, 90_000);
 
-  it("escalates on a blocking review finding rather than opening a PR", async () => {
+  it.skip("escalates on a blocking review finding rather than opening a PR (pending qualified sandbox execution)", async () => {
     const provider = new FakeProviderAdapter({
       byRole: {
         implementer: [
@@ -695,7 +695,7 @@ describe.skip("end-to-end refusals requiring qualified sandbox execution", () =>
     expect(forge.openPullRequests()).toHaveLength(0);
   }, 90_000);
 
-  it("says what was actually wrong with the review, not just the category", async () => {
+  it.skip("says what was actually wrong with the review, not just the category (pending qualified sandbox execution)", async () => {
     // "Review output did not match the schema" is the same sentence whether
     // the reviewer emitted the wrong shape or emitted nothing at all, and a
     // provider the sandbox killed produces the second. The specific line is
@@ -726,7 +726,7 @@ describe.skip("end-to-end refusals requiring qualified sandbox execution", () =>
     expect(outcome.reason).toMatch(/no structured output/i);
   }, 90_000);
 
-  it("quarantines on a malformed review rather than treating it as a pass", async () => {
+  it.skip("quarantines on a malformed review rather than treating it as a pass (pending qualified sandbox execution)", async () => {
     const provider = new FakeProviderAdapter({
       byRole: {
         implementer: [
@@ -747,7 +747,7 @@ describe.skip("end-to-end refusals requiring qualified sandbox execution", () =>
     expect(forge.openPullRequests()).toHaveLength(0);
   }, 90_000);
 
-  it("refuses to merge when the credential can rewrite branch protection", async () => {
+  it.skip("refuses to merge when the credential can rewrite branch protection (pending qualified sandbox execution)", async () => {
     const forge = new FakeForgeAdapter({ credentialCanWriteProtection: true });
     const cfg = { ...config(), autonomy: "guarded-merge" as const };
     const { orchestrator } = makeOrchestrator({ forge, cfg });
@@ -775,7 +775,7 @@ describe.skip("end-to-end refusals requiring qualified sandbox execution", () =>
     expect(backlog.peek("ENG-101")?.state).toBe("Todo");
   }, 60_000);
 
-  it("blocks a second run from claiming the same issue while one is live", async () => {
+  it.skip("blocks a second run from claiming the same issue while one is live (pending qualified sandbox execution)", async () => {
     const { orchestrator } = makeOrchestrator({});
     const first = orchestrator.run({
       runId: "run_1",
@@ -800,7 +800,7 @@ describe.skip("end-to-end refusals requiring qualified sandbox execution", () =>
     expect(outcome.reason).toMatch(/already leased/i);
   }, 90_000);
 
-  it("stops before delivery when the whole-run invocation budget is exhausted", async () => {
+  it.skip("stops before delivery when the whole-run invocation budget is exhausted (pending qualified sandbox execution)", async () => {
     const base = config();
     const cfg = {
       ...base,

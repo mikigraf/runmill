@@ -3,6 +3,7 @@ import { run, runWithInput } from "../../src/platform/process.js";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, cpSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
+import { StateStore } from "../../src/state/store.js";
 
 const CLI = resolve(process.cwd(), "src/cli/main.ts");
 const QUICKSTART = resolve(process.cwd(), "examples/quickstart");
@@ -38,7 +39,15 @@ async function cli(
   // opt into this fixture explicitly instead of weakening the production
   // boundary with a legacy cwd fallback.
   const commandArgs = [CLI, "--config", join(dir, "runmill.yaml"), ...args];
-  const options = { cwd: dir, env: { ...process.env, PATH: TEST_PATH, ...env } };
+  const options = {
+    cwd: dir,
+    env: {
+      ...process.env,
+      RUNMILL_DATA_DIR: join(dir, "state"),
+      PATH: TEST_PATH,
+      ...env,
+    },
+  };
   const result = stdin === undefined
     ? await run(TSX, commandArgs, options)
     : await runWithInput(TSX, commandArgs, stdin, options);
@@ -211,7 +220,17 @@ describe("runmill config show", () => {
 });
 
 describe("standalone mode without ASF", () => {
-  it("completes observe selection with sandbox none and never probes a provider", async () => {
+  it("persists the standard observe outcome without probing a provider", async () => {
+    for (const args of [
+      ["init", "-q", "-b", "main", "."],
+      ["config", "user.email", "runmill-test@example.invalid"],
+      ["config", "user.name", "Runmill Test"],
+      ["add", "-A"],
+      ["commit", "-q", "-m", "fixture"],
+    ]) {
+      const setup = await run("git", args, { cwd: dir });
+      expect(setup.ok).toBe(true);
+    }
     const configPath = join(dir, "runmill.yaml");
     writeFileSync(
       configPath,
@@ -229,18 +248,35 @@ describe("standalone mode without ASF", () => {
     );
 
     const result = await cli(["--json", "run"], {
+      RUNMILL_DEMO: "1",
       RUNMILL_FAKE_BACKLOG: "issues.json",
       PATH: `${fakeBin}${delimiter}${TEST_PATH}`,
       GITHUB_TOKEN: "must-not-be-read-for-observe",
     });
 
     expect(result.code).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({
-      ran: false,
+    const outcome = JSON.parse(result.stdout) as {
+      runId: string;
+      issueId: string;
+      finalState: string;
+      reason: string;
+      costUsd: number;
+      agentInvocations: number;
+    };
+    expect(outcome).toMatchObject({
       issueId: "ENG-102",
       finalState: "COMPLETED",
-      reason: "autonomy is observe",
+      reason: "observe mode",
+      costUsd: 0,
+      agentInvocations: 0,
     });
+    expect(outcome.runId).toMatch(/^run_/u);
+    const store = StateStore.open(join(dir, "state", "runmill.db"));
+    try {
+      expect(store.getRun(outcome.runId)).toMatchObject({ state: "COMPLETED" });
+    } finally {
+      store.close();
+    }
     expect(existsSync(marker)).toBe(false);
     expect(result.stderr).toBe("");
   });

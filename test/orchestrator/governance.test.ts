@@ -152,7 +152,7 @@ function lease(runId: string): GitRefLease {
 
 const TARGET = { repo: "acme/platform", baseBranch: "main" };
 
-describe.skip("verification policy runtime guard (pending qualified sandbox execution)", () => {
+describe("verification policy runtime guard", () => {
   it("refuses an empty effective union before claiming or invoking an agent", async () => {
     const forge = new FakeForgeAdapter();
     const { orchestrator, backlog, provider } = build(
@@ -393,7 +393,7 @@ describe("observe mode", () => {
   }, 60_000);
 });
 
-describe.skip("repository identity (pending qualified sandbox execution)", () => {
+describe("repository identity", () => {
   it("refuses a cross-repository route before any backlog, lease, or forge mutation", async () => {
     const forge = new FakeForgeAdapter();
     const { orchestrator, backlog } = build("pr-only", forge);

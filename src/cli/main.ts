@@ -757,16 +757,6 @@ export function buildProgram(): Command {
             process.exit(EXIT.ok);
           }
 
-          if (cfg.autonomy === "observe") {
-            emit(opts, `${candidate.issue.identifier} observed; no execution was authorized.`, {
-              ran: false,
-              issueId: candidate.issue.identifier,
-              finalState: "COMPLETED",
-              reason: "autonomy is observe",
-            });
-            process.exit(EXIT.ok);
-          }
-
           const { orchestrator, lease } = await buildOrchestrator(
             cfg,
             adapters,

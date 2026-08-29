@@ -8,16 +8,18 @@ runmill init
 
 The wizard uses existing GitHub and Linear access to preload repository, team, and workflow choices.
 Provider authentication/execution probes run only after a production sandbox is qualified; this
-checkpoint has none, so doctor blocks before those probes. It never
+checkpoint has none, so init writes the generated `native` policy and then fails its sandbox
+selection gate before dispatching doctor. It never
 asks for a GitHub token or Linear API key in an interactive terminal. If GitHub is not configured,
 it can hand sign-in to `gh auth login`; if Linear is not configured, it writes unmistakable
 `REPLACE_WITH_LINEAR_*` placeholders and prints the environment/keychain command to use before
 rerunning setup. Those placeholders never pass doctor. Provider subscription sign-in is likewise
 handed to the provider's own CLI.
-After writing the files, `init` runs the full doctor suite. It creates and validates a candidate
-commit in a disposable repository using the source checkout's identity and signing policy. Once an
-execution backend is qualified, it also sends one short, potentially billable request for each
-distinct configured provider/model through the same sandbox used for real work.
+After writing the files, `init` runs the full doctor suite only when that sandbox-selection gate
+passes. Doctor creates and validates a candidate commit in a disposable repository using the source
+checkout's identity and signing policy. Once an execution backend is qualified, it also sends one
+short, potentially billable request for each distinct configured provider/model through the same
+sandbox used for real work.
 Runmill does not accept those secrets as wizard answers or command arguments, and never writes them
 to the policy file. In CI or another non-interactive shell, `runmill init --defaults` accepts
 discovered values and conservative defaults, then performs the same readiness checks.

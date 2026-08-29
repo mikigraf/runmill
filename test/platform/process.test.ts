@@ -149,6 +149,50 @@ describe("runWithInput", () => {
     expect(result.stderr).toContain("command cancelled");
   });
 
+  it("bounds pipe drain after the direct child exits", async () => {
+    if (process.platform === "win32") return;
+    const script = [
+      'import { spawn } from "node:child_process";',
+      'import { writeSync } from "node:fs";',
+      "const held = spawn(process.execPath, [",
+      '  "--input-type=module",',
+      '  "-e",',
+      '  "setTimeout(() => {}, 10000)",',
+      "], {",
+      "  detached: true,",
+      '  stdio: ["ignore", process.stdout, process.stderr],',
+      "});",
+      "if (held.pid === undefined) process.exit(2);",
+      'writeSync(1, String(held.pid) + "\\n");',
+      "held.unref();",
+    ].join("\n");
+    let descendantPid: number | undefined;
+    try {
+      const started = Date.now();
+      const result = await runWithInput(
+        process.execPath,
+        ["--input-type=module", "-e", script],
+        "",
+        { timeoutMs: 20_000 },
+      );
+      const elapsedMs = Date.now() - started;
+      descendantPid = Number.parseInt(result.stdout.trim(), 10);
+
+      expect(elapsedMs).toBeLessThan(7_500);
+      expect(result.ok).toBe(false);
+      expect(result.code).toBe(0);
+      expect(result.stderr).toMatch(/output pipes did not close/i);
+    } finally {
+      if (descendantPid !== undefined && Number.isSafeInteger(descendantPid)) {
+        try {
+          process.kill(descendantPid, "SIGKILL");
+        } catch {
+          // The bounded fixture may already have exited.
+        }
+      }
+    }
+  }, 15_000);
+
   it("uses one cancellable hard signal and arms no delayed escalation", () => {
     vi.useFakeTimers();
     const kill = vi.spyOn(process, "kill").mockImplementation(() => true);

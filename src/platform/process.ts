@@ -198,6 +198,10 @@ export async function runWithInput(
     let timedOut = false;
     let cancelled = false;
     let terminal = false;
+    let settled = false;
+    let exitCode: number | null = null;
+    let drainTimedOut = false;
+    let drainTimer: NodeJS.Timeout | undefined;
     const abort = (): void => {
       if (cancelled || terminal) return;
       cancelled = true;
@@ -211,34 +215,61 @@ export async function runWithInput(
             timedOut = true;
           });
 
-    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.on("error", (error) => {
-      spawnError = error;
-    });
-    child.on("exit", () => {
+    const finish = (code: number | null): void => {
+      if (settled) return;
+      settled = true;
       terminal = true;
       cancelTimer();
-      options.signal?.removeEventListener("abort", abort);
-    });
-    child.on("close", (code) => {
-      terminal = true;
-      cancelTimer();
+      if (drainTimer !== undefined) clearTimeout(drainTimer);
       options.signal?.removeEventListener("abort", abort);
       const failure = [
         stderr.text(),
         ...(timedOut ? [`command timed out after ${String(options.timeoutMs)} ms`] : []),
         ...(cancelled ? ["command cancelled"] : []),
         ...(spawnError === undefined ? [] : [spawnError.message]),
+        ...(drainTimedOut
+          ? ["command output pipes did not close after the process exited"]
+          : []),
       ]
         .filter((part) => part !== "")
         .join("\n");
       resolve({
-        ok: code === 0 && !timedOut && !cancelled && spawnError === undefined,
+        ok:
+          code === 0 &&
+          !timedOut &&
+          !cancelled &&
+          !drainTimedOut &&
+          spawnError === undefined,
         stdout: stdout.text(),
         stderr: failure,
         code,
       });
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", (error) => {
+      spawnError = error;
+    });
+    child.on("exit", (code) => {
+      terminal = true;
+      exitCode = code;
+      cancelTimer();
+      options.signal?.removeEventListener("abort", abort);
+      // A descendant can inherit stdout/stderr and keep `close` from ever
+      // arriving after the direct child exits. Numeric PID/PGID signalling is
+      // no longer safe at this point, so bound the drain, destroy only our pipe
+      // handles, and report the incomplete drain as a failure.
+      drainTimer = setTimeout(() => {
+        drainTimedOut = true;
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish(exitCode);
+      }, KILL_GRACE_MS);
+      drainTimer.unref();
+    });
+    child.on("close", (code) => {
+      finish(code ?? exitCode);
     });
 
     // A command may reject input before consuming it. EPIPE is an ordinary
