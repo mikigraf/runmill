@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   mkdtempSync,
   rmSync,
@@ -7,11 +8,21 @@ import {
   accessSync,
   constants,
   existsSync,
+  lstatSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
 } from "node:fs";
-import { tmpdir, platform } from "node:os";
-import { delimiter, dirname, join, sep } from "node:path";
+import { arch, tmpdir, platform } from "node:os";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { RunmillError, errorMessage } from "../errors/runmill-error.js";
-import { armKillTimer, BoundedCapture } from "../platform/process.js";
+import {
+  armKillTimer,
+  BoundedCapture,
+  run as runProcess,
+  terminateTree,
+} from "../platform/process.js";
 
 export type SandboxMechanism = "seatbelt" | "bubblewrap" | "none";
 
@@ -35,7 +46,7 @@ export interface SandboxPolicy {
 }
 
 export interface SandboxResult {
-  readonly outcome: "exited" | "signaled" | "timeout" | "sandbox-denied";
+  readonly outcome: "exited" | "signaled" | "timeout" | "aborted" | "sandbox-denied";
   readonly exitCode: number | null;
   readonly signal: string | null;
   readonly stdout: string;
@@ -51,6 +62,80 @@ export interface SandboxRunInput {
   readonly timeoutMs: number;
   /** Extra variables to add on top of the allowlist. */
   readonly env?: Readonly<Record<string, string>> | undefined;
+  /** Exact subprocess commands the caller authorizes this invocation to launch. */
+  readonly subprocesses?: readonly string[] | undefined;
+  /** Immutable, previously-qualified dependency trees required by this invocation. */
+  readonly preparedDependencyPaths?: readonly string[] | undefined;
+  /** Aggregate retained/observed stdout+stderr ceiling. */
+  readonly maxOutputBytes?: number | undefined;
+  readonly onStdout?: ((chunk: Buffer) => void) | undefined;
+  readonly onStderr?: ((chunk: Buffer) => void) | undefined;
+}
+
+export interface SandboxRuntimeIdentity {
+  readonly os: NodeJS.Platform;
+  readonly arch: string;
+  readonly libc: "darwin" | "glibc" | "musl" | "unknown";
+  readonly nodeAbi: string;
+}
+
+export interface SandboxExecutableIdentity {
+  readonly path: string;
+  readonly sha256: string;
+  readonly device: number;
+  readonly inode: number;
+  readonly size: number;
+}
+
+export interface SandboxQualification {
+  readonly mechanism: Exclude<SandboxMechanism, "none">;
+  readonly runtime: SandboxRuntimeIdentity;
+  readonly executable: SandboxExecutableIdentity;
+  readonly executableIdentities: readonly SandboxExecutableIdentity[];
+  /** Logical guest PATH. Native execution materializes an equivalent private shim directory. */
+  readonly sanitizedPath: string;
+  readonly digest: string;
+}
+
+export interface SandboxPathMount {
+  readonly hostPath: string;
+  readonly guestPath: string;
+  readonly access: "read-only" | "read-write" | "write-file";
+  readonly purpose: "workspace" | "provider-home" | "temporary" | "output" | "dependency" | "runtime";
+}
+
+export interface SandboxPathLayout {
+  readonly cwd: { readonly hostPath: string; readonly guestPath: string };
+  readonly home: { readonly hostPath: string; readonly guestPath: string };
+  readonly temporary: { readonly hostPath: string; readonly guestPath: string };
+  readonly mounts: readonly SandboxPathMount[];
+}
+
+export interface SandboxExecution {
+  readonly layout: SandboxPathLayout;
+  readonly qualification: SandboxQualification;
+  readonly result: Promise<SandboxResult>;
+  /** Awaited and idempotent. Resolves only after backend completion and cleanup. */
+  abort(): Promise<void>;
+}
+
+export interface SandboxBackend {
+  readonly mechanism: SandboxMechanism;
+  readonly runtime: SandboxRuntimeIdentity;
+  qualify(input: {
+    readonly command: string;
+    readonly cwd?: string | undefined;
+    readonly subprocesses?: readonly string[] | undefined;
+  }): Promise<SandboxQualification>;
+  start(input: SandboxRunInput): Promise<SandboxExecution>;
+  run(input: SandboxRunInput): Promise<SandboxResult>;
+  prepareDisposableHome(): { readonly path: string; cleanup(): void };
+  prepareDependencyCheckout(path: string): { readonly path: string; readonly runtime: SandboxRuntimeIdentity };
+}
+
+export interface NativeSandboxOptions {
+  readonly platform?: NodeJS.Platform | undefined;
+  readonly path?: string | undefined;
 }
 
 /**
@@ -199,66 +284,6 @@ export function detectMechanism(): SandboxMechanism {
 }
 
 /**
- * Directories a sandboxed command needs in order to load itself.
- *
- * Every policy here denies by default and then grants the system prefixes,
- * which is enough only when the toolchain happens to live in one of them. It
- * frequently does not: codex installed through bun lives in ~/.bun/bin, node
- * through nvm or volta lives under ~/.nvm or ~/.volta, and pipx, cargo and
- * `npm --prefix ~/.local` all land in ~/.local/bin. On those machines the
- * sandbox denied the binary itself, so the process never started and the run
- * failed in milliseconds with no output at all.
- *
- * The grant is read-only and bounded to two things: the directories already on
- * PATH, which are by definition where this machine looks for executables, and
- * the tree that actually holds the resolved command. Writes are unaffected, and
- * the credential denials are emitted after every grant, so they still win.
- */
-export function toolchainReadPaths(
-  command: string,
-  env: NodeJS.ProcessEnv = process.env,
-): string[] {
-  const out = new Set<string>();
-  const add = (path: string | undefined): void => {
-    if (path === undefined || path === "") return;
-    try {
-      out.add(realpathSync(path));
-    } catch {
-      // A PATH entry that is not there grants nothing. Skipping it keeps the
-      // profile to paths that exist, which is also what bwrap requires.
-    }
-  };
-
-  const entries = (env["PATH"] ?? "").split(delimiter).filter((e) => e !== "");
-  for (const entry of entries) add(entry);
-
-  // Follow the command to where it really lives. ~/.bun/bin/codex is a symlink
-  // into ../install/global/node_modules/@openai/codex/bin/codex.js, so granting
-  // only the PATH directory grants a link whose target is still denied.
-  //
-  // Every candidate on PATH is resolved, not just the first, because wrappers
-  // re-resolve through PATH: the codex on ~/.superset/bin is a shell script
-  // that searches PATH for the next codex and execs that. Stopping at the first
-  // match grants the wrapper and denies the program it exists to run.
-  const candidates = command.includes(sep) ? [command] : findOnPath(command, entries);
-  for (const candidate of candidates) {
-    let real: string;
-    try {
-      real = realpathSync(candidate);
-    } catch {
-      continue;
-    }
-    // A package needs its siblings, not just its own bin directory: the entry
-    // script immediately requires dependencies from the same node_modules tree.
-    const marker = `${sep}node_modules${sep}`;
-    const index = real.indexOf(marker);
-    add(index === -1 ? dirname(real) : real.slice(0, index));
-  }
-
-  return [...out];
-}
-
-/**
  * A temporary directory of the child's own.
  *
  * TMPDIR is on the environment allowlist, so the sandbox handed the child a
@@ -306,12 +331,311 @@ function findOnPath(command: string, entries: readonly string[]): string[] {
   return found;
 }
 
+const MAX_SHEBANG_DEPTH = 4;
+const MAX_PACKAGE_EXECUTABLES = 512;
+const LOGICAL_SANITIZED_PATH = "/runmill/runtime/bin";
+
+function sandboxFailure(detail: string): RunmillError {
+  return RunmillError.fromCatalog("RM-SANDBOX-001", { whatHappened: detail });
+}
+
+function sha256File(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function executableIdentity(path: string): SandboxExecutableIdentity {
+  const canonical = realpathSync(path);
+  const info = statSync(canonical);
+  if (!info.isFile() || (info.mode & 0o111) === 0) {
+    throw sandboxFailure(`Sandbox executable is not a regular executable file: ${canonical}`);
+  }
+  return {
+    path: canonical,
+    sha256: sha256File(canonical),
+    device: info.dev,
+    inode: info.ino,
+    size: info.size,
+  };
+}
+
+function exactExecutable(command: string, searchPath: string, cwd = process.cwd()): string {
+  const candidates = command.includes(sep)
+    ? [isAbsolute(command) ? command : resolve(cwd, command)]
+    : findOnPath(command, searchPath.split(delimiter).filter((entry) => entry !== ""));
+  const candidate = candidates[0];
+  if (candidate === undefined) {
+    throw sandboxFailure(`Cannot resolve exact sandbox executable ${JSON.stringify(command)}.`);
+  }
+  try {
+    return executableIdentity(candidate).path;
+  } catch (error) {
+    if (error instanceof RunmillError) throw error;
+    throw sandboxFailure(
+      `Cannot prove exact sandbox executable ${JSON.stringify(command)}: ${errorMessage(error)}`,
+    );
+  }
+}
+
+function shebang(path: string): readonly string[] | undefined {
+  const bytes = readFileSync(path).subarray(0, 4096).toString("utf8");
+  if (!bytes.startsWith("#!")) return undefined;
+  const line = bytes.slice(2).split(/\r?\n/, 1)[0]?.trim() ?? "";
+  const parts = line.split(/\s+/).filter((part) => part !== "");
+  if (parts.length === 0 || !isAbsolute(parts[0] ?? "")) {
+    throw sandboxFailure(`Executable ${path} has an unprovable shebang.`);
+  }
+  return parts;
+}
+
+function nearestPackageRoot(entrypoint: string): string | undefined {
+  let current = dirname(entrypoint);
+  const root = resolve(sep);
+  for (let depth = 0; depth < 32; depth += 1) {
+    if (existsSync(join(current, "package.json"))) return realpathSync(current);
+    if (current === root) return undefined;
+    current = dirname(current);
+  }
+  throw sandboxFailure(`Package boundary for ${entrypoint} exceeds the supported depth.`);
+}
+
+function owningNodeModules(packageRoot: string): string | undefined {
+  let current = dirname(packageRoot);
+  for (let depth = 0; depth < 32; depth += 1) {
+    if (basename(current) === "node_modules") return current;
+    const next = dirname(current);
+    if (next === current) return undefined;
+    current = next;
+  }
+  return undefined;
+}
+
+function installedOptionalPackageRoots(packageRoot: string): string[] {
+  let manifest: { readonly optionalDependencies?: Readonly<Record<string, string>> };
+  try {
+    manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as typeof manifest;
+  } catch (error) {
+    throw sandboxFailure(`Cannot prove provider package manifest at ${packageRoot}: ${errorMessage(error)}`);
+  }
+  const modules = owningNodeModules(packageRoot);
+  if (modules === undefined) return [];
+  const roots: string[] = [];
+  for (const name of Object.keys(manifest.optionalDependencies ?? {}).sort()) {
+    const candidate = resolve(modules, ...name.split("/"));
+    if (!existsSync(candidate)) continue;
+    const canonical = realpathSync(candidate);
+    const rel = relative(modules, canonical);
+    if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+      throw sandboxFailure(`Provider dependency ${name} escapes its node_modules directory.`);
+    }
+    roots.push(canonical);
+  }
+  return roots;
+}
+
+function packageExecutables(root: string): string[] {
+  const executables: string[] = [];
+  const visit = (path: string, depth: number): void => {
+    if (depth > 16 || executables.length > MAX_PACKAGE_EXECUTABLES) {
+      throw sandboxFailure(`Provider package executable closure is too large: ${root}`);
+    }
+    const info = lstatSync(path);
+    if (info.isSymbolicLink()) {
+      const canonical = realpathSync(path);
+      const rel = relative(root, canonical);
+      if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+        throw sandboxFailure(`Provider package symlink escapes its package: ${path}`);
+      }
+      return;
+    }
+    if (info.isDirectory()) {
+      for (const name of readdirSync(path).sort()) visit(join(path, name), depth + 1);
+      return;
+    }
+    if (info.isFile() && (info.mode & 0o111) !== 0) executables.push(realpathSync(path));
+  };
+  visit(root, 0);
+  return executables;
+}
+
+function runtimeIdentity(os: NodeJS.Platform): SandboxRuntimeIdentity {
+  if (os !== "darwin" && os !== "linux") {
+    throw sandboxFailure(`No native sandbox backend is implemented for ${os}.`);
+  }
+  return {
+    os,
+    arch: arch(),
+    libc: os === "darwin" ? "darwin" : "unknown",
+    nodeAbi: process.versions.modules,
+  };
+}
+
+const LINUX_RUNTIME_FILES = [
+  "/etc/ld.so.cache",
+  "/etc/nsswitch.conf",
+  "/etc/hosts",
+  "/etc/resolv.conf",
+  "/etc/localtime",
+  "/etc/ssl/certs",
+  "/usr/share/zoneinfo",
+] as const;
+
+async function linuxRuntimeClosure(
+  executables: readonly SandboxExecutableIdentity[],
+): Promise<string[]> {
+  const paths = new Set<string>();
+  for (const candidate of LINUX_RUNTIME_FILES) {
+    if (existsSync(candidate)) paths.add(realpathSync(candidate));
+  }
+  for (const executable of executables) {
+    const header = readFileSync(executable.path).subarray(0, 4);
+    if (!header.equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) continue;
+    const observation = await runProcess("/usr/bin/ldd", [executable.path], {
+      timeoutMs: 10_000,
+      env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+    });
+    if (/\bnot found\b/.test(`${observation.stdout}\n${observation.stderr}`)) {
+      throw sandboxFailure(`Dynamic library closure is incomplete for ${executable.path}.`);
+    }
+    if (!observation.ok && !/statically linked|not a dynamic executable/i.test(observation.stderr)) {
+      throw sandboxFailure(
+        `Cannot qualify dynamic libraries for ${executable.path}: ${observation.stderr.trim()}`,
+      );
+    }
+    for (const line of observation.stdout.split("\n")) {
+      const matches = line.match(/\/[^\s()]+/g) ?? [];
+      for (const match of matches) {
+        const value = match.replace(/:$/, "");
+        if (!existsSync(value)) {
+          throw sandboxFailure(`Qualified dynamic library disappeared: ${value}`);
+        }
+        paths.add(realpathSync(value));
+      }
+    }
+  }
+  return [...paths].sort();
+}
+
+function within(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+
+function canonicalExisting(path: string, label: string): string {
+  try {
+    return realpathSync(path);
+  } catch (error) {
+    throw sandboxFailure(`${label} does not exist or cannot be canonicalized: ${path} (${errorMessage(error)})`);
+  }
+}
+
+function assertGrantIsBounded(grant: string, cwd: string, operatorHome: string | undefined): void {
+  if (grant === resolve(sep)) throw sandboxFailure(`Refusing over-broad sandbox grant ${grant}.`);
+  if (grant !== cwd && within(grant, cwd)) {
+    throw sandboxFailure(`Refusing sandbox grant ${grant}: it is an ancestor of workspace ${cwd}.`);
+  }
+  if (operatorHome !== undefined) {
+    const home = realPath(operatorHome);
+    if (grant === home || within(grant, home)) {
+      throw sandboxFailure(`Refusing sandbox grant ${grant}: it is the operator home or its ancestor.`);
+    }
+    for (const credential of CREDENTIAL_PATHS) {
+      const path = join(home, credential);
+      if (grant === path || within(grant, path)) {
+        throw sandboxFailure(`Refusing sandbox grant ${grant}: it contains credential path ${path}.`);
+      }
+    }
+  }
+}
+
+interface NormalizedPolicy {
+  readonly writablePaths: readonly string[];
+  readonly writableFiles: readonly string[];
+  readonly readablePaths: readonly string[];
+  readonly protectedPaths: readonly string[];
+  readonly preparedDependencyPaths: readonly string[];
+  readonly allowNetwork: boolean;
+}
+
+function normalizePolicy(input: SandboxRunInput, childTmp: string): NormalizedPolicy {
+  const cwd = canonicalExisting(input.cwd, "Sandbox working directory");
+  const writablePaths = input.policy.writablePaths.map((path) => canonicalExisting(path, "Writable path"));
+  const writableFiles = (input.policy.writableFiles ?? []).map((path) => canonicalExisting(path, "Writable file"));
+  const readablePaths = (input.policy.readablePaths ?? []).map((path) => canonicalExisting(path, "Readable path"));
+  const protectedPaths = (input.policy.protectedPaths ?? []).map((path) => canonicalExisting(path, "Protected path"));
+  const preparedDependencyPaths = (input.preparedDependencyPaths ?? []).map((path) =>
+    canonicalExisting(path, "Prepared dependency checkout"),
+  );
+  for (const grant of [...writablePaths, ...writableFiles, ...readablePaths]) {
+    assertGrantIsBounded(grant, cwd, process.env["HOME"]);
+  }
+  const modes = new Map<string, string>();
+  for (const [mode, paths] of [
+    ["read-write", writablePaths],
+    ["write-file", writableFiles],
+    ["read-only", readablePaths],
+  ] as const) {
+    for (const path of paths) {
+      const prior = modes.get(path);
+      if (prior !== undefined) {
+        throw sandboxFailure(`Duplicate or conflicting sandbox mount ${path}: ${prior} and ${mode}.`);
+      }
+      modes.set(path, mode);
+    }
+  }
+  const rejectOverlaps = (paths: readonly string[], label: string): void => {
+    for (let left = 0; left < paths.length; left += 1) {
+      for (let right = left + 1; right < paths.length; right += 1) {
+        const a = paths[left];
+        const b = paths[right];
+        if (a !== undefined && b !== undefined && (within(a, b) || within(b, a))) {
+          throw sandboxFailure(`Overlapping ${label} sandbox mounts ${a} and ${b}.`);
+        }
+      }
+    }
+  };
+  rejectOverlaps(writablePaths, "writable");
+  rejectOverlaps(writableFiles, "writable-file");
+  rejectOverlaps(readablePaths, "readable");
+  for (const writable of writablePaths) {
+    for (const readable of readablePaths) {
+      if (within(writable, readable) || within(readable, writable)) {
+        throw sandboxFailure(`Overlapping writable/read-only sandbox mounts ${writable} and ${readable}.`);
+      }
+    }
+  }
+  for (const file of writableFiles) {
+    if (writablePaths.some((path) => within(path, file) || within(file, path))) {
+      throw sandboxFailure(`Writable file mount ${file} overlaps a writable directory mount.`);
+    }
+  }
+  for (const path of preparedDependencyPaths) {
+    if (!protectedPaths.includes(path)) {
+      throw sandboxFailure(
+        `Prepared dependency checkout ${path} must also be a mandatory protected path.`,
+      );
+    }
+  }
+  return {
+    writablePaths: [...writablePaths, childTmp],
+    writableFiles,
+    readablePaths,
+    protectedPaths,
+    preparedDependencyPaths,
+    allowNetwork: input.policy.allowNetwork,
+  };
+}
+
 /** Generate a Seatbelt profile: deny by default, then grant the minimum. */
-export function buildSeatbeltProfile(policy: SandboxPolicy, home: string): string {
+export function buildSeatbeltProfile(
+  policy: SandboxPolicy & {
+    readonly executablePaths?: readonly string[] | undefined;
+    readonly executableSubpaths?: readonly string[] | undefined;
+  },
+  home: string,
+): string {
   const lines = [
     "(version 1)",
     "(deny default)",
-    "(allow process-exec)",
     "(allow process-fork)",
     "(allow sysctl-read)",
     "(allow signal (target same-sandbox))",
@@ -326,17 +650,26 @@ export function buildSeatbeltProfile(policy: SandboxPolicy, home: string): strin
     // while denying every file in it, and the visible symptom was that
     // /private/etc/ssl/cert.pem was unreadable: certificate validation failed
     // and no agent could reach its own API from inside the sandbox.
-    '(allow file-read* (subpath "/usr") (subpath "/bin") (subpath "/sbin")',
-    '                  (subpath "/System") (subpath "/Library") (subpath "/opt")',
+    '(allow file-read* (subpath "/System") (subpath "/usr/lib")',
     '                  (subpath "/private/var/select") (subpath "/private/var/db/dyld")',
     // /etc/localtime is a symlink into /private/var/db/timezone, so a process
     // that formats a local time reads there. Denying it is not a restriction
     // anyone chose: it takes out `date`, every logger with a timestamp, and
     // the Claude CLI, which exits with a bare "internal error (EPERM)".
-    '                  (subpath "/private/etc") (subpath "/etc") (subpath "/dev")',
+    '                  (subpath "/private/etc/ssl") (literal "/private/etc/hosts")',
+    '                  (literal "/private/etc/resolv.conf") (literal "/dev/null")',
+    '                  (literal "/dev/random") (literal "/dev/urandom")',
     '                  (subpath "/private/var/db/timezone") (literal "/"))',
     '(allow file-write* (subpath "/dev/null") (subpath "/dev/dtracehelper"))',
   ];
+
+  for (const p of policy.executablePaths ?? []) {
+    lines.push(`(allow process-exec (literal ${JSON.stringify(p)}))`);
+    lines.push(`(allow file-read* (literal ${JSON.stringify(p)}))`);
+  }
+  for (const p of policy.executableSubpaths ?? []) {
+    lines.push(`(allow process-exec (subpath ${JSON.stringify(p)}))`);
+  }
 
   for (const p of policy.writablePaths) {
     lines.push(`(allow file-read* file-write* (subpath ${JSON.stringify(p)}))`);
@@ -345,7 +678,14 @@ export function buildSeatbeltProfile(policy: SandboxPolicy, home: string): strin
     lines.push(`(allow file-read* file-write* (literal ${JSON.stringify(p)}))`);
   }
   for (const p of policy.readablePaths ?? []) {
-    lines.push(`(allow file-read* (subpath ${JSON.stringify(p)}))`);
+    const matcher = (() => {
+      try {
+        return statSync(p).isDirectory() ? "subpath" : "literal";
+      } catch {
+        return "literal";
+      }
+    })();
+    lines.push(`(allow file-read* (${matcher} ${JSON.stringify(p)}))`);
   }
 
   // A broad writable workspace contains `.git`, but the worker must not own
@@ -372,17 +712,6 @@ export function buildSeatbeltProfile(policy: SandboxPolicy, home: string): strin
   return lines.join("\n");
 }
 
-/**
- * System directories that hold the runtime linker and shared objects.
- *
- * Which of these exist depends on the architecture and on how merged-/usr the
- * distribution is: /lib64 carries the ELF interpreter on x86-64 and does not
- * exist at all on arm64, and /sbin is a symlink or absent on merged images.
- * They are bound with the -try form because a plain --ro-bind on a missing
- * source makes bwrap exit before the child ever starts.
- */
-const OPTIONAL_SYSTEM_PATHS = ["/bin", "/sbin", "/lib", "/lib32", "/lib64"];
-
 export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string[] {
   const args = [
     "--unshare-pid",
@@ -393,12 +722,7 @@ export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string
     "--proc", "/proc",
     "--dev", "/dev",
     "--tmpfs", "/tmp",
-    // /usr and /etc exist on every supported distribution, so a missing one is
-    // a broken host rather than a portability case, and should fail loudly.
-    "--ro-bind", "/usr", "/usr",
-    "--ro-bind", "/etc", "/etc",
   ];
-  for (const p of OPTIONAL_SYSTEM_PATHS) args.push("--ro-bind-try", p, p);
   if (!policy.allowNetwork) args.push("--unshare-net");
   // Read-only binds are emitted BEFORE the writable ones, because bwrap applies
   // mounts in order and the last one wins. The two sets overlap in practice --
@@ -406,10 +730,10 @@ export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string
   // when the read-only bind landed last it remounted the workspace read-only,
   // leaving the agent unable to write the tree it had just been told to change.
   //
-  // The -try form is used because an absent path is normal here: a developer
-  // who runs only Codex has no ~/.claude, and vice versa. That means "this
-  // provider is not installed", not "refuse to start the sandbox".
-  for (const p of policy.readablePaths ?? []) args.push("--ro-bind-try", p, p);
+  // Qualification canonicalizes every source before this builder runs.
+  // Required closure mounts therefore use plain binds: a source disappearing
+  // between qualification and launch is a refusal, never an optional omission.
+  for (const p of policy.readablePaths ?? []) args.push("--ro-bind", p, p);
   for (const p of policy.writablePaths) args.push("--bind", p, p);
   // A reviewer receives the source tree read-only and one pre-created output
   // file writable. A nested file bind lets that file remain writable without
@@ -418,210 +742,459 @@ export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string
   // These are not `-try` mounts. Silently omitting a missing `.git` overlay
   // would turn the whole workspace bind back into writable Git metadata.
   for (const p of policy.protectedPaths ?? []) args.push("--ro-bind", p, p);
-  // Mask credential paths so even a broad bind cannot reach them, then make
-  // each empty mask read-only. A writable tmpfs would still protect the host
-  // bytes, but it would make an absolute write appear to succeed inside the
-  // sandbox. Refusing the write is both clearer to tools and consistent with
-  // the Seatbelt boundary.
-  for (const rel of CREDENTIAL_PATHS) {
-    const path = join(home, rel);
-    args.push("--tmpfs", path, "--remount-ro", path);
-  }
+  // Bubblewrap starts from an empty root. The operator home is not bound at
+  // all, so adding credential-path masks would create paths rather than remove
+  // authority. Provider authentication lives only in the explicitly mounted
+  // disposable HOME and must remain visible to the provider.
+  void home;
   return args;
 }
 
+interface ResolvedRuntimeClosure {
+  readonly qualification: SandboxQualification;
+  readonly executable: string;
+  readonly readablePaths: readonly string[];
+  readonly shimTargets: ReadonlyMap<string, string>;
+}
+
 /**
- * Run a command under OS isolation.
+ * Lifecycle-owning native backend used by production composition.
  *
- * Mandatory: when a mechanism cannot be constructed the run does not start.
- * There is no silent downgrade, because a silent downgrade turns every
- * isolation claim in the credential table into a false statement.
+ * Callers receive only lifecycle operations; no wrapper command is exposed,
+ * so process ownership and cleanup cannot escape the backend.
  */
-export class Sandbox {
-  readonly #mechanism: SandboxMechanism;
+class NativeSandboxBackend implements SandboxBackend {
+  readonly mechanism: Exclude<SandboxMechanism, "none">;
+  readonly runtime: SandboxRuntimeIdentity;
+  readonly #searchPath: string;
 
-  constructor(mechanism: SandboxMechanism = detectMechanism()) {
-    this.#mechanism = mechanism;
+  constructor(os: "darwin" | "linux", searchPath: string) {
+    this.mechanism = os === "darwin" ? "seatbelt" : "bubblewrap";
+    this.runtime = runtimeIdentity(os);
+    this.#searchPath = searchPath;
   }
 
-  get mechanism(): SandboxMechanism {
-    return this.#mechanism;
+  async qualify(input: {
+    readonly command: string;
+    readonly cwd?: string | undefined;
+    readonly subprocesses?: readonly string[] | undefined;
+  }): Promise<SandboxQualification> {
+    return (await this.#resolveClosure(input)).qualification;
   }
 
-  /**
-   * Wrap a command in this platform's sandbox.
-   *
-   * The single primitive every child process goes through. Returns the
-   * rewritten command plus a cleanup handle for the generated profile.
-   */
-  wrap(input: {
-    command: string;
-    args: readonly string[];
-    cwd: string;
-    policy: SandboxPolicy;
-    env?: Readonly<Record<string, string>> | undefined;
-  }): {
-    command: string;
-    args: string[];
-    cwd: string;
-    env: Record<string, string>;
-    cleanup: () => void;
+  prepareDisposableHome(): { readonly path: string; cleanup(): void } {
+    const path = realpathSync(mkdtempSync(join(tmpdir(), "runmill-provider-home-")));
+    let cleaned = false;
+    return {
+      path,
+      cleanup: () => {
+        if (cleaned) return;
+        cleaned = true;
+        rmSync(path, { recursive: true, force: true });
+      },
+    };
+  }
+
+  prepareDependencyCheckout(path: string): {
+    readonly path: string;
+    readonly runtime: SandboxRuntimeIdentity;
   } {
-    if (this.#mechanism === "none") {
-      throw RunmillError.fromCatalog("RM-SANDBOX-001", {
-        whatHappened: `No sandbox mechanism available on ${platform()}.`,
-      });
-    }
+    return { path: canonicalExisting(path, "Prepared dependency checkout"), runtime: this.runtime };
+  }
 
-    const protectedPaths = (input.policy.protectedPaths ?? []).map(realPath);
-    for (const path of protectedPaths) {
-      if (!existsSync(path)) {
-        throw RunmillError.fromCatalog("RM-SANDBOX-001", {
-          whatHappened:
-            `Required read-only sandbox path ${path} does not exist. ` +
-            "Refusing to run with a missing protective mount.",
-        });
+  async #resolveClosure(input: {
+    readonly command: string;
+    readonly cwd?: string | undefined;
+    readonly subprocesses?: readonly string[] | undefined;
+  }): Promise<ResolvedRuntimeClosure> {
+    const executable = exactExecutable(input.command, this.#searchPath, input.cwd);
+    const identities = new Map<string, SandboxExecutableIdentity>();
+    const readable = new Set<string>();
+    const shims = new Map<string, string>();
+
+    const addExecutable = (path: string, shimName?: string): string => {
+      const identity = executableIdentity(path);
+      identities.set(identity.path, identity);
+      if (shimName !== undefined && shimName !== "") {
+        const previous = shims.get(shimName);
+        if (previous !== undefined && previous !== identity.path) {
+          throw sandboxFailure(
+            `Runtime closure maps ${shimName} to both ${previous} and ${identity.path}.`,
+          );
+        }
+        shims.set(shimName, identity.path);
+      }
+      return identity.path;
+    };
+
+    addExecutable(executable, basename(input.command));
+    if (this.runtime.os === "darwin" && executable === "/bin/sh") {
+      const bash = exactExecutable("/bin/bash", this.#searchPath, input.cwd);
+      addExecutable(bash);
+      readable.add(bash);
+    }
+    let current = executable;
+    const visited = new Set<string>();
+    for (let depth = 0; depth < MAX_SHEBANG_DEPTH; depth += 1) {
+      if (visited.has(current)) throw sandboxFailure(`Executable shebang cycle at ${current}.`);
+      visited.add(current);
+      const declaration = shebang(current);
+      if (declaration === undefined) break;
+      const interpreter = addExecutable(declaration[0] ?? "");
+      if (interpreter === "/usr/bin/env") {
+        const name = declaration[1];
+        if (name === undefined || name.startsWith("-")) {
+          throw sandboxFailure(`Executable ${current} uses an unprovable env shebang.`);
+        }
+        current = addExecutable(exactExecutable(name, this.#searchPath, input.cwd), name);
+      } else {
+        current = interpreter;
+        shims.set(basename(interpreter), interpreter);
+        if (this.runtime.os === "darwin" && interpreter === "/bin/sh") {
+          const bash = exactExecutable("/bin/bash", this.#searchPath, input.cwd);
+          addExecutable(bash);
+          readable.add(bash);
+        }
+      }
+      if (depth === MAX_SHEBANG_DEPTH - 1 && shebang(current) !== undefined) {
+        throw sandboxFailure(`Executable shebang chain exceeds ${MAX_SHEBANG_DEPTH} entries.`);
       }
     }
 
-    const writableFiles = (input.policy.writableFiles ?? []).map(realPath);
-    for (const path of writableFiles) {
-      if (!existsSync(path)) {
-        throw RunmillError.fromCatalog("RM-SANDBOX-001", {
-          whatHappened:
-            `Required writable sandbox file ${path} does not exist. ` +
-            "Refusing to widen the grant to its parent directory.",
-        });
+    const packageRoot = nearestPackageRoot(executable);
+    if (packageRoot !== undefined && packageRoot.split(sep).includes("node_modules")) {
+      readable.add(packageRoot);
+      for (const dependencyRoot of installedOptionalPackageRoots(packageRoot)) {
+        readable.add(dependencyRoot);
+        for (const path of packageExecutables(dependencyRoot)) addExecutable(path);
       }
+    } else {
+      readable.add(executable);
     }
 
-    const home = process.env["HOME"] ?? tmpdir();
+    for (const command of input.subprocesses ?? []) {
+      if (command.trim() === "" || /\s/.test(command)) {
+        throw sandboxFailure(`Sandbox subprocess must be one executable name: ${JSON.stringify(command)}.`);
+      }
+      const path = exactExecutable(command, this.#searchPath, input.cwd);
+      addExecutable(path, basename(command));
+      // On macOS, the kernel launches /bin/bash as the implementation variant
+      // for a script whose declared interpreter is /bin/sh. Seatbelt checks
+      // that variant separately, so qualify the one exact OS-owned executable
+      // instead of widening process-exec to a directory or arbitrary process.
+      if (this.runtime.os === "darwin" && path === "/bin/sh") {
+        const bash = exactExecutable("/bin/bash", this.#searchPath, input.cwd);
+        addExecutable(bash);
+        readable.add(bash);
+      }
+      const root = nearestPackageRoot(path);
+      readable.add(root?.split(sep).includes("node_modules") === true ? root : path);
+    }
+
+    const orderedIdentities = [...identities.values()].sort((a, b) => a.path.localeCompare(b.path));
+    if (this.runtime.os === "linux") {
+      for (const path of await linuxRuntimeClosure(orderedIdentities)) readable.add(path);
+    }
+    const digest = createHash("sha256")
+      .update(
+        JSON.stringify({
+          mechanism: this.mechanism,
+          runtime: this.runtime,
+          identities: orderedIdentities,
+          readable: [...readable].sort(),
+        }),
+      )
+      .digest("hex");
+    return {
+      executable,
+      readablePaths: [...readable].sort(),
+      shimTargets: shims,
+      qualification: {
+        mechanism: this.mechanism,
+        runtime: this.runtime,
+        executable: executableIdentity(executable),
+        executableIdentities: orderedIdentities,
+        sanitizedPath: LOGICAL_SANITIZED_PATH,
+        digest,
+      },
+    };
+  }
+
+  async start(input: SandboxRunInput): Promise<SandboxExecution> {
+    if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0) {
+      throw sandboxFailure("Sandbox timeout must be a positive safe integer.");
+    }
+    const maxOutputBytes = input.maxOutputBytes ?? MAX_CAPTURED_OUTPUT * 2;
+    if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) {
+      throw sandboxFailure("Sandbox output limit must be a positive safe integer.");
+    }
+
+    const closure = await this.#resolveClosure({
+      command: input.command,
+      cwd: input.cwd,
+      subprocesses: input.subprocesses,
+    });
     const childTmp = createPrivateTempDir();
-    // The child is told to use it, so the grant and the environment agree.
-    // API keys are never accepted here. Anything in the provider process
-    // environment is inherited by the shell and tool processes it launches,
-    // which would hand untrusted repository content the credential.
+    const shimDir = realpathSync(mkdtempSync(join(tmpdir(), "runmill-runtime-bin-")));
+    for (const [name, target] of closure.shimTargets) symlinkSync(target, join(shimDir, name));
+    let profileDir: string | undefined;
+    let cleaned = false;
+    const cleanup = (): void => {
+      if (cleaned) return;
+      cleaned = true;
+      if (profileDir !== undefined) rmSync(profileDir, { recursive: true, force: true });
+      rmSync(shimDir, { recursive: true, force: true });
+      rmSync(childTmp, { recursive: true, force: true });
+    };
+
+    let normalized: NormalizedPolicy;
+    try {
+      normalized = normalizePolicy(input, childTmp);
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
+
+    const cwd = canonicalExisting(input.cwd, "Sandbox working directory");
+    const homePath = input.env?.["HOME"] ?? process.env["HOME"] ?? childTmp;
+    const home = realPath(homePath);
+    const inheritedEnvironment = buildEnvironment(input.env, {
+      ...process.env,
+      PATH: this.#searchPath,
+    });
+    const configuredTrustRoots = trustStoreReadPaths(inheritedEnvironment);
+    for (const path of configuredTrustRoots) {
+      assertGrantIsBounded(path, cwd, process.env["HOME"]);
+    }
+    const runtimeReadable = [...new Set([
+      ...closure.readablePaths,
+      ...configuredTrustRoots,
+      ...(this.mechanism === "seatbelt" ? [shimDir] : []),
+    ])];
+    const policy: SandboxPolicy & {
+      readonly executablePaths: readonly string[];
+      readonly executableSubpaths: readonly string[];
+    } = {
+      writablePaths: normalized.writablePaths,
+      writableFiles: normalized.writableFiles,
+      readablePaths: [...normalized.readablePaths, ...runtimeReadable],
+      protectedPaths: normalized.protectedPaths,
+      allowNetwork: normalized.allowNetwork,
+      executablePaths: closure.qualification.executableIdentities.map((entry) => entry.path),
+      executableSubpaths: normalized.preparedDependencyPaths,
+    };
     const env = {
-      ...buildEnvironment(input.env),
+      ...inheritedEnvironment,
+      PATH: this.mechanism === "bubblewrap" ? LOGICAL_SANITIZED_PATH : shimDir,
       TMPDIR: childTmp,
-      // Read-only Git metadata still supports status/diff/log. This tells Git
-      // not to attempt optional index refresh locks for those read operations.
       GIT_OPTIONAL_LOCKS: "0",
     };
-    const policy: SandboxPolicy = {
-      ...input.policy,
-      writablePaths: [...input.policy.writablePaths.map(realPath), childTmp],
-      writableFiles,
-      protectedPaths,
-      readablePaths: [
-        ...(input.policy.readablePaths ?? []).map(realPath),
-        // Resolved against the PATH the child will actually see, not this
-        // process's, so the grant matches what it will try to execute. Without
-        // this a toolchain installed under the user's home is denied and the
-        // command dies before it produces a single byte.
-        ...toolchainReadPaths(input.command, env),
-        // The trust store the environment points at. /etc/ssl/cert.pem is
-        // covered by the system grant, but SSL_CERT_FILE may name a bundle
-        // anywhere, and naming it without granting it reads as no trust at all.
-        ...trustStoreReadPaths(env),
+    const layout: SandboxPathLayout = {
+      cwd: { hostPath: cwd, guestPath: cwd },
+      home: { hostPath: home, guestPath: home },
+      temporary: { hostPath: childTmp, guestPath: childTmp },
+      mounts: [
+        ...normalized.writablePaths.map((path): SandboxPathMount => ({
+          hostPath: path,
+          guestPath: path,
+          access: "read-write",
+          purpose: path === cwd ? "workspace" : path === childTmp ? "temporary" : "provider-home",
+        })),
+        ...normalized.writableFiles.map((path): SandboxPathMount => ({
+          hostPath: path,
+          guestPath: path,
+          access: "write-file",
+          purpose: "output",
+        })),
+        ...normalized.readablePaths.map((path): SandboxPathMount => ({
+          hostPath: path,
+          guestPath: path,
+          access: "read-only",
+          purpose: normalized.preparedDependencyPaths.includes(path) ? "dependency" : "workspace",
+        })),
+        ...runtimeReadable.map((path): SandboxPathMount => ({
+          hostPath: path,
+          guestPath: path,
+          access: "read-only",
+          purpose: "runtime",
+        })),
+        ...(this.mechanism === "bubblewrap"
+          ? [{
+              hostPath: shimDir,
+              guestPath: LOGICAL_SANITIZED_PATH,
+              access: "read-only" as const,
+              purpose: "runtime" as const,
+            }]
+          : []),
       ],
     };
-    const cwd = realPath(input.cwd);
 
-    if (this.#mechanism === "seatbelt") {
-      const profileDir = mkdtempSync(join(tmpdir(), "runmill-sb-"));
-      const profile = join(profileDir, "policy.sb");
-      writeFileSync(profile, buildSeatbeltProfile(policy, home));
-      return {
-        command: "/usr/bin/sandbox-exec",
-        args: ["-f", profile, input.command, ...input.args],
-        cwd,
-        env,
-        cleanup: () => {
-          rmSync(profileDir, { recursive: true, force: true });
-          rmSync(childTmp, { recursive: true, force: true });
-        },
-      };
-    }
-
-    return {
-      command: "bwrap",
-      args: [...buildBubblewrapArgs(policy, home), input.command, ...input.args],
-      cwd,
-      env,
-      cleanup: () => rmSync(childTmp, { recursive: true, force: true }),
-    };
-  }
-
-  async run(input: SandboxRunInput): Promise<SandboxResult> {
-    const wrapped = this.wrap(input);
-    const started = Date.now();
+    let command: string;
+    let args: string[];
     try {
-      return await this.#spawn(
-        wrapped.command,
-        wrapped.args,
-        { ...input, cwd: wrapped.cwd },
-        wrapped.env,
-        started,
-      );
-    } finally {
-      wrapped.cleanup();
+      if (this.mechanism === "seatbelt") {
+        profileDir = mkdtempSync(join(tmpdir(), "runmill-sb-"));
+        const profile = join(profileDir, "policy.sb");
+        writeFileSync(profile, buildSeatbeltProfile(policy, process.env["HOME"] ?? tmpdir()));
+        command = "/usr/bin/sandbox-exec";
+        args = ["-f", profile, closure.executable, ...input.args];
+      } else {
+        command = exactExecutable("bwrap", this.#searchPath, cwd);
+        args = [
+          ...buildBubblewrapArgs(policy, process.env["HOME"] ?? tmpdir()),
+          "--ro-bind", shimDir, LOGICAL_SANITIZED_PATH,
+          closure.executable,
+          ...input.args,
+        ];
+      }
+    } catch (error) {
+      cleanup();
+      throw error;
     }
-  }
 
-  #spawn(
-    command: string,
-    args: readonly string[],
-    input: SandboxRunInput,
-    env: Record<string, string>,
-    started: number,
-  ): Promise<SandboxResult> {
-    return new Promise<SandboxResult>((resolve) => {
-      // `detached` puts the child in its own process group so a timeout can
-      // kill the whole tree. An agent spawns `npm test`, which spawns workers;
-      // signalling only the direct child leaves grandchildren holding file
-      // handles in the worktree, and cleanup then fails.
-      const child = spawn(command, [...args], {
-        cwd: input.cwd,
+    const started = Date.now();
+    const stdout = new BoundedCapture(maxOutputBytes);
+    const stderr = new BoundedCapture(maxOutputBytes);
+    let observed = 0;
+    let timedOut = false;
+    let aborted = false;
+    let outputLimited = false;
+    let child: ChildProcess;
+    try {
+      child = spawn(command, args, {
+        cwd,
         env,
         detached: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
+    } catch (error) {
+      cleanup();
+      throw sandboxFailure(`Sandbox process could not start: ${errorMessage(error)}`);
+    }
 
-      const out = new BoundedCapture(MAX_CAPTURED_OUTPUT);
-      const err = new BoundedCapture(MAX_CAPTURED_OUTPUT);
-      let timedOut = false;
+    const observe = (
+      capture: BoundedCapture,
+      callback: ((chunk: Buffer) => void) | undefined,
+      chunk: Buffer,
+    ): void => {
+      observed += chunk.length;
+      capture.push(chunk);
+      if (observed <= maxOutputBytes) callback?.(chunk);
+      if (observed > maxOutputBytes && !outputLimited) {
+        outputLimited = true;
+        terminateTree(child);
+      }
+    };
+    child.stdout?.on("data", (chunk: Buffer) => observe(stdout, input.onStdout, chunk));
+    child.stderr?.on("data", (chunk: Buffer) => observe(stderr, input.onStderr, chunk));
+    const cancelTimer = armKillTimer(child, input.timeoutMs, () => {
+      timedOut = true;
+    });
 
-      child.stdout?.on("data", (c: Buffer) => out.push(c));
-      child.stderr?.on("data", (c: Buffer) => err.push(c));
-
-      const cancelTimer = armKillTimer(child, input.timeoutMs, () => {
-        timedOut = true;
+    const result = new Promise<SandboxResult>((resolveResult) => {
+      let spawnError: Error | undefined;
+      child.on("error", (error) => {
+        spawnError = error;
       });
-
-      child.on("error", (spawnError) => {
-        cancelTimer();
-        resolve({
-          outcome: "sandbox-denied",
-          exitCode: null,
-          signal: null,
-          stdout: out.text(),
-          stderr: `${err.text()}${errorMessage(spawnError)}`,
-          durationMs: Date.now() - started,
-        });
-      });
-
       child.on("close", (code, signal) => {
         cancelTimer();
-        resolve({
-          outcome: timedOut ? "timeout" : signal !== null ? "signaled" : "exited",
+        const outcome: SandboxResult["outcome"] = aborted
+          ? "aborted"
+          : timedOut
+            ? "timeout"
+            : outputLimited || spawnError !== undefined
+              ? "sandbox-denied"
+              : signal !== null
+                ? "signaled"
+                : "exited";
+        const value: SandboxResult = {
+          outcome,
           exitCode: code,
-          signal,
-          stdout: out.text(),
-          stderr: err.text(),
+          signal: aborted ? "ABORT" : signal,
+          stdout: stdout.text(),
+          stderr: [stderr.text(), spawnError?.message, outputLimited ? "sandbox output limit exceeded" : undefined]
+            .filter((part): part is string => part !== undefined && part !== "")
+            .join("\n"),
           durationMs: Date.now() - started,
-        });
+        };
+        cleanup();
+        resolveResult(value);
       });
     });
+    let abortPromise: Promise<void> | undefined;
+    const abort = (): Promise<void> => {
+      if (abortPromise !== undefined) return abortPromise;
+      aborted = true;
+      terminateTree(child);
+      abortPromise = result.then(() => undefined);
+      return abortPromise;
+    };
+
+    return {
+      layout,
+      qualification: closure.qualification,
+      result,
+      abort,
+    };
   }
+
+  async run(input: SandboxRunInput): Promise<SandboxResult> {
+    return (await this.start(input)).result;
+  }
+}
+
+class DisabledSandboxBackend implements SandboxBackend {
+  readonly mechanism = "none" as const;
+  readonly runtime: SandboxRuntimeIdentity = {
+    os: platform(),
+    arch: arch(),
+    libc: platform() === "darwin" ? "darwin" : "unknown",
+    nodeAbi: process.versions.modules,
+  };
+
+  #refuse(): never {
+    throw sandboxFailure(
+      "The configured none backend is non-executing and is permitted only for observe mode.",
+    );
+  }
+
+  async qualify(): Promise<SandboxQualification> {
+    return this.#refuse();
+  }
+
+  async start(): Promise<SandboxExecution> {
+    return this.#refuse();
+  }
+
+  async run(): Promise<SandboxResult> {
+    return this.#refuse();
+  }
+
+  prepareDisposableHome(): { readonly path: string; cleanup(): void } {
+    return this.#refuse();
+  }
+
+  prepareDependencyCheckout(): {
+    readonly path: string;
+    readonly runtime: SandboxRuntimeIdentity;
+  } {
+    return this.#refuse();
+  }
+}
+
+export function createNativeSandboxBackend(
+  selection: "native" | "none" | "docker",
+  options: NativeSandboxOptions = {},
+): SandboxBackend {
+  if (selection === "none") return new DisabledSandboxBackend();
+  if (selection === "docker") {
+    throw sandboxFailure(
+      "The Docker sandbox backend is not implemented in this release.",
+    );
+  }
+  const os = options.platform ?? platform();
+  if (os !== "darwin" && os !== "linux") {
+    throw sandboxFailure(`The native sandbox backend is not implemented for ${os}.`);
+  }
+  return new NativeSandboxBackend(os, options.path ?? process.env["PATH"] ?? "");
 }

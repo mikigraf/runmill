@@ -1,8 +1,8 @@
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { tmpdir, platform } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { run } from "../platform/process.js";
-import { Sandbox, detectMechanism } from "../workspace/sandbox.js";
+import type { SandboxBackend } from "../workspace/sandbox.js";
 import { CLAUDE_DIALECT, CODEX_DIALECT, CliProviderAdapter } from "../agent/cli-provider.js";
 import type { AuthStatus, ProviderInstallation } from "../agent/adapter.js";
 import type { ProviderExecutionStatus } from "../agent/cli-provider.js";
@@ -58,6 +58,8 @@ export interface DoctorContext {
   readonly providerAdapterFactory?:
     | ((target: ProviderCheckTarget) => ProviderDoctorAdapter)
     | undefined;
+  /** The composition root's exact backend; doctor never selects an ambient one. */
+  readonly sandbox?: SandboxBackend | undefined;
 }
 
 export interface ProviderCheckTarget {
@@ -768,10 +770,14 @@ function providerCheckId(target: ProviderCheckTarget): string {
   return `provider:${target.implementation}${target.model === undefined ? "" : `:${target.model}`}`;
 }
 
-function createProviderDoctorAdapter(target: ProviderCheckTarget): ProviderDoctorAdapter {
+function createProviderDoctorAdapter(
+  target: ProviderCheckTarget,
+  sandbox: SandboxBackend,
+): ProviderDoctorAdapter {
   const dialect = target.implementation === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
   return new CliProviderAdapter({
     dialect,
+    sandbox,
     ...(target.model === undefined ? {} : { model: target.model }),
   });
 }
@@ -779,6 +785,7 @@ function createProviderDoctorAdapter(target: ProviderCheckTarget): ProviderDocto
 export async function checkProvider(
   input: string | ProviderCheckTarget,
   injectedAdapter?: ProviderDoctorAdapter,
+  sandbox?: SandboxBackend,
 ): Promise<CheckResult> {
   const target = normalizeProviderTarget(input);
   const { implementation } = target;
@@ -796,7 +803,18 @@ export async function checkProvider(
     };
   }
   const dialect = implementation === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
-  const adapter = injectedAdapter ?? createProviderDoctorAdapter(target);
+  const adapter =
+    injectedAdapter ?? (sandbox === undefined ? undefined : createProviderDoctorAdapter(target, sandbox));
+  if (adapter === undefined) {
+    return {
+      id,
+      status: "fail",
+      code: "RM-SANDBOX-001",
+      observed: "no configured sandbox backend was injected",
+      expected: `${dialect.binary} qualified through the configured sandbox backend`,
+      remediation: "runmill doctor --check sandbox",
+    };
+  }
   const installation = await adapter.detect();
   if (!installation.installed) {
     return {
@@ -831,6 +849,7 @@ export async function checkProvider(
 export async function checkProviderExecution(
   input: string | ProviderCheckTarget,
   adapter?: ProviderDoctorAdapter,
+  sandbox?: SandboxBackend,
 ): Promise<CheckResult> {
   const target = normalizeProviderTarget(input);
   const id = `${providerCheckId(target)}:request`;
@@ -845,7 +864,19 @@ export async function checkProviderExecution(
     };
   }
 
-  const execution = await (adapter ?? createProviderDoctorAdapter(target)).sandboxExecutionStatus();
+  const resolved =
+    adapter ?? (sandbox === undefined ? undefined : createProviderDoctorAdapter(target, sandbox));
+  if (resolved === undefined) {
+    return {
+      id,
+      status: "fail",
+      code: "RM-SANDBOX-001",
+      observed: "no configured sandbox backend was injected",
+      expected: "one configured backend shared by doctor and provider execution",
+      remediation: "runmill doctor --check sandbox",
+    };
+  }
+  const execution = await resolved.sandboxExecutionStatus();
   return {
     id,
     status: execution.executed ? "pass" : "fail",
@@ -886,8 +917,8 @@ export function checkProviderCredentialIsolation(implementation: string): CheckR
  * These attempt operations that MUST fail, and treat success as a failure of
  * the isolation guarantee.
  */
-export async function checkSandbox(): Promise<CheckResult[]> {
-  const os = platform();
+export async function checkSandbox(backend: SandboxBackend): Promise<CheckResult[]> {
+  const os = backend.runtime.os;
   const results: CheckResult[] = [];
 
   // -- is a mechanism there at all ---------------------------------------
@@ -962,7 +993,7 @@ export async function checkSandbox(): Promise<CheckResult[]> {
     ];
   }
 
-  results.push(await probeCredentialDenial());
+  results.push(await probeCredentialDenial(backend));
 
   // The schema reserves a future proxy mode, but no hostname-filtering proxy
   // ships yet. `allowNetwork: true` is unrestricted outbound on both
@@ -996,7 +1027,7 @@ export async function checkSandbox(): Promise<CheckResult[]> {
  * a temporary HOME, confirms the secret IS readable outside the sandbox, and
  * only then treats a failed read inside as evidence of denial.
  */
-async function probeCredentialDenial(): Promise<CheckResult> {
+async function probeCredentialDenial(sandbox: SandboxBackend): Promise<CheckResult> {
   const dir = mkdtempSync(join(tmpdir(), "runmill-probe-"));
   const fakeHome = mkdtempSync(join(tmpdir(), "runmill-probe-home-"));
   const realHome = process.env["HOME"];
@@ -1020,7 +1051,6 @@ async function probeCredentialDenial(): Promise<CheckResult> {
       };
     }
 
-    const sandbox = new Sandbox(detectMechanism());
     const attempt = await sandbox.run({
       command: "/bin/cat",
       args: [secret],
@@ -1120,13 +1150,25 @@ export async function runAllChecks(
     Promise.all(selectedTargets.map(async (target) => {
       const known = target.implementation === "codex" || target.implementation === "claude";
       const adapter = known
-        ? (ctx.providerAdapterFactory?.(target) ?? createProviderDoctorAdapter(target))
-        : undefined;
-      const auth = await checkProvider(target, adapter);
+          ? (ctx.providerAdapterFactory?.(target) ??
+            (ctx.sandbox === undefined ? undefined : createProviderDoctorAdapter(target, ctx.sandbox)))
+          : undefined;
+      const auth = await checkProvider(target, adapter, ctx.sandbox);
       if (auth.status !== "pass" || adapter === undefined) return [auth];
       return [auth, await checkProviderExecution(target, adapter)];
     })),
-    wants("sandbox") ? checkSandbox() : Promise.resolve([]),
+    wants("sandbox")
+      ? ctx.sandbox === undefined
+        ? Promise.resolve([{
+            id: "sandbox:mechanism",
+            status: "fail" as const,
+            code: "RM-SANDBOX-001",
+            observed: "no configured sandbox backend was injected",
+            expected: "one configured backend shared by every execution path",
+            remediation: "load a valid Runmill configuration and rerun doctor",
+          }])
+        : checkSandbox(ctx.sandbox)
+      : Promise.resolve([]),
   ]);
   const isolationWarnings = new Set<string>();
   const providerChecks = providers.flatMap((results, index) => {

@@ -76,11 +76,14 @@ describe("parseConfig", () => {
     ).toThrow(/Configuration is invalid/);
   });
 
-  it("rejects the unimplemented container sandbox backend", () => {
-    expect(() => parseConfig(`${MINIMAL}\nworkspace:\n  sandbox: container\n`)).toThrow(
-      /Configuration is invalid/,
-    );
-  });
+  it.each(["container", "docker", "wsl"])(
+    "rejects the unimplemented %s sandbox backend",
+    (backend) => {
+      expect(() => parseConfig(`${MINIMAL}\nworkspace:\n  sandbox: ${backend}\n`)).toThrow(
+        /Configuration is invalid/,
+      );
+    },
+  );
 
   it("rejects backlog providers without a live adapter", () => {
     expect(() =>

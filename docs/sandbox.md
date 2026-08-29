@@ -20,7 +20,7 @@ containment, and instructions in a system prompt are not containment.
 |---|---|
 | macOS | Seatbelt (`sandbox-exec`) with a generated deny-by-default profile |
 | Linux | bubblewrap with mount, PID, IPC, and UTS namespaces |
-| Other | None — `doctor` says so and refuses to run rather than proceeding unprotected |
+| Other | No execution backend — `doctor` says so and refuses to run rather than proceeding unprotected |
 
 What each platform can enforce differs, and runmill does not pretend otherwise:
 
@@ -43,15 +43,24 @@ Deny by default, then grant the minimum:
 ```lisp
 (version 1)
 (deny default)
-(allow process-exec)
 (allow process-fork)
-(allow file-read* (subpath "/usr") (subpath "/bin") ... (literal "/"))
+(allow process-exec (literal "/exact/qualified/executable"))
+(allow file-read* (subpath "/System") (subpath "/usr/lib") ... (literal "/"))
 ```
 
 Two entries are load-bearing and non-obvious: `/private/var/db/dyld` and the root literal `"/"`.
 Without them the dynamic loader aborts with `SIGABRT` before the target binary starts — every
 command appears to *fail* rather than be *restricted*, which looks like a broken sandbox instead
 of a working one.
+
+There is no ambient executable-directory grant. Before starting a child, the backend resolves the
+first executable on the configured host PATH, records its canonical identity and SHA-256, follows a
+bounded shebang chain, and qualifies explicitly supported subprocesses. Installed Node provider
+CLIs receive their exact package tree and declared platform package, not the containing global
+`node_modules` tree or sibling packages. Seatbelt permits `process-exec` only for this qualified
+closure. Linux constructs an empty bubblewrap root and binds the same exact executable, dynamic
+library, runtime-file, provider-package, workspace, and prepared-dependency closure with mandatory
+`--ro-bind`; a required path disappearing between qualification and launch refuses the run.
 
 Writable paths are granted per policy. Then credential paths are denied **last**, so the denial
 wins over any broader grant:
@@ -108,6 +117,12 @@ const ENV_ALLOWLIST = [
 Everything else is dropped, so a variable nobody anticipated is excluded by default rather than
 inherited until someone notices.
 
+The inherited `PATH` is used only during host-side qualification. The child receives a private PATH
+containing symlinks to the qualified executable closure (the fixed guest path
+`/runmill/runtime/bin` under bubblewrap), so an ambient later PATH entry cannot replace the program
+that was qualified. A configured TLS trust root is canonicalized and rejected if it is root, the
+operator home, a workspace ancestor, or another over-broad grant.
+
 The TLS and proxy entries let a provider reach its API on managed hosts. Proxy URLs containing
 userinfo, such as `http://user:password@proxy`, are stripped because every provider tool would
 otherwise inherit the proxy credential. Use a credential-free proxy address until the host-side
@@ -155,26 +170,35 @@ broker is required to remove both forms of provider credential from the agent bo
 
 ## Everything runs inside it
 
-Both the agent **and** every verification check run wrapped:
+Both the agent **and** every verification check run through the same lifecycle-owning backend:
 
 ```ts
 const outcome = await this.#sandbox.run({
   command, args,
   cwd: verifyPath,
   policy: {
-    writablePaths: [verifyPath],
+    writablePaths: [],
+    writableFiles: [reportPath],
+    readablePaths: [verifyPath],
     protectedPaths: [join(verifyPath, ".git"), join(verifyPath, "node_modules")],
     allowNetwork: false,
   },
 });
 ```
 
-Checks execute with network disabled and only the verification checkout writable. A test suite is
-arbitrary code from the same repository the agent just modified; sandboxing the agent while
+Checks execute with network disabled, the verification checkout read-only, and only a pre-created
+declared report file writable. A test suite is arbitrary code from the same repository the agent
+just modified; sandboxing the agent while
 running its tests unconfined would leave the boundary open at exactly the moment the agent's
 output gets executed. Prepared npm dependencies are content-keyed to the exact lockfile and
 hard-linked into the checkout before a check starts; their nested read-only overlay prevents the
 test process from unlinking, replacing, or patching its own toolchain.
+
+`start()` owns the profile/namespace, process group, bounded streaming, timeout, and cleanup.
+Callers receive a completion promise plus an awaited, idempotent `abort()`; no API returns a wrapped
+command that callers could spawn outside backend lifecycle ownership. The selected backend object
+is constructed once at each composition root and shared by provider, reviewer, verification,
+doctor, evaluation, and orchestrator paths.
 
 The provider CLI runs with **its own** sandbox disabled inside runmill's, so there is one
 enforcement layer rather than two half-configured ones.

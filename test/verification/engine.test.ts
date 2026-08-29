@@ -14,7 +14,8 @@ import { join } from "node:path";
 import { VerificationEngine, type CheckSpec } from "../../src/verification/engine.js";
 import { validateReportContent } from "../../src/verification/report.js";
 import {
-  Sandbox,
+  createNativeSandboxBackend,
+  type SandboxBackend,
   type SandboxResult,
   type SandboxRunInput,
 } from "../../src/workspace/sandbox.js";
@@ -51,8 +52,15 @@ function workspaces(): WorkspaceManager {
   } as unknown as WorkspaceManager;
 }
 
-function sandbox(afterRun?: (cwd: string) => void): Sandbox {
+function sandbox(afterRun?: (cwd: string) => void): SandboxBackend {
+  const native = createNativeSandboxBackend("native");
   return {
+    mechanism: native.mechanism,
+    runtime: native.runtime,
+    qualify: native.qualify.bind(native),
+    start: native.start.bind(native),
+    prepareDisposableHome: native.prepareDisposableHome.bind(native),
+    prepareDependencyCheckout: (path) => ({ path, runtime: native.runtime }),
     run: async (input: SandboxRunInput): Promise<SandboxResult> => {
       afterRun?.(input.cwd);
       return {
@@ -64,7 +72,14 @@ function sandbox(afterRun?: (cwd: string) => void): Sandbox {
         durationMs: 1,
       };
     },
-  } as unknown as Sandbox;
+  };
+}
+
+function sandboxWithRun(
+  run: SandboxBackend["run"],
+): SandboxBackend {
+  const provider = sandbox();
+  return { ...provider, run };
 }
 
 function check(report?: CheckSpec["report"]): CheckSpec {
@@ -94,12 +109,12 @@ async function run(
 describe("VerificationEngine coverage proof", () => {
   it("refuses an empty effective manifest instead of treating zero checks as a pass", async () => {
     let executed = false;
-    const neverRun = {
-      run: async (): Promise<SandboxResult> => {
+    const neverRun = sandboxWithRun(
+      async (): Promise<SandboxResult> => {
         executed = true;
         throw new Error("verification must not execute");
       },
-    } as unknown as Sandbox;
+    );
 
     await expect(
       new VerificationEngine(neverRun).run({
@@ -114,8 +129,8 @@ describe("VerificationEngine coverage proof", () => {
 
   it("requires the verification checkout Git metadata to remain read-only", async () => {
     let observed: SandboxRunInput | undefined;
-    const capture = {
-      run: async (input: SandboxRunInput): Promise<SandboxResult> => {
+    const capture = sandboxWithRun(
+      async (input: SandboxRunInput): Promise<SandboxResult> => {
         observed = input;
         return {
           outcome: "exited",
@@ -126,7 +141,7 @@ describe("VerificationEngine coverage proof", () => {
           durationMs: 1,
         };
       },
-    } as unknown as Sandbox;
+    );
 
     await new VerificationEngine(capture).run({
       workspace,
@@ -143,8 +158,8 @@ describe("VerificationEngine coverage proof", () => {
   it("keeps prepared dependencies read-only while the verification tree is writable", async () => {
     let observed: SandboxRunInput | undefined;
     const modules = join(dir, "candidate", "node_modules");
-    const capture = {
-      run: async (input: SandboxRunInput): Promise<SandboxResult> => {
+    const capture = sandboxWithRun(
+      async (input: SandboxRunInput): Promise<SandboxResult> => {
         observed = input;
         return {
           outcome: "exited",
@@ -155,7 +170,7 @@ describe("VerificationEngine coverage proof", () => {
           durationMs: 1,
         };
       },
-    } as unknown as Sandbox;
+    );
     const manager = {
       ...workspaces(),
       verificationDependencyPath: (checkout: string) => join(checkout, "node_modules"),
@@ -173,6 +188,7 @@ describe("VerificationEngine coverage proof", () => {
       join(dir, "candidate", ".git"),
       modules,
     ]);
+    expect(observed?.preparedDependencyPaths).toEqual([modules]);
     expect(observed?.policy.allowNetwork).toBe(false);
   });
 
@@ -259,8 +275,8 @@ describe("VerificationEngine coverage proof", () => {
 
   it("runs the same sandbox and read-only dependency policy at base, then candidate", async () => {
     const observed: SandboxRunInput[] = [];
-    const capture = {
-      run: async (input: SandboxRunInput): Promise<SandboxResult> => {
+    const capture = sandboxWithRun(
+      async (input: SandboxRunInput): Promise<SandboxResult> => {
         observed.push(input);
         writeFileSync(join(input.cwd, "report.tap"), "TAP version 13\n1..1\nok 1 - unit\n");
         return {
@@ -272,7 +288,7 @@ describe("VerificationEngine coverage proof", () => {
           durationMs: 1,
         };
       },
-    } as unknown as Sandbox;
+    );
     const manager = {
       ...workspaces(),
       verificationDependencyPath: (checkout: string) => join(checkout, "node_modules"),
@@ -324,8 +340,8 @@ async function compareTap(input: {
   readonly baseExitCode?: number;
   readonly manager?: WorkspaceManager;
 }) {
-  const provider = {
-    run: async (request: SandboxRunInput): Promise<SandboxResult> => {
+  const provider = sandboxWithRun(
+    async (request: SandboxRunInput): Promise<SandboxResult> => {
       const baseline = request.cwd === join(dir, "base");
       writeFileSync(join(request.cwd, "report.tap"), baseline ? input.base : input.candidate);
       return {
@@ -337,7 +353,7 @@ async function compareTap(input: {
         durationMs: 1,
       };
     },
-  } as unknown as Sandbox;
+  );
   return new VerificationEngine(provider).run({
     workspace,
     workspaces: input.manager ?? workspaces(),
@@ -403,8 +419,8 @@ describe("base-to-candidate test identity proof", () => {
   });
 
   it("does not let a declaration for one check affect another check", async () => {
-    const provider = {
-      run: async (request: SandboxRunInput): Promise<SandboxResult> => {
+    const provider = sandboxWithRun(
+      async (request: SandboxRunInput): Promise<SandboxResult> => {
         const isUnit = request.command === "unit-command";
         const isBase = request.cwd === join(dir, "base");
         const path = join(request.cwd, isUnit ? "unit.tap" : "e2e.tap");
@@ -423,7 +439,7 @@ describe("base-to-candidate test identity proof", () => {
           durationMs: 1,
         };
       },
-    } as unknown as Sandbox;
+    );
     const outcome = await new VerificationEngine(provider).run({
       workspace,
       workspaces: workspaces(),
@@ -481,7 +497,7 @@ describe("base-to-candidate test identity proof", () => {
     expect(outcome.results[0]?.notes.join(" ")).toMatch(/baseline inventory: 1 passed/i);
   });
 
-  it.runIf(new Sandbox().mechanism !== "none")(
+  it.runIf(createNativeSandboxBackend("native").mechanism !== "none")(
     "denies a malicious source mutate-and-restore attempt instead of trusting only hashes",
     async () => {
       const manager = {
@@ -511,7 +527,7 @@ describe("base-to-candidate test identity proof", () => {
         treeHash: async (checkout: Workspace) => readFileSync(join(checkout.path, "source.txt"), "utf8"),
       } as unknown as WorkspaceManager;
 
-      const outcome = await new VerificationEngine().run({
+      const outcome = await new VerificationEngine(createNativeSandboxBackend("native")).run({
         workspace,
         workspaces: manager,
         manifest: [

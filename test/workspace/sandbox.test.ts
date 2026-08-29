@@ -6,25 +6,20 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   symlinkSync,
 } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import {
-  Sandbox,
   buildEnvironment,
   buildSeatbeltProfile,
   buildBubblewrapArgs,
   detectMechanism,
-  toolchainReadPaths,
   trustStoreReadPaths,
+  createNativeSandboxBackend,
 } from "../../src/workspace/sandbox.js";
-
-/** realpath'd parent directory, matching what the profile actually grants. */
-function dirOf(file: string): string {
-  return realpathSync(dirname(file));
-}
 
 let dir: string;
 beforeEach(() => {
@@ -152,10 +147,67 @@ describe("buildEnvironment", () => {
   });
 });
 
+describe("explicit backend selection", () => {
+  it("represents none as a non-executing backend instead of falling back", async () => {
+    const backend = createNativeSandboxBackend("none");
+    expect(backend.mechanism).toBe("none");
+    await expect(
+      backend.run({
+        command: "/usr/bin/true",
+        args: [],
+        cwd: dir,
+        policy: { writablePaths: [], allowNetwork: false },
+        timeoutMs: 1_000,
+      }),
+    ).rejects.toMatchObject({ code: "RM-SANDBOX-001" });
+  });
+
+  it.runIf(platform() === "linux")(
+    "requires bubblewrap and denies a planted outside resource with the real mechanism",
+    async () => {
+      const workspace = mkdtempSync(join(tmpdir(), "runmill-bwrap-workspace-"));
+      const outside = mkdtempSync(join(tmpdir(), "runmill-bwrap-outside-"));
+      const allowed = join(workspace, "allowed.txt");
+      const secret = join(outside, "secret.txt");
+      writeFileSync(allowed, "allowed\n");
+      writeFileSync(secret, "planted-secret\n");
+      expect(readFileSync(secret, "utf8")).toContain("planted-secret");
+      try {
+        const backend = createNativeSandboxBackend("native");
+        expect(backend.mechanism).toBe("bubblewrap");
+        const permitted = await backend.run({
+          command: "/bin/cat",
+          args: [allowed],
+          cwd: workspace,
+          policy: { writablePaths: [workspace], allowNetwork: false },
+          timeoutMs: 10_000,
+        });
+        expect(permitted).toMatchObject({ outcome: "exited", exitCode: 0 });
+        expect(permitted.stdout).toContain("allowed");
+
+        const denied = await backend.run({
+          command: "/bin/cat",
+          args: [secret],
+          cwd: workspace,
+          policy: { writablePaths: [workspace], allowNetwork: false },
+          timeoutMs: 10_000,
+        });
+        expect(denied.exitCode).not.toBe(0);
+        expect(denied.stdout).not.toContain("planted-secret");
+      } finally {
+        rmSync(workspace, { recursive: true, force: true });
+        rmSync(outside, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+});
+
 describe("buildSeatbeltProfile", () => {
   it("denies by default", () => {
     const p = buildSeatbeltProfile({ writablePaths: ["/w"], allowNetwork: false }, "/Users/x");
     expect(p).toContain("(deny default)");
+    expect(p).not.toContain("(allow process-exec)");
   });
 
   it("grants writes only to declared paths", () => {
@@ -204,7 +256,10 @@ describe("buildSeatbeltProfile", () => {
     // certificate validation failed and no agent could reach its API.
     const p = buildSeatbeltProfile({ writablePaths: ["/w"], allowNetwork: false }, "/Users/x");
 
-    expect(p).toContain('(subpath "/private/etc")');
+    expect(p).toContain('(subpath "/private/etc/ssl")');
+    expect(p).not.toContain('(subpath "/private/etc")');
+    expect(p).not.toContain('(subpath "/Library")');
+    expect(p).not.toContain('(subpath "/opt")');
   });
 
   it("grants the timezone database, which every local clock reads", () => {
@@ -230,21 +285,33 @@ describe("buildSeatbeltProfile", () => {
 });
 
 describe("buildBubblewrapArgs", () => {
+  it("binds only required qualified paths and never ambient system trees", () => {
+    const args = buildBubblewrapArgs(
+      {
+        writablePaths: ["/w"],
+        readablePaths: ["/runtime/tool", "/runtime/lib.so"],
+        allowNetwork: false,
+      },
+      "/home/x",
+    );
+    const joined = args.join(" ");
+    expect(joined).toContain("--ro-bind /runtime/tool /runtime/tool");
+    expect(joined).toContain("--ro-bind /runtime/lib.so /runtime/lib.so");
+    expect(joined).not.toContain("--ro-bind-try");
+    expect(joined).not.toContain("--ro-bind /usr /usr");
+    expect(joined).not.toContain("--ro-bind /etc /etc");
+  });
+
   it("unshares the network namespace when network is denied", () => {
     const args = buildBubblewrapArgs({ writablePaths: ["/w"], allowNetwork: false }, "/home/x");
     expect(args).toContain("--unshare-net");
   });
 
-  it("binds declared writable paths and masks credential directories", () => {
+  it("binds declared writable paths without materializing ambient home paths", () => {
     const args = buildBubblewrapArgs({ writablePaths: ["/w"], allowNetwork: false }, "/home/x");
     const joined = args.join(" ");
     expect(joined).toContain("--bind /w /w");
-    expect(joined).toContain("--tmpfs /home/x/.ssh --remount-ro /home/x/.ssh");
-    expect(joined).toContain("--tmpfs /home/x/.codex --remount-ro /home/x/.codex");
-    expect(joined).toContain("--tmpfs /home/x/.claude --remount-ro /home/x/.claude");
-    expect(joined).toContain(
-      "--tmpfs /home/x/.config/claude --remount-ro /home/x/.config/claude",
-    );
+    expect(joined).not.toContain("/home/x");
   });
 
   it("dies with the parent so an orphaned agent cannot outlive the run", () => {
@@ -252,21 +319,12 @@ describe("buildBubblewrapArgs", () => {
     expect(args).toContain("--die-with-parent");
   });
 
-  it("binds the 64-bit library directory so dynamic binaries can find their loader", () => {
-    // On x86-64 Linux the ELF interpreter is /lib64/ld-linux-x86-64.so.2. Without
-    // it inside the namespace EVERY sandboxed exec dies at load time — agents and
-    // check runs alike — with a bare exit 127/133 and no explanation.
-    const args = buildBubblewrapArgs({ writablePaths: ["/w"], allowNetwork: false }, "/home/x");
-    expect(args.join(" ")).toContain("/lib64 /lib64");
-  });
-
-  it("tolerates system directories a distribution does not have", () => {
-    // /lib64 is absent on arm64, /sbin is merged away on some images. A plain
-    // --ro-bind aborts the whole sandbox when the source is missing, so the
-    // optional ones must use the -try form.
-    const args = buildBubblewrapArgs({ writablePaths: ["/w"], allowNetwork: false }, "/home/x");
-    const joined = args.join(" ");
-    expect(joined).toContain("--ro-bind-try /lib64 /lib64");
+  it("does not bind ambient library or executable directories", () => {
+    const joined = buildBubblewrapArgs(
+      { writablePaths: ["/w"], allowNetwork: false },
+      "/home/x",
+    ).join(" ");
+    expect(joined).not.toMatch(/\/(?:usr|bin|sbin|lib64?) \//);
   });
 
   it("lets a writable path win over a read-only grant for the same directory", () => {
@@ -282,7 +340,7 @@ describe("buildBubblewrapArgs", () => {
     const joined = args.join(" ");
 
     expect(joined.indexOf("--bind /w /w")).toBeGreaterThan(
-      joined.indexOf("--ro-bind-try /w /w"),
+      joined.indexOf("--ro-bind /w /w"),
     );
   });
 
@@ -312,20 +370,18 @@ describe("buildBubblewrapArgs", () => {
     const joined = args.join(" ");
     expect(joined).toContain("--bind /w/review.json /w/review.json");
     expect(joined.indexOf("--bind /w/review.json /w/review.json")).toBeGreaterThan(
-      joined.indexOf("--ro-bind-try /w /w"),
+      joined.indexOf("--ro-bind /w /w"),
     );
     expect(joined).not.toContain("--bind /w /w");
   });
 
-  it("tolerates a provider config directory that is not installed", () => {
-    // An optional read-only tool path can be absent. A hard --ro-bind would
-    // make bwrap exit before the agent starts, turning a harmless missing path
-    // into an opaque provider failure.
+  it("treats every qualified provider path as required at launch", () => {
     const args = buildBubblewrapArgs(
       { writablePaths: ["/w"], readablePaths: ["/home/x/.codex"], allowNetwork: false },
       "/home/x",
     );
-    expect(args.join(" ")).toContain("--ro-bind-try /home/x/.codex /home/x/.codex");
+    expect(args.join(" ")).toContain("--ro-bind /home/x/.codex /home/x/.codex");
+    expect(args).not.toContain("--ro-bind-try");
   });
 });
 
@@ -356,99 +412,243 @@ describe("trustStoreReadPaths", () => {
   });
 });
 
-describe("toolchainReadPaths", () => {
-  /**
-   * A sandboxed command has to be able to load itself.
-   *
-   * Every policy here denies by default and then grants /usr, /bin and friends,
-   * which is enough only when the toolchain happens to live in a system prefix.
-   * codex installed through bun lives at ~/.bun/bin, node through nvm lives at
-   * ~/.nvm/versions/..., and pipx and cargo put theirs under ~/.local/bin. On
-   * those machines the sandbox denied the binary itself, and the run failed in
-   * milliseconds with no output, because the process never started.
-   */
-  it("includes the directories on PATH", () => {
-    const paths = toolchainReadPaths("node", { PATH: `/usr/bin:${dirOf(process.execPath)}` });
-
-    expect(paths).toContain(dirOf(process.execPath));
-  });
-
-  it("skips PATH entries that do not exist rather than granting them", () => {
-    const paths = toolchainReadPaths("node", { PATH: "/usr/bin:/nope/not/here" });
-
-    expect(paths).not.toContain("/nope/not/here");
-  });
-
-  it("ignores an empty PATH entry instead of granting the whole filesystem", () => {
-    // A trailing or doubled colon means "the current directory" to some shells.
-    // Turning that into a subpath grant would hand over everything.
-    const paths = toolchainReadPaths("node", { PATH: "/usr/bin::" });
-
-    expect(paths).not.toContain("");
-    expect(paths).not.toContain(".");
-  });
-
-  it("follows a symlinked binary to the tree that actually holds it", () => {
-    // ~/.bun/bin/codex is a symlink into ../install/global/node_modules/...,
-    // so granting only the PATH directory grants a symlink pointing at a
-    // directory the sandbox still denies.
-    const pkg = join(dir, "install", "global", "node_modules", "demo", "bin");
-    mkdirSync(pkg, { recursive: true });
-    writeFileSync(join(pkg, "tool.js"), "#!/usr/bin/env node\n", { mode: 0o755 });
-    const binDir = join(dir, "bin");
-    mkdirSync(binDir, { recursive: true });
-    symlinkSync(join(pkg, "tool.js"), join(binDir, "tool"));
-
-    const paths = toolchainReadPaths("tool", { PATH: binDir });
-
-    // The package root, so sibling dependencies resolve too, not just the file.
-    expect(paths).toContain(realpathSync(join(dir, "install", "global")));
-  });
-
-  it("follows every candidate on PATH, not just the first", () => {
-    // Wrappers re-resolve through PATH: ~/.superset/bin/codex is a shell script
-    // that searches PATH for the next codex and execs it. Granting only the
-    // first match grants the wrapper and denies the program it runs, which
-    // fails as an unreadable file rather than as a denied binary.
-    const wrapperDir = join(dir, "wrapper");
-    const realDir = join(dir, "real");
-    const pkg = join(dir, "pkgroot", "node_modules", "demo", "bin");
-    mkdirSync(wrapperDir, { recursive: true });
-    mkdirSync(realDir, { recursive: true });
-    mkdirSync(pkg, { recursive: true });
-    writeFileSync(join(wrapperDir, "tool"), "#!/bin/sh\n", { mode: 0o755 });
-    writeFileSync(join(pkg, "tool.js"), "#!/usr/bin/env node\n", { mode: 0o755 });
-    symlinkSync(join(pkg, "tool.js"), join(realDir, "tool"));
-
-    const paths = toolchainReadPaths("tool", { PATH: `${wrapperDir}${delimiter}${realDir}` });
-
-    expect(paths).toContain(realpathSync(join(dir, "pkgroot")));
-  });
-
-  it("grants the directory of a binary given as an absolute path", () => {
-    const binDir = join(dir, "abs");
-    mkdirSync(binDir, { recursive: true });
-    writeFileSync(join(binDir, "tool"), "#!/bin/sh\n", { mode: 0o755 });
-
-    const paths = toolchainReadPaths(join(binDir, "tool"), { PATH: "/usr/bin" });
-
-    expect(paths).toContain(realpathSync(binDir));
-  });
-
-  it("returns no duplicates, so the profile stays readable", () => {
-    const paths = toolchainReadPaths("node", { PATH: "/usr/bin:/usr/bin:/usr/bin" });
-
-    expect(new Set(paths).size).toBe(paths.length);
-  });
-
-  it("survives a command that cannot be found at all", () => {
-    expect(() => toolchainReadPaths("definitely-not-a-real-binary", { PATH: "/usr/bin" })).not.toThrow();
-  });
-});
-
 describe("Sandbox.run", () => {
+  it("resolves one exact PATH executable and sanitizes PATH to closure shims", async () => {
+    const firstBin = join(dir, "first-bin");
+    const secondBin = join(dir, "second-bin");
+    mkdirSync(firstBin);
+    mkdirSync(secondBin);
+    writeFileSync(join(firstBin, "tool"), "#!/bin/sh\nprintf exact\n", { mode: 0o755 });
+    writeFileSync(join(secondBin, "tool"), "#!/bin/sh\nprintf ambient\n", { mode: 0o755 });
+    writeFileSync(join(firstBin, "ambient-sibling"), "#!/bin/sh\nprintf leaked\n", {
+      mode: 0o755,
+    });
+
+    const backend = createNativeSandboxBackend("native", {
+      platform: platform(),
+      path: `${firstBin}${delimiter}${secondBin}:/bin:/usr/bin`,
+    });
+    const qualification = await backend.qualify({ command: "tool", subprocesses: [] });
+
+    expect(qualification.executable.path).toBe(realpathSync(join(firstBin, "tool")));
+    expect(qualification.executable.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(qualification.executableIdentities.map((entry) => entry.path)).not.toContain(
+      realpathSync(join(secondBin, "tool")),
+    );
+    expect(qualification.sanitizedPath.split(delimiter)).not.toContain(firstBin);
+    expect(qualification.sanitizedPath.split(delimiter)).not.toContain(secondBin);
+  });
+
+  it("refuses root, home, and workspace-ancestor grants before spawning", async () => {
+    const workspace = join(dir, "workspace", "nested");
+    mkdirSync(workspace, { recursive: true });
+    const backend = createNativeSandboxBackend("native", {
+      platform: platform(),
+      path: "/bin:/usr/bin",
+    });
+
+    for (const readablePath of ["/", dirname(workspace), process.env["HOME"]].filter(
+      (value): value is string => value !== undefined,
+    )) {
+      await expect(
+        backend.run({
+          command: "/usr/bin/true",
+          args: [],
+          cwd: workspace,
+          policy: { writablePaths: [], readablePaths: [readablePath], allowNetwork: false },
+          timeoutMs: 1_000,
+        }),
+      ).rejects.toThrow(/over-broad|ancestor|home|RM-SANDBOX-001/i);
+    }
+  });
+
+  it("rejects duplicate and conflicting guest mounts", async () => {
+    const workspace = join(dir, "workspace");
+    mkdirSync(workspace);
+    const backend = createNativeSandboxBackend("native", {
+      platform: platform(),
+      path: "/bin:/usr/bin",
+    });
+
+    await expect(
+      backend.run({
+        command: "/usr/bin/true",
+        args: [],
+        cwd: workspace,
+        policy: {
+          writablePaths: [workspace],
+          readablePaths: [workspace],
+          allowNetwork: false,
+        },
+        timeoutMs: 1_000,
+      }),
+    ).rejects.toThrow(/duplicate|conflicting|overlap|RM-SANDBOX-001/i);
+
+    const nested = join(workspace, "nested");
+    mkdirSync(nested);
+    await expect(
+      backend.run({
+        command: "/usr/bin/true",
+        args: [],
+        cwd: workspace,
+        policy: {
+          writablePaths: [workspace, nested],
+          allowNetwork: false,
+        },
+        timeoutMs: 1_000,
+      }),
+    ).rejects.toThrow(/overlap|RM-SANDBOX-001/i);
+  });
+
+  it("refuses an over-broad configured trust root", async () => {
+    const workspace = join(dir, "trust-workspace");
+    mkdirSync(workspace);
+    const backend = createNativeSandboxBackend("native");
+    await expect(
+      backend.run({
+        command: "/usr/bin/true",
+        args: [],
+        cwd: workspace,
+        env: { SSL_CERT_DIR: "/" },
+        policy: { writablePaths: [workspace], allowNetwork: false },
+        timeoutMs: 1_000,
+      }),
+    ).rejects.toThrow(/over-broad|trust|RM-SANDBOX-001/i);
+  });
+
+  it.runIf(onMac)(
+    "starts an installed-style Node CLI while denying PATH and package siblings with real Seatbelt",
+    async () => {
+      const installRoot = join(dir, "install");
+      const packageRoot = join(installRoot, "node_modules", "demo-cli");
+      const siblingRoot = join(installRoot, "node_modules", "ambient-package");
+      const bin = join(installRoot, "bin");
+      const workspace = join(dir, "workspace");
+      mkdirSync(join(packageRoot, "bin"), { recursive: true });
+      mkdirSync(siblingRoot, { recursive: true });
+      mkdirSync(bin, { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "demo-cli" }));
+      writeFileSync(join(packageRoot, "payload.txt"), "PACKAGE_OK\n");
+      const secret = join(siblingRoot, "secret.txt");
+      writeFileSync(secret, "PACKAGE_SECRET\n");
+      const cli = join(packageRoot, "bin", "demo.js");
+      writeFileSync(
+        cli,
+        "#!/usr/bin/env node\n" +
+          "const fs=require('node:fs');const path=require('node:path');" +
+          "process.stdout.write(fs.readFileSync(path.join(__dirname,'..','payload.txt'),'utf8'));" +
+          "try{process.stdout.write(fs.readFileSync(process.argv[2],'utf8'))}" +
+          "catch{process.stdout.write('SIBLING_DENIED\\n')}\n",
+        { mode: 0o755 },
+      );
+      symlinkSync(cli, join(bin, "demo-cli"));
+      writeFileSync(join(bin, "ambient-tool"), "#!/bin/sh\nprintf AMBIENT_TOOL\n", {
+        mode: 0o755,
+      });
+
+      // Positive controls: both planted resources are readable outside Seatbelt.
+      expect(readFileSync(join(packageRoot, "payload.txt"), "utf8")).toContain("PACKAGE_OK");
+      expect(readFileSync(secret, "utf8")).toContain("PACKAGE_SECRET");
+
+      const backend = createNativeSandboxBackend("native", {
+        platform: "darwin",
+        path: `${bin}${delimiter}${dirname(process.execPath)}:/usr/bin:/bin`,
+      });
+      const result = await backend.run({
+        command: "demo-cli",
+        args: [secret],
+        cwd: workspace,
+        policy: { writablePaths: [workspace], allowNetwork: false },
+        timeoutMs: 20_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("PACKAGE_OK");
+      expect(result.stdout).toContain("SIBLING_DENIED");
+      expect(result.stdout).not.toContain("PACKAGE_SECRET");
+    },
+    30_000,
+  );
+
+  it.runIf(onMac)("starts npm verification through the exact runtime closure", async () => {
+    const workspace = join(dir, "npm-verifier");
+    mkdirSync(workspace);
+    writeFileSync(
+      join(workspace, "package.json"),
+      JSON.stringify({
+        private: true,
+        scripts: { verify: "node -e \"process.stdout.write('NPM_VERIFY_OK')\"" },
+      }),
+    );
+    const backend = createNativeSandboxBackend("native");
+    const result = await backend.run({
+      command: "npm",
+      args: ["run", "verify"],
+      cwd: workspace,
+      subprocesses: ["/bin/sh"],
+      policy: { writablePaths: [], readablePaths: [workspace], allowNetwork: false },
+      timeoutMs: 20_000,
+    });
+
+    expect(result).toMatchObject({ outcome: "exited", exitCode: 0 });
+    expect(result.stdout).toContain("NPM_VERIFY_OK");
+  }, 30_000);
+
+  it.runIf(onMac)("awaits an idempotent abort through the backend lifecycle", async () => {
+    const workspace = join(dir, "abort-workspace");
+    mkdirSync(workspace);
+    const backend = createNativeSandboxBackend("native", {
+      platform: "darwin",
+      path: "/bin:/usr/bin",
+    });
+    const execution = await backend.start({
+      command: "/bin/sh",
+      args: ["-c", "trap '' TERM; sleep 30"],
+      cwd: workspace,
+      policy: { writablePaths: [workspace], allowNetwork: false },
+      timeoutMs: 20_000,
+    });
+
+    await Promise.all([execution.abort(), execution.abort()]);
+    const result = await execution.result;
+    expect(result.outcome).toBe("aborted");
+    expect(result.durationMs).toBeLessThan(10_000);
+  }, 20_000);
+
+  it("cleans prepared runtime directories when backend launch qualification fails", async () => {
+    const isolatedTmp = join(dir, "isolated-tmp");
+    const workspace = join(isolatedTmp, "workspace");
+    const bin = join(workspace, "opaque-tool");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(bin, "not-an-elf-or-script", { mode: 0o755 });
+    const previousTmp = process.env["TMPDIR"];
+    process.env["TMPDIR"] = isolatedTmp;
+    try {
+      const backend = createNativeSandboxBackend("native", {
+        platform: "linux",
+        path: workspace,
+      });
+      await expect(
+        backend.start({
+          command: bin,
+          args: [],
+          cwd: workspace,
+          policy: { writablePaths: [workspace], allowNetwork: false },
+          timeoutMs: 1_000,
+        }),
+      ).rejects.toThrow(/bwrap|sandbox/i);
+      expect(
+        readdirSync(isolatedTmp).filter((name) => name.startsWith("runmill-")),
+      ).toEqual([]);
+    } finally {
+      if (previousTmp === undefined) delete process.env["TMPDIR"];
+      else process.env["TMPDIR"] = previousTmp;
+    }
+  });
+
   it("refuses to run when no mechanism is available", async () => {
-    const sandbox = new Sandbox("none");
+    const sandbox = createNativeSandboxBackend("none");
     await expect(
       sandbox.run({
         command: "/bin/echo",
@@ -460,24 +660,25 @@ describe("Sandbox.run", () => {
     ).rejects.toThrow(/RM-SANDBOX-001|No sandbox mechanism/);
   });
 
-  it("refuses a missing writable file instead of granting its parent directory", () => {
-    const sandbox = new Sandbox(platform() === "linux" ? "bubblewrap" : "seatbelt");
-    expect(() => sandbox.wrap({
-      command: "/usr/bin/true",
-      args: [],
-      cwd: tmpdir(),
-      policy: {
-        writablePaths: [],
-        writableFiles: [join(dir, "missing", "review.json")],
-        allowNetwork: false,
-      },
-    })).toThrow(/Required writable sandbox file|RM-SANDBOX-001/);
+  it("refuses a missing writable file instead of granting its parent directory", async () => {
+    const sandbox = createNativeSandboxBackend("native");
+    await expect(sandbox.start({
+        command: "/usr/bin/true",
+        args: [],
+        cwd: tmpdir(),
+        policy: {
+          writablePaths: [],
+          writableFiles: [join(dir, "missing", "review.json")],
+          allowNetwork: false,
+        },
+        timeoutMs: 1_000,
+      })).rejects.toThrow(/writable sandbox file|does not exist|RM-SANDBOX-001/i);
   });
 
   it.runIf(hasSandbox)("does not expose a provider API key to tool subprocesses", async () => {
     const ws = mkdtempSync(join(tmpdir(), "runmill-cred-"));
     try {
-      const result = await new Sandbox(detectMechanism()).run({
+      const result = await createNativeSandboxBackend("native").run({
         command: "/bin/sh",
         args: ["-c", 'printf "%s" "${ANTHROPIC_API_KEY:-absent}"'],
         cwd: ws,
@@ -496,7 +697,7 @@ describe("Sandbox.run", () => {
     // an explicit hand-off survives.
     const ws = mkdtempSync(join(tmpdir(), "runmill-cred2-"));
     try {
-      const result = await new Sandbox(detectMechanism()).run({
+      const result = await createNativeSandboxBackend("native").run({
         command: "/bin/sh",
         args: ["-c", 'printf "%s" "${ANTHROPIC_API_KEY:-absent}"'],
         cwd: ws,
@@ -516,9 +717,10 @@ describe("Sandbox.run", () => {
     // and the agent CLIs all write there; the Claude CLI could not start at all.
     const ws = mkdtempSync(join(tmpdir(), "runmill-tmp-"));
     try {
-      const result = await new Sandbox(detectMechanism()).run({
+      const result = await createNativeSandboxBackend("native").run({
         command: "/bin/sh",
         args: ["-c", 'printf ok > "$TMPDIR/runmill-probe" && cat "$TMPDIR/runmill-probe"'],
+        subprocesses: ["/bin/cat"],
         cwd: ws,
         policy: { writablePaths: [ws], allowNetwork: false },
         timeoutMs: 20_000,
@@ -533,9 +735,10 @@ describe("Sandbox.run", () => {
   it.runIf(hasSandbox)("can read the local timezone", async () => {
     const ws = mkdtempSync(join(tmpdir(), "runmill-tz-"));
     try {
-      const result = await new Sandbox(detectMechanism()).run({
+      const result = await createNativeSandboxBackend("native").run({
         command: "/bin/sh",
         args: ["-c", "date +%Z"],
+        subprocesses: ["/bin/date"],
         cwd: ws,
         policy: { writablePaths: [ws], allowNetwork: false },
         timeoutMs: 20_000,
@@ -554,7 +757,7 @@ describe("Sandbox.run", () => {
     // "invalid peer certificate: UnknownIssuer".
     const ws = mkdtempSync(join(tmpdir(), "runmill-ca-"));
     try {
-      const result = await new Sandbox(detectMechanism()).run({
+      const result = await createNativeSandboxBackend("native").run({
         command: "/bin/cat",
         args: ["/etc/ssl/cert.pem"],
         cwd: ws,
@@ -585,7 +788,7 @@ describe("Sandbox.run", () => {
       const tool = join(toolDir, "hello-tool");
       writeFileSync(tool, "#!/bin/sh\necho toolchain-ran\n", { mode: 0o755 });
 
-      const sandbox = new Sandbox(detectMechanism());
+      const sandbox = createNativeSandboxBackend("native");
       let result;
       try {
         result = await sandbox.run({
@@ -609,7 +812,7 @@ describe("Sandbox.run", () => {
 
   it.runIf(hasSandbox)("runs a permitted command and captures output", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
-    const sandbox = new Sandbox(detectMechanism());
+    const sandbox = createNativeSandboxBackend("native");
     const result = await sandbox.run({
       command: "/bin/echo",
       args: ["hello"],
@@ -625,7 +828,7 @@ describe("Sandbox.run", () => {
 
   it.runIf(hasSandbox)("permits writes inside the workspace", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
-    const sandbox = new Sandbox(detectMechanism());
+    const sandbox = createNativeSandboxBackend("native");
     const target = join(dir, "written.txt");
     const result = await sandbox.run({
       command: "/usr/bin/tee",
@@ -657,7 +860,7 @@ describe("Sandbox.run", () => {
         expect(readFileSync(config, "utf8")).toContain("outside-write-worked");
         writeFileSync(config, originalConfig);
 
-        const result = await new Sandbox(detectMechanism()).run({
+        const result = await createNativeSandboxBackend("native").run({
           command: "/bin/sh",
           args: [
             "-c",
@@ -695,7 +898,7 @@ describe("Sandbox.run", () => {
       expect(readFileSync(dotGit, "utf8")).toContain("outside-write-worked");
       writeFileSync(dotGit, original);
 
-      const result = await new Sandbox(detectMechanism()).run({
+      const result = await createNativeSandboxBackend("native").run({
         command: "/bin/sh",
         args: ["-c", "printf normal > normal.txt; printf pwn >> .git"],
         cwd: workspace,
@@ -715,13 +918,12 @@ describe("Sandbox.run", () => {
     }
   }, 30_000);
 
-  it.runIf(hasSandbox)("refuses a missing protective mount instead of silently dropping it", () => {
+  it.runIf(hasSandbox)("refuses a missing protective mount instead of silently dropping it", async () => {
     const workspace = mkdtempSync(join(tmpdir(), "runmill-missing-protection-"));
     try {
-      let thrown: unknown;
-      try {
-        new Sandbox(detectMechanism()).wrap({
-          command: "/bin/true",
+      await expect(
+        createNativeSandboxBackend("native").start({
+          command: "/usr/bin/true",
           args: [],
           cwd: workspace,
           policy: {
@@ -729,13 +931,11 @@ describe("Sandbox.run", () => {
             protectedPaths: [join(workspace, ".git")],
             allowNetwork: false,
           },
+          timeoutMs: 1_000,
+        }),
+      ).rejects.toMatchObject({
+          whatHappened: expect.stringMatching(/protective mount|does not exist/i),
         });
-      } catch (error) {
-        thrown = error;
-      }
-      expect(thrown).toMatchObject({
-        whatHappened: expect.stringMatching(/missing protective mount|does not exist/i),
-      });
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }
@@ -767,7 +967,7 @@ describe("Sandbox.run", () => {
       // Non-vacuity: unsandboxed, this read succeeds.
       expect(readFileSync(secret, "utf8")).toContain("PRIVATE-KEY-MATERIAL");
 
-      const sandbox = new Sandbox(detectMechanism());
+      const sandbox = createNativeSandboxBackend("native");
       const result = await sandbox.run({
         command: "/bin/cat",
         args: [secret],
@@ -789,7 +989,7 @@ describe("Sandbox.run", () => {
   it.runIf(hasSandbox)("DENIES writing outside the declared workspace", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
     const outside = mkdtempSync(join(tmpdir(), "runmill-outside-"));
-    const sandbox = new Sandbox(detectMechanism());
+    const sandbox = createNativeSandboxBackend("native");
     const result = await sandbox.run({
       command: "/usr/bin/tee",
       args: [join(outside, "escaped.txt")],
@@ -806,10 +1006,11 @@ describe("Sandbox.run", () => {
   it.runIf(hasSandbox)("kills the whole process group on timeout", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-"));
     writeFileSync(join(dir, "slow.sh"), "#!/bin/sh\nsleep 30\n");
-    const sandbox = new Sandbox(detectMechanism());
+    const sandbox = createNativeSandboxBackend("native");
     const result = await sandbox.run({
       command: "/bin/sh",
       args: [join(dir, "slow.sh")],
+      subprocesses: ["/bin/sleep"],
       cwd: dir,
       policy: { writablePaths: [dir], allowNetwork: false },
       timeoutMs: 1_000,

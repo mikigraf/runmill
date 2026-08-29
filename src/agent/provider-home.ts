@@ -118,8 +118,12 @@ export function createProviderSessionHome(
   configPaths: ConfigPaths,
   copiedEntries: ConfigPaths,
   sourceHome: string | undefined = process.env["HOME"],
+  preparedHome?: string,
 ): ProviderSessionHome {
-  const sessionHome = realpathSync(mkdtempSync(join(tmpdir(), "runmill-provider-home-")));
+  const sessionHome =
+    preparedHome === undefined
+      ? realpathSync(mkdtempSync(join(tmpdir(), "runmill-provider-home-")))
+      : realpathSync(preparedHome);
   chmodSync(sessionHome, 0o700);
   let cleaned = false;
   const cleanup = (): void => {

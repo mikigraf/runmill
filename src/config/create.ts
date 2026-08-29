@@ -16,6 +16,7 @@ import { writeSchemaBeside } from "./schema-asset.js";
 import { tryGit } from "../platform/git.js";
 import { parseGitHubRepository as parseGitRemote } from "../workspace/repository-identity.js";
 import { parseConfig, validateConfig } from "./load.js";
+import { createNativeSandboxBackend, type SandboxBackend } from "../workspace/sandbox.js";
 
 export interface DiscoveredSetup {
   readonly repository: string;
@@ -97,6 +98,7 @@ function parseGhRepositoryJson(
 export async function discoverSetup(
   root: string,
   credentials: CredentialReader = new CredentialStore(),
+  sandbox: SandboxBackend = createNativeSandboxBackend("native"),
 ): Promise<DiscoveredSetup> {
   const remote = await tryGit(root, ["remote", "get-url", "origin"]);
   const localRepo = remote.ok
@@ -131,7 +133,7 @@ export async function discoverSetup(
 
   const providers = await Promise.all(
     ([CODEX_DIALECT, CLAUDE_DIALECT] as const).map(async (dialect) => {
-      const adapter = new CliProviderAdapter({ dialect });
+      const adapter = new CliProviderAdapter({ dialect, sandbox });
       const installation = await adapter.detect();
       const auth = installation.installed
         ? await adapter.sandboxAuthStatus()

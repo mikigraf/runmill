@@ -31,7 +31,10 @@ import { writeSchemaBeside } from "../../src/config/schema-asset.js";
 import { parseConfig } from "../../src/config/load.js";
 import { loadChecksManifest } from "../../src/verification/manifest.js";
 import { VerificationEngine } from "../../src/verification/engine.js";
-import type { Sandbox } from "../../src/workspace/sandbox.js";
+import {
+  createNativeSandboxBackend,
+  type SandboxBackend,
+} from "../../src/workspace/sandbox.js";
 import { WorkspaceManager } from "../../src/workspace/manager.js";
 import type { CheckResult } from "../../src/doctor/checks.js";
 import { leaseRefName } from "../../src/queue/git-lease.js";
@@ -408,8 +411,15 @@ describe("init", () => {
       root: join(data, "runs"),
       isolation: "clone",
     });
-    const sandbox = {
-      run: async (input: Parameters<Sandbox["run"]>[0]) => {
+    const native = createNativeSandboxBackend("native");
+    const sandbox: SandboxBackend = {
+      mechanism: native.mechanism,
+      runtime: native.runtime,
+      qualify: native.qualify.bind(native),
+      start: native.start.bind(native),
+      prepareDisposableHome: native.prepareDisposableHome.bind(native),
+      prepareDependencyCheckout: (path) => ({ path, runtime: native.runtime }),
+      run: async (input: Parameters<SandboxBackend["run"]>[0]) => {
         const started = Date.now();
         const result = await runProcess(input.command, input.args, {
           cwd: input.cwd,
@@ -425,7 +435,7 @@ describe("init", () => {
           durationMs: Date.now() - started,
         };
       },
-    } as unknown as Sandbox;
+    };
 
     const outcome = await new VerificationEngine(sandbox).run({
       workspace,

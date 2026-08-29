@@ -14,6 +14,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { GitHubGitCredential } from "./platform/github-git-credential.js";
+import {
+  createNativeSandboxBackend,
+  type SandboxBackend,
+} from "./workspace/sandbox.js";
 
 /**
  * The issue fixture demo mode falls back to.
@@ -36,6 +40,8 @@ export interface AdapterSet {
   /** Runs the review roles. The same adapter as `provider` unless configured otherwise. */
   readonly reviewProvider: CodingAgentAdapter;
   readonly forge: ForgeAdapter;
+  /** The one backend instance selected at the composition root. */
+  readonly sandbox: SandboxBackend;
   /** Host-only Git transport using the exact token resolved for the forge. */
   readonly gitCredential?: GitHubGitCredential | undefined;
   /** Which boundary resolved to a live implementation. */
@@ -63,6 +69,8 @@ export interface BuildAdaptersOptions {
    * billable inference — that `next` and `prepare` never use.
    */
   readonly need?: readonly Boundary[] | undefined;
+  /** Test/embedding seam; production resolves from workspace.sandbox exactly once. */
+  readonly sandbox?: SandboxBackend | undefined;
 }
 
 export function resolveReviewerAgent(config: RunmillConfig): {
@@ -100,6 +108,8 @@ export async function buildAdapters(
   const need = options.need ?? (["backlog", "provider", "forge"] as const);
   const wants = (b: Boundary): boolean => need.includes(b);
   const externalEffectsDenied = options.externalEffects === "deny";
+  const sandbox =
+    options.sandbox ?? createNativeSandboxBackend(config.workspace.sandbox);
 
   // -- backlog -----------------------------------------------------------
   let backlog: BacklogAdapter;
@@ -151,6 +161,7 @@ export async function buildAdapters(
   const dialect = config.providers.implementer.implementation === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
   const cli = new CliProviderAdapter({
     dialect,
+    sandbox,
     ...(config.providers.implementer.model === undefined ? {} : { model: config.providers.implementer.model }),
   });
   // Demo mode never uses the real provider, so probing for it is a subprocess
@@ -206,6 +217,7 @@ export async function buildAdapters(
       const reviewDialect = reviewImpl === "claude" ? CLAUDE_DIALECT : CODEX_DIALECT;
       const reviewCli = new CliProviderAdapter({
         dialect: reviewDialect,
+        sandbox,
         ...(reviewModel === undefined ? {} : { model: reviewModel }),
       });
 
@@ -269,6 +281,7 @@ export async function buildAdapters(
     provider,
     reviewProvider,
     forge,
+    sandbox,
     ...(gitCredential === undefined ? {} : { gitCredential }),
     live: {
       backlog: backlogLive,

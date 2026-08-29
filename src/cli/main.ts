@@ -53,7 +53,7 @@ import {
   recordDoctorFailure,
   readFunnel,
 } from "../state/funnel.js";
-import type { CheckSpec } from "../verification/engine.js";
+import { VerificationEngine, type CheckSpec } from "../verification/engine.js";
 import {
   loadChecksManifest,
   mergeCheckSources,
@@ -68,6 +68,10 @@ import {
 } from "../platform/paths.js";
 import { repositoryIdentity } from "../workspace/repository-identity.js";
 import { fetchTrustedBase } from "../workspace/manager.js";
+import {
+  createNativeSandboxBackend,
+  type SandboxBackend,
+} from "../workspace/sandbox.js";
 import { runDemo } from "./demo.js";
 import {
   asfDaemonRuntimePaths,
@@ -289,6 +293,7 @@ async function buildOrchestrator(
       sourceRepository,
       sourceBaseRef,
       workspaceRoot: join(dataDir(), "runs"),
+      verification: new VerificationEngine(adapters.sandbox),
       checks,
       onEvent: (m) => {
         eventSink?.(m);
@@ -517,8 +522,10 @@ export function buildProgram(): Command {
           { implementation: "codex" },
         ];
         let backlogProvider = "linear" as const;
+        let sandbox: SandboxBackend | undefined;
         try {
           const loadedConfig = loadOrExit(opts, repoRoot).config;
+          sandbox = createNativeSandboxBackend(loadedConfig.workspace.sandbox);
           const providers = loadedConfig.providers;
           backlogProvider = loadedConfig.backlog.provider;
           // Observe mode never dispatches an agent. Do not spend a provider
@@ -547,7 +554,7 @@ export function buildProgram(): Command {
         }
 
         let results = await runAllChecks(
-          { repoRoot, configPath, backlogProvider, checkPrefix: cmdOpts.check },
+          { repoRoot, configPath, backlogProvider, checkPrefix: cmdOpts.check, sandbox },
           providerTargets,
         );
         if (cmdOpts.check !== undefined) {

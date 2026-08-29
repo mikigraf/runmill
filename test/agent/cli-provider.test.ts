@@ -24,12 +24,41 @@ import {
   CLAUDE_DIALECT,
   BASE_CAPABILITIES,
   defaultPrompt,
+  type CliProviderOptions,
 } from "../../src/agent/cli-provider.js";
 import { ResumeNotPermittedError } from "../../src/agent/adapter.js";
 import { UnknownEventError } from "../../src/agent/events.js";
 import { outputPathFor } from "../../src/agent/output-contract.js";
 import type { AgentRunRequest } from "../../src/agent/adapter.js";
-import { detectMechanism } from "../../src/workspace/sandbox.js";
+import {
+  createNativeSandboxBackend,
+  detectMechanism,
+  type SandboxBackend,
+} from "../../src/workspace/sandbox.js";
+
+function nativeSandbox(): SandboxBackend {
+  return createNativeSandboxBackend("native");
+}
+
+function backend(overrides: Partial<SandboxBackend> = {}): SandboxBackend {
+  const native = nativeSandbox();
+  return {
+    mechanism: native.mechanism,
+    runtime: native.runtime,
+    qualify: native.qualify.bind(native),
+    start: native.start.bind(native),
+    run: native.run.bind(native),
+    prepareDisposableHome: native.prepareDisposableHome.bind(native),
+    prepareDependencyCheckout: native.prepareDependencyCheckout.bind(native),
+    ...overrides,
+  };
+}
+
+function providerAdapter(
+  options: Omit<CliProviderOptions, "sandbox"> & { readonly sandbox?: SandboxBackend },
+): CliProviderAdapter {
+  return new CliProviderAdapter({ ...options, sandbox: options.sandbox ?? nativeSandbox() });
+}
 
 function request(overrides: Partial<AgentRunRequest> = {}): AgentRunRequest {
   const built: AgentRunRequest = {
@@ -302,8 +331,14 @@ describe("defaultPrompt", () => {
 });
 
 describe("CliProviderAdapter", () => {
+  it("requires the composition root to inject a sandbox backend", () => {
+    expect(() => new CliProviderAdapter({ dialect: CODEX_DIALECT } as never)).toThrow(
+      /sandbox backend/i,
+    );
+  });
+
   const adapter = (dialect = CODEX_DIALECT): CliProviderAdapter =>
-    new CliProviderAdapter({ dialect });
+    providerAdapter({ dialect });
 
   it("takes its name from the dialect", () => {
     expect(adapter().name).toBe("codex");
@@ -312,14 +347,14 @@ describe("CliProviderAdapter", () => {
 
   it("reports not-installed for a binary that does not exist", async () => {
     const missing = { ...CODEX_DIALECT, binary: "definitely-not-installed-xyz" };
-    expect(await new CliProviderAdapter({ dialect: missing }).detect()).toEqual({
+    expect(await providerAdapter({ dialect: missing }).detect()).toEqual({
       installed: false,
     });
   });
 
   it("reports unauthenticated, with detail, when the binary is absent", async () => {
     const missing = { ...CODEX_DIALECT, binary: "definitely-not-installed-xyz" };
-    const status = await new CliProviderAdapter({ dialect: missing }).authStatus();
+    const status = await providerAdapter({ dialect: missing }).authStatus();
     expect(status.authenticated).toBe(false);
   });
 
@@ -341,9 +376,9 @@ describe("CliProviderAdapter", () => {
       },
     };
     try {
-      const status = await new CliProviderAdapter({
+      const status = await providerAdapter({
         dialect: CODEX_DIALECT,
-        sandbox: sandbox as never,
+        sandbox: backend({ run: sandbox.run as unknown as SandboxBackend["run"] }),
       }).sandboxAuthStatus();
       expect(status.authenticated).toBe(false);
       expect(status.detail).toMatch(/not passed into agent sandboxes/);
@@ -382,7 +417,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":8,"output_tokens":1}}'
             return [];
           },
         };
-        const status = await new CliProviderAdapter({ dialect }).sandboxExecutionStatus();
+        const status = await providerAdapter({ dialect }).sandboxExecutionStatus();
 
         expect(status.executed).toBe(true);
         expect(status.detail).toMatch(/one-turn provider request/);
@@ -410,7 +445,7 @@ echo '{"type":"task_complete"}'
       chmodSync(bin, 0o755);
       try {
         const dialect = { ...CODEX_DIALECT, binary: bin, buildArgs: () => [] };
-        const status = await new CliProviderAdapter({ dialect }).sandboxExecutionStatus();
+        const status = await providerAdapter({ dialect }).sandboxExecutionStatus();
 
         expect(status.executed).toBe(false);
         expect(status.detail).toMatch(/did not return the readiness marker/);
@@ -470,7 +505,7 @@ echo 'safe-provider 1.0.0'
 
     try {
       const dialect = { ...CODEX_DIALECT, binary: bin };
-      const adapter = new CliProviderAdapter({ dialect });
+      const adapter = providerAdapter({ dialect });
       expect(await adapter.detect()).toEqual({
         installed: true,
         version: "safe-provider 1.0.0",
@@ -496,7 +531,7 @@ echo 'safe-provider 1.0.0'
 
     try {
       const dialect = { ...CODEX_DIALECT, binary: bin };
-      const installation = await new CliProviderAdapter({ dialect }).detect();
+      const installation = await providerAdapter({ dialect }).detect();
       expect(installation.installed).toBe(true);
       expect(installation.version).toBe("fake-cli 9.9.9");
     } finally {
@@ -511,7 +546,7 @@ echo 'safe-provider 1.0.0'
     chmodSync(bin, 0o755);
     try {
       const dialect = { ...CODEX_DIALECT, binary: bin };
-      const a = new CliProviderAdapter({ dialect });
+      const a = providerAdapter({ dialect });
       expect((await a.detect()).version).toBe("v1");
 
       writeFileSync(bin, "#!/bin/sh\necho 'v2'\n");
@@ -538,7 +573,7 @@ describe("sandbox policy", () => {
       env: Record<string, string>;
       copiedAuth: string | undefined;
     }[];
-    wrap: unknown;
+    start: SandboxBackend["start"];
   } {
     const calls: {
       command: string;
@@ -548,29 +583,29 @@ describe("sandbox policy", () => {
     }[] = [];
     return {
       calls,
-      wrap: (input: {
-        command: string;
-        args: string[];
-        cwd: string;
-        policy: Record<string, unknown>;
-        env: Record<string, string>;
-      }) => {
-        const sessionHome = input.env["HOME"] ?? "";
+      start: async (input) => {
+        const sessionHome = input.env?.["HOME"] ?? "";
         const copiedAuthPath = join(sessionHome, ".codex", "auth.json");
         calls.push({
           command: input.command,
-          policy: input.policy,
-          env: input.env,
+          policy: input.policy as unknown as Record<string, unknown>,
+          env: { ...input.env },
           copiedAuth: existsSync(copiedAuthPath)
             ? readFileSync(copiedAuthPath, "utf8")
             : undefined,
         });
         return {
-          command: "/usr/bin/true",
-          args: [],
-          cwd: tmpdir(),
-          env: input.env,
-          cleanup: () => undefined,
+          layout: {} as never,
+          qualification: {} as never,
+          result: Promise.resolve({
+            outcome: "exited",
+            exitCode: 0,
+            signal: null,
+            stdout: "",
+            stderr: "",
+            durationMs: 1,
+          }),
+          abort: async () => undefined,
         };
       },
     };
@@ -593,9 +628,9 @@ describe("sandbox policy", () => {
   it("copies provider config into a writable disposable HOME", async () => {
     const sandbox = capturingSandbox();
     await withProviderHome(async (realHome) => {
-      const adapter = new CliProviderAdapter({
+      const adapter = providerAdapter({
         dialect: CODEX_DIALECT,
-        sandbox: { wrap: sandbox.wrap } as never,
+        sandbox: backend({ start: sandbox.start }),
       });
       const session = await adapter.start(request({ workingDirectory: "/tmp/ws" }));
       await session.result;
@@ -619,9 +654,9 @@ describe("sandbox policy", () => {
     const previous = process.env["HOME"];
     process.env["HOME"] = home;
     try {
-      const adapter = new CliProviderAdapter({
+      const adapter = providerAdapter({
         dialect: CODEX_DIALECT,
-        sandbox: { wrap: sandbox.wrap } as never,
+        sandbox: backend({ start: sandbox.start }),
       });
       const session = await adapter.start(request({ workingDirectory: "/tmp/ws" }));
       await session.result;
@@ -641,9 +676,9 @@ describe("sandbox policy", () => {
   it("confines writes to the workspace and disposable HOME", async () => {
     const sandbox = capturingSandbox();
     await withProviderHome(async () => {
-      const adapter = new CliProviderAdapter({
+      const adapter = providerAdapter({
         dialect: CODEX_DIALECT,
-        sandbox: { wrap: sandbox.wrap } as never,
+        sandbox: backend({ start: sandbox.start }),
       });
       const session = await adapter.start(request({ workingDirectory: "/tmp/ws" }));
       await session.result;
@@ -657,9 +692,9 @@ describe("sandbox policy", () => {
 
   it("requires the workspace Git metadata to be mounted read-only", async () => {
     const sandbox = capturingSandbox();
-    const adapter = new CliProviderAdapter({
+    const adapter = providerAdapter({
       dialect: CODEX_DIALECT,
-      sandbox: { wrap: sandbox.wrap } as never,
+      sandbox: backend({ start: sandbox.start }),
     });
     const session = await adapter.start(request({ workingDirectory: "/tmp/ws" }));
     await session.result;
@@ -671,9 +706,9 @@ describe("sandbox policy", () => {
     const workspace = mkdtempSync(join(tmpdir(), "runmill-review-policy-"));
     const sandbox = capturingSandbox();
     try {
-      const adapter = new CliProviderAdapter({
+      const adapter = providerAdapter({
         dialect: CODEX_DIALECT,
-        sandbox: { wrap: sandbox.wrap } as never,
+        sandbox: backend({ start: sandbox.start }),
       });
       const session = await adapter.start(request({
         workingDirectory: workspace,
@@ -715,7 +750,7 @@ echo '{"type":"task_complete"}'
       chmodSync(bin, 0o755);
       try {
         const dialect = { ...CODEX_DIALECT, binary: bin, buildArgs: () => [] };
-        const session = await new CliProviderAdapter({ dialect }).start(
+        const session = await providerAdapter({ dialect }).start(
           request({ workingDirectory: workspace, role: "local-reviewer" }),
         );
         const result = await session.result;
@@ -740,17 +775,17 @@ echo '{"type":"task_complete"}'
   it("removes the disposable HOME when sandbox construction fails", async () => {
     let sessionHome = "";
     const sandbox = {
-      wrap: (input: { env: Record<string, string> }) => {
-        sessionHome = input.env["HOME"] ?? "";
+      start: async (input: Parameters<SandboxBackend["start"]>[0]) => {
+        sessionHome = input.env?.["HOME"] ?? "";
         expect(existsSync(sessionHome)).toBe(true);
         throw new Error("profile construction failed");
       },
     };
 
     await withProviderHome(async () => {
-      const adapter = new CliProviderAdapter({
+      const adapter = providerAdapter({
         dialect: CODEX_DIALECT,
-        sandbox: sandbox as never,
+        sandbox: backend({ start: sandbox.start }),
       });
       await expect(adapter.start(request({ workingDirectory: "/tmp/ws" }))).rejects.toThrow(
         /profile construction failed/,
@@ -823,7 +858,7 @@ exit 0
             realState,
           ],
         });
-        const session = await new CliProviderAdapter({ dialect }).start(
+        const session = await providerAdapter({ dialect }).start(
           request({ workingDirectory: dir }),
         );
         const result = await session.result;
@@ -861,7 +896,7 @@ exit 0
 `,
     );
     try {
-      const adapter = new CliProviderAdapter({ dialect: dialectFor(bin) });
+      const adapter = providerAdapter({ dialect: dialectFor(bin) });
       const session = await adapter.start(request({ workingDirectory: dir }));
       const result = await session.result;
 
@@ -891,7 +926,7 @@ exit 0
 `,
     );
     try {
-      const adapter = new CliProviderAdapter({ dialect: dialectFor(bin) });
+      const adapter = providerAdapter({ dialect: dialectFor(bin) });
       const result = await (await adapter.start(request({ workingDirectory: dir }))).result;
       expect(result.status).toBe("success");
       expect(result.events).toHaveLength(2);
@@ -912,9 +947,24 @@ exit 0
 `,
     );
     try {
-      const adapter = new CliProviderAdapter({ dialect: dialectFor(bin) });
+      const adapter = providerAdapter({ dialect: dialectFor(bin) });
       const result = await (await adapter.start(request({ workingDirectory: dir }))).result;
       expect(result.events.map((e) => e.type)).toEqual(["session.started", "result"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("parses the final JSON event even when the provider omits a trailing newline", async () => {
+    const { dir, bin } = fakeProvider(`#!/bin/sh\nprintf '{"type":"task_complete"}'\n`);
+    try {
+      const result = await (
+        await providerAdapter({ dialect: dialectFor(bin) }).start(
+          request({ workingDirectory: dir }),
+        )
+      ).result;
+      expect(result.events.map((event) => event.type)).toEqual(["result"]);
+      expect(result.status).toBe("success");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -941,7 +991,7 @@ exit 0
         },
       });
       const result = await (
-        await new CliProviderAdapter({ dialect }).start(request({ workingDirectory: dir }))
+        await providerAdapter({ dialect }).start(request({ workingDirectory: dir }))
       ).result;
 
       expect(result.status).toBe("failure");
@@ -962,7 +1012,7 @@ exit 1
     );
     try {
       const result = await (
-        await new CliProviderAdapter({ dialect: dialectFor(bin) }).start(
+        await providerAdapter({ dialect: dialectFor(bin) }).start(
           request({ workingDirectory: dir }),
         )
       ).result;
@@ -984,7 +1034,7 @@ exit 1
     );
     try {
       const result = await (
-        await new CliProviderAdapter({ dialect: dialectFor(bin) }).start(
+        await providerAdapter({ dialect: dialectFor(bin) }).start(
           request({ workingDirectory: dir }),
         )
       ).result;
@@ -999,7 +1049,7 @@ exit 1
     const { dir, bin } = fakeProvider(`#!/bin/sh\nsleep 30\n`);
     try {
       const result = await (
-        await new CliProviderAdapter({ dialect: dialectFor(bin) }).start(
+        await providerAdapter({ dialect: dialectFor(bin) }).start(
           request({ workingDirectory: dir, timeoutMs: 1_000 }),
         )
       ).result;
@@ -1019,7 +1069,7 @@ exit 1
     const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
     try {
       const result = await (
-        await new CliProviderAdapter({ dialect }).start(request({ workingDirectory: dir }))
+        await providerAdapter({ dialect }).start(request({ workingDirectory: dir }))
       ).result;
       expect(result.status).toBe("failure");
       expect(result.error).toBeDefined();
@@ -1034,7 +1084,7 @@ exit 1
     const dialect = dialectFor("/nonexistent/provider/binary");
     const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
     try {
-      const session = await new CliProviderAdapter({ dialect }).start(
+      const session = await providerAdapter({ dialect }).start(
         request({ workingDirectory: dir }),
       );
       await session.result;
@@ -1049,7 +1099,7 @@ exit 1
       `#!/bin/sh\necho '{"type":"task_started"}'\necho '{"type":"task_complete"}'\nexit 0\n`,
     );
     try {
-      const session = await new CliProviderAdapter({ dialect: dialectFor(bin) }).start(
+      const session = await providerAdapter({ dialect: dialectFor(bin) }).start(
         request({ workingDirectory: dir }),
       );
       const seen: string[] = [];
@@ -1067,7 +1117,7 @@ exit 1
     const { dir, bin } = fakeProvider(`#!/bin/sh\nsleep 30\n`);
     const controller = new AbortController();
     try {
-      const session = await new CliProviderAdapter({ dialect: dialectFor(bin) }).start(
+      const session = await providerAdapter({ dialect: dialectFor(bin) }).start(
         request({ workingDirectory: dir, signal: controller.signal, timeoutMs: 20_000 }),
       );
       controller.abort();
@@ -1086,7 +1136,7 @@ exit 1
     const { dir, bin } = fakeProvider(`#!/bin/sh\ntrap '' TERM\nsleep 60\n`);
     const controller = new AbortController();
     try {
-      const session = await new CliProviderAdapter({ dialect: dialectFor(bin) }).start(
+      const session = await providerAdapter({ dialect: dialectFor(bin) }).start(
         request({ workingDirectory: dir, signal: controller.signal, timeoutMs: 120_000 }),
       );
       controller.abort();
@@ -1114,7 +1164,7 @@ exit 0
     chmodSync(bin, 0o755);
     try {
       const result = await (
-        await new CliProviderAdapter({ dialect: dialectFor(bin) }).start(
+        await providerAdapter({ dialect: dialectFor(bin) }).start(
           request({ workingDirectory: dir, role: "local-reviewer" }),
         )
       ).result;
@@ -1135,7 +1185,7 @@ exit 0
     writeFileSync(stale, '{"verdict":"approved"}\n');
     try {
       const result = await (
-        await new CliProviderAdapter({ dialect: dialectFor(bin) }).start(
+        await providerAdapter({ dialect: dialectFor(bin) }).start(
           request({ workingDirectory: dir, role: "local-reviewer" }),
         )
       ).result;
@@ -1157,8 +1207,8 @@ describe("model selection", () => {
   });
 
   it("reports the model in the adapter name, so two adapters are tellable apart", () => {
-    const plain = new CliProviderAdapter({ dialect: CODEX_DIALECT });
-    const pinned = new CliProviderAdapter({ dialect: CODEX_DIALECT, model: "m1" });
+    const plain = providerAdapter({ dialect: CODEX_DIALECT });
+    const pinned = providerAdapter({ dialect: CODEX_DIALECT, model: "m1" });
     expect(plain.name).toBe("codex");
     expect(pinned.name).toBe("codex:m1");
     expect(pinned.model).toBe("m1");
@@ -1175,7 +1225,7 @@ describe("model selection", () => {
     try {
       const dialect = { ...CODEX_DIALECT, binary: bin, buildArgs: () => ["exec"] };
       await (
-        await new CliProviderAdapter({ dialect, model: "" }).start(
+        await providerAdapter({ dialect, model: "" }).start(
           request({ workingDirectory: dir }),
         )
       ).result;

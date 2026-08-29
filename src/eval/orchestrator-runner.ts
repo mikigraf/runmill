@@ -19,6 +19,7 @@ import type { BacklogIssue } from "../domain/types.js";
 import { WorkspaceManager, type Workspace } from "../workspace/manager.js";
 import { validateInstalledDependencies } from "../workspace/dependencies.js";
 import { errorMessage, RunmillError } from "../errors/runmill-error.js";
+import { VerificationEngine } from "../verification/engine.js";
 
 export interface OrchestratorRunnerOptions {
   readonly config: RunmillConfig;
@@ -138,6 +139,7 @@ export function orchestratorRunner(options: OrchestratorRunnerOptions): TaskRunn
           sourceBaseRef,
           workspaceRoot: join(dataDir, "runs"),
           workspaces,
+          verification: new VerificationEngine(adapters.sandbox),
           checks,
           onEvent: () => undefined,
         });

@@ -79,7 +79,7 @@ export interface OrchestratorDeps {
   readonly clock: Clock;
   readonly config: RunmillConfig;
   readonly workspaces?: WorkspaceManager | undefined;
-  readonly verification?: VerificationEngine | undefined;
+  readonly verification: VerificationEngine;
   readonly sourceRepoPath: string;
   /** GitHub owner/name parsed from the exact local origin being cloned. */
   readonly sourceRepository: string;
@@ -134,7 +134,7 @@ export class Orchestrator {
   constructor(deps: OrchestratorDeps) {
     this.#d = deps;
     this.#workspaces = deps.workspaces ?? new WorkspaceManager();
-    this.#verification = deps.verification ?? new VerificationEngine();
+    this.#verification = deps.verification;
     this.#runLog = new RunLog(deps.runLogPath ?? join(deps.workspaceRoot, "..", "log.md"));
   }
 

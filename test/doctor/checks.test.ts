@@ -37,6 +37,9 @@ import {
   worstStatus,
 } from "../../src/doctor/checks.js";
 import type { ProviderDoctorAdapter } from "../../src/doctor/checks.js";
+import { createNativeSandboxBackend } from "../../src/workspace/sandbox.js";
+
+const nativeSandbox = () => createNativeSandboxBackend("native");
 
 let dir: string;
 
@@ -114,7 +117,7 @@ async function sandboxProbeLeftovers(): Promise<string[]> {
   const previousTmp = process.env["TMPDIR"];
   process.env["TMPDIR"] = isolatedTmp;
   try {
-    await checkSandbox();
+    await checkSandbox(nativeSandbox());
     return readdirSync(isolatedTmp);
   } finally {
     if (previousTmp === undefined) delete process.env["TMPDIR"];
@@ -317,7 +320,7 @@ describe("checkRemote", () => {
     execFileSync("git", ["init", "-q", "."], { cwd: dir });
 
     const results = await runAllChecks(
-      { repoRoot: dir, providerAdapterFactory: () => fakeProvider() },
+      { repoRoot: dir, sandbox: nativeSandbox(), providerAdapterFactory: () => fakeProvider() },
       ["codex"],
     );
 
@@ -611,7 +614,7 @@ describe("checkProvider", () => {
     execFileSync("git", ["init", "-q", "."], { cwd: dir });
 
     const results = await runAllChecks(
-      { repoRoot: dir, providerAdapterFactory: () => guarded },
+      { repoRoot: dir, sandbox: nativeSandbox(), providerAdapterFactory: () => guarded },
       "codex",
     );
 
@@ -845,7 +848,7 @@ describe("checkCiEnvironment", () => {
 
 describe("checkSandbox", () => {
   it("reports a mechanism appropriate to this platform", async () => {
-    const results = await checkSandbox();
+    const results = await checkSandbox(nativeSandbox());
     const mechanism = results.find((r) => r.id === "sandbox:mechanism");
     expect(mechanism).toBeDefined();
     if (platform() === "darwin") {
@@ -861,7 +864,7 @@ describe("checkSandbox", () => {
     // This probe only existed on the macOS path, so on Linux doctor asked
     // whether a sandbox existed — exactly what it claims not to do.
     if (platform() !== "darwin" && platform() !== "linux") return;
-    const results = await checkSandbox();
+    const results = await checkSandbox(nativeSandbox());
     const probe = results.find((r) => r.id === "sandbox:deny-credential-read");
     expect(probe, "no credential-denial probe ran").toBeDefined();
     expect(probe?.status).toBe("pass");
@@ -875,7 +878,7 @@ describe("checkSandbox", () => {
 
   it("surfaces unrestricted provider egress on every supported platform", async () => {
     if (platform() !== "darwin" && platform() !== "linux") return;
-    const results = await checkSandbox();
+    const results = await checkSandbox(nativeSandbox());
     const network = results.find((r) => r.id === "sandbox:network");
     expect(network?.status).toBe("warn");
     expect(network?.observed).toMatch(/unrestricted/);
@@ -884,7 +887,7 @@ describe("checkSandbox", () => {
 
   it("checks user namespaces on Linux, where the sandbox depends on them", async () => {
     if (platform() !== "linux") return;
-    const results = await checkSandbox();
+    const results = await checkSandbox(nativeSandbox());
     expect(results.some((r) => r.id === "sandbox:userns")).toBe(true);
   }, 30_000);
 });
@@ -894,6 +897,7 @@ describe("runAllChecks", () => {
     execFileSync("git", ["init", "-q", "."], { cwd: dir });
     const results = await runAllChecks({
       repoRoot: dir,
+      sandbox: nativeSandbox(),
       providerAdapterFactory: () => fakeProvider(),
     });
     expect(results[0]?.id).toBe("environment");
@@ -910,7 +914,7 @@ describe("runAllChecks", () => {
   it("honours the configured provider implementation", async () => {
     execFileSync("git", ["init", "-q", "."], { cwd: dir });
     const results = await runAllChecks(
-      { repoRoot: dir, providerAdapterFactory: () => fakeProvider() },
+      { repoRoot: dir, sandbox: nativeSandbox(), providerAdapterFactory: () => fakeProvider() },
       "claude",
     );
     expect(results.some((r) => r.id === "provider:claude")).toBe(true);
@@ -922,6 +926,7 @@ describe("runAllChecks", () => {
     let providerFactories = 0;
     const results = await runAllChecks({
       repoRoot: dir,
+      sandbox: nativeSandbox(),
       checkPrefix: "sandbox",
       providerAdapterFactory: () => {
         providerFactories += 1;
@@ -937,7 +942,7 @@ describe("runAllChecks", () => {
   it("probes an independently configured reviewer as well as the implementer", async () => {
     execFileSync("git", ["init", "-q", "."], { cwd: dir });
     const results = await runAllChecks(
-      { repoRoot: dir, providerAdapterFactory: () => fakeProvider() },
+      { repoRoot: dir, sandbox: nativeSandbox(), providerAdapterFactory: () => fakeProvider() },
       ["codex", "claude"],
     );
     expect(results.some((r) => r.id === "provider:codex")).toBe(true);
@@ -952,6 +957,7 @@ describe("runAllChecks", () => {
     const results = await runAllChecks(
       {
         repoRoot: dir,
+        sandbox: nativeSandbox(),
         providerAdapterFactory: (target) => {
           targets.push(`${target.implementation}:${target.model ?? "default"}`);
           return fakeProvider();
@@ -972,6 +978,7 @@ describe("runAllChecks", () => {
     execFileSync("git", ["init", "-q", "."], { cwd: dir });
     const ids = (await runAllChecks({
       repoRoot: dir,
+      sandbox: nativeSandbox(),
       providerAdapterFactory: () => fakeProvider(),
     })).map((r) => r.id);
     expect(new Set(ids).size).toBe(ids.length);

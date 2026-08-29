@@ -34,6 +34,8 @@ import {
   type ProviderCheckTarget,
 } from "../doctor/checks.js";
 import { renderDoctor } from "./render.js";
+import { createNativeSandboxBackend } from "../workspace/sandbox.js";
+import type { SandboxBackend } from "../workspace/sandbox.js";
 
 export interface InitDoctorInput {
   readonly repoRoot: string;
@@ -381,12 +383,14 @@ async function runDoctorAfterInit(
 ): Promise<readonly CheckResult[]> {
   let backlogProvider = "linear" as const;
   let providers: readonly ProviderCheckTarget[] = [];
+  let sandbox: SandboxBackend | undefined;
   try {
     const config = loadConfig(input.configPath, {
       repoRoot: input.repoRoot,
     }).config;
     backlogProvider = config.backlog.provider;
     providers = [config.providers.implementer, resolveReviewerAgent(config)];
+    sandbox = createNativeSandboxBackend(config.workspace.sandbox);
   } catch {
     // checkConfiguration below owns the actionable parse error. Do not spend a
     // provider turn against a guessed default when the written policy cannot
@@ -397,6 +401,7 @@ async function runDoctorAfterInit(
       repoRoot: input.repoRoot,
       configPath: input.configPath,
       backlogProvider,
+      sandbox,
     },
     providers,
   );

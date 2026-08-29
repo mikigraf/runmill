@@ -20,6 +20,7 @@ import {
   type RunChecksInput,
   type VerificationOutcome,
 } from "../verification/engine.js";
+import { createNativeSandboxBackend } from "../workspace/sandbox.js";
 
 export interface DemoResult {
   readonly issue: Pick<BacklogIssue, "identifier" | "title">;
@@ -160,7 +161,7 @@ verification:
       sourceRepoPath: source,
       sourceRepository: selected.target.repo,
       workspaceRoot: join(root, "runs"),
-      verification: new DemoVerificationEngine(),
+      verification: new DemoVerificationEngine(createNativeSandboxBackend("native")),
       checks: [
         {
           id: "demo-candidate",

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { outputContractFor, outputPathFor } from "../../src/agent/output-contract.js";
 import { CliProviderAdapter, CODEX_DIALECT, CLAUDE_DIALECT, defaultPrompt } from "../../src/agent/cli-provider.js";
 import type { AgentRunRequest } from "../../src/agent/adapter.js";
+import { createNativeSandboxBackend } from "../../src/workspace/sandbox.js";
 
 function request(role: AgentRunRequest["role"]): AgentRunRequest {
   return {
@@ -51,8 +52,9 @@ describe("output contract", () => {
 
 describe("provider capability parity", () => {
   it("reads capabilities from the dialect rather than switching on a name", async () => {
-    const codex = await new CliProviderAdapter({ dialect: CODEX_DIALECT }).capabilities();
-    const claude = await new CliProviderAdapter({ dialect: CLAUDE_DIALECT }).capabilities();
+    const sandbox = createNativeSandboxBackend("native");
+    const codex = await new CliProviderAdapter({ dialect: CODEX_DIALECT, sandbox }).capabilities();
+    const claude = await new CliProviderAdapter({ dialect: CLAUDE_DIALECT, sandbox }).capabilities();
     expect(codex.sessionResume).toBe(false);
     expect(claude.sessionResume).toBe(true);
     expect(claude.costReporting).toBe(true);

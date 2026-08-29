@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { Sandbox } from "../workspace/sandbox.js";
+import type { SandboxBackend } from "../workspace/sandbox.js";
 import type { WorkspaceManager, Workspace } from "../workspace/manager.js";
 import { RunmillError } from "../errors/runmill-error.js";
 import {
@@ -41,7 +41,7 @@ export interface CheckResult {
   readonly treeHashBefore: string;
   readonly treeHashAfter: string;
   readonly executor: "orchestrator" | "agent";
-  readonly outcome: "exited" | "signaled" | "timeout" | "sandbox-denied";
+  readonly outcome: "exited" | "signaled" | "timeout" | "aborted" | "sandbox-denied";
   readonly exitCode: number | null;
   readonly status: "passed" | "failed" | "not_applicable";
   readonly coverage: Coverage;
@@ -361,7 +361,7 @@ function removeGeneratedReport(
 interface CheckExecution {
   readonly before: string;
   readonly after: string;
-  readonly outcome: Awaited<ReturnType<Sandbox["run"]>>;
+  readonly outcome: Awaited<ReturnType<SandboxBackend["run"]>>;
   readonly report: ReturnType<typeof inspectReport>;
   readonly combined: string;
 }
@@ -453,9 +453,9 @@ function compareInventories(
  * protected Git metadata, read-only dependency tree, timeout and tree hash.
  */
 export class VerificationEngine {
-  readonly #sandbox: Sandbox;
+  readonly #sandbox: SandboxBackend;
 
-  constructor(sandbox: Sandbox = new Sandbox()) {
+  constructor(sandbox: SandboxBackend) {
     this.#sandbox = sandbox;
   }
 
@@ -476,6 +476,10 @@ export class VerificationEngine {
         verificationDependencyPath?: (checkoutPath: string) => string | undefined;
       };
       const dependencyPath = dependencyLookup.verificationDependencyPath?.(verifyPath);
+      const preparedDependency =
+        dependencyPath === undefined
+          ? undefined
+          : this.#sandbox.prepareDependencyCheckout(dependencyPath);
       const outcome = await this.#sandbox.run({
         command: command ?? "",
         args,
@@ -492,11 +496,14 @@ export class VerificationEngine {
           readablePaths: [verifyPath],
           protectedPaths: [
             join(verifyPath, ".git"),
-            ...(dependencyPath === undefined ? [] : [dependencyPath]),
+            ...(preparedDependency === undefined ? [] : [preparedDependency.path]),
           ],
           allowNetwork: false,
         },
         timeoutMs: input.timeoutMs ?? 10 * 60_000,
+        ...(preparedDependency === undefined
+          ? {}
+          : { preparedDependencyPaths: [preparedDependency.path] }),
       });
       const report = inspectReport(verifyPath, spec, preparedReport);
       removeGeneratedReport(verifyPath, preparedReport);

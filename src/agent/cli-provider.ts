@@ -1,8 +1,7 @@
-import { spawn } from "node:child_process";
 import { readFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { errorMessage } from "../errors/runmill-error.js";
+import { errorMessage, RunmillError } from "../errors/runmill-error.js";
 import type {
   AgentRunRequest,
   AgentRunResult,
@@ -17,8 +16,8 @@ import type { AgentEvent, AgentEventBody } from "./events.js";
 import { UnknownEventError } from "./events.js";
 import type { Clock } from "../platform/clock.js";
 import { SystemClock } from "../platform/clock.js";
-import { buildEnvironment, Sandbox } from "../workspace/sandbox.js";
-import { run, armKillTimer, BoundedCapture, terminateTree } from "../platform/process.js";
+import { buildEnvironment, type SandboxBackend } from "../workspace/sandbox.js";
+import { run } from "../platform/process.js";
 import { outputPathFor, outputContractFor } from "./output-contract.js";
 import { LOCAL_REVIEW_SKILL, PR_REVIEW_SKILL } from "../review/default-skills.js";
 import { createProviderSessionHome } from "./provider-home.js";
@@ -226,7 +225,7 @@ export interface CliProviderOptions {
   readonly model?: string | undefined;
   readonly clock?: Clock | undefined;
   readonly promptBuilder?: ((request: AgentRunRequest) => string) | undefined;
-  readonly sandbox?: Sandbox | undefined;
+  readonly sandbox: SandboxBackend;
 }
 
 export interface ProviderExecutionStatus {
@@ -236,6 +235,24 @@ export interface ProviderExecutionStatus {
 
 const READINESS_MARKER = "RUNMILL_READY";
 const READINESS_TIMEOUT_MS = 30_000;
+const PROVIDER_OUTPUT_LIMIT_BYTES = 16 * 1024 * 1024;
+const PROVIDER_SUBPROCESSES = [
+  "/bin/sh",
+  "/bin/cat",
+  "/bin/chmod",
+  "/bin/mkdir",
+  "/bin/sleep",
+  "/usr/bin/dirname",
+  "/usr/bin/env",
+  "/usr/bin/git",
+] as const;
+
+function providerSubprocesses(request: AgentRunRequest): string[] {
+  const configured = request.allowedCommands
+    .map((command) => command.trim().split(/\s+/, 1)[0])
+    .filter((command): command is string => command !== undefined && command !== "");
+  return [...new Set([...PROVIDER_SUBPROCESSES, ...configured])];
+}
 
 /**
  * Runs a real coding-agent CLI and normalizes its output.
@@ -250,14 +267,17 @@ export class CliProviderAdapter implements CodingAgentAdapter {
   readonly #model: string | undefined;
   readonly #clock: Clock;
   readonly #promptBuilder: (request: AgentRunRequest) => string;
-  readonly #sandbox: Sandbox;
+  readonly #sandbox: SandboxBackend;
 
   constructor(options: CliProviderOptions) {
+    if (options.sandbox === undefined) {
+      throw new Error("CliProviderAdapter requires an injected sandbox backend");
+    }
     this.#dialect = options.dialect;
     this.#model = options.model;
     this.#clock = options.clock ?? new SystemClock();
     this.#promptBuilder = options.promptBuilder ?? defaultPrompt;
-    this.#sandbox = options.sandbox ?? new Sandbox();
+    this.#sandbox = options.sandbox;
   }
 
   get name(): string {
@@ -269,6 +289,11 @@ export class CliProviderAdapter implements CodingAgentAdapter {
   /** The model this adapter runs, or undefined for the CLI's default. */
   get model(): string | undefined {
     return this.#model;
+  }
+
+  /** Internal composition evidence: provider and verification share this instance. */
+  get sandboxBackend(): SandboxBackend {
+    return this.#sandbox;
   }
 
   async detect(): Promise<ProviderInstallation> {
@@ -296,11 +321,15 @@ export class CliProviderAdapter implements CodingAgentAdapter {
   /** Prove auth in the same sandbox used for a real agent session. */
   async sandboxAuthStatus(): Promise<AuthStatus> {
     const workspace = mkdtempSync(join(tmpdir(), "runmill-provider-auth-"));
+    let preparedHome: ReturnType<SandboxBackend["prepareDisposableHome"]> | undefined;
     let providerHome: ReturnType<typeof createProviderSessionHome> | undefined;
     try {
+      preparedHome = this.#sandbox.prepareDisposableHome();
       providerHome = createProviderSessionHome(
         (home) => this.#dialect.configPaths(home),
         (home) => this.#dialect.sessionConfigEntries(home),
+        process.env["HOME"],
+        preparedHome.path,
       );
       const result = await this.#sandbox.run({
         command: this.#dialect.binary,
@@ -334,7 +363,11 @@ export class CliProviderAdapter implements CodingAgentAdapter {
         detail: `sandbox probe failed: ${error instanceof Error ? error.message : String(error)}`,
       };
     } finally {
-      providerHome?.cleanup();
+      try {
+        providerHome?.cleanup();
+      } finally {
+        preparedHome?.cleanup();
+      }
       rmSync(workspace, { recursive: true, force: true });
     }
   }
@@ -451,7 +484,7 @@ export class CliProviderAdapter implements CodingAgentAdapter {
 
     const events: AgentEvent[] = [];
     let seq = 0;
-    let sessionIdResolve: (id: string) => void;
+    let sessionIdResolve!: (id: string) => void;
     const sessionIdPromise = new Promise<string>((resolve) => {
       sessionIdResolve = resolve;
     });
@@ -490,20 +523,52 @@ export class CliProviderAdapter implements CodingAgentAdapter {
     // for the duration of the process but cannot alter a later unsandboxed CLI
     // run. Tool children can still read the copied token, so this is persistence
     // isolation, not credential brokering.
-    const providerHome = createProviderSessionHome(
-      (home) => this.#dialect.configPaths(home),
-      (home) => this.#dialect.sessionConfigEntries(home),
-    );
-    let wrapped: ReturnType<Sandbox["wrap"]>;
+    const preparedHome = this.#sandbox.prepareDisposableHome();
+    let providerHome: ReturnType<typeof createProviderSessionHome>;
     try {
-      // The agent is the untrusted party, so it runs under the same sandbox
-      // primitive as the check runner. Previously only checks were isolated
-      // while the agent itself ran unconfined — the inverse of the intent.
-      wrapped = this.#sandbox.wrap({
+      providerHome = createProviderSessionHome(
+        (home) => this.#dialect.configPaths(home),
+        (home) => this.#dialect.sessionConfigEntries(home),
+        process.env["HOME"],
+        preparedHome.path,
+      );
+    } catch (error) {
+      preparedHome.cleanup();
+      throw error;
+    }
+    let buffer = "";
+    let parseError: Error | undefined;
+    const onStdout = (chunk: Buffer): void => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.trim() === "") continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        try {
+          const body = this.#dialect.mapLine(parsed);
+          if (body !== undefined) emit(body);
+        } catch (error) {
+          if (error instanceof UnknownEventError) parseError = error;
+        }
+      }
+    };
+
+    let execution: Awaited<ReturnType<SandboxBackend["start"]>>;
+    try {
+      execution = await this.#sandbox.start({
         command: this.#dialect.binary,
         args,
         cwd: request.workingDirectory,
         env: { HOME: providerHome.path },
+        subprocesses: providerSubprocesses(request),
+        maxOutputBytes: PROVIDER_OUTPUT_LIMIT_BYTES,
+        onStdout,
         policy: {
           // The entire disposable HOME is writable. Both CLIs keep caches and
           // session state beside their authentication config and may fail
@@ -519,97 +584,50 @@ export class CliProviderAdapter implements CodingAgentAdapter {
           protectedPaths: [join(request.workingDirectory, ".git")],
           allowNetwork: request.network !== "none",
         },
+        timeoutMs: request.timeoutMs,
       });
     } catch (error) {
-      providerHome.cleanup();
-      throw error;
-    }
-
-    let cleaned = false;
-    const cleanup = (): void => {
-      if (cleaned) return;
-      cleaned = true;
       try {
-        wrapped.cleanup();
-      } finally {
         providerHome.cleanup();
+      } finally {
+        preparedHome.cleanup();
       }
-    };
-
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn(wrapped.command, wrapped.args, {
-        cwd: wrapped.cwd,
-        env: wrapped.env,
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
+      if (!(error instanceof RunmillError)) throw error;
+      sessionIdResolve(sessionId);
+      const result = Promise.resolve<AgentRunResult>({
+        status: "failure",
+        sessionId,
+        events,
+        error: {
+          class: "provider_internal",
+          retryable: false,
+          detail: errorMessage(error),
+        },
       });
-    } catch (error) {
-      cleanup();
-      throw error;
+      return {
+        sessionId: sessionIdPromise,
+        events: (async function* () {
+          await result;
+          for (const event of events) yield event;
+        })(),
+        result,
+        respondToPermission: async () => undefined,
+        abort: async () => undefined,
+      };
     }
+    const abortFromSignal = (): void => {
+      void execution.abort();
+    };
+    request.signal?.addEventListener("abort", abortFromSignal, { once: true });
+    if (request.signal?.aborted === true) abortFromSignal();
 
-    // Cancellation works even before session.started arrives, because the
-    // process handle is captured here rather than derived from a session id.
-    // SIGTERM, then SIGKILL after the same grace period the timeout path uses.
-    // Terminating only once leaves a provider that traps or ignores SIGTERM
-    // running, and session.result pending behind it, which would hold the run
-    // and the daemon open indefinitely.
-    request.signal?.addEventListener("abort", () => terminateTree(child), { once: true });
-
-    const cancelTimer = armKillTimer(child, request.timeoutMs);
-
-    // Only ever read by two regexes; a two-hour chatty session should not
-    // retain every byte to answer them.
-    const stderrCapture = new BoundedCapture(64 * 1024);
-    let buffer = "";
-    let parseError: Error | undefined;
-
-    child.stderr?.on("data", (c: Buffer) => stderrCapture.push(c));
-    child.stdout?.on("data", (chunk: Buffer) => {
-      buffer += chunk.toString();
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (line.trim() === "") continue;
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          // Not JSON: providers interleave human-readable output. Ignored
-          // rather than treated as an event, but never treated as a result.
-          continue;
-        }
-        try {
-          const body = this.#dialect.mapLine(parsed);
-          if (body !== undefined) emit(body);
-        } catch (err) {
-          if (err instanceof UnknownEventError) parseError = err;
-        }
-      }
-    });
-
-    const result = new Promise<AgentRunResult>((resolve) => {
-      child.on("error", (err) => {
-        cancelTimer();
-        cleanup();
-        sessionIdResolve(sessionId);
-        resolve({
-          status: "failure",
-          sessionId,
-          events,
-          error: { class: "transport", retryable: true, detail: errorMessage(err) },
-          outputRef: undefined,
-        });
-      });
-
-      child.on("close", (code, signal) => {
-        cancelTimer();
-        cleanup();
+    const result = execution.result.then((sandboxResult): AgentRunResult => {
+      try {
+        if (buffer !== "") onStdout(Buffer.from("\n"));
         sessionIdResolve(sessionId);
 
         if (parseError !== undefined) {
-          resolve({
+          return {
             status: "failure",
             sessionId,
             events,
@@ -618,8 +636,7 @@ export class CliProviderAdapter implements CodingAgentAdapter {
               retryable: false,
               detail: parseError.message,
             },
-          });
-          return;
+          };
         }
 
         // Structured output is resolved from the shared role contract, not
@@ -635,29 +652,41 @@ export class CliProviderAdapter implements CodingAgentAdapter {
           }
         }
 
-        if (signal !== null) {
-          resolve({ status: request.signal?.aborted === true ? "cancelled" : "timeout", sessionId, events });
-          return;
+        if (sandboxResult.outcome === "aborted" || request.signal?.aborted === true) {
+          return { status: "cancelled", sessionId, events };
+        }
+        if (sandboxResult.outcome === "timeout") {
+          return { status: "timeout", sessionId, events };
         }
 
-        resolve({
-          status: code === 0 ? "success" : "failure",
+        return {
+          status:
+            sandboxResult.outcome === "exited" && sandboxResult.exitCode === 0
+              ? "success"
+              : "failure",
           sessionId,
           events,
           outputRef,
           error:
-            code === 0
+            sandboxResult.outcome === "exited" && sandboxResult.exitCode === 0
               ? undefined
               : (() => {
-                  const stderr = stderrCapture.text();
+                  const stderr = sandboxResult.stderr;
                   return {
                     class: classifyStderr(stderr),
                     retryable: isRetryable(stderr),
                     detail: lastMeaningfulLines(stderr),
                   };
                 })(),
-        });
-      });
+        };
+      } finally {
+        request.signal?.removeEventListener("abort", abortFromSignal);
+        try {
+          providerHome.cleanup();
+        } finally {
+          preparedHome.cleanup();
+        }
+      }
     });
 
     return {
@@ -671,9 +700,7 @@ export class CliProviderAdapter implements CodingAgentAdapter {
         // Permissions are granted up front via explicit tool allowlists, so a
         // mid-run request is not expected. Nothing to answer.
       },
-      abort: async () => {
-        terminateTree(child);
-      },
+      abort: () => execution.abort(),
     };
   }
 }

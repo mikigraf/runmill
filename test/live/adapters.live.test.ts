@@ -15,13 +15,15 @@ import { CredentialStore } from "../../src/credentials/store.js";
 import { GitHubForgeAdapter } from "../../src/pr/github.js";
 import { LinearBacklogAdapter } from "../../src/backlog/linear.js";
 import { snapshotHash } from "../../src/domain/snapshot.js";
+import { createNativeSandboxBackend } from "../../src/workspace/sandbox.js";
 
 const creds = new CredentialStore();
 const githubToken = await creds.get("github");
 const linearKey = await creds.get("linear");
 
-const codex = new CliProviderAdapter({ dialect: CODEX_DIALECT });
-const claude = new CliProviderAdapter({ dialect: CLAUDE_DIALECT });
+const sandbox = createNativeSandboxBackend("native");
+const codex = new CliProviderAdapter({ dialect: CODEX_DIALECT, sandbox });
+const claude = new CliProviderAdapter({ dialect: CLAUDE_DIALECT, sandbox });
 const codexInstalled = (await codex.detect()).installed;
 const claudeInstalled = (await claude.detect()).installed;
 

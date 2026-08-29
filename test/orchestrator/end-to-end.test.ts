@@ -20,7 +20,8 @@ import { FakeForgeAdapter } from "../../src/testing/fake-forge.js";
 import { FakeClock } from "../../src/testing/fake-clock.js";
 import { GitRefLease } from "../../src/queue/git-lease.js";
 import { parseConfig } from "../../src/config/load.js";
-import type { CheckSpec } from "../../src/verification/engine.js";
+import { VerificationEngine, type CheckSpec } from "../../src/verification/engine.js";
+import { createNativeSandboxBackend } from "../../src/workspace/sandbox.js";
 import type { BacklogIssue } from "../../src/domain/types.js";
 import { BacklogMutationNotStartedError } from "../../src/backlog/adapter.js";
 import { selectNext } from "../../src/queue/selector.js";
@@ -168,6 +169,7 @@ function makeOrchestrator(opts: {
       sourceRepoPath: source,
       sourceRepository: "acme/platform",
       workspaceRoot: join(root, "runs"),
+      verification: new VerificationEngine(createNativeSandboxBackend("native")),
       checks: opts.checks ?? [PASSING_CHECK],
       onEvent: (m) => opts.log?.push(m),
       ciPollIntervalMs: 1,
@@ -464,7 +466,7 @@ describe("end-to-end: issue to governed pull request", () => {
   it("claims with the configured automation assignee and restores ownership on failure", async () => {
     const failing: CheckSpec = {
       id: "unit",
-      run: "/bin/false",
+      run: "/usr/bin/false",
       required: true,
       source: "repository-policy",
     };
@@ -481,7 +483,6 @@ describe("end-to-end: issue to governed pull request", () => {
       target: TARGET,
       lease: lease("run_assignment_restore"),
     });
-
     expect(outcome.finalState).toBe("NEEDS_HUMAN");
     expect(backlog.peek(ISSUE.identifier)).toMatchObject({ state: "Todo" });
     expect(backlog.peek(ISSUE.identifier)?.assigneeId).toBeUndefined();
