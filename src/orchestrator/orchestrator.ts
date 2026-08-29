@@ -1,4 +1,4 @@
-import { isAbsolute, join, resolve } from "node:path";
+import { join } from "node:path";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import {
   BacklogMutationNotStartedError,
@@ -32,6 +32,8 @@ import {
   PR_EVIDENCE_PATH,
   serializePullRequestEvidence,
 } from "./pr-evidence.js";
+import { tryGit } from "../platform/git.js";
+import { normalizeRepositoryPath } from "../workspace/path-scope.js";
 
 export type RunState =
   | "DISCOVERED"
@@ -144,24 +146,80 @@ export class Orchestrator {
     this.#d.onEvent?.(message);
   }
 
-  /** Capture repository guidance before the implementer can edit the tree. */
-  #reviewGuidance(
+  /** Capture repository guidance from the exact base commit before implementation. */
+  async #reviewGuidance(
     configuredPath: string | undefined,
     workspace: Workspace,
-  ): { source: string; content: string } | undefined {
+  ): Promise<{ source: string; content: string } | undefined> {
     if (configuredPath === undefined) return undefined;
-    const path = isAbsolute(configuredPath)
-      ? configuredPath
-      : resolve(workspace.path, configuredPath);
-    const content = readFileSync(path, "utf8");
-    if (Buffer.byteLength(content) > MAX_REVIEW_GUIDANCE_BYTES) {
+
+    try {
+      normalizeRepositoryPath(configuredPath);
+    } catch (cause) {
+      throw RunmillError.fromCatalog("RM-CONFIG-001", {
+        whatHappened:
+          `${JSON.stringify(configuredPath)} is not a normalized, non-empty ` +
+          "repository-relative POSIX review guidance path.",
+        cause,
+      });
+    }
+
+    const tree = await tryGit(workspace.path, [
+      "--literal-pathspecs",
+      "ls-tree",
+      "-z",
+      workspace.baseCommit,
+      "--",
+      configuredPath,
+    ]);
+    const entry = tree.ok ? tree.stdout : "";
+    const separator = entry.indexOf("\t");
+    const metadata = separator === -1 ? [] : entry.slice(0, separator).split(" ");
+    const listedPath = separator === -1 ? "" : entry.slice(separator + 1, -1);
+    const [mode, type, objectId] = metadata;
+    if (
+      !tree.ok ||
+      !entry.endsWith("\0") ||
+      entry.indexOf("\0") !== entry.length - 1 ||
+      listedPath !== configuredPath ||
+      (mode !== "100644" && mode !== "100755") ||
+      type !== "blob" ||
+      objectId === undefined
+    ) {
+      throw RunmillError.fromCatalog("RM-CONFIG-001", {
+        whatHappened:
+          `${JSON.stringify(configuredPath)} at base commit ${workspace.baseCommit} ` +
+          "is not a regular Git blob.",
+      });
+    }
+
+    const sizeResult = await tryGit(workspace.path, ["cat-file", "-s", objectId]);
+    const sizeText = sizeResult.stdout.trim();
+    const size = /^\d+$/u.test(sizeText) ? Number(sizeText) : Number.NaN;
+    if (!sizeResult.ok || !Number.isSafeInteger(size) || size < 0) {
+      throw RunmillError.fromCatalog("RM-CONFIG-001", {
+        whatHappened:
+          `Could not determine the size of ${JSON.stringify(configuredPath)} at base commit ` +
+          `${workspace.baseCommit}.`,
+      });
+    }
+    if (size > MAX_REVIEW_GUIDANCE_BYTES) {
       throw RunmillError.fromCatalog("RM-CONFIG-001", {
         whatHappened:
           `${configuredPath} is larger than ${MAX_REVIEW_GUIDANCE_BYTES} bytes. ` +
           "Repository review guidance is prompt input, so keep it bounded.",
       });
     }
-    return { source: configuredPath, content };
+
+    const blob = await tryGit(workspace.path, ["cat-file", "blob", objectId]);
+    if (!blob.ok || Buffer.byteLength(blob.stdout) !== size) {
+      throw RunmillError.fromCatalog("RM-CONFIG-001", {
+        whatHappened:
+          `Could not read ${JSON.stringify(configuredPath)} exactly from base commit ` +
+          `${workspace.baseCommit}.`,
+      });
+    }
+    return { source: configuredPath, content: blob.stdout };
   }
 
   /** Re-read the remote PR and bind it to the exact local candidate. */
@@ -535,11 +593,11 @@ export class Orchestrator {
       // These files are repository-controlled prompt input. Capture their
       // base-commit contents before implementation begins, then append them as
       // untrusted, narrowing-only guidance after the immutable rubric.
-      const localReviewGuidance = this.#reviewGuidance(
+      const localReviewGuidance = await this.#reviewGuidance(
         cfg.review.localReviewSkill,
         workspace,
       );
-      const prReviewGuidance = this.#reviewGuidance(cfg.review.prReviewSkill, workspace);
+      const prReviewGuidance = await this.#reviewGuidance(cfg.review.prReviewSkill, workspace);
 
       // -- task packet ---------------------------------------------------
       const snapshot = snapshotHash(issue);

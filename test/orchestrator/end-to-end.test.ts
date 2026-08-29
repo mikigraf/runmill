@@ -6,10 +6,12 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:net";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
 import { StateStore } from "../../src/state/store.js";
 import { FakeBacklogAdapter } from "../../src/testing/fake-backlog.js";
@@ -22,6 +24,7 @@ import type { CheckSpec } from "../../src/verification/engine.js";
 import type { BacklogIssue } from "../../src/domain/types.js";
 import { BacklogMutationNotStartedError } from "../../src/backlog/adapter.js";
 import { selectNext } from "../../src/queue/selector.js";
+import { WorkspaceManager } from "../../src/workspace/manager.js";
 
 let root: string;
 let origin: string;
@@ -144,6 +147,7 @@ function makeOrchestrator(opts: {
   checks?: CheckSpec[];
   cfg?: ReturnType<typeof parseConfig>;
   log?: string[];
+  workspaces?: WorkspaceManager;
 }) {
   const backlog = opts.backlog ?? new FakeBacklogAdapter([ISSUE]);
   const provider = opts.provider ?? defaultProvider();
@@ -160,6 +164,7 @@ function makeOrchestrator(opts: {
       store,
       clock,
       config: opts.cfg ?? config(),
+      workspaces: opts.workspaces,
       sourceRepoPath: source,
       sourceRepository: "acme/platform",
       workspaceRoot: join(root, "runs"),
@@ -180,6 +185,37 @@ function lease(runId: string): GitRefLease {
     hostId: "host-1",
     pid: 1,
   });
+}
+
+async function expectReviewGuidanceRefusal(input: {
+  runId: string;
+  configuredPath: string;
+  secret: string;
+  workspaces?: WorkspaceManager;
+}): Promise<void> {
+  const base = config();
+  const cfg = {
+    ...base,
+    review: { ...base.review, localReviewSkill: input.configuredPath },
+  };
+  const provider = defaultProvider();
+  const log: string[] = [];
+  const { orchestrator } = makeOrchestrator({
+    provider,
+    cfg,
+    log,
+    ...(input.workspaces === undefined ? {} : { workspaces: input.workspaces }),
+  });
+  const outcome = await orchestrator.run({
+    runId: input.runId,
+    issue: ISSUE,
+    target: TARGET,
+    lease: lease(input.runId),
+  });
+
+  expect(outcome.finalState, outcome.reason).toBe("QUARANTINED");
+  expect(provider.startedRequests).toEqual([]);
+  expect(JSON.stringify({ outcome, log })).not.toContain(input.secret);
 }
 
 const TARGET = { repo: "acme/platform", baseBranch: "main" };
@@ -1026,6 +1062,217 @@ describe("PR review", () => {
       provider.startedRequests.find((request) => request.role === "implementer")
         ?.supplementalReviewGuidance,
     ).toBeUndefined();
+  }, 90_000);
+
+  it("binds review guidance to the base commit instead of the mutable workspace path", async () => {
+    const guidancePath = "review-guidance.md";
+    const hostSecret = "HOST-ONLY-SECRET-DO-NOT-LEAK";
+    writeFileSync(join(source, guidancePath), "Inspect committed tenant boundaries.\n");
+    git(source, "add", guidancePath);
+    git(source, "commit", "-q", "-m", "add committed review guidance");
+    git(source, "push", "-q", "origin", "main");
+
+    class HostMutatingWorkspaceManager extends WorkspaceManager {
+      override async create(input: Parameters<WorkspaceManager["create"]>[0]) {
+        const workspace = await super.create(input);
+        writeFileSync(join(workspace.path, guidancePath), `${hostSecret}\n`);
+        return workspace;
+      }
+
+      override async checkpoint(...args: Parameters<WorkspaceManager["checkpoint"]>) {
+        writeFileSync(
+          join(args[0].path, guidancePath),
+          "Inspect committed tenant boundaries.\n",
+        );
+        return super.checkpoint(...args);
+      }
+    }
+
+    const base = config();
+    const cfg = {
+      ...base,
+      review: { ...base.review, localReviewSkill: guidancePath },
+    };
+    const provider = defaultProvider();
+    const { orchestrator } = makeOrchestrator({
+      provider,
+      cfg,
+      workspaces: new HostMutatingWorkspaceManager(),
+    });
+    const outcome = await orchestrator.run({
+      runId: "run_base_guidance",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_base_guidance"),
+    });
+
+    expect(outcome.finalState, outcome.reason).toBe("PR_DELIVERED");
+    expect(
+      provider.startedRequests.find((request) => request.role === "local-reviewer")
+        ?.supplementalReviewGuidance,
+    ).toMatchObject({
+      source: guidancePath,
+      content: "Inspect committed tenant boundaries.\n",
+    });
+    expect(JSON.stringify(provider.startedRequests)).not.toContain(hostSecret);
+  }, 90_000);
+
+  it("refuses an absolute guidance path without exposing the planted host secret", async () => {
+    const secret = "ABSOLUTE-HOST-SECRET-DO-NOT-LEAK";
+    const secretPath = join(root, "absolute-host-secret.md");
+    writeFileSync(secretPath, `${secret}\n`);
+
+    await expectReviewGuidanceRefusal({
+      runId: "run_absolute_guidance",
+      configuredPath: secretPath,
+      secret,
+    });
+  }, 90_000);
+
+  it("refuses a traversing guidance path without exposing the planted host secret", async () => {
+    const secret = "TRAVERSAL-HOST-SECRET-DO-NOT-LEAK";
+    writeFileSync(join(root, "traversal-host-secret.md"), `${secret}\n`);
+
+    await expectReviewGuidanceRefusal({
+      runId: "run_traversal_guidance",
+      configuredPath: "../../traversal-host-secret.md",
+      secret,
+    });
+  }, 90_000);
+
+  it("refuses guidance below an intermediate symlink without exposing its host target", async () => {
+    const secret = "INTERMEDIATE-SYMLINK-SECRET-DO-NOT-LEAK";
+    writeFileSync(join(root, "intermediate-host-secret.md"), `${secret}\n`);
+    mkdirSync(join(source, ".runmill"), { recursive: true });
+    symlinkSync(root, join(source, ".runmill", "outside"));
+    git(source, "add", ".runmill/outside");
+    git(source, "commit", "-q", "-m", "add intermediate guidance symlink");
+    git(source, "push", "-q", "origin", "main");
+
+    await expectReviewGuidanceRefusal({
+      runId: "run_intermediate_symlink_guidance",
+      configuredPath: ".runmill/outside/intermediate-host-secret.md",
+      secret,
+    });
+  }, 90_000);
+
+  it("refuses a final guidance symlink without exposing its planted host target", async () => {
+    const secret = "FINAL-SYMLINK-SECRET-DO-NOT-LEAK";
+    const hostTarget = join(root, "final-host-secret.md");
+    writeFileSync(hostTarget, `${secret}\n`);
+    symlinkSync(hostTarget, join(source, "review-guidance.md"));
+    git(source, "add", "review-guidance.md");
+    git(source, "commit", "-q", "-m", "add final guidance symlink");
+    git(source, "push", "-q", "origin", "main");
+
+    await expectReviewGuidanceRefusal({
+      runId: "run_final_symlink_guidance",
+      configuredPath: "review-guidance.md",
+      secret,
+    });
+  }, 90_000);
+
+  it("refuses a special Git target before any provider call", async () => {
+    const secret = "SPECIAL-TARGET-SECRET-DO-NOT-LEAK";
+    const commit = git(source, "rev-parse", "HEAD");
+    git(
+      source,
+      "update-index",
+      "--add",
+      "--cacheinfo",
+      `160000,${commit},review-guidance.md`,
+    );
+    git(source, "commit", "-q", "-m", "add guidance gitlink");
+    git(source, "push", "-q", "origin", "main");
+
+    await expectReviewGuidanceRefusal({
+      runId: "run_special_guidance",
+      configuredPath: "review-guidance.md",
+      secret,
+    });
+  }, 90_000);
+
+  it("refuses a host special file without reading the secret served through it", async () => {
+    const secret = "SPECIAL-FILE-SECRET-DO-NOT-LEAK";
+    const guidancePath = "review-guidance.sock";
+    const server = createServer((socket) => socket.end(secret));
+
+    class SpecialFileWorkspaceManager extends WorkspaceManager {
+      override async create(input: Parameters<WorkspaceManager["create"]>[0]) {
+        const workspace = await super.create(input);
+        await new Promise<void>((resolve, reject) => {
+          const onError = (error: Error): void => reject(error);
+          server.once("error", onError);
+          server.listen(join(workspace.path, guidancePath), () => {
+            server.off("error", onError);
+            resolve();
+          });
+        });
+        return workspace;
+      }
+    }
+
+    try {
+      await expectReviewGuidanceRefusal({
+        runId: "run_special_file_guidance",
+        configuredPath: guidancePath,
+        secret,
+        workspaces: new SpecialFileWorkspaceManager(),
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 90_000);
+
+  it("refuses a missing base-commit guidance target before any provider call", async () => {
+    await expectReviewGuidanceRefusal({
+      runId: "run_missing_guidance",
+      configuredPath: "missing-review-guidance.md",
+      secret: "MISSING-TARGET-SECRET-DO-NOT-LEAK",
+    });
+  }, 90_000);
+
+  it("refuses oversized committed guidance before any provider call", async () => {
+    const secret = "OVERSIZED-GUIDANCE-SECRET-DO-NOT-LEAK";
+    const oversizedGuidance = `${secret}\n`.padEnd(64 * 1024 + 1, "x");
+    writeFileSync(join(source, "review-guidance.md"), oversizedGuidance);
+    git(source, "add", "review-guidance.md");
+    git(source, "commit", "-q", "-m", "add oversized guidance");
+    git(source, "push", "-q", "origin", "main");
+
+    await expectReviewGuidanceRefusal({
+      runId: "run_oversized_guidance",
+      configuredPath: "review-guidance.md",
+      secret,
+    });
+  }, 90_000);
+
+  it("accepts committed guidance at exactly the 64 KiB limit", async () => {
+    const guidance = "g".repeat(64 * 1024);
+    writeFileSync(join(source, "review-guidance.md"), guidance);
+    git(source, "add", "review-guidance.md");
+    git(source, "commit", "-q", "-m", "add maximum-size guidance");
+    git(source, "push", "-q", "origin", "main");
+
+    const base = config();
+    const cfg = {
+      ...base,
+      review: { ...base.review, localReviewSkill: "review-guidance.md" },
+    };
+    const provider = defaultProvider();
+    const { orchestrator } = makeOrchestrator({ provider, cfg });
+    const outcome = await orchestrator.run({
+      runId: "run_maximum_guidance",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_maximum_guidance"),
+    });
+
+    expect(outcome.finalState, outcome.reason).toBe("PR_DELIVERED");
+    expect(
+      provider.startedRequests.find((request) => request.role === "local-reviewer")
+        ?.supplementalReviewGuidance?.content,
+    ).toBe(guidance);
   }, 90_000);
 
   it("refuses PR evidence when the remote head is not the local candidate", async () => {

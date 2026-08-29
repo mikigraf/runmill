@@ -235,6 +235,32 @@ describe("validateConfig", () => {
     expect(validateConfig(parseConfig(MINIMAL)).valid).toBe(true);
   });
 
+  it("rejects review guidance paths that are not normalized repository-relative POSIX paths", () => {
+    const cfg = parseConfig(MINIMAL);
+    const invalidPaths = [
+      "",
+      "/etc/passwd",
+      "C:/Windows/system.ini",
+      ".",
+      "../secret.md",
+      "skills/../secret.md",
+      "skills//review.md",
+      "skills\\review.md",
+      "skills/review.md\0secret",
+    ];
+
+    for (const path of invalidPaths) {
+      for (const key of ["localReviewSkill", "prReviewSkill"] as const) {
+        const result = validateConfig({
+          ...cfg,
+          review: { ...cfg.review, [key]: path },
+        });
+        expect(result.valid, `${key}: ${JSON.stringify(path)}`).toBe(false);
+        expect(result.errors.join("\n")).toMatch(/review\..*must be.*repository-relative/i);
+      }
+    }
+  });
+
   it("rejects an unknown autonomy mode", () => {
     const result = validateConfig({ ...parseConfig(MINIMAL), autonomy: "yolo" } as never);
     expect(result.valid).toBe(false);
@@ -418,20 +444,13 @@ describe("loadConfig", () => {
     }
   });
 
-  it("throws RM-CONFIG-002 when a referenced review skill is missing", () => {
-    // FR-22: this must fail at load, not at LOCAL_REVIEW after real spend.
+  it("does not resolve repository guidance paths against the mutable host checkout", () => {
     const path = write(
       "runmill.yaml",
       `${MINIMAL}\nreview:\n  local_review_skill: .runmill/skills/code-review.md\n`,
     );
-    try {
-      loadConfig(path, { repoRoot: dir });
-      expect.unreachable("should reject a missing referenced file");
-    } catch (err) {
-      expect(err).toBeInstanceOf(RunmillError);
-      expect((err as RunmillError).code).toBe("RM-CONFIG-002");
-      expect((err as RunmillError).whatHappened).toMatch(/code-review\.md/);
-    }
+
+    expect(() => loadConfig(path, { repoRoot: dir })).not.toThrow();
   });
 
   it("distinguishes no-config-at-all from a bad reference inside one", () => {
@@ -461,18 +480,13 @@ describe("loadConfig", () => {
     expect(() => loadConfig(path, { repoRoot: dir })).not.toThrow();
   });
 
-  it("reports every missing referenced path at once", () => {
+  it("defers both normalized review guidance targets to base-commit validation", () => {
     const path = write(
       "runmill.yaml",
       `${MINIMAL}\nreview:\n  local_review_skill: a.md\n  pr_review_skill: b.md\n`,
     );
-    try {
-      loadConfig(path, { repoRoot: dir });
-      expect.unreachable();
-    } catch (err) {
-      expect((err as RunmillError).whatHappened).toMatch(/a\.md/);
-      expect((err as RunmillError).whatHappened).toMatch(/b\.md/);
-    }
+
+    expect(() => loadConfig(path, { repoRoot: dir })).not.toThrow();
   });
 });
 

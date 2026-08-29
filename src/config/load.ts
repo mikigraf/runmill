@@ -7,6 +7,7 @@ import { findConflictingRules, type RepositoryRule } from "../queue/repository-m
 import type { RunmillConfig, ValidationResult } from "./types.js";
 import configSchema from "../../runmill.schema.json" with { type: "json" };
 import { SUPPORTED_REPORT_FORMATS } from "../verification/report.js";
+import { normalizeRepositoryPath } from "../workspace/path-scope.js";
 
 export type { RunmillConfig } from "./types.js";
 
@@ -473,6 +474,20 @@ export function validateConfig(config: RunmillConfig): ValidationResult {
     );
   }
 
+  for (const [key, path] of [
+    ["local_review_skill", config.review.localReviewSkill],
+    ["pr_review_skill", config.review.prReviewSkill],
+  ] as const) {
+    if (path === undefined) continue;
+    try {
+      normalizeRepositoryPath(path);
+    } catch {
+      errors.push(
+        `review.${key} must be a normalized, non-empty repository-relative POSIX path`,
+      );
+    }
+  }
+
   const perRole =
     config.budgets.maxAgentInvocations.implementer +
     config.budgets.maxAgentInvocations.localReview +
@@ -535,20 +550,18 @@ export function validateConfig(config: RunmillConfig): ValidationResult {
 }
 
 export interface LoadOptions {
-  /** Root used to resolve relative paths referenced by the config. */
+  /** Repository root retained for loader API compatibility and future repository validation. */
   readonly repoRoot: string;
 }
 
 /**
- * Load, validate, and eagerly check every referenced path.
- *
- * FR-22: nothing config-shaped may first fail after an agent has been
- * dispatched. A missing review skill discovered at LOCAL_REVIEW costs twenty
- * minutes and real model spend; discovered here it costs nothing.
+ * Load and validate operator policy without resolving repository-controlled
+ * paths against the mutable host checkout. Review guidance targets are bound
+ * to the run's exact base commit by the orchestrator.
  */
 export function loadConfig(
   path: string,
-  options: LoadOptions,
+  _options: LoadOptions,
 ): { config: RunmillConfig; path: string } {
   if (!existsSync(path)) {
     // Distinct from RM-CONFIG-002 (a path INSIDE the config is unresolvable).
@@ -568,26 +581,6 @@ export function loadConfig(
   if (!result.valid) {
     throw RunmillError.fromCatalog("RM-CONFIG-001", {
       whatHappened: `${path}\n\n${result.errors.map((e) => `  - ${e}`).join("\n")}`,
-    });
-  }
-
-  const referenced: { key: string; value: string }[] = [];
-  if (config.review.localReviewSkill !== undefined) {
-    referenced.push({ key: "review.local_review_skill", value: config.review.localReviewSkill });
-  }
-  if (config.review.prReviewSkill !== undefined) {
-    referenced.push({ key: "review.pr_review_skill", value: config.review.prReviewSkill });
-  }
-  const missing = referenced.filter(({ value }) => {
-    const abs = isAbsolute(value) ? value : resolve(options.repoRoot, value);
-    return !existsSync(abs);
-  });
-
-  if (missing.length > 0) {
-    throw RunmillError.fromCatalog("RM-CONFIG-002", {
-      whatHappened:
-        `${path} references files that do not exist:\n` +
-        missing.map((m) => `  - ${m.key}: ${m.value}`).join("\n"),
     });
   }
 
