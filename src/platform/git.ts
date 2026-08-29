@@ -1,4 +1,10 @@
-import { run, runOrThrow, type RunResult } from "./process.js";
+import {
+  run,
+  runBytes,
+  runOrThrow,
+  type RunBytesResult,
+  type RunResult,
+} from "./process.js";
 
 /**
  * Identity used only for internal lease-ref objects.
@@ -99,6 +105,21 @@ export async function tryGit(
   return run("git", args, {
     cwd,
     env: envFor(options),
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+  });
+}
+
+/** Run git and preserve stdout as exact bytes under a caller-owned ceiling. */
+export async function tryGitBytes(
+  cwd: string,
+  args: readonly string[],
+  maxOutputBytes: number,
+  options: GitOptions = {},
+): Promise<RunBytesResult> {
+  return runBytes("git", args, {
+    cwd,
+    env: envFor(options),
+    maxOutputBytes,
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
   });
 }

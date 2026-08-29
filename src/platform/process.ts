@@ -55,10 +55,22 @@ export interface RunResult {
   readonly code: number | null;
 }
 
+export interface RunBytesResult {
+  readonly ok: boolean;
+  readonly stdout: Buffer;
+  readonly stderr: string;
+  readonly code: number | null;
+}
+
 export interface RunOptions {
   readonly cwd?: string | undefined;
   readonly env?: NodeJS.ProcessEnv | undefined;
   readonly timeoutMs?: number | undefined;
+}
+
+export interface RunBytesOptions extends RunOptions {
+  /** Hard ceiling for each captured stream. */
+  readonly maxOutputBytes: number;
 }
 
 export interface RunWithInputOptions extends RunOptions {
@@ -93,6 +105,47 @@ export async function run(
       ok: false,
       stdout: e.stdout ?? "",
       stderr: e.stderr ?? e.message ?? "",
+      code: typeof e.code === "number" ? e.code : null,
+    };
+  }
+}
+
+/** Run a command while preserving stdout as exact, size-bounded bytes. */
+export async function runBytes(
+  command: string,
+  args: readonly string[],
+  options: RunBytesOptions,
+): Promise<RunBytesResult> {
+  try {
+    const { stdout, stderr } = await execFileAsync(command, [...args], {
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      ...(options.env === undefined ? {} : { env: options.env }),
+      ...(options.timeoutMs === undefined ? {} : { timeout: options.timeoutMs }),
+      encoding: "buffer",
+      maxBuffer: options.maxOutputBytes,
+    });
+    return {
+      ok: true,
+      stdout: Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout),
+      stderr: stderr.toString(),
+      code: 0,
+    };
+  } catch (err) {
+    const e = err as {
+      stdout?: Buffer | string;
+      stderr?: Buffer | string;
+      code?: number;
+      message?: string;
+    };
+    return {
+      ok: false,
+      stdout:
+        e.stdout === undefined
+          ? Buffer.alloc(0)
+          : Buffer.isBuffer(e.stdout)
+            ? e.stdout
+            : Buffer.from(e.stdout),
+      stderr: e.stderr?.toString() ?? e.message ?? "",
       code: typeof e.code === "number" ? e.code : null,
     };
   }

@@ -1247,8 +1247,28 @@ describe("PR review", () => {
     });
   }, 90_000);
 
+  it("refuses invalid UTF-8 guidance without exposing committed secret bytes", async () => {
+    const secret = "INVALID-UTF8-SECRET-DO-NOT-LEAK";
+    const invalidUtf8 = Buffer.concat([
+      Buffer.from([0xf0, 0x90, 0x80]),
+      Buffer.from(secret, "utf8"),
+    ]);
+    writeFileSync(join(source, "review-guidance.md"), invalidUtf8);
+    git(source, "add", "review-guidance.md");
+    git(source, "commit", "-q", "-m", "add invalid UTF-8 guidance");
+    git(source, "push", "-q", "origin", "main");
+
+    await expectReviewGuidanceRefusal({
+      runId: "run_invalid_utf8_guidance",
+      configuredPath: "review-guidance.md",
+      secret,
+    });
+  }, 90_000);
+
   it("accepts committed guidance at exactly the 64 KiB limit", async () => {
-    const guidance = "g".repeat(64 * 1024);
+    const prefix = "\ufeffInspect multilingual guidance: €\n";
+    const guidance = prefix + "g".repeat(64 * 1024 - Buffer.byteLength(prefix, "utf8"));
+    expect(Buffer.byteLength(guidance, "utf8")).toBe(64 * 1024);
     writeFileSync(join(source, "review-guidance.md"), guidance);
     git(source, "add", "review-guidance.md");
     git(source, "commit", "-q", "-m", "add maximum-size guidance");

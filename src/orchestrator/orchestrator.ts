@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { TextDecoder } from "node:util";
 import {
   BacklogMutationNotStartedError,
   type BacklogAdapter,
@@ -32,7 +33,7 @@ import {
   PR_EVIDENCE_PATH,
   serializePullRequestEvidence,
 } from "./pr-evidence.js";
-import { tryGit } from "../platform/git.js";
+import { tryGit, tryGitBytes } from "../platform/git.js";
 import { normalizeRepositoryPath } from "../workspace/path-scope.js";
 
 export type RunState =
@@ -211,15 +212,37 @@ export class Orchestrator {
       });
     }
 
-    const blob = await tryGit(workspace.path, ["cat-file", "blob", objectId]);
-    if (!blob.ok || Buffer.byteLength(blob.stdout) !== size) {
+    const blob = await tryGitBytes(
+      workspace.path,
+      ["cat-file", "blob", objectId],
+      Math.max(1, size),
+    );
+    if (!blob.ok || blob.stdout.length !== size) {
       throw RunmillError.fromCatalog("RM-CONFIG-001", {
         whatHappened:
           `Could not read ${JSON.stringify(configuredPath)} exactly from base commit ` +
           `${workspace.baseCommit}.`,
       });
     }
-    return { source: configuredPath, content: blob.stdout };
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(blob.stdout);
+    } catch (cause) {
+      throw RunmillError.fromCatalog("RM-CONFIG-001", {
+        whatHappened:
+          `${JSON.stringify(configuredPath)} at base commit ${workspace.baseCommit} ` +
+          "is not valid UTF-8 review guidance.",
+        cause,
+      });
+    }
+    if (!Buffer.from(content, "utf8").equals(blob.stdout)) {
+      throw RunmillError.fromCatalog("RM-CONFIG-001", {
+        whatHappened:
+          `Could not preserve ${JSON.stringify(configuredPath)} exactly from base commit ` +
+          `${workspace.baseCommit}.`,
+      });
+    }
+    return { source: configuredPath, content };
   }
 
   /** Re-read the remote PR and bind it to the exact local candidate. */
