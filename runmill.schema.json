@@ -225,7 +225,7 @@
             "none"
           ],
           "default": "native",
-          "description": "native resolves to Seatbelt on macOS and bubblewrap on Linux, chosen by doctor rather than by the user. `none` is rejected unless the run is in observe mode."
+          "description": "native is reserved for a production-qualified local backend and currently fails closed: Darwin awaits lifecycle containment, Linux awaits complete descriptor-bound runtime/policy closure, and Windows/WSL is not implemented. `none` is accepted only for observe mode."
         },
         "network": {
           "enum": [

@@ -6,17 +6,18 @@ Use one command for the complete setup:
 runmill init
 ```
 
-The wizard uses existing GitHub and Linear access to preload repository, team, and workflow choices,
-and checks which Codex and Claude Code sessions authenticate inside Runmill's sandbox. It never
+The wizard uses existing GitHub and Linear access to preload repository, team, and workflow choices.
+Provider authentication/execution probes run only after a production sandbox is qualified; this
+checkpoint has none, so doctor blocks before those probes. It never
 asks for a GitHub token or Linear API key in an interactive terminal. If GitHub is not configured,
 it can hand sign-in to `gh auth login`; if Linear is not configured, it writes unmistakable
 `REPLACE_WITH_LINEAR_*` placeholders and prints the environment/keychain command to use before
 rerunning setup. Those placeholders never pass doctor. Provider subscription sign-in is likewise
 handed to the provider's own CLI.
 After writing the files, `init` runs the full doctor suite. It creates and validates a candidate
-commit in a disposable repository using the source checkout's identity and signing policy, then
-sends one short, one-turn request for each distinct configured provider/model through the same
-sandbox used for real work. The provider requests use a small number of tokens and may be billable.
+commit in a disposable repository using the source checkout's identity and signing policy. Once an
+execution backend is qualified, it also sends one short, potentially billable request for each
+distinct configured provider/model through the same sandbox used for real work.
 Runmill does not accept those secrets as wizard answers or command arguments, and never writes them
 to the policy file. In CI or another non-interactive shell, `runmill init --defaults` accepts
 discovered values and conservative defaults, then performs the same readiness checks.
@@ -205,14 +206,16 @@ GitHub or operator policy rather than a configuration switch that the runtime do
 | Key                 | Default  | Notes                                                                                        |
 | ------------------- | -------- | -------------------------------------------------------------------------------------------- |
 | `git_isolation` | `clone` | See below |
-| `sandbox`           | `native` | Resolved by `doctor`, never chosen by hand                                                   |
+| `sandbox`           | `native` | Reserved for a qualified local backend; currently fails closed on Darwin, Linux, and Windows |
 | `network`           | `proxy`  | `proxy` currently permits unrestricted provider egress; `none` is accepted only in `observe` |
 | `network_allowlist` | `[]`     | Reserved for the planned proxy. Non-empty values are rejected rather than silently ignored.  |
 | `allow_unenforced`  | `[]`     | Reserved. Non-empty values are rejected because no runtime gate consumes them yet.           |
 
-`sandbox: native` is the only execution mode. `none` is accepted only for `observe`, where no
-agent runs. Container isolation is not exposed until Runmill has a container backend it can probe
-and enforce.
+`sandbox: native` is the configured execution mode, but this checkpoint does not qualify a
+production local backend. Darwin awaits lifecycle containment, Linux awaits complete
+descriptor-bound runtime and policy closure, and Windows/WSL remains pending. Selection therefore
+fails closed before provider or verification execution. `none` is accepted only for `observe`,
+where no agent runs. Read-only backlog and preparation flows do not construct an execution backend.
 
 The Codex and Claude CLIs need network access for implementation and review. For that reason,
 `network: none` is also limited to `observe`; selecting it for a live delivery mode fails policy

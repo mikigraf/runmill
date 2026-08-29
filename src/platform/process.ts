@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { fstatSync } from "node:fs";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -323,35 +324,13 @@ export interface ControlledProcessInput {
   readonly signal: AbortSignal;
   readonly onStdout?: ((chunk: Buffer) => void) | undefined;
   readonly onStderr?: ((chunk: Buffer) => void) | undefined;
-}
-
-function processGroupExists(pid: number): boolean {
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-async function waitForProcessGroupExit(pid: number, maximumMs: number): Promise<boolean> {
-  const deadline = Date.now() + maximumMs;
-  while (processGroupExists(pid) && Date.now() < deadline) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
-  }
-  return !processGroupExists(pid);
-}
-
-/** Terminate and prove the detached process group is gone before cleanup may begin. */
-async function terminateAndConfirmTree(child: ChildProcess): Promise<void> {
-  const pid = child.pid;
-  if (pid === undefined) return;
-  killTree(child, "SIGTERM");
-  if (await waitForProcessGroupExit(pid, KILL_GRACE_MS)) return;
-  killTree(child, "SIGKILL");
-  if (!(await waitForProcessGroupExit(pid, KILL_GRACE_MS))) {
-    throw new Error(`process group ${String(pid)} did not quiesce after SIGKILL`);
-  }
+  /**
+   * Detached process-group signaling only. This never proves descendants are
+   * gone; a lifecycle backend needs its own kernel-resource acknowledgement.
+   */
+  readonly containment?: "process-group" | undefined;
+  /** Already-open sources inherited as child descriptors 3, 4, ... in order. */
+  readonly inheritedFileDescriptors?: readonly number[] | undefined;
 }
 
 export interface ControlledProcessResult {
@@ -361,6 +340,8 @@ export interface ControlledProcessResult {
   readonly stdout: string;
   readonly stderr: string;
   readonly outputBytesObserved: number;
+  /** True only when exit of an owned kernel containment resource proves teardown. */
+  readonly containmentConfirmed: boolean;
 }
 
 function utf8Suffix(text: string, maximumBytes: number): string {
@@ -395,6 +376,19 @@ export function runControlledProcess(
   ) {
     throw new Error("controlled process limits must be positive safe integers");
   }
+  const inherited = input.inheritedFileDescriptors ?? [];
+  if (inherited.length > 1_024 || new Set(inherited).size !== inherited.length) {
+    throw new Error("controlled process inherited descriptor inventory is invalid");
+  }
+  for (const descriptor of inherited) {
+    if (!Number.isSafeInteger(descriptor) || descriptor < 3) {
+      throw new Error("controlled process inherited descriptor inventory is invalid");
+    }
+    const info = fstatSync(descriptor);
+    if (!info.isFile() && !info.isDirectory()) {
+      throw new Error("controlled process inherits only regular files or directories");
+    }
+  }
 
   return new Promise((resolve) => {
     const stdout = new BoundedCapture(input.maxOutputBytes);
@@ -406,23 +400,95 @@ export function runControlledProcess(
     let outputLimited = false;
     let observedBytes = 0;
     let spawnError: Error | undefined;
-    let quiescence: Promise<void> | undefined;
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+    let stopTimer: NodeJS.Timeout | undefined;
+    let forceTimer: NodeJS.Timeout | undefined;
+    let drainTimer: NodeJS.Timeout | undefined;
+    let exited = false;
 
-    const ensureQuiescence = (): Promise<void> => {
-      quiescence ??= terminateAndConfirmTree(child);
-      return quiescence;
+    const clearStopTimers = (): void => {
+      if (stopTimer !== undefined) clearTimeout(stopTimer);
+      if (forceTimer !== undefined) clearTimeout(forceTimer);
+      if (drainTimer !== undefined) clearTimeout(drainTimer);
+      stopTimer = undefined;
+      forceTimer = undefined;
+      drainTimer = undefined;
+    };
+
+    const requestStop = (): void => {
+      if (child === undefined || child.exitCode !== null || child.signalCode !== null) return;
+      killTree(child, "SIGTERM");
+      if (stopTimer !== undefined) return;
+      stopTimer = setTimeout(() => {
+        stopTimer = undefined;
+        if (child.exitCode === null && child.signalCode === null) killTree(child, "SIGKILL");
+        forceTimer = setTimeout(() => {
+          forceTimer = undefined;
+          if (child.exitCode !== null || child.signalCode !== null || settled) return;
+          finish({
+            outcome: "spawn-error",
+            exitCode: null,
+            signal: null,
+            stdout: utf8Suffix(stdout.text(), Math.floor(input.maxOutputBytes / 2)),
+            stderr: utf8Suffix(
+              "contained process did not exit after SIGKILL; cleanup is not proven safe",
+              Math.ceil(input.maxOutputBytes / 2),
+            ),
+            outputBytesObserved: observedBytes,
+            containmentConfirmed: false,
+          });
+        }, KILL_GRACE_MS);
+        forceTimer.unref();
+      }, KILL_GRACE_MS);
+      stopTimer.unref();
     };
 
     const finish = (result: ControlledProcessResult): void => {
       if (settled) return;
       settled = true;
+      clearStopTimers();
       input.signal.removeEventListener("abort", onAbort);
       resolve(result);
     };
 
+    const completeAfterExit = (containmentConfirmed: boolean): void => {
+      const outcome: ControlledProcessOutcome = aborted
+        ? "aborted"
+        : timedOut
+          ? "timeout"
+          : outputLimited
+            ? "output-limit"
+            : spawnError !== undefined
+              ? "spawn-error"
+              : exitSignal !== null
+                ? "signaled"
+                : "exited";
+      const rawErrors = [stderr.text(), ...(spawnError === undefined ? [] : [spawnError.message])]
+        .filter((part) => part !== "")
+        .join("\n");
+      const stdoutBudget = Math.floor(input.maxOutputBytes / 2);
+      const safeStdout = utf8Suffix(stdout.text(), stdoutBudget);
+      const stderrBudget = input.maxOutputBytes - Buffer.byteLength(safeStdout, "utf8");
+      finish({
+        outcome,
+        exitCode,
+        signal:
+          outcome === "aborted"
+            ? "ABORT"
+            : outcome === "output-limit"
+              ? "OUTPUT_LIMIT"
+              : exitSignal,
+        stdout: safeStdout,
+        stderr: utf8Suffix(rawErrors, stderrBudget),
+        outputBytesObserved: observedBytes,
+        containmentConfirmed,
+      });
+    };
+
     const onAbort = (): void => {
       aborted = true;
-      if (child !== undefined) void ensureQuiescence();
+      if (child !== undefined) requestStop();
     };
 
     if (aborted) {
@@ -433,6 +499,7 @@ export function runControlledProcess(
         stdout: "",
         stderr: "",
         outputBytesObserved: 0,
+        containmentConfirmed: true,
       });
       return;
     }
@@ -442,7 +509,12 @@ export function runControlledProcess(
         cwd: input.cwd,
         env: { ...input.env },
         detached: true,
-        stdio: [input.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+        stdio: [
+          input.stdin === undefined ? "ignore" : "pipe",
+          "pipe",
+          "pipe",
+          ...(input.inheritedFileDescriptors ?? []),
+        ],
       });
     } catch (error) {
       finish({
@@ -452,6 +524,7 @@ export function runControlledProcess(
         stdout: "",
         stderr: error instanceof Error ? error.message : String(error),
         outputBytesObserved: 0,
+        containmentConfirmed: true,
       });
       return;
     }
@@ -470,7 +543,7 @@ export function runControlledProcess(
       if (observedBytes <= input.maxOutputBytes) callback?.(chunk);
       if (observedBytes > input.maxOutputBytes && !outputLimited) {
         outputLimited = true;
-        void ensureQuiescence();
+        requestStop();
       }
     };
 
@@ -486,64 +559,43 @@ export function runControlledProcess(
 
     const timeoutTimer = setTimeout(() => {
       timedOut = true;
-      void ensureQuiescence();
+      requestStop();
     }, input.timeoutMs);
     const cancelTimer = (): void => clearTimeout(timeoutTimer);
 
-    // `close` can be delayed forever by a background descendant inheriting a
-    // pipe, or arrive while a descendant with redirected stdio is still live.
-    // A direct-child exit therefore always initiates group quiescence.
-    child.on("exit", () => {
-      void ensureQuiescence();
+    // Direct-child exit starts a bounded drain. We never poll or signal the
+    // numeric PGID after this event, avoiding PID/PGID reuse (ABA).
+    child.on("exit", (code, signal) => {
+      cancelTimer();
+      clearStopTimers();
+      exited = true;
+      exitCode = code;
+      exitSignal = signal;
+      // Allow buffered pipe data to drain, but bound the wait because an
+      // uncontained descendant can retain a pipe forever. This runner does
+      // not claim backend-wide containment; bwrap must add a PID-init sync-fd
+      // acknowledgement before production may treat teardown as confirmed.
+      drainTimer = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        completeAfterExit(false);
+      }, KILL_GRACE_MS);
+      drainTimer.unref();
     });
 
-    child.on("close", (code, signal) => {
+    child.on("close", () => {
       cancelTimer();
-      void ensureQuiescence().then(
-        () => {
-          const outcome: ControlledProcessOutcome = aborted
-            ? "aborted"
-            : timedOut
-              ? "timeout"
-              : outputLimited
-                ? "output-limit"
-                : spawnError !== undefined
-                  ? "spawn-error"
-                  : signal !== null
-                    ? "signaled"
-                    : "exited";
-          const rawErrors = [stderr.text(), ...(spawnError === undefined ? [] : [spawnError.message])]
-            .filter((part) => part !== "")
-            .join("\n");
-          const stdoutBudget = Math.floor(input.maxOutputBytes / 2);
-          const safeStdout = utf8Suffix(stdout.text(), stdoutBudget);
-          const stderrBudget = input.maxOutputBytes - Buffer.byteLength(safeStdout, "utf8");
-          const safeStderr = utf8Suffix(rawErrors, stderrBudget);
-          finish({
-            outcome,
-            exitCode: code,
-            signal:
-              outcome === "aborted"
-                ? "ABORT"
-                : outcome === "output-limit"
-                  ? "OUTPUT_LIMIT"
-                  : signal,
-            stdout: safeStdout,
-            stderr: safeStderr,
-            outputBytesObserved: observedBytes,
-          });
-        },
-        (error: unknown) => {
-          finish({
-            outcome: "spawn-error",
-            exitCode: code,
-            signal,
-            stdout: stdout.text(),
-            stderr: error instanceof Error ? error.message : String(error),
-            outputBytesObserved: observedBytes,
-          });
-        },
-      );
+      if (exited) {
+        completeAfterExit(false);
+        return;
+      }
+      // ENOENT and equivalent asynchronous spawn failures may never emit
+      // `exit`; `close` plus the captured spawn error is terminal.
+      if (spawnError !== undefined) {
+        exitCode = null;
+        exitSignal = null;
+        completeAfterExit(true);
+      }
     });
 
     if (input.stdin !== undefined) {

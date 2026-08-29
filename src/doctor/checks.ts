@@ -921,32 +921,30 @@ export async function checkSandbox(backend: SandboxBackend): Promise<CheckResult
   const os = backend.runtime.os;
   const results: CheckResult[] = [];
 
-  // -- is a mechanism there at all ---------------------------------------
-  if (os === "darwin") {
-    let qualification;
-    try {
-      qualification = await backend.qualify({ command: "/usr/bin/true" });
-    } catch {
-      return [
-        {
-          id: "sandbox:mechanism",
-          status: "fail",
-          code: "RM-SANDBOX-001",
-          observed: "configured Seatbelt launcher could not be qualified",
-          expected: "Seatbelt (sandbox-exec) available",
-          remediation: "runmill requires sandbox-exec on macOS",
-        },
-      ];
-    }
-    results.push({
+  if (backend.productionQualified !== true) {
+    return [{
       id: "sandbox:mechanism",
-      status: "pass",
-      observed:
-        `sandbox-exec (Seatbelt) ${qualification.launcher?.path ?? "identity missing"} ` +
-        `${qualification.launcher?.sha256 ?? "digest missing"}`,
-      expected: "Seatbelt available",
-    });
-  } else if (os === "linux") {
+      status: "fail",
+      code: "RM-SANDBOX-001",
+      observed: `${backend.mechanism} is not a production-qualified lifecycle backend`,
+      expected: "a lifecycle-owning, production-qualified local execution backend",
+      remediation: "No local execution backend is qualified in this checkpoint; use observe-only workflows",
+    }];
+  }
+
+  if (backend.mechanism === "seatbelt") {
+    return [{
+      id: "sandbox:mechanism",
+      status: "fail",
+      code: "RM-SANDBOX-001",
+      observed: "Seatbelt cannot own descendants that create a new session",
+      expected: "a lifecycle-owning local execution backend",
+      remediation: "Use a Linux host with bubblewrap; native macOS execution is pending Task 12a",
+    }];
+  }
+
+  // -- is a mechanism there at all ---------------------------------------
+  if (os === "linux" && backend.mechanism === "bubblewrap") {
     let qualification;
     try {
       qualification = await backend.qualify({ command: "/usr/bin/true" });
@@ -1013,8 +1011,8 @@ export async function checkSandbox(backend: SandboxBackend): Promise<CheckResult
         status: "fail",
         code: "RM-SANDBOX-001",
         observed: `unsupported platform: ${os}`,
-        expected: "macOS or Linux",
-        remediation: "runmill supports macOS (Seatbelt) and Linux (bubblewrap) only",
+        expected: "Linux with bubblewrap",
+        remediation: "Use Linux with bubblewrap; macOS and Windows execution are pending",
       },
     ];
   }
@@ -1053,18 +1051,16 @@ export async function checkSandbox(backend: SandboxBackend): Promise<CheckResult
  * a temporary HOME, confirms the secret IS readable outside the sandbox, and
  * only then treats a failed read inside as evidence of denial.
  */
-async function probeCredentialDenial(sandbox: SandboxBackend): Promise<CheckResult> {
+/** Exported for the concurrency regression; production reaches it through checkSandbox. */
+export async function probeCredentialDenial(sandbox: SandboxBackend): Promise<CheckResult> {
   const dir = mkdtempSync(join(tmpdir(), "runmill-probe-"));
   const fakeHome = mkdtempSync(join(tmpdir(), "runmill-probe-home-"));
-  const realHome = process.env["HOME"];
   const secret = join(fakeHome, ".ssh", "id_rsa");
   const marker = "RUNMILL-PROBE-SECRET";
 
   try {
     mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
     writeFileSync(secret, `${marker}\n`, { mode: 0o600 });
-    process.env["HOME"] = fakeHome;
-
     // Control: if this is not readable unsandboxed, the probe cannot conclude
     // anything from a failure inside.
     if (!readFileSync(secret, "utf8").includes(marker)) {
@@ -1083,6 +1079,7 @@ async function probeCredentialDenial(sandbox: SandboxBackend): Promise<CheckResu
       cwd: dir,
       policy: { writablePaths: [dir], allowNetwork: false },
       timeoutMs: 15_000,
+      env: { HOME: fakeHome },
     });
 
     const leaked = attempt.exitCode === 0 || attempt.stdout.includes(marker);
@@ -1106,8 +1103,6 @@ async function probeCredentialDenial(sandbox: SandboxBackend): Promise<CheckResu
       remediation: "runmill doctor --explain sandbox",
     };
   } finally {
-    if (realHome === undefined) delete process.env["HOME"];
-    else process.env["HOME"] = realHome;
     rmSync(dir, { recursive: true, force: true });
     rmSync(fakeHome, { recursive: true, force: true });
   }
@@ -1191,11 +1186,12 @@ export async function runAllChecks(
             code: "RM-SANDBOX-001",
             observed: platform() === "darwin"
               ? "Darwin native sandbox refused: Seatbelt cannot contain new-session descendants"
-              : "no configured sandbox backend was injected",
+              : platform() === "linux"
+                ? "Linux native sandbox refused: descriptor-bound runtime/policy closure is incomplete"
+                : "no configured sandbox backend was injected",
             expected: "one configured backend shared by every execution path",
-            remediation: platform() === "darwin"
-              ? "Run Runmill on Linux with trusted bubblewrap; no lifecycle-owning local macOS backend is available"
-              : "load a valid Runmill configuration and rerun doctor",
+            remediation:
+              "No local execution backend is production-qualified in this checkpoint; use observe-only workflows",
           }])
         : checkSandbox(ctx.sandbox)
       : Promise.resolve([]),

@@ -745,7 +745,7 @@ async function qualify(context: QualificationContext): Promise<AsfBubblewrapQual
   };
 
   const requireExit = (result: ControlledProcessResult, label: string): ControlledProcessResult => {
-    if (result.outcome !== "exited" || result.exitCode !== 0) {
+    if (!result.containmentConfirmed || result.outcome !== "exited" || result.exitCode !== 0) {
       refuse("qualification-failed", `${label} probe did not complete inside bubblewrap`);
     }
     return result;
@@ -1109,6 +1109,12 @@ export class AsfBubblewrapProductionSandbox implements CredentialFreeProductionS
       maxOutputBytes: this.#maxOutputBytes,
       signal: input.signal,
     });
+    if (!controlled.containmentConfirmed) {
+      refuse(
+        "qualification-failed",
+        "bubblewrap lifecycle completion is unproven until PID-namespace init sync-fd acknowledgement is implemented",
+      );
+    }
     const durationMs = Math.max(0, this.#clock.monotonicMs() - startedMonotonic);
     const result = sandboxResult(controlled, durationMs);
 

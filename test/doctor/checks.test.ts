@@ -33,6 +33,7 @@ import {
   checkProviderExecution,
   checkProviderCredentialIsolation,
   checkSandbox,
+  probeCredentialDenial,
   checkCiEnvironment,
   runAllChecks,
   worstStatus,
@@ -41,6 +42,7 @@ import type { ProviderDoctorAdapter } from "../../src/doctor/checks.js";
 import {
   createNativeSandboxBackend,
   createTestSandboxBackend,
+  type SandboxBackend,
 } from "../../src/workspace/sandbox.js";
 
 const nativeSandbox = () => createTestSandboxBackend();
@@ -851,6 +853,44 @@ describe("checkCiEnvironment", () => {
 });
 
 describe("checkSandbox", () => {
+  it("passes isolated HOME values without mutating process.env during concurrent probes", async () => {
+    const originalHome = process.env["HOME"];
+    const observedHomes: string[] = [];
+    const probeBackend = (): SandboxBackend => {
+      const base = nativeSandbox();
+      return {
+        mechanism: base.mechanism,
+        runtime: base.runtime,
+        productionQualified: true,
+        qualify: base.qualify.bind(base),
+        start: base.start.bind(base),
+        run: async (input) => {
+          observedHomes.push(input.env?.["HOME"] ?? "");
+          await Promise.resolve();
+          return {
+            outcome: "sandbox-denied",
+            exitCode: 1,
+            signal: null,
+            stdout: "",
+            stderr: "denied",
+            durationMs: 1,
+          };
+        },
+        prepareDisposableHome: base.prepareDisposableHome.bind(base),
+        prepareDependencyCheckout: base.prepareDependencyCheckout.bind(base),
+      };
+    };
+
+    await Promise.all([
+      probeCredentialDenial(probeBackend()),
+      probeCredentialDenial(probeBackend()),
+    ]);
+    expect(process.env["HOME"]).toBe(originalHome);
+    expect(observedHomes).toHaveLength(2);
+    expect(new Set(observedHomes).size).toBe(2);
+    expect(observedHomes.every((home) => home.includes("runmill-probe-home-"))).toBe(true);
+  });
+
   it.runIf(platform() === "darwin")(
     "reports the production Darwin lifecycle refusal with actionable remediation",
     async () => {
@@ -862,8 +902,8 @@ describe("checkSandbox", () => {
         id: "sandbox:mechanism",
         status: "fail",
         code: "RM-SANDBOX-001",
-        observed: expect.stringMatching(/Seatbelt cannot contain/i),
-        remediation: expect.stringMatching(/Linux.*bubblewrap/i),
+        observed: expect.stringMatching(/not a production-qualified/i),
+        remediation: expect.stringMatching(/observe-only/i),
       }));
     },
   );
@@ -880,11 +920,10 @@ describe("checkSandbox", () => {
     const previousPath = process.env["PATH"];
     process.env["PATH"] = fakeBin;
     try {
-      const results = await checkSandbox(createNativeSandboxBackend("native", {
+      expect(() => createNativeSandboxBackend("native", {
         platform: "linux",
         path: fakeBin,
-      }));
-      expect(results[0]).toMatchObject({ id: "sandbox:mechanism", status: "fail" });
+      })).toThrow(/fails closed|pending|RM-SANDBOX-001/i);
       expect(existsSync(marker)).toBe(false);
     } finally {
       if (previousPath === undefined) delete process.env["PATH"];
@@ -896,24 +935,15 @@ describe("checkSandbox", () => {
     const results = await checkSandbox(nativeSandbox());
     const mechanism = results.find((r) => r.id === "sandbox:mechanism");
     expect(mechanism).toBeDefined();
-    if (platform() === "darwin") {
-      expect(mechanism?.observed).toMatch(/Seatbelt/);
-    } else if (platform() === "linux") {
-      expect(mechanism?.observed).toMatch(/bubblewrap/);
-    } else {
-      expect(mechanism?.status).toBe("fail");
-    }
+    expect(mechanism?.status).toBe("fail");
+    expect(mechanism?.observed).toMatch(/not a production-qualified/i);
   }, 30_000);
 
-  it("PROVES credential denial on every supported platform", async () => {
-    // This probe only existed on the macOS path, so on Linux doctor asked
-    // whether a sandbox existed — exactly what it claims not to do.
-    if (platform() !== "darwin" && platform() !== "linux") return;
+  it("never treats a mechanism test harness as credential-denial certification", async () => {
     const results = await checkSandbox(nativeSandbox());
     const probe = results.find((r) => r.id === "sandbox:deny-credential-read");
-    expect(probe, "no credential-denial probe ran").toBeDefined();
-    expect(probe?.status).toBe("pass");
-    expect(probe?.observed).toBe("read denied");
+    expect(probe).toBeUndefined();
+    expect(results[0]).toMatchObject({ status: "fail", code: "RM-SANDBOX-001" });
   }, 30_000);
 
   it("does not leave its probe secret behind", async () => {
@@ -921,19 +951,16 @@ describe("checkSandbox", () => {
     expect(leftovers.filter((f) => f.startsWith("runmill-probe-home-"))).toEqual([]);
   }, 30_000);
 
-  it("surfaces unrestricted provider egress on every supported platform", async () => {
-    if (platform() !== "darwin" && platform() !== "linux") return;
+  it("does not emit downstream network certification for an unqualified harness", async () => {
     const results = await checkSandbox(nativeSandbox());
     const network = results.find((r) => r.id === "sandbox:network");
-    expect(network?.status).toBe("warn");
-    expect(network?.observed).toMatch(/unrestricted/);
-    expect(network?.remediation).toMatch(/proxy/);
+    expect(network).toBeUndefined();
   }, 30_000);
 
   it("checks user namespaces on Linux, where the sandbox depends on them", async () => {
     if (platform() !== "linux") return;
     const results = await checkSandbox(nativeSandbox());
-    expect(results.some((r) => r.id === "sandbox:userns")).toBe(true);
+    expect(results.some((r) => r.id === "sandbox:userns")).toBe(false);
   }, 30_000);
 });
 

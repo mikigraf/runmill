@@ -34,12 +34,13 @@ import {
   type ProviderCheckTarget,
 } from "../doctor/checks.js";
 import { renderDoctor } from "./render.js";
-import { createNativeSandboxBackend } from "../workspace/sandbox.js";
+import { assertSandboxSelection } from "../workspace/sandbox.js";
 import type { SandboxBackend } from "../workspace/sandbox.js";
 
 export interface InitDoctorInput {
   readonly repoRoot: string;
   readonly configPath: string;
+  readonly sandbox: SandboxBackend;
 }
 
 export interface CommandContext {
@@ -392,7 +393,7 @@ async function runDoctorAfterInit(
     }).config;
     backlogProvider = config.backlog.provider;
     providers = [config.providers.implementer, resolveReviewerAgent(config)];
-    sandbox = createNativeSandboxBackend(config.workspace.sandbox);
+    sandbox = assertSandboxSelection(config.workspace.sandbox, input.sandbox);
   } catch {
     // checkConfiguration below owns the actionable parse error. Do not spend a
     // provider turn against a guessed default when the written policy cannot
@@ -474,6 +475,7 @@ function registerInit(program: Command, ctx: CommandContext): void {
         const probed = await (ctx.runDoctor ?? runDoctorAfterInit)({
           repoRoot: root,
           configPath,
+          sandbox: ctx.sandbox,
         });
         // Test seams and custom embedders may supply only host/provider
         // probes. Verification readiness is local, deterministic, and must

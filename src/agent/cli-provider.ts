@@ -312,7 +312,9 @@ export class CliProviderAdapter implements CodingAgentAdapter {
       return {
         installed: true,
         version: version.split("\n")[0] ?? version,
-        path: execution.qualification.executable.path,
+        // Report the canonical installed CLI, never the private immutable
+        // snapshot that exists only for this one sandbox execution.
+        path: execution.originalQualification.executable.path,
       };
     } catch {
       return { installed: false };

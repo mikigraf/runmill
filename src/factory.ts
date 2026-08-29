@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { GitHubGitCredential } from "./platform/github-git-credential.js";
 import {
+  assertSandboxSelection,
   createNativeSandboxBackend,
   type SandboxBackend,
 } from "./workspace/sandbox.js";
@@ -108,8 +109,12 @@ export async function buildAdapters(
   const need = options.need ?? (["backlog", "provider", "forge"] as const);
   const wants = (b: Boundary): boolean => need.includes(b);
   const externalEffectsDenied = options.externalEffects === "deny";
-  const sandbox =
-    options.sandbox ?? createNativeSandboxBackend(config.workspace.sandbox);
+  const requiresExecution = wants("provider") && !demo;
+  const sandbox = options.sandbox === undefined
+    ? requiresExecution
+      ? createNativeSandboxBackend(config.workspace.sandbox)
+      : createNativeSandboxBackend("none")
+    : assertSandboxSelection(config.workspace.sandbox, options.sandbox);
 
   // -- backlog -----------------------------------------------------------
   let backlog: BacklogAdapter;

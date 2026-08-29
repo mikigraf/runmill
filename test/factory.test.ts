@@ -170,12 +170,27 @@ describe("scoping which boundaries resolve", () => {
   it("does not resolve a provider for a read-only command", async () => {
     // Resolving a provider costs a subprocess, and for one dialect a real
     // billable inference. `next` and `prepare` never use it.
-    const { live } = await buildAdapters(CONFIG, {
+    const { live, sandbox } = await buildAdapters(CONFIG, {
       demo: true,
       need: ["backlog"],
       credentials: NO_CREDENTIALS,
     });
     expect(live.provider).toBe(false);
+    expect(sandbox.mechanism).toBe("none");
+  });
+
+  it("never widens an observe-only none policy through an injected backend", async () => {
+    const observeOnly = {
+      ...CONFIG,
+      autonomy: "observe" as const,
+      workspace: { ...CONFIG.workspace, sandbox: "none" as const },
+    };
+    await expect(buildAdapters(observeOnly, {
+      demo: true,
+      need: ["backlog"],
+      credentials: NO_CREDENTIALS,
+      sandbox: createTestSandboxBackend(),
+    })).rejects.toThrow(/does not match|RM-SANDBOX-001/i);
   });
 
   it("reports which boundaries are live rather than leaving it to be inferred", async () => {

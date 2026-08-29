@@ -51,7 +51,7 @@ class Exited extends Error {
 interface Harness {
   readonly emitted: { human: string; data: unknown }[];
   readonly failures: unknown[];
-  readonly doctorCalls: { repoRoot: string; configPath: string }[];
+  readonly doctorCalls: { repoRoot: string; configPath: string; sandbox: SandboxBackend }[];
   readonly storedCredentials: { name: string; value: string }[];
   readonly configurationSandboxes: unknown[];
   readonly sandbox: SandboxBackend;
@@ -95,7 +95,7 @@ function harness(options: {
 } = {}): Harness {
   const emitted: { human: string; data: unknown }[] = [];
   const failures: unknown[] = [];
-  const doctorCalls: { repoRoot: string; configPath: string }[] = [];
+  const doctorCalls: { repoRoot: string; configPath: string; sandbox: SandboxBackend }[] = [];
   const storedCredentials: { name: string; value: string }[] = [];
 
   const sandbox = createNativeSandboxBackend("none");
@@ -505,7 +505,7 @@ describe("init", () => {
       },
     });
     await h.run(["init"]);
-    expect(h.doctorCalls).toEqual([{ repoRoot: repo, configPath: policy }]);
+    expect(h.doctorCalls).toEqual([{ repoRoot: repo, configPath: policy, sandbox: h.sandbox }]);
     expect(h.emitted[0]?.human).toContain("provider:codex:request");
     expect(h.emitted[0]?.human).toContain("overall: PASS");
     expect(h.emitted[0]?.human).not.toContain("runmill doctor");

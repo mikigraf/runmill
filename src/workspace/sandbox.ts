@@ -16,12 +16,12 @@ import {
   fstatSync,
   readSync,
   opendirSync,
+  readdirSync,
   mkdirSync,
   chmodSync,
   writeSync,
   fsyncSync,
   fchmodSync,
-  renameSync,
   type Stats,
 } from "node:fs";
 import { arch, tmpdir, platform } from "node:os";
@@ -109,6 +109,23 @@ export interface SandboxQualification {
   readonly policyDigest?: string | undefined;
   /** Trusted sandbox launcher identity revalidated immediately before spawn. */
   readonly launcher?: SandboxExecutableIdentity | undefined;
+  /** Complete immutable execution snapshot, absent from source qualification. */
+  readonly snapshotManifest?: readonly SandboxSnapshotManifestEntry[] | undefined;
+}
+
+export interface SandboxRuntimeMount {
+  /** Immutable qualified/snapshotted object on the host. */
+  readonly hostPath: string;
+  /** Original canonical installation path visible in the empty guest root. */
+  readonly guestPath: string;
+  /** Descriptor number inherited by bubblewrap (3+), never part of policy evidence. */
+  readonly childFd?: number | undefined;
+}
+
+export interface SandboxSnapshotManifestEntry {
+  readonly sourcePath: string;
+  readonly guestPath: string;
+  readonly snapshot: SandboxExecutableIdentity;
 }
 
 export interface SandboxPathMount {
@@ -127,6 +144,9 @@ export interface SandboxPathLayout {
 
 export interface SandboxExecution {
   readonly layout: SandboxPathLayout;
+  /** Original installed executable/runtime evidence returned by qualify(). */
+  readonly originalQualification: SandboxQualification;
+  /** Effective immutable execution and policy evidence. */
   readonly qualification: SandboxQualification;
   readonly result: Promise<SandboxResult>;
   /** Awaited and idempotent. Resolves only after backend completion and cleanup. */
@@ -136,6 +156,8 @@ export interface SandboxExecution {
 export interface SandboxBackend {
   readonly mechanism: SandboxMechanism;
   readonly runtime: SandboxRuntimeIdentity;
+  /** Doctor may certify only an explicitly production-qualified backend. */
+  readonly productionQualified?: boolean | undefined;
   qualify(input: {
     readonly command: string;
     readonly cwd?: string | undefined;
@@ -291,8 +313,6 @@ function realPath(p: string): string {
 }
 
 export function detectMechanism(): SandboxMechanism {
-  const os = platform();
-  if (os === "linux") return "bubblewrap";
   return "none";
 }
 
@@ -351,7 +371,14 @@ const MAX_EXECUTABLE_INSPECTION_BYTES = 512 * 1024 * 1024;
 const MAX_PACKAGE_MANIFEST_BYTES = 1024 * 1024;
 const MAX_RUNTIME_SNAPSHOT_ENTRIES = 10_000;
 const MAX_RUNTIME_SNAPSHOT_BYTES = 1024 * 1024 * 1024;
+const MAX_ELF_CLOSURE_FILES = 512;
+const MAX_ELF_CLOSURE_EDGES = 4_096;
+const MAX_ELF_CLOSURE_INSPECTED_BYTES = 1024 * 1024 * 1024;
 const LOGICAL_SANITIZED_PATH = "/runmill/runtime/bin";
+
+function bytewiseCompare(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
 
 function sandboxFailure(detail: string): RunmillError {
   return RunmillError.fromCatalog("RM-SANDBOX-001", { whatHappened: detail });
@@ -375,7 +402,10 @@ function openInspectedFile(
   if (before.isSymbolicLink()) throw sandboxFailure(`${label} is a symbolic link: ${openPath}.`);
   let descriptor: number | undefined;
   try {
-    descriptor = openSync(openPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    descriptor = openSync(
+      openPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
     const info = fstatSync(descriptor);
     if (info.dev !== before.dev || info.ino !== before.ino) {
       throw sandboxFailure(`${label} changed before its no-follow descriptor was opened: ${openPath}.`);
@@ -541,7 +571,7 @@ function installedOptionalPackageRoots(packageRoot: string): string[] {
   const modules = owningNodeModules(packageRoot);
   if (modules === undefined) return [];
   const roots: string[] = [];
-  for (const name of Object.keys(manifest.optionalDependencies ?? {}).sort()) {
+  for (const name of Object.keys(manifest.optionalDependencies ?? {}).sort(bytewiseCompare)) {
     const candidate = resolve(modules, ...name.split("/"));
     if (!existsSync(candidate)) continue;
     const canonical = realpathSync(candidate);
@@ -587,7 +617,7 @@ function packageExecutables(root: string): string[] {
       } finally {
         directory.closeSync();
       }
-      for (const name of names.sort()) visit(join(path, name), depth + 1);
+      for (const name of names.sort(bytewiseCompare)) visit(join(path, name), depth + 1);
       return;
     }
     if (info.isFile() && (info.mode & 0o111) !== 0) executables.push(realpathSync(path));
@@ -609,7 +639,6 @@ function runtimeIdentity(os: NodeJS.Platform): SandboxRuntimeIdentity {
 }
 
 const LINUX_RUNTIME_FILES = [
-  "/etc/ld.so.cache",
   "/etc/nsswitch.conf",
   "/etc/hosts",
   "/etc/resolv.conf",
@@ -624,13 +653,30 @@ interface ElfMetadata {
   readonly searchPaths: readonly string[];
 }
 
-function parseElfMetadata(path: string): ElfMetadata | undefined {
+interface ElfClosureBudget {
+  files: number;
+  edges: number;
+  inspectedBytes: number;
+}
+
+function parseElfMetadata(path: string, budget: ElfClosureBudget): ElfMetadata | undefined {
   const opened = openInspectedFile(
     path,
     "ELF inspection byte limit",
     MAX_EXECUTABLE_INSPECTION_BYTES,
   );
   try {
+    budget.files += 1;
+    budget.inspectedBytes += opened.info.size;
+    if (budget.files > MAX_ELF_CLOSURE_FILES) {
+      throw sandboxFailure(`ELF closure file limit exceeded at ${path}.`);
+    }
+    if (
+      !Number.isSafeInteger(budget.inspectedBytes) ||
+      budget.inspectedBytes > MAX_ELF_CLOSURE_INSPECTED_BYTES
+    ) {
+      throw sandboxFailure(`ELF closure inspected-byte limit exceeded at ${path}.`);
+    }
     const finish = <T>(value: T): T => {
       const after = fstatSync(opened.descriptor);
       if (
@@ -781,20 +827,43 @@ function parseElfMetadata(path: string): ElfMetadata | undefined {
   }
 }
 
+interface ElfRuntimePath {
+  readonly sourcePath: string;
+  readonly guestPath: string;
+}
+
 /** Pure ELF metadata inspection: reads bytes and never executes the inspected target. */
-export function inspectElfRuntimePaths(executablePaths: readonly string[]): string[] {
-  const paths = new Set<string>();
+function inspectElfRuntimeMounts(executablePaths: readonly string[]): ElfRuntimePath[] {
+  const paths = new Map<string, ElfRuntimePath>();
+  const addPath = (sourcePath: string, guestPath = sourcePath): void => {
+    paths.set(`${guestPath}\0${sourcePath}`, { sourcePath, guestPath });
+  };
   for (const candidate of LINUX_RUNTIME_FILES) {
-    if (existsSync(candidate)) paths.add(realpathSync(candidate));
+    if (existsSync(candidate)) addPath(realpathSync(candidate), candidate);
   }
   const triplet = arch() === "x64" ? "x86_64-linux-gnu" : arch() === "arm64" ? "aarch64-linux-gnu" : undefined;
   const pending = executablePaths.map((path) => realpathSync(path));
   const visited = new Set<string>();
+  const budget: ElfClosureBudget = {
+    files: 0,
+    edges: pending.length,
+    inspectedBytes: 0,
+  };
+  if (budget.edges > MAX_ELF_CLOSURE_EDGES) {
+    throw sandboxFailure("ELF closure pending-edge limit exceeded.");
+  }
+  const enqueue = (path: string): void => {
+    budget.edges += 1;
+    if (budget.edges > MAX_ELF_CLOSURE_EDGES) {
+      throw sandboxFailure(`ELF closure pending-edge limit exceeded at ${path}.`);
+    }
+    pending.push(path);
+  };
   while (pending.length > 0) {
     const executable = pending.shift();
     if (executable === undefined || visited.has(executable)) continue;
     visited.add(executable);
-    const metadata = parseElfMetadata(executable);
+    const metadata = parseElfMetadata(executable, budget);
     if (metadata === undefined) continue;
     const interpreter = metadata.interpreter;
     if (interpreter !== undefined) {
@@ -802,8 +871,8 @@ export function inspectElfRuntimePaths(executablePaths: readonly string[]): stri
         throw sandboxFailure(`ELF interpreter is not an exact existing path: ${interpreter}.`);
       }
       const canonical = realpathSync(interpreter);
-      paths.add(canonical);
-      pending.push(canonical);
+      addPath(canonical, interpreter);
+      enqueue(canonical);
     }
     const declaredSearch = metadata.searchPaths.map((entry) => {
       if (!isAbsolute(entry) || entry.includes("$")) {
@@ -829,11 +898,17 @@ export function inspectElfRuntimePaths(executablePaths: readonly string[]): stri
         throw sandboxFailure(`Dynamic library closure is incomplete for ${executable}: ${needed}.`);
       }
       const canonical = realpathSync(found);
-      paths.add(canonical);
-      pending.push(canonical);
+      addPath(canonical, found);
+      enqueue(canonical);
     }
   }
-  return [...paths].sort();
+  return [...paths.values()].sort((a, b) =>
+    bytewiseCompare(a.guestPath, b.guestPath) || bytewiseCompare(a.sourcePath, b.sourcePath));
+}
+
+export function inspectElfRuntimePaths(executablePaths: readonly string[]): string[] {
+  return [...new Set(inspectElfRuntimeMounts(executablePaths).map((entry) => entry.sourcePath))]
+    .sort(bytewiseCompare);
 }
 
 function within(root: string, candidate: string): boolean {
@@ -1057,7 +1132,11 @@ export function buildSeatbeltProfile(
   return lines.join("\n");
 }
 
-export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string[] {
+export function buildBubblewrapArgs(
+  policy: SandboxPolicy,
+  home: string,
+  runtimeMounts: readonly SandboxRuntimeMount[] = [],
+): string[] {
   const args = [
     "--unshare-pid",
     "--unshare-ipc",
@@ -1078,6 +1157,18 @@ export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string
   // Qualification canonicalizes every source before this builder runs.
   // Required closure mounts therefore use plain binds: a source disappearing
   // between qualification and launch is a refusal, never an optional omission.
+  for (const mount of runtimeMounts) {
+    if (mount.childFd === undefined) {
+      if (mount.hostPath !== mount.guestPath) {
+        throw sandboxFailure(
+          `Immutable runtime snapshot requires descriptor binding: ${mount.guestPath}.`,
+        );
+      }
+      args.push("--ro-bind", mount.hostPath, mount.guestPath);
+    } else {
+      args.push("--ro-bind-fd", String(mount.childFd), mount.guestPath);
+    }
+  }
   for (const p of policy.readablePaths ?? []) args.push("--ro-bind", p, p);
   for (const p of policy.writablePaths) args.push("--bind", p, p);
   // A reviewer receives the source tree read-only and one pre-created output
@@ -1097,10 +1188,11 @@ export function buildBubblewrapArgs(policy: SandboxPolicy, home: string): string
 
 interface ResolvedRuntimeClosure {
   readonly qualification: SandboxQualification;
-  readonly executable: string;
+  readonly executableGuestPath: string;
   readonly launcherExecutable: string;
   readonly snapshotExecutableIdentities: readonly SandboxExecutableIdentity[];
-  readonly readablePaths: readonly string[];
+  readonly runtimeMounts: readonly SandboxRuntimeMount[];
+  readonly snapshotManifest: readonly SandboxSnapshotManifestEntry[];
   readonly shimTargets: ReadonlyMap<string, string>;
 }
 
@@ -1128,20 +1220,15 @@ function chargeSnapshot(budget: SnapshotBudget, size: number, source: string): v
   }
 }
 
-function copySnapshotFile(
-  source: string,
+function copySnapshotFileFromDescriptor(
+  opened: InspectedFile,
+  sourcePath: string,
+  guestPath: string,
   target: string,
   budget: SnapshotBudget,
   expectedSha256?: string,
-): string {
-  const opened = openInspectedFile(
-    source,
-    "Runtime snapshot file",
-    MAX_EXECUTABLE_INSPECTION_BYTES,
-    false,
-    false,
-  );
-  chargeSnapshot(budget, opened.info.size, source);
+): SandboxSnapshotManifestEntry {
+  chargeSnapshot(budget, opened.info.size, sourcePath);
   mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
   let destination: number | undefined;
   try {
@@ -1162,7 +1249,7 @@ function copySnapshotFile(
         offset,
       );
       if (count <= 0) {
-        throw sandboxFailure(`Runtime snapshot source changed while it was copied: ${source}.`);
+        throw sandboxFailure(`Runtime snapshot source changed while it was copied: ${sourcePath}.`);
       }
       digest.update(chunk.subarray(0, count));
       let written = 0;
@@ -1181,15 +1268,28 @@ function copySnapshotFile(
       sourceAfter.ctimeMs !== opened.info.ctimeMs || !destinationAfter.isFile() ||
       destinationAfter.size !== opened.info.size
     ) {
-      throw sandboxFailure(`Runtime snapshot source changed while it was copied: ${source}.`);
+      throw sandboxFailure(`Runtime snapshot source changed while it was copied: ${sourcePath}.`);
     }
     const sha256 = digest.digest("hex");
     if (expectedSha256 !== undefined && sha256 !== expectedSha256) {
-      throw sandboxFailure(`Qualified executable bytes changed before snapshot: ${source}.`);
+      throw sandboxFailure(`Qualified executable bytes changed before snapshot: ${sourcePath}.`);
     }
     fchmodSync(destination, (opened.info.mode & 0o111) === 0 ? 0o400 : 0o500);
     fsyncSync(destination);
-    return sha256;
+    const immutable = fstatSync(destination);
+    return {
+      sourcePath,
+      guestPath,
+      snapshot: {
+        path: realpathSync(target),
+        sha256,
+        device: immutable.dev,
+        inode: immutable.ino,
+        size: immutable.size,
+        uid: immutable.uid,
+        mode: immutable.mode & 0o7777,
+      },
+    };
   } catch (error) {
     if (destination !== undefined) closeSync(destination);
     destination = undefined;
@@ -1197,112 +1297,170 @@ function copySnapshotFile(
     throw error;
   } finally {
     if (destination !== undefined) closeSync(destination);
-    closeSync(opened.descriptor);
   }
 }
 
-function copySnapshotTree(source: string, target: string, budget: SnapshotBudget, depth = 0): void {
-  if (depth > 32) throw sandboxFailure(`Runtime snapshot depth limit exceeded: ${source}.`);
-  const info = lstatSync(source);
-  if (info.isSymbolicLink()) {
-    throw sandboxFailure(`Runtime snapshot refuses symbolic links inside a qualified tree: ${source}.`);
-  }
-  if (info.isFile()) {
-    copySnapshotFile(source, target, budget);
-    return;
-  }
-  if (!info.isDirectory()) {
-    throw sandboxFailure(`Runtime snapshot refuses a special filesystem object: ${source}.`);
-  }
-  chargeSnapshot(budget, 0, source);
-  mkdirSync(target, { recursive: true, mode: 0o700 });
-  const directory = opendirSync(source);
-  const names: string[] = [];
+function copySnapshotFile(
+  source: string,
+  guestPath: string,
+  target: string,
+  budget: SnapshotBudget,
+  expectedSha256?: string,
+): SandboxSnapshotManifestEntry {
+  const opened = openInspectedFile(
+    source,
+    "Runtime snapshot file",
+    MAX_EXECUTABLE_INSPECTION_BYTES,
+    false,
+    false,
+  );
   try {
-    for (let entry = directory.readSync(); entry !== null; entry = directory.readSync()) {
-      names.push(entry.name);
-      if (budget.entries + names.length > MAX_RUNTIME_SNAPSHOT_ENTRIES) {
-        throw sandboxFailure(`Runtime snapshot entry limit exceeded at ${source}.`);
-      }
-    }
-  } finally {
-    directory.closeSync();
-  }
-  for (const name of names.sort()) {
-    copySnapshotTree(join(source, name), join(target, name), budget, depth + 1);
-  }
-  chmodSync(target, 0o500);
-}
-
-function replaceSnapshotShebang(path: string, interpreter: string, budget: SnapshotBudget): void {
-  const opened = openInspectedFile(path, "Snapshot executable", MAX_EXECUTABLE_INSPECTION_BYTES, true);
-  const temporary = `${path}.runmill-shebang`;
-  let destination: number | undefined;
-  try {
-    const prefix = Buffer.alloc(Math.min(4096, opened.info.size));
-    const prefixCount = prefix.length === 0
-      ? 0
-      : readSync(opened.descriptor, prefix, 0, prefix.length, 0);
-    const newline = prefix.subarray(0, prefixCount).indexOf(0x0a);
-    if (newline < 0) throw sandboxFailure(`Snapshot executable has no complete shebang line: ${path}.`);
-    const replacement = Buffer.from(`#!${interpreter}\n`, "utf8");
-    const updatedSize = replacement.length + opened.info.size - newline - 1;
-    if (!Number.isSafeInteger(updatedSize) || updatedSize > MAX_EXECUTABLE_INSPECTION_BYTES) {
-      throw sandboxFailure(`Snapshot executable exceeds its byte limit after shebang binding: ${path}.`);
-    }
-    chargeSnapshot(budget, Math.max(0, updatedSize - opened.info.size), path);
-    destination = openSync(
-      temporary,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-      0o600,
+    return copySnapshotFileFromDescriptor(
+      opened,
+      source,
+      guestPath,
+      target,
+      budget,
+      expectedSha256,
     );
-    writeSync(destination, replacement, 0, replacement.length, 0);
-    const chunk = Buffer.allocUnsafe(64 * 1024);
-    let sourceOffset = newline + 1;
-    let targetOffset = replacement.length;
-    while (sourceOffset < opened.info.size) {
-      const count = readSync(
-        opened.descriptor,
-        chunk,
-        0,
-        Math.min(chunk.length, opened.info.size - sourceOffset),
-        sourceOffset,
-      );
-      if (count <= 0) throw sandboxFailure(`Snapshot executable changed during rewrite: ${path}.`);
-      let written = 0;
-      while (written < count) {
-        const countWritten = writeSync(
-          destination,
-          chunk,
-          written,
-          count - written,
-          targetOffset + written,
-        );
-        if (countWritten <= 0) throw sandboxFailure(`Snapshot shebang write failed: ${temporary}.`);
-        written += countWritten;
-      }
-      sourceOffset += count;
-      targetOffset += count;
-    }
-    const after = fstatSync(opened.descriptor);
-    if (
-      after.dev !== opened.info.dev || after.ino !== opened.info.ino || after.size !== opened.info.size ||
-      after.mtimeMs !== opened.info.mtimeMs || after.ctimeMs !== opened.info.ctimeMs
-    ) {
-      throw sandboxFailure(`Snapshot executable changed during rewrite: ${path}.`);
-    }
-    fchmodSync(destination, 0o500);
-    fsyncSync(destination);
-    closeSync(destination);
-    destination = undefined;
-    renameSync(temporary, path);
-  } catch (error) {
-    if (destination !== undefined) closeSync(destination);
-    rmSync(temporary, { force: true });
-    throw error;
   } finally {
     closeSync(opened.descriptor);
   }
+}
+
+function directoryUnchanged(before: Stats, after: Stats): boolean {
+  return before.dev === after.dev && before.ino === after.ino && before.size === after.size &&
+    before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs;
+}
+
+function openAnchoredDirectory(path: string): number {
+  const absolute = resolve(path);
+  if (!isAbsolute(absolute)) throw sandboxFailure(`Runtime tree is not absolute: ${path}.`);
+  let descriptor = openSync(
+    resolve(sep),
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    for (const component of absolute.split(sep).filter((part) => part !== "")) {
+      const next = openSync(
+        join(`/proc/self/fd/${String(descriptor)}`, component),
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      closeSync(descriptor);
+      descriptor = next;
+    }
+    return descriptor;
+  } catch (error) {
+    closeSync(descriptor);
+    throw error;
+  }
+}
+
+/**
+ * Snapshot a tree through held no-follow directory descriptors. `/proc/self/fd`
+ * keeps every child lookup anchored to the proven parent object even if an
+ * attacker renames or replaces the source pathname during traversal.
+ */
+function copySnapshotTree(
+  sourceRoot: string,
+  guestRoot: string,
+  targetRoot: string,
+  budget: SnapshotBudget,
+  expectedDigests: ReadonlyMap<string, string>,
+): readonly SandboxSnapshotManifestEntry[] {
+  const manifest: SandboxSnapshotManifestEntry[] = [];
+  const visit = (
+    descriptor: number,
+    sourcePath: string,
+    guestPath: string,
+    targetPath: string,
+    depth: number,
+  ): void => {
+    if (depth > 32) throw sandboxFailure(`Runtime snapshot depth limit exceeded: ${sourcePath}.`);
+    const before = fstatSync(descriptor);
+    if (!before.isDirectory()) throw sandboxFailure(`Runtime snapshot source is not a directory: ${sourcePath}.`);
+    chargeSnapshot(budget, 0, sourcePath);
+    mkdirSync(targetPath, { recursive: true, mode: 0o700 });
+    const anchor = `/proc/self/fd/${String(descriptor)}`;
+    const names = readdirSync(anchor, { encoding: "buffer" })
+      .map((raw) => {
+        const name = raw.toString("utf8");
+        if (!Buffer.from(name, "utf8").equals(raw)) {
+          throw sandboxFailure(`Runtime snapshot contains a non-UTF-8 entry: ${sourcePath}.`);
+        }
+        return name;
+      })
+      .sort(bytewiseCompare);
+    if (budget.entries + names.length > MAX_RUNTIME_SNAPSHOT_ENTRIES) {
+      throw sandboxFailure(`Runtime snapshot entry limit exceeded at ${sourcePath}.`);
+    }
+    for (const name of names) {
+      if (name === "." || name === ".." || name.includes(sep)) {
+        throw sandboxFailure(`Runtime snapshot contains an invalid entry name: ${sourcePath}.`);
+      }
+      const anchoredPath = join(anchor, name);
+      const logicalSource = join(sourcePath, name);
+      const logicalGuest = join(guestPath, name);
+      const target = join(targetPath, name);
+      const observed = lstatSync(anchoredPath);
+      if (observed.isSymbolicLink()) {
+        throw sandboxFailure(`Runtime snapshot refuses symbolic links inside a qualified tree: ${logicalSource}.`);
+      }
+      if (observed.isDirectory()) {
+        const child = openSync(
+          anchoredPath,
+          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        );
+        try {
+          const opened = fstatSync(child);
+          if (opened.dev !== observed.dev || opened.ino !== observed.ino) {
+            throw sandboxFailure(`Runtime snapshot directory changed before open: ${logicalSource}.`);
+          }
+          visit(child, logicalSource, logicalGuest, target, depth + 1);
+        } finally {
+          closeSync(child);
+        }
+        continue;
+      }
+      if (!observed.isFile()) {
+        throw sandboxFailure(`Runtime snapshot refuses a special filesystem object: ${logicalSource}.`);
+      }
+      const child = openSync(
+        anchoredPath,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      try {
+        const opened = fstatSync(child);
+        if (opened.dev !== observed.dev || opened.ino !== observed.ino || !opened.isFile()) {
+          throw sandboxFailure(`Runtime snapshot file changed before open: ${logicalSource}.`);
+        }
+        manifest.push(copySnapshotFileFromDescriptor(
+          { canonical: logicalSource, descriptor: child, info: opened },
+          logicalSource,
+          logicalGuest,
+          target,
+          budget,
+          expectedDigests.get(logicalSource),
+        ));
+      } finally {
+        closeSync(child);
+      }
+    }
+    const after = fstatSync(descriptor);
+    if (!directoryUnchanged(before, after)) {
+      throw sandboxFailure(`Runtime snapshot directory changed during traversal: ${sourcePath}.`);
+    }
+    chmodSync(targetPath, 0o500);
+  };
+
+  const root = openAnchoredDirectory(sourceRoot);
+  try {
+    visit(root, sourceRoot, guestRoot, targetRoot, 0);
+  } finally {
+    closeSync(root);
+  }
+  return manifest.sort((a, b) =>
+    bytewiseCompare(a.guestPath, b.guestPath) || bytewiseCompare(a.sourcePath, b.sourcePath));
 }
 
 function sameExecutableIdentity(
@@ -1330,6 +1488,42 @@ function assertExecutableIdentityCurrent(identity: SandboxExecutableIdentity, la
   }
 }
 
+function openRuntimeMountDescriptor(
+  path: string,
+  expected?: SandboxExecutableIdentity,
+): number {
+  const before = lstatSync(path);
+  if (before.isSymbolicLink() || (!before.isFile() && !before.isDirectory())) {
+    throw sandboxFailure(`Runtime mount is not a regular no-follow source: ${path}.`);
+  }
+  const descriptor = openSync(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const after = fstatSync(descriptor);
+    if (
+      after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size ||
+      after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs ||
+      (after.isFile() !== before.isFile()) || (after.isDirectory() !== before.isDirectory())
+    ) {
+      throw sandboxFailure(`Runtime mount changed before its descriptor was acquired: ${path}.`);
+    }
+    if (
+      expected !== undefined &&
+      (after.dev !== expected.device || after.ino !== expected.inode ||
+        after.size !== expected.size || after.uid !== expected.uid ||
+        (after.mode & 0o7777) !== expected.mode)
+    ) {
+      throw sandboxFailure(`Qualified runtime object changed before descriptor binding: ${path}.`);
+    }
+    return descriptor;
+  } catch (error) {
+    closeSync(descriptor);
+    throw error;
+  }
+}
+
 function isTrustedImmutableSystemExecutable(identity: SandboxExecutableIdentity): boolean {
   return identity.uid === 0 && (identity.mode & 0o022) === 0 && [
     "/bin",
@@ -1349,6 +1543,7 @@ function isTrustedImmutableSystemExecutable(identity: SandboxExecutableIdentity)
 class NativeSandboxBackend implements SandboxBackend {
   readonly mechanism: Exclude<SandboxMechanism, "none">;
   readonly runtime: SandboxRuntimeIdentity;
+  readonly productionQualified = false;
   readonly #searchPath: string;
 
   constructor(os: "darwin" | "linux", searchPath: string) {
@@ -1368,9 +1563,10 @@ class NativeSandboxBackend implements SandboxBackend {
       }
       identity = executableIdentity(candidate);
     }
-    if (identity.uid !== 0 || (identity.mode & 0o022) !== 0) {
+    if (identity.uid !== 0 || (identity.mode & 0o022) !== 0 ||
+        (this.mechanism === "bubblewrap" && (identity.mode & 0o6000) !== 0)) {
       throw sandboxFailure(
-        `Sandbox launcher must be root-owned and not group/other writable: ${identity.path}.`,
+        `Sandbox launcher must be root-owned, rootless (non-setuid), and not group/other writable: ${identity.path}.`,
       );
     }
     return identity;
@@ -1415,10 +1611,10 @@ class NativeSandboxBackend implements SandboxBackend {
     const executable = exactExecutable(input.command, this.#searchPath, input.cwd);
     const identities = new Map<string, SandboxExecutableIdentity>();
     const readable = new Set<string>();
+    const runtimeGuestPaths = new Map<string, Set<string>>();
     const snapshotTrees = new Set<string>();
     const shims = new Map<string, string>();
     const declarations = new Map<string, readonly string[] | undefined>();
-    const snapshotInterpreters = new Map<string, string>();
 
     const addExecutable = (path: string, shimName?: string): string => {
       const inspected = inspectExecutable(path);
@@ -1462,7 +1658,6 @@ class NativeSandboxBackend implements SandboxBackend {
         } else {
           shims.set(basename(interpreter), interpreter);
         }
-        snapshotInterpreters.set(current, interpreter);
         current = interpreter;
         if (depth === MAX_SHEBANG_DEPTH - 1 && declarations.get(current) !== undefined) {
           throw sandboxFailure(`Executable shebang chain exceeds ${MAX_SHEBANG_DEPTH} entries.`);
@@ -1507,7 +1702,7 @@ class NativeSandboxBackend implements SandboxBackend {
       }
     }
 
-    const orderedIdentities = [...identities.values()].sort((a, b) => a.path.localeCompare(b.path));
+    const orderedIdentities = [...identities.values()].sort((a, b) => bytewiseCompare(a.path, b.path));
     if (this.runtime.os === "linux") {
       for (const identity of orderedIdentities) {
         const alreadyCovered = [...readable].some((path) => {
@@ -1519,8 +1714,13 @@ class NativeSandboxBackend implements SandboxBackend {
         });
         if (!alreadyCovered) readable.add(identity.path);
       }
-      for (const path of inspectElfRuntimePaths(orderedIdentities.map((identity) => identity.path))) {
-        readable.add(path);
+      for (const mount of inspectElfRuntimeMounts(
+        orderedIdentities.map((identity) => identity.path),
+      )) {
+        readable.add(mount.sourcePath);
+        const guests = runtimeGuestPaths.get(mount.sourcePath) ?? new Set<string>();
+        guests.add(mount.guestPath);
+        runtimeGuestPaths.set(mount.sourcePath, guests);
       }
     }
     const launcher = this.#launcherIdentity();
@@ -1530,7 +1730,7 @@ class NativeSandboxBackend implements SandboxBackend {
           mechanism: this.mechanism,
           runtime: this.runtime,
           identities: orderedIdentities,
-          readable: [...readable].sort(),
+          readable: [...readable].sort(bytewiseCompare),
           launcher,
         }),
       )
@@ -1546,88 +1746,116 @@ class NativeSandboxBackend implements SandboxBackend {
     };
     if (snapshotRoot === undefined) {
       return {
-        executable,
+        executableGuestPath: executable,
         launcherExecutable: launcher.path,
         snapshotExecutableIdentities: orderedIdentities,
-        readablePaths: [...readable].sort(),
+        runtimeMounts: [...readable].sort(bytewiseCompare).map((path) => ({ hostPath: path, guestPath: path })),
+        snapshotManifest: [],
         shimTargets: shims,
         qualification,
       };
     }
 
     const budget: SnapshotBudget = { entries: 0, bytes: 0 };
-    const mappedReadable = new Set<string>();
-    const snapshotPaths = new Map(
-      orderedIdentities.map((identity) => [
-        identity.path,
-        isTrustedImmutableSystemExecutable(identity)
-          ? identity.path
-          : runtimeSnapshotPath(snapshotRoot, identity.path),
-      ]),
+    const runtimeMounts: SandboxRuntimeMount[] = [];
+    const snapshotManifest: SandboxSnapshotManifestEntry[] = [];
+    const snapshotPaths = new Map<string, string>();
+    const expectedDigests = new Map(
+      orderedIdentities.map((identity) => [identity.path, identity.sha256]),
     );
     const copiedTrees = [...snapshotTrees].sort((a, b) => a.length - b.length);
-    for (const source of [...readable].sort()) {
-      const immutableExecutable = snapshotPaths.get(source);
-      if (immutableExecutable === source) {
-        mappedReadable.add(source);
-        continue;
-      }
+    const addRuntimeMounts = (hostPath: string, sourcePath: string): void => {
+      const guests = runtimeGuestPaths.get(sourcePath) ?? new Set([sourcePath]);
+      for (const guestPath of [...guests].sort(bytewiseCompare)) runtimeMounts.push({ hostPath, guestPath });
+    };
+    for (const source of [...readable].sort(bytewiseCompare)) {
       const coveredTree = copiedTrees.find((root) => source === root || within(root, source));
       if (coveredTree !== undefined && source !== coveredTree) continue;
+      const sourceIdentity = orderedIdentities.find((identity) => identity.path === source);
+      if (sourceIdentity !== undefined && isTrustedImmutableSystemExecutable(sourceIdentity)) {
+        snapshotPaths.set(source, source);
+        addRuntimeMounts(source, source);
+        continue;
+      }
       const target = runtimeSnapshotPath(snapshotRoot, source);
-      if (snapshotTrees.has(source) || !lstatSync(source).isDirectory()) {
-        copySnapshotTree(source, target, budget);
-        mappedReadable.add(target);
+      if (snapshotTrees.has(source)) {
+        const entries = copySnapshotTree(
+          source,
+          source,
+          target,
+          budget,
+          expectedDigests,
+        );
+        snapshotManifest.push(...entries);
+        for (const entry of entries) snapshotPaths.set(entry.sourcePath, entry.snapshot.path);
+        addRuntimeMounts(target, source);
+      } else if (!lstatSync(source).isDirectory()) {
+        const entry = copySnapshotFile(
+          source,
+          source,
+          target,
+          budget,
+          expectedDigests.get(source),
+        );
+        snapshotManifest.push(entry);
+        snapshotPaths.set(source, entry.snapshot.path);
+        addRuntimeMounts(entry.snapshot.path, source);
       } else {
         // Runtime data directories (timezone/cert stores) are not executable
         // objects. They remain exact read-only mounts; executable and library
         // bytes are always snapshotted below.
-        mappedReadable.add(source);
+        addRuntimeMounts(source, source);
       }
     }
-    for (const tree of copiedTrees) mappedReadable.add(runtimeSnapshotPath(snapshotRoot, tree));
 
     for (const identity of orderedIdentities) {
-      const target = snapshotPaths.get(identity.path);
-      if (target === undefined) throw sandboxFailure(`Runtime snapshot mapping is incomplete: ${identity.path}.`);
-      if (target === identity.path) continue;
-      if (!existsSync(target)) copySnapshotFile(identity.path, target, budget, identity.sha256);
-      const copied = executableIdentity(target);
-      if (copied.sha256 !== identity.sha256) {
-        throw sandboxFailure(`Qualified executable bytes changed before snapshot: ${identity.path}.`);
+      if (snapshotPaths.has(identity.path)) continue;
+      if (isTrustedImmutableSystemExecutable(identity)) {
+        snapshotPaths.set(identity.path, identity.path);
+        if (!runtimeMounts.some((mount) => mount.guestPath === identity.path)) {
+          addRuntimeMounts(identity.path, identity.path);
+        }
+        continue;
       }
-    }
-    for (const [source, interpreterSource] of snapshotInterpreters) {
-      const sourceTarget = snapshotPaths.get(source);
-      const interpreterTarget = snapshotPaths.get(interpreterSource);
-      if (sourceTarget === undefined || interpreterTarget === undefined) {
-        throw sandboxFailure(`Executable snapshot shebang mapping is incomplete: ${source}.`);
-      }
-      if (sourceTarget === source || interpreterTarget === interpreterSource) continue;
-      replaceSnapshotShebang(
-        sourceTarget,
-        interpreterTarget,
+      const target = runtimeSnapshotPath(snapshotRoot, identity.path);
+      const entry = copySnapshotFile(
+        identity.path,
+        identity.path,
+        target,
         budget,
+        identity.sha256,
       );
+      snapshotManifest.push(entry);
+      snapshotPaths.set(identity.path, entry.snapshot.path);
+      addRuntimeMounts(entry.snapshot.path, identity.path);
     }
 
     const snapshotExecutableIdentities = orderedIdentities
-      .map((identity) => executableIdentity(snapshotPaths.get(identity.path) ?? identity.path))
-      .sort((a, b) => a.path.localeCompare(b.path));
-    const mappedShims = new Map(
-      [...shims].map(([name, source]) => [name, snapshotPaths.get(source) ?? source]),
-    );
+      .map((identity) =>
+        snapshotManifest.find((entry) => entry.sourcePath === identity.path)?.snapshot ?? identity)
+      .sort((a, b) => bytewiseCompare(a.path, b.path));
     return {
-      executable: snapshotPaths.get(executable) ?? executable,
+      executableGuestPath: executable,
       launcherExecutable: launcher.path,
       snapshotExecutableIdentities,
-      readablePaths: [...mappedReadable].sort(),
-      shimTargets: mappedShims,
+      runtimeMounts: runtimeMounts.sort((a, b) =>
+        bytewiseCompare(a.guestPath, b.guestPath) || bytewiseCompare(a.hostPath, b.hostPath)),
+      snapshotManifest: snapshotManifest.sort((a, b) =>
+        bytewiseCompare(a.guestPath, b.guestPath) || bytewiseCompare(a.sourcePath, b.sourcePath)),
+      // Shims point at original guest paths. No private host snapshot pathname
+      // is meaningful inside bubblewrap's empty root.
+      shimTargets: shims,
       qualification,
     };
   }
 
   async start(input: SandboxRunInput): Promise<SandboxExecution> {
+    if (!this.productionQualified) {
+      throw sandboxFailure(
+        `${this.mechanism} is a policy-qualification test harness only; execution remains disabled ` +
+          "until backend-empty lifecycle acknowledgement is implemented.",
+      );
+    }
     if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0) {
       throw sandboxFailure("Sandbox timeout must be a positive safe integer.");
     }
@@ -1636,214 +1864,242 @@ class NativeSandboxBackend implements SandboxBackend {
       throw sandboxFailure("Sandbox output limit must be a positive safe integer.");
     }
 
-    const runtimeSnapshot = realpathSync(mkdtempSync(join(tmpdir(), "runmill-runtime-snapshot-")));
-    let closure: ResolvedRuntimeClosure;
+    const acquiredPaths: string[] = [];
+    const acquiredDescriptors: number[] = [];
+    let cleaned = false;
+    const acquire = (prefix: string): string => {
+      const path = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+      acquiredPaths.push(path);
+      return path;
+    };
+    const cleanup = (): void => {
+      if (cleaned) return;
+      cleaned = true;
+      for (const descriptor of acquiredDescriptors.splice(0).reverse()) closeSync(descriptor);
+      for (const path of [...acquiredPaths].reverse()) {
+        rmSync(path, { recursive: true, force: true });
+      }
+    };
+
     try {
-      closure = await this.#resolveClosure({
+      const runtimeSnapshot = acquire("runmill-runtime-snapshot-");
+      const closure = await this.#resolveClosure({
         command: input.command,
         cwd: input.cwd,
         subprocesses: input.subprocesses,
       }, this.runtime.os === "linux" ? runtimeSnapshot : undefined);
-    } catch (error) {
-      rmSync(runtimeSnapshot, { recursive: true, force: true });
-      throw error;
-    }
-    const childTmp = createPrivateTempDir();
-    const shimDir = realpathSync(mkdtempSync(join(tmpdir(), "runmill-runtime-bin-")));
-    for (const [name, target] of closure.shimTargets) symlinkSync(target, join(shimDir, name));
-    let profileDir: string | undefined;
-    let cleaned = false;
-    const cleanup = (): void => {
-      if (cleaned) return;
-      cleaned = true;
-      if (profileDir !== undefined) rmSync(profileDir, { recursive: true, force: true });
-      rmSync(shimDir, { recursive: true, force: true });
-      rmSync(childTmp, { recursive: true, force: true });
-      rmSync(runtimeSnapshot, { recursive: true, force: true });
-    };
+      const childTmp = acquire("runmill-child-tmp-");
+      const shimDir = acquire("runmill-runtime-bin-");
+      for (const [name, target] of closure.shimTargets) symlinkSync(target, join(shimDir, name));
+      const normalized = normalizePolicy(input, childTmp);
 
-    let normalized: NormalizedPolicy;
-    try {
-      normalized = normalizePolicy(input, childTmp);
-    } catch (error) {
-      cleanup();
-      throw error;
-    }
+      const cwd = canonicalExisting(input.cwd, "Sandbox working directory");
+      const homePath = input.env?.["HOME"] ?? process.env["HOME"] ?? childTmp;
+      const home = realPath(homePath);
+      const inheritedEnvironment = buildEnvironment(input.env, {
+        ...process.env,
+        PATH: this.#searchPath,
+      });
+      const configuredTrustRoots = trustStoreReadPaths(inheritedEnvironment);
+      for (const path of configuredTrustRoots) assertGrantIsBounded(path, cwd, process.env["HOME"]);
+      const runtimeMounts = [
+        ...closure.runtimeMounts,
+        ...configuredTrustRoots.map((path) => ({ hostPath: path, guestPath: path })),
+      ].sort((a, b) =>
+        bytewiseCompare(a.guestPath, b.guestPath) || bytewiseCompare(a.hostPath, b.hostPath));
+      const policy: SandboxPolicy & {
+        readonly executablePaths: readonly string[];
+        readonly executableSubpaths: readonly string[];
+      } = {
+        writablePaths: normalized.writablePaths,
+        writableFiles: normalized.writableFiles,
+        readablePaths: [
+          ...normalized.readablePaths,
+          ...(this.mechanism === "seatbelt"
+            ? [...runtimeMounts.map((mount) => mount.hostPath), shimDir]
+            : []),
+        ],
+        protectedPaths: normalized.protectedPaths,
+        allowNetwork: normalized.allowNetwork,
+        executablePaths: this.mechanism === "seatbelt"
+          ? closure.qualification.executableIdentities.map((entry) => entry.path)
+          : [],
+        executableSubpaths: normalized.preparedDependencyPaths,
+      };
+      const env = {
+        ...inheritedEnvironment,
+        PATH: this.mechanism === "bubblewrap" ? LOGICAL_SANITIZED_PATH : shimDir,
+        TMPDIR: childTmp,
+        GIT_OPTIONAL_LOCKS: "0",
+      };
+      const layout: SandboxPathLayout = {
+        cwd: { hostPath: cwd, guestPath: cwd },
+        home: { hostPath: home, guestPath: home },
+        temporary: { hostPath: childTmp, guestPath: childTmp },
+        mounts: [
+          ...normalized.writablePaths.map((path): SandboxPathMount => ({
+            hostPath: path,
+            guestPath: path,
+            access: "read-write",
+            purpose: path === cwd ? "workspace" : path === childTmp ? "temporary" : "provider-home",
+          })),
+          ...normalized.writableFiles.map((path): SandboxPathMount => ({
+            hostPath: path,
+            guestPath: path,
+            access: "write-file",
+            purpose: "output",
+          })),
+          ...normalized.readablePaths.map((path): SandboxPathMount => ({
+            hostPath: path,
+            guestPath: path,
+            access: "read-only",
+            purpose: normalized.preparedDependencyPaths.includes(path) ? "dependency" : "workspace",
+          })),
+          ...runtimeMounts.map((mount): SandboxPathMount => ({
+            ...mount,
+            access: "read-only",
+            purpose: "runtime",
+          })),
+          ...(this.mechanism === "bubblewrap"
+            ? [{
+                hostPath: shimDir,
+                guestPath: LOGICAL_SANITIZED_PATH,
+                access: "read-only" as const,
+                purpose: "runtime" as const,
+              }]
+            : []),
+        ],
+      };
 
-    const cwd = canonicalExisting(input.cwd, "Sandbox working directory");
-    const homePath = input.env?.["HOME"] ?? process.env["HOME"] ?? childTmp;
-    const home = realPath(homePath);
-    const inheritedEnvironment = buildEnvironment(input.env, {
-      ...process.env,
-      PATH: this.#searchPath,
-    });
-    const configuredTrustRoots = trustStoreReadPaths(inheritedEnvironment);
-    for (const path of configuredTrustRoots) {
-      assertGrantIsBounded(path, cwd, process.env["HOME"]);
-    }
-    const runtimeReadable = [...new Set([
-      ...closure.readablePaths,
-      ...configuredTrustRoots,
-      ...(this.mechanism === "seatbelt" ? [shimDir] : []),
-    ])];
-    const policy: SandboxPolicy & {
-      readonly executablePaths: readonly string[];
-      readonly executableSubpaths: readonly string[];
-    } = {
-      writablePaths: normalized.writablePaths,
-      writableFiles: normalized.writableFiles,
-      readablePaths: [...normalized.readablePaths, ...runtimeReadable],
-      protectedPaths: normalized.protectedPaths,
-      allowNetwork: normalized.allowNetwork,
-      executablePaths: closure.snapshotExecutableIdentities.map((entry) => entry.path),
-      executableSubpaths: normalized.preparedDependencyPaths,
-    };
-    const env = {
-      ...inheritedEnvironment,
-      PATH: this.mechanism === "bubblewrap" ? LOGICAL_SANITIZED_PATH : shimDir,
-      TMPDIR: childTmp,
-      GIT_OPTIONAL_LOCKS: "0",
-    };
-    const layout: SandboxPathLayout = {
-      cwd: { hostPath: cwd, guestPath: cwd },
-      home: { hostPath: home, guestPath: home },
-      temporary: { hostPath: childTmp, guestPath: childTmp },
-      mounts: [
-        ...normalized.writablePaths.map((path): SandboxPathMount => ({
-          hostPath: path,
-          guestPath: path,
-          access: "read-write",
-          purpose: path === cwd ? "workspace" : path === childTmp ? "temporary" : "provider-home",
-        })),
-        ...normalized.writableFiles.map((path): SandboxPathMount => ({
-          hostPath: path,
-          guestPath: path,
-          access: "write-file",
-          purpose: "output",
-        })),
-        ...normalized.readablePaths.map((path): SandboxPathMount => ({
-          hostPath: path,
-          guestPath: path,
-          access: "read-only",
-          purpose: normalized.preparedDependencyPaths.includes(path) ? "dependency" : "workspace",
-        })),
-        ...runtimeReadable.map((path): SandboxPathMount => ({
-          hostPath: path,
-          guestPath: path,
-          access: "read-only",
-          purpose: "runtime",
-        })),
-        ...(this.mechanism === "bubblewrap"
-          ? [{
-              hostPath: shimDir,
-              guestPath: LOGICAL_SANITIZED_PATH,
-              access: "read-only" as const,
-              purpose: "runtime" as const,
-            }]
-          : []),
-      ],
-    };
+      const launcher = closure.qualification.launcher;
+      if (launcher === undefined) throw sandboxFailure("Sandbox launcher identity is missing.");
+      const policyDigest = createHash("sha256").update(JSON.stringify({
+        mechanism: this.mechanism,
+        runtime: this.runtime,
+        runtimeDigest: closure.qualification.runtimeDigest,
+        launcher,
+        snapshotExecutableIdentities: closure.snapshotExecutableIdentities,
+        snapshotManifest: closure.snapshotManifest,
+        layout,
+        protectedPaths: normalized.protectedPaths,
+        preparedDependencyPaths: normalized.preparedDependencyPaths,
+        allowNetwork: normalized.allowNetwork,
+        limits: { timeoutMs: input.timeoutMs, maxOutputBytes },
+      })).digest("hex");
+      const qualification: SandboxQualification = {
+        ...closure.qualification,
+        executable: closure.snapshotManifest.find(
+          (entry) => entry.sourcePath === closure.qualification.executable.path,
+        )?.snapshot ?? closure.qualification.executable,
+        executableIdentities: closure.snapshotExecutableIdentities,
+        snapshotManifest: closure.snapshotManifest,
+        policyDigest,
+      };
 
-    const launcher = closure.qualification.launcher;
-    if (launcher === undefined) throw sandboxFailure("Sandbox launcher identity is missing.");
-    const policyDigest = createHash("sha256").update(JSON.stringify({
-      mechanism: this.mechanism,
-      runtime: this.runtime,
-      runtimeDigest: closure.qualification.runtimeDigest,
-      launcher,
-      snapshotExecutableIdentities: closure.snapshotExecutableIdentities,
-      layout,
-      protectedPaths: normalized.protectedPaths,
-      preparedDependencyPaths: normalized.preparedDependencyPaths,
-      allowNetwork: normalized.allowNetwork,
-      limits: { timeoutMs: input.timeoutMs, maxOutputBytes },
-    })).digest("hex");
-    const qualification: SandboxQualification = {
-      ...closure.qualification,
-      executable: closure.snapshotExecutableIdentities.find(
-        (identity) => identity.path === closure.executable,
-      ) ?? closure.qualification.executable,
-      executableIdentities: closure.snapshotExecutableIdentities,
-      policyDigest,
-    };
-
-    let command: string;
-    let args: string[];
-    try {
+      let command: string;
+      let args: string[];
       if (this.mechanism === "seatbelt") {
-        profileDir = mkdtempSync(join(tmpdir(), "runmill-sb-"));
+        const profileDir = acquire("runmill-sb-");
         const profile = join(profileDir, "policy.sb");
-        writeFileSync(profile, buildSeatbeltProfile(policy, process.env["HOME"] ?? tmpdir()));
+        writeFileSync(profile, buildSeatbeltProfile(policy, home));
         command = closure.launcherExecutable;
-        args = ["-f", profile, closure.executable, ...input.args];
+        args = ["-f", profile, closure.executableGuestPath, ...input.args];
       } else {
+        const descriptorMounts = [
+          ...runtimeMounts,
+          { hostPath: shimDir, guestPath: LOGICAL_SANITIZED_PATH },
+        ].map((mount, index): SandboxRuntimeMount => {
+          const expected = closure.snapshotExecutableIdentities.find(
+            (identity) => identity.path === mount.hostPath,
+          );
+          const descriptor = openRuntimeMountDescriptor(mount.hostPath, expected);
+          acquiredDescriptors.push(descriptor);
+          return { ...mount, childFd: 3 + index };
+        });
         command = closure.launcherExecutable;
         args = [
-          ...buildBubblewrapArgs(policy, process.env["HOME"] ?? tmpdir()),
-          "--ro-bind", shimDir, LOGICAL_SANITIZED_PATH,
-          closure.executable,
+          ...buildBubblewrapArgs(policy, home, descriptorMounts),
+          closure.executableGuestPath,
           ...input.args,
         ];
       }
+
+      for (const identity of closure.snapshotExecutableIdentities) {
+        assertExecutableIdentityCurrent(identity, "Sandbox executable snapshot");
+      }
+      assertExecutableIdentityCurrent(launcher, "Sandbox launcher");
+
+      const started = Date.now();
+      const controller = new AbortController();
+      const controlled = runControlledProcess({
+        command,
+        args,
+        cwd,
+        env,
+        timeoutMs: input.timeoutMs,
+        maxOutputBytes,
+        signal: controller.signal,
+        // Neither Seatbelt nor the current bwrap monitor provides a proven
+        // backend-empty acknowledgement. These explicitly named test
+        // harnesses exercise mechanism policy only, never lifecycle claims.
+        containment: "process-group",
+        ...(acquiredDescriptors.length === 0
+          ? {}
+          : { inheritedFileDescriptors: [...acquiredDescriptors] }),
+        ...(input.onStdout === undefined ? {} : { onStdout: input.onStdout }),
+        ...(input.onStderr === undefined ? {} : { onStderr: input.onStderr }),
+      });
+      // spawn() duplicates these into the child synchronously. Parent copies
+      // are no longer needed and must not leak until result cleanup.
+      for (const descriptor of acquiredDescriptors.splice(0)) closeSync(descriptor);
+      const result = controlled.then((completed): SandboxResult => {
+        if (!completed.containmentConfirmed) {
+          // Keep every private resource quarantined and reject completion. An
+          // awaited abort may not resolve while backend teardown is unproven.
+          throw sandboxFailure(
+            completed.stderr || "bubblewrap containment teardown could not be proven",
+          );
+        }
+        const outcome: SandboxResult["outcome"] =
+          completed.outcome === "output-limit" || completed.outcome === "spawn-error"
+            ? "sandbox-denied"
+            : completed.outcome;
+        const value: SandboxResult = {
+          outcome,
+          exitCode: completed.exitCode,
+          signal: completed.signal,
+          stdout: completed.stdout,
+          stderr: [
+            completed.stderr,
+            completed.outcome === "output-limit" ? "sandbox output limit exceeded" : undefined,
+          ].filter((part): part is string => part !== undefined && part !== "").join("\n"),
+          durationMs: Date.now() - started,
+        };
+        cleanup();
+        return value;
+      }, (error: unknown) => {
+        cleanup();
+        throw error;
+      });
+      let abortPromise: Promise<void> | undefined;
+      const abort = (): Promise<void> => {
+        if (abortPromise !== undefined) return abortPromise;
+        controller.abort();
+        abortPromise = result.then(() => undefined);
+        return abortPromise;
+      };
+
+      return {
+        layout,
+        originalQualification: closure.qualification,
+        qualification,
+        result,
+        abort,
+      };
     } catch (error) {
       cleanup();
       throw error;
     }
-
-    for (const identity of closure.snapshotExecutableIdentities) {
-      assertExecutableIdentityCurrent(identity, "Sandbox executable snapshot");
-    }
-    assertExecutableIdentityCurrent(launcher, "Sandbox launcher");
-
-    const started = Date.now();
-    const controller = new AbortController();
-    const controlled = runControlledProcess({
-      command,
-      args,
-      cwd,
-      env,
-      timeoutMs: input.timeoutMs,
-      maxOutputBytes,
-      signal: controller.signal,
-      ...(input.onStdout === undefined ? {} : { onStdout: input.onStdout }),
-      ...(input.onStderr === undefined ? {} : { onStderr: input.onStderr }),
-    });
-    const result = controlled.then((completed): SandboxResult => {
-      const outcome: SandboxResult["outcome"] =
-        completed.outcome === "output-limit" || completed.outcome === "spawn-error"
-          ? "sandbox-denied"
-          : completed.outcome;
-      const value: SandboxResult = {
-        outcome,
-        exitCode: completed.exitCode,
-        signal: completed.signal,
-        stdout: completed.stdout,
-        stderr: [
-          completed.stderr,
-          completed.outcome === "output-limit" ? "sandbox output limit exceeded" : undefined,
-        ].filter((part): part is string => part !== undefined && part !== "").join("\n"),
-        durationMs: Date.now() - started,
-      };
-      cleanup();
-      return value;
-    }, (error: unknown) => {
-      cleanup();
-      throw error;
-    });
-    let abortPromise: Promise<void> | undefined;
-    const abort = (): Promise<void> => {
-      if (abortPromise !== undefined) return abortPromise;
-      controller.abort();
-      abortPromise = result.then(() => undefined);
-      return abortPromise;
-    };
-
-    return {
-      layout,
-      qualification,
-      result,
-      abort,
-    };
   }
 
   async run(input: SandboxRunInput): Promise<SandboxResult> {
@@ -1853,6 +2109,7 @@ class NativeSandboxBackend implements SandboxBackend {
 
 class DisabledSandboxBackend implements SandboxBackend {
   readonly mechanism = "none" as const;
+  readonly productionQualified = false;
   readonly runtime: SandboxRuntimeIdentity = {
     os: platform(),
     arch: arch(),
@@ -1910,7 +2167,23 @@ export function createNativeSandboxBackend(
   if (os !== "linux") {
     throw sandboxFailure(`The native sandbox backend is not implemented for ${os}.`);
   }
-  return new NativeSandboxBackend(os, options.path ?? process.env["PATH"] ?? "");
+  throw sandboxFailure(
+    "The Linux bubblewrap backend is pending complete descriptor-bound runtime and policy " +
+      "closure qualification; native execution fails closed.",
+  );
+}
+
+export function assertSandboxSelection(
+  selection: "native" | "none" | "docker",
+  backend: SandboxBackend,
+): SandboxBackend {
+  const actual = backend.mechanism === "none" ? "none" : "native";
+  if (selection !== actual) {
+    throw sandboxFailure(
+      `Configured sandbox ${selection} does not match the injected ${actual} backend.`,
+    );
+  }
+  return backend;
 }
 
 /**
@@ -1929,9 +2202,19 @@ export function createTestSeatbeltSandboxBackend(
   return new NativeSandboxBackend("darwin", options.path ?? process.env["PATH"] ?? "");
 }
 
+/** Test-only bubblewrap mechanism harness; production native selection refuses. */
+export function createTestBubblewrapSandboxBackend(
+  options: Omit<NativeSandboxOptions, "platform"> = {},
+): SandboxBackend {
+  if (platform() !== "linux") {
+    throw sandboxFailure("The bubblewrap mechanism test harness requires Linux.");
+  }
+  return new NativeSandboxBackend("linux", options.path ?? process.env["PATH"] ?? "");
+}
+
 /** Test-only current-host mechanism selection; never use in production composition. */
 export function createTestSandboxBackend(options: NativeSandboxOptions = {}): SandboxBackend {
   return platform() === "darwin"
     ? createTestSeatbeltSandboxBackend(options.path === undefined ? {} : { path: options.path })
-    : createNativeSandboxBackend("native", options);
+    : createTestBubblewrapSandboxBackend(options.path === undefined ? {} : { path: options.path });
 }

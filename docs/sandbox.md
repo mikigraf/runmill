@@ -19,24 +19,24 @@ containment, and instructions in a system prompt are not containment.
 | Platform | Mechanism |
 |---|---|
 | macOS | No production execution backend. Seatbelt policy is tested, but cannot own escaped-session descendants. |
-| Linux | bubblewrap with mount, PID, IPC, and UTS namespaces |
+| Linux | No production execution backend. The bubblewrap harness awaits complete descriptor-bound runtime and policy closure. |
 | Other | No execution backend — `doctor` says so and refuses to run rather than proceeding unprotected |
 
 What each platform can enforce differs, and runmill does not pretend otherwise:
 
 | Control | macOS | Linux |
 |---|---|---|
-| File scoping | no production execution | yes |
-| Credential denial | no production execution | yes |
-| Network scoping | no production execution | yes (`--unshare-net`) |
-| Resource limits | no production execution | with cgroup v2 |
+| File scoping | no production execution | no production execution |
+| Credential denial | no production execution | no production execution |
+| Network scoping | no production execution | no production execution |
+| Resource limits | no production execution | no production execution |
 
 Seatbelt has no lifecycle container: a child can create a new session and survive process-group
 termination. Runmill therefore refuses production native execution on macOS. The Seatbelt profile
 remains an explicit test-only mechanism for file-policy regressions; it is not selected by the
 factory, config composition, or doctor. Runmill also does not yet ship its planned hostname-filtering
-proxy. Today `workspace.network: proxy` permits unrestricted provider egress on Linux;
-`none` disables it. A non-empty `network_allowlist` is rejected rather than silently accepted as a
+proxy. When an execution backend is qualified, `workspace.network: proxy` will initially permit
+unrestricted provider egress; `none` disables it. A non-empty `network_allowlist` is rejected rather than silently accepted as a
 control that does not exist. `runmill doctor` reports unrestricted egress as a warning.
 
 ## The Seatbelt profile
@@ -63,12 +63,11 @@ tool inventory is deliberately small (`git`, `rg`, `node`, `npm`, and `npx`) and
 the exact installed or absolute executables named by configured verification checks. Installed Node provider
 CLIs receive their exact package tree and declared platform package, not the containing global
 `node_modules` tree or sibling packages. Seatbelt permits `process-exec` only for this qualified
-closure. Linux constructs an empty bubblewrap root and binds the same exact executable, dynamic
-library, runtime-file, provider-package, workspace, and prepared-dependency closure with mandatory
-`--ro-bind`; its launcher is an exact approved system path, never an ambient `PATH` result. Linux
-ELF dependencies are discovered by parsing executable bytes rather than running the target or
-`ldd` with host authority. A required path disappearing or changing identity between qualification
-and launch refuses the run.
+closure. The Linux test harness constructs an empty bubblewrap root and is being hardened around
+descriptor-bound original guest paths and immutable runtime manifests. Production selection remains
+disabled until ELF loader aliases, libc/NSS behavior, trust/DNS/timezone inputs, every policy mount,
+and FD-bind launcher support are proved as one closure. ELF metadata inspection reads bytes and
+never executes the target or invokes `ldd` with host authority.
 
 Writable paths are granted per policy. Then credential paths are denied **last**, so the denial
 wins over any broader grant:
@@ -186,10 +185,10 @@ Provider API keys are not a workaround. `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`
 the agent environment because tool subprocesses would inherit them directly. A host-side credential
 broker is required to remove both forms of provider credential from the agent boundary.
 
-## Everything runs inside it
+## One backend contract
 
-On supported Linux hosts, both the agent **and** every verification check run through the same
-lifecycle-owning backend:
+When a backend is production-qualified, both the agent **and** every verification check use the
+same injected lifecycle-owning instance. No backend currently satisfies that qualification:
 
 ```ts
 const outcome = await this.#sandbox.run({
@@ -215,13 +214,10 @@ read-only for provider sessions, allowing declared local npm scripts without gra
 packages or an ambient package root. Its nested read-only overlay prevents the process from
 unlinking, replacing, or patching its own toolchain.
 
-`start()` owns the profile/namespace, process group, bounded streaming, timeout, and cleanup.
-Callers receive a completion promise plus an awaited, idempotent `abort()`; no API returns a wrapped
-command that callers could spawn outside backend lifecycle ownership. Completion is reported only
-after the backend has terminated and confirmed quiescence of the process group, including descendants
-left behind after a normal direct-child exit. The selected backend object
-is constructed once at each composition root and shared by provider, reviewer, verification,
-doctor, evaluation, and orchestrator paths.
+The backend contract exposes `start()`, a completion promise, and awaited idempotent `abort()` rather
+than a wrapper command. No production implementation is selected until its kernel-owned containment
+resource and cleanup semantics are proved. The test harnesses do not constitute that proof and
+`doctor` categorically refuses to certify Seatbelt or the incomplete bubblewrap harness.
 
 The provider CLI runs with **its own** sandbox disabled inside runmill's, so there is one
 enforcement layer rather than two half-configured ones.
@@ -232,23 +228,14 @@ enforcement layer rather than two half-configured ones.
 from inside it, and fails if that succeeds:
 
 ```
-✓ sandbox:mechanism             bubblewrap /usr/bin/bwrap <identity>
-✓ sandbox:deny-credential-read  read denied
-! sandbox:network               provider egress is unrestricted in proxy mode
-✓ provider:codex                authenticated inside sandbox
-✓ provider:codex:request        one-turn provider request completed inside sandbox
+✗ sandbox:mechanism             RM-SANDBOX-001 (no production-qualified local backend)
 ```
 
 There is no silent downgrade. If isolation cannot be constructed and verified, no run starts —
 [`RM-SANDBOX-001`](./errors.md#rm-sandbox-001).
 
-On macOS, this check fails with `RM-SANDBOX-001`; run production execution on a Linux host with
-trusted bubblewrap. On Linux, `setting up uid map: Permission denied` means unprivileged user
-namespaces are disabled:
-
-```bash
-sudo sysctl -w kernel.unprivileged_userns_clone=1
-```
+On macOS and Linux this check currently fails with `RM-SANDBOX-001`. Linux bubblewrap mechanism
+tests remain required in Linux CI, but they do not certify production selection.
 
 ## Output capture
 

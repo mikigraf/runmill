@@ -85,7 +85,7 @@ function request(overrides: Partial<AgentRunRequest> = {}): AgentRunRequest {
   return built;
 }
 
-const hasSandbox = platform() === "darwin" || detectMechanism() !== "none";
+const hasSandbox = detectMechanism() !== "none";
 
 describe("dialect definitions", () => {
   it("declares capabilities per dialect rather than switching on a name", () => {
@@ -507,6 +507,39 @@ echo '{"type":"task_complete"}'
 });
 
 describe("detect against a real binary", () => {
+  it("reports the original installed executable rather than an ephemeral Linux snapshot", async () => {
+    const installedPath = "/opt/provider/bin/codex";
+    const snapshotPath = "/private/runmill-runtime-snapshot/root/opt/provider/bin/codex";
+    const fakeQualification = (path: string) => ({
+      mechanism: "bubblewrap" as const,
+      runtime: { os: "linux" as const, arch: "x64", libc: "glibc" as const, nodeAbi: "127" },
+      executable: { path, sha256: "a".repeat(64), device: 1, inode: 2, size: 3, uid: 0, mode: 0o555 },
+      executableIdentities: [],
+      sanitizedPath: "/runmill/runtime/bin",
+      runtimeDigest: "b".repeat(64),
+    });
+    const originalQualification = fakeQualification(installedPath);
+    const qualification = fakeQualification(snapshotPath);
+    const sandbox = backend({
+      start: async () => ({
+        layout: {} as never,
+        originalQualification,
+        qualification,
+        result: Promise.resolve({
+          outcome: "exited", exitCode: 0, signal: null,
+          stdout: "codex 1.2.3\n", stderr: "", durationMs: 1,
+        }),
+        abort: async () => undefined,
+      }),
+    });
+
+    await expect(providerAdapter({ dialect: CODEX_DIALECT, sandbox }).detect()).resolves.toEqual({
+      installed: true,
+      version: "codex 1.2.3",
+      path: installedPath,
+    });
+  });
+
   it.runIf(hasSandbox)("never executes a provider PATH shim outside the selected backend", async () => {
     const dir = mkdtempSync(join(tmpdir(), "runmill-detect-marker-"));
     const marker = join(dir, "host-marker");
@@ -645,6 +678,7 @@ describe("sandbox policy", () => {
         });
         return {
           layout: {} as never,
+          originalQualification: {} as never,
           qualification: {} as never,
           result: Promise.resolve({
             outcome: "exited",
