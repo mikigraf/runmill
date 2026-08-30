@@ -45,6 +45,15 @@ export function buildPullRequestEvidence(input: {
   readonly requiredContexts: readonly string[];
   readonly verdicts: ReadonlyMap<string, ReconcileVerdict>;
 }): PullRequestEvidence {
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(input.candidateSha)) {
+    throw new Error("pull request evidence candidate must be an exact lowercase Git object id");
+  }
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(input.pullRequest.headSha)) {
+    throw new Error("pull request evidence head must be an exact lowercase Git object id");
+  }
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(input.pullRequest.baseSha)) {
+    throw new Error("pull request evidence base must be an exact lowercase Git object id");
+  }
   if (input.pullRequest.headSha !== input.candidateSha) {
     throw new Error(
       `pull request head ${input.pullRequest.headSha} does not match candidate ${input.candidateSha}`,

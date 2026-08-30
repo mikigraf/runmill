@@ -209,7 +209,7 @@ Runmill is available under the [MIT License](./LICENSE).
 | `runmill effects resolve <key> --outcome <applied\|not-applied>` | Record an outcome verified in the remote system                                                                 |
 | `runmill leases list`                                            | Show local lease rows left by interrupted runs                                                                  |
 | `runmill leases resolve <issue> --confirm-remote-cleared`        | Clear a local row after the exact remote ref is gone                                                            |
-| `runmill policy explain <run-id>`                                | Explain a delivery or merge decision                                                                            |
+| `runmill policy explain <run-id>`                                | Show persisted policy decisions; report `unknown` when no decision evidence exists                              |
 | `runmill init`                                                   | Configure Runmill and add missing repository files                                                              |
 | `runmill config create`                                          | Legacy configuration-only setup. New installations should use `runmill init`.                                   |
 | `runmill config validate`                                        | Validate operator policy and repository checks                                                                  |

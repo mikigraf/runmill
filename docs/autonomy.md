@@ -40,7 +40,16 @@ Evaluated in order. Any failure ends the run in a terminal state that names whic
 7. autonomy mode permits the classified risk
 ```
 
-`runmill policy explain <run-id>` prints this for any run, with the state it reached.
+`runmill policy explain <run-id>` prints only the decisions durably recorded for that run. It does
+not replay the run against today's configuration or invent a gate result from a terminal state.
+When no policy evidence exists, its answer is `unknown`; use `runmill inspect <run-id>` for the
+underlying candidate-bound inputs and observations.
+
+Issue authority is a cross-cutting prerequisite around these gates. Runmill re-observes the full
+issue immediately before the first push and before PR delivery or merge. It accepts only the exact
+confirmed claim-state and configured claim-assignee delta that Runmill itself made. Any other edit,
+missing observation, ineligibility, cancellation, completion, or repository retargeting withholds
+the next mutation and is persisted as a policy refusal or unknown result.
 
 ### Gate 1 — the lease
 

@@ -223,6 +223,122 @@ async function expectReviewGuidanceRefusal(input: {
 const TARGET = { repo: "acme/platform", baseBranch: "main" };
 
 describe.skip("end-to-end: issue to governed pull request (pending qualified sandbox execution)", () => {
+  it("re-observes issue authority after implementation and refuses before the first push", async () => {
+    const backlog = new FakeBacklogAdapter([ISSUE]);
+    class EditingProvider extends FakeProviderAdapter {
+      override async start(request: Parameters<FakeProviderAdapter["start"]>[0]) {
+        const session = await super.start(request);
+        if (request.role === "local-reviewer") {
+          backlog.editIssue(ISSUE.identifier, { title: "Human changed the requested work" });
+        }
+        return session;
+      }
+    }
+    const provider = new EditingProvider({
+      byRole: {
+        implementer: [
+          { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
+        ],
+      },
+      outputByRole: { "local-reviewer": GOOD_REVIEW },
+    });
+    const { orchestrator, forge } = makeOrchestrator({ backlog, provider });
+
+    const outcome = await orchestrator.run({
+      runId: "run_issue_changed_before_push",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_issue_changed_before_push"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/issue authority changed/iu);
+    expect(forge.calls.some((call) => call.op === "push")).toBe(false);
+    expect(store.standalonePolicyDecisions(outcome.runId).at(-1)).toMatchObject({
+      outcome: "refused",
+    });
+  }, 60_000);
+
+  it("re-observes issue authority after CI and refuses delivery", async () => {
+    const backlog = new FakeBacklogAdapter([ISSUE]);
+    class EditingForge extends FakeForgeAdapter {
+      #edited = false;
+
+      override async listChecks(input: Parameters<FakeForgeAdapter["listChecks"]>[0]) {
+        const checks = await super.listChecks(input);
+        if (!this.#edited) {
+          this.#edited = true;
+          backlog.editIssue(ISSUE.identifier, {
+            labels: [...ISSUE.labels, "human-edited-during-ci"],
+          });
+        }
+        return checks;
+      }
+    }
+    const forge = new EditingForge();
+    const { orchestrator } = makeOrchestrator({ backlog, forge });
+
+    const outcome = await orchestrator.run({
+      runId: "run_issue_changed_during_ci",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_issue_changed_during_ci"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/issue authority changed/iu);
+    expect(
+      backlog.calls.some(
+        (call) =>
+          call.op === "transitionState" &&
+          (call.args as { toState?: string }).toState === "In Review",
+      ),
+    ).toBe(false);
+    expect(store.standalonePolicyDecisions(outcome.runId).at(-1)).toMatchObject({
+      outcome: "refused",
+    });
+  }, 60_000);
+
+  it("re-observes issue authority after PR review and refuses delivery", async () => {
+    const backlog = new FakeBacklogAdapter([ISSUE]);
+    class EditingProvider extends FakeProviderAdapter {
+      override async start(request: Parameters<FakeProviderAdapter["start"]>[0]) {
+        const session = await super.start(request);
+        if (request.role === "pr-reviewer") {
+          backlog.editIssue(ISSUE.identifier, {
+            description: `${ISSUE.description}\nHuman clarification after review started.`,
+          });
+        }
+        return session;
+      }
+    }
+    const provider = new EditingProvider({
+      byRole: {
+        implementer: [
+          { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
+        ],
+      },
+      outputByRole: {
+        "local-reviewer": GOOD_REVIEW,
+        "pr-reviewer": GOOD_REVIEW,
+      },
+    });
+    const { orchestrator } = makeOrchestrator({ backlog, provider });
+
+    const outcome = await orchestrator.run({
+      runId: "run_issue_changed_during_review",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_issue_changed_during_review"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/issue authority changed/iu);
+    expect(store.standalonePolicyDecisions(outcome.runId).at(-1)).toMatchObject({
+      outcome: "refused",
+    });
+  }, 60_000);
+
   it("delivers once and cannot reselect the issue on the next poll", async () => {
     const log: string[] = [];
     const { orchestrator, forge, backlog } = makeOrchestrator({ log });
@@ -1226,6 +1342,36 @@ describe("end-to-end refusal boundaries", () => {
 });
 
 describe.skip("guarded merge (pending qualified sandbox execution)", () => {
+  it("re-observes issue authority immediately before merge", async () => {
+    const backlog = new FakeBacklogAdapter([ISSUE]);
+    class EditingForge extends FakeForgeAdapter {
+      override async getMergeability(
+        input: Parameters<FakeForgeAdapter["getMergeability"]>[0],
+      ) {
+        const result = await super.getMergeability(input);
+        backlog.editIssue(ISSUE.identifier, { canceled: true });
+        return result;
+      }
+    }
+    const forge = new EditingForge({ credentialCanWriteProtection: false });
+    const cfg = { ...config(), autonomy: "guarded-merge" as const };
+    const { orchestrator } = makeOrchestrator({ backlog, forge, cfg });
+
+    const outcome = await orchestrator.run({
+      runId: "run_issue_changed_before_merge",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_issue_changed_before_merge"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/issue authority changed/iu);
+    expect(forge.calls.some((call) => call.op === "merge")).toBe(false);
+    expect(store.standalonePolicyDecisions(outcome.runId).at(-1)).toMatchObject({
+      outcome: "refused",
+    });
+  }, 90_000);
+
   it("merges when every gate passes and records the merge sha", async () => {
     // credentialCanWriteProtection: false is the properly-scoped App token.
     // The fake defaults to true, mirroring the real adapter's fail-closed
@@ -1242,7 +1388,7 @@ describe.skip("guarded merge (pending qualified sandbox execution)", () => {
     });
 
     expect(outcome.finalState).toBe("COMPLETED");
-    expect(outcome.mergeSha).toBe("merge-1");
+    expect(outcome.mergeSha).toMatch(/^[a-f0-9]{40}$/u);
     expect(backlog.peek("ENG-101")?.state).toBe("Done");
     const evidence = provider.capturedPrEvidence[0] as { candidate: { sha: string } };
     const merge = forge.calls.find((call) => call.op === "merge")?.args as {

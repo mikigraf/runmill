@@ -9,6 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Command } from "commander";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -848,6 +849,137 @@ describe("inspect", () => {
     expect(h.emitted[0]?.human).toContain("run_x");
     expect(h.emitted[0]?.human).toContain("CLAIMED");
   });
+
+  it("returns the complete additive standalone evidence contract", async () => {
+    const store = StateStore.open(join(data, "runmill.db"), { clock: new SystemClock() });
+    const base = "a".repeat(40);
+    const candidate = "b".repeat(40);
+    store.createRun({
+      runId: "run_evidence",
+      issueId: "ENG-8",
+      repo: "acme/widget",
+      provider: "codex",
+    });
+    store.bindStandaloneWorkspace({
+      runId: "run_evidence",
+      path: join(data, "runs", "run_evidence"),
+      branch: "runmill/ENG-8-evidence-1",
+      baseCommit: base,
+    });
+    store.setStandaloneCandidate({
+      runId: "run_evidence",
+      expectedCandidateSha: base,
+      candidateSha: candidate,
+    });
+    const issueBody = JSON.stringify({
+      identifier: "ENG-8",
+      schema: "runmill.issue-snapshot/v1",
+    });
+    store.recordStandaloneIssueSnapshot({
+      runId: "run_evidence",
+      issueId: "ENG-8",
+      fingerprint: `sha256:${createHash("sha256").update(issueBody).digest("hex")}`,
+      body: issueBody,
+    });
+    store.recordStandaloneVerification({
+      runId: "run_evidence",
+      candidateSha: candidate,
+      mergeReady: true,
+      failures: [],
+      results: [
+        {
+          checkId: "unit",
+          required: true,
+          source: "repository-policy",
+          command: "npm test",
+          attempt: 1,
+          commitSha: candidate,
+          treeHashBefore: "d".repeat(40),
+          treeHashAfter: "d".repeat(40),
+          executor: "orchestrator",
+          outcome: "exited",
+          exitCode: 0,
+          status: "passed",
+          coverage: "proven",
+          durationMs: 10,
+          stdoutHash: "e".repeat(16),
+          notes: [],
+        },
+      ],
+    });
+    const outputText = JSON.stringify({
+      verdict: "no_findings",
+      scope_assessment: "within_scope",
+      acceptance_criteria_met: [],
+      findings: [],
+    });
+    store.recordStandaloneReview({
+      runId: "run_evidence",
+      candidateSha: candidate,
+      role: "local-reviewer",
+      iteration: 1,
+      status: "completed",
+      outputText,
+      verdict: "no_findings",
+      scopeAssessment: "within_scope",
+      accepted: true,
+      explanation: "accepted",
+      findings: [],
+    });
+    store.recordStandalonePullRequest({
+      runId: "run_evidence",
+      repo: "acme/widget",
+      number: 8,
+      headSha: candidate,
+      baseSha: base,
+      draft: false,
+      url: "https://example.test/acme/widget/pull/8",
+    });
+    store.recordStandalonePolicyDecision({
+      runId: "run_evidence",
+      candidateSha: candidate,
+      inputs: { kind: "test" },
+      matched: { rule: "exact" },
+      outcome: "accepted",
+      explanation: "exact evidence accepted",
+    });
+    store.transitionRun("run_evidence", {
+      from: "DISCOVERED",
+      to: "NEEDS_HUMAN",
+      expectedVersion: 1,
+      reason: "test terminal reason",
+      actor: "policy",
+    });
+    store.close();
+
+    const h = harness();
+    await h.run(["inspect", "run_evidence"]);
+    const payload = h.emitted[0]?.data as {
+      checks: { checkId: string; status: string; coverage: string }[];
+      reviews: { verdict: string }[];
+      findings: unknown[];
+      pullRequest: { number: number };
+      workspace: { status: string };
+      issueSnapshot: { fingerprint: string };
+      policyDecisions: { outcome: string }[];
+      transitions: { reason: string; actor: string }[];
+    };
+    expect(payload.checks[0]).toMatchObject({
+      checkId: "unit",
+      status: "passed",
+      coverage: "proven",
+    });
+    expect(payload.reviews[0]).toMatchObject({ verdict: "no_findings" });
+    expect(payload.findings).toEqual([]);
+    expect(payload.pullRequest).toMatchObject({ number: 8 });
+    expect(payload.workspace).toMatchObject({ status: "active" });
+    expect(payload.issueSnapshot.fingerprint).toMatch(/^sha256:[a-f0-9]{64}$/u);
+    expect(payload.policyDecisions[0]).toMatchObject({ outcome: "accepted" });
+    expect(payload.transitions[0]).toMatchObject({
+      reason: "test terminal reason",
+      actor: "policy",
+    });
+  });
 });
 
 describe("effects", () => {
@@ -1009,7 +1141,7 @@ describe("resume", () => {
 });
 
 describe("policy explain", () => {
-  it("lists the gates in evaluation order", async () => {
+  it("returns unknown when no persisted policy evidence exists", async () => {
     const store = StateStore.open(join(data, "runmill.db"), { clock: new SystemClock() });
     store.createRun({
       runId: "run_p",
@@ -1023,11 +1155,46 @@ describe("policy explain", () => {
     const h = harness();
     await h.run(["policy", "explain", "run_p"]);
     const out = h.emitted[0]?.human ?? "";
-    expect(out).toMatch(/lease held/);
-    expect(out).toMatch(/branch protection/);
-    // The gate that distinguishes guarded-merge from pr-only.
-    expect(out).toMatch(/cannot edit branch protection/);
-    expect(out).toMatch(/never merges by design/);
+    expect(out).toMatch(/unknown/iu);
+    expect(h.emitted[0]?.data).toMatchObject({
+      runId: "run_p",
+      explanation: "unknown",
+      policyDecisions: [],
+    });
+  });
+
+  it("explains only persisted policy decisions", async () => {
+    const store = StateStore.open(join(data, "runmill.db"), { clock: new SystemClock() });
+    const base = "a".repeat(40);
+    store.createRun({
+      runId: "run_policy",
+      issueId: "ENG-9",
+      repo: "acme/widget",
+      provider: "codex",
+    });
+    store.bindStandaloneWorkspace({
+      runId: "run_policy",
+      path: join(data, "runs", "run_policy"),
+      branch: "runmill/ENG-9-policy-1",
+      baseCommit: base,
+    });
+    store.recordStandalonePolicyDecision({
+      runId: "run_policy",
+      candidateSha: base,
+      inputs: { kind: "issue-authority-revalidation" },
+      matched: { rules: ["workflow-state"] },
+      outcome: "refused",
+      explanation: "issue state changed unexpectedly",
+    });
+    store.close();
+
+    const h = harness();
+    await h.run(["policy", "explain", "run_policy"]);
+    expect(h.emitted[0]?.human).toContain("issue state changed unexpectedly");
+    expect(h.emitted[0]?.data).toMatchObject({
+      explanation: "refused",
+      policyDecisions: [{ outcome: "refused" }],
+    });
   });
 
   it("says so when the run does not exist", async () => {

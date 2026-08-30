@@ -377,6 +377,10 @@ describe("observe mode", () => {
       lease: lease("run_o"),
     });
     expect(outcome.finalState).toBe("COMPLETED");
+    expect(store.standaloneIssueSnapshot("run_o")).toMatchObject({
+      issueId: ISSUE.identifier,
+      fingerprint: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+    });
 
     // The claim previously happened before the observe bail-out, so the log
     // line "no repository mutation" was false.

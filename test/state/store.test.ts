@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import Database from "better-sqlite3";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StateStore, CURRENT_SCHEMA_VERSION } from "../../src/state/store.js";
@@ -360,22 +361,479 @@ describe("runs and optimistic state transitions", () => {
 });
 
 describe("events", () => {
-  it("enforces unique (run_id, seq) so replay cannot duplicate", () => {
+  it("allocates monotonically increasing event sequences transactionally", () => {
     const store = open();
     store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    store.appendEvent({ runId: "run_1", seq: 1, type: "session.started", payload: {} });
-    expect(() =>
-      store.appendEvent({ runId: "run_1", seq: 1, type: "session.started", payload: {} }),
-    ).toThrow();
+    expect(store.appendEvent({ runId: "run_1", type: "session.started", payload: {} })).toBe(1);
+    expect(store.appendEvent({ runId: "run_1", type: "session.finished", payload: {} })).toBe(2);
     store.close();
   });
 
   it("returns events in sequence order", () => {
     const store = open();
     store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    store.appendEvent({ runId: "run_1", seq: 2, type: "b", payload: {} });
-    store.appendEvent({ runId: "run_1", seq: 1, type: "a", payload: {} });
+    store.appendEvent({ runId: "run_1", type: "a", payload: {} });
+    store.appendEvent({ runId: "run_1", type: "b", payload: {} });
     expect(store.eventsFor("run_1").map((e) => e.type)).toEqual(["a", "b"]);
+    store.close();
+  });
+});
+
+describe("standalone workflow evidence", () => {
+  const BASE = "a".repeat(40);
+  const CANDIDATE_A = "b".repeat(40);
+  const CANDIDATE_B = "c".repeat(40);
+
+  function createBoundRun(store: StateStore): void {
+    store.createRun({
+      runId: "run_evidence",
+      issueId: "ENG-1",
+      repo: "acme/platform",
+      provider: "codex",
+    });
+    store.bindStandaloneWorkspace({
+      runId: "run_evidence",
+      path: join(dir, "runs", "run_evidence"),
+      branch: "runmill/ENG-1-evidence-1",
+      baseCommit: BASE,
+    });
+  }
+
+  it("binds workspace, base, branch, and candidate lineage exactly across reopen", () => {
+    const store = open();
+    createBoundRun(store);
+    expect(store.getRun("run_evidence")).toMatchObject({
+      baseCommit: BASE,
+      candidateSha: BASE,
+      branch: "runmill/ENG-1-evidence-1",
+    });
+    expect(store.standaloneWorkspace("run_evidence")).toMatchObject({
+      path: join(dir, "runs", "run_evidence"),
+      branch: "runmill/ENG-1-evidence-1",
+      status: "active",
+    });
+
+    store.setStandaloneCandidate({
+      runId: "run_evidence",
+      expectedCandidateSha: BASE,
+      candidateSha: CANDIDATE_A,
+    });
+    expect(() =>
+      store.setStandaloneCandidate({
+        runId: "run_evidence",
+        expectedCandidateSha: BASE,
+        candidateSha: CANDIDATE_B,
+      }),
+    ).toThrow(/candidate/iu);
+    store.close();
+
+    const reopened = open();
+    expect(reopened.getRun("run_evidence")?.candidateSha).toBe(CANDIDATE_A);
+    expect(reopened.standaloneWorkspace("run_evidence")?.status).toBe("active");
+    reopened.markStandaloneWorkspace("run_evidence", "preserved");
+    expect(reopened.standaloneWorkspace("run_evidence")?.status).toBe("preserved");
+    expect(reopened.eventsFor("run_evidence").map((event) => event.type)).toEqual([
+      "workspace.bound",
+      "candidate.bound",
+      "workspace.status",
+    ]);
+    reopened.close();
+  });
+
+  it("persists one canonical full issue snapshot and refuses contradictory replay", () => {
+    const store = open();
+    createBoundRun(store);
+    const body = JSON.stringify({ identifier: "ENG-1", schema: "runmill.issue-snapshot/v1" });
+    const fingerprint = `sha256:${createHash("sha256").update(body).digest("hex")}`;
+
+    store.recordStandaloneIssueSnapshot({
+      runId: "run_evidence",
+      issueId: "ENG-1",
+      fingerprint,
+      body,
+    });
+    expect(store.standaloneIssueSnapshot("run_evidence")).toMatchObject({
+      issueId: "ENG-1",
+      fingerprint,
+      body,
+    });
+    const contradictoryBody = JSON.stringify({
+      identifier: "ENG-1",
+      schema: "runmill.issue-snapshot/v2",
+    });
+    expect(() =>
+      store.recordStandaloneIssueSnapshot({
+        runId: "run_evidence",
+        issueId: "ENG-1",
+        fingerprint: `sha256:${createHash("sha256").update(contradictoryBody).digest("hex")}`,
+        body: contradictoryBody,
+      }),
+    ).toThrow(/contradictory/iu);
+    store.close();
+  });
+
+  it("allocates every failed and retried check attempt against the exact current candidate", () => {
+    let store = open();
+    createBoundRun(store);
+    store.setStandaloneCandidate({
+      runId: "run_evidence",
+      expectedCandidateSha: BASE,
+      candidateSha: CANDIDATE_A,
+    });
+    const result = {
+      checkId: "unit",
+      required: true,
+      source: "repository-policy",
+      command: "npm test",
+      attempt: 1,
+      commitSha: CANDIDATE_A,
+      treeHashBefore: "d".repeat(40),
+      treeHashAfter: "d".repeat(40),
+      executor: "orchestrator" as const,
+      outcome: "exited" as const,
+      exitCode: 1,
+      status: "failed" as const,
+      coverage: "proven" as const,
+      durationMs: 12,
+      stdoutHash: "e".repeat(16),
+      notes: ["first failure"],
+    };
+
+    const first = store.recordStandaloneVerification({
+      runId: "run_evidence",
+      candidateSha: CANDIDATE_A,
+      mergeReady: false,
+      failures: ["unit failed"],
+      results: [result],
+    });
+    store.close();
+    store = open();
+    const second = store.recordStandaloneVerification({
+      runId: "run_evidence",
+      candidateSha: CANDIDATE_A,
+      mergeReady: true,
+      failures: [],
+      results: [{ ...result, exitCode: 0, status: "passed", notes: ["retry passed"] }],
+    });
+
+    expect(first.eventSeq).toBe(3);
+    expect(second.eventSeq).toBe(4);
+    expect(store.standaloneChecks("run_evidence")).toMatchObject([
+      { checkId: "unit", candidateSha: CANDIDATE_A, attempt: 1, status: "failed" },
+      { checkId: "unit", candidateSha: CANDIDATE_A, attempt: 2, status: "passed" },
+    ]);
+    expect(() =>
+      store.recordStandaloneVerification({
+        runId: "run_evidence",
+        candidateSha: CANDIDATE_B,
+        mergeReady: true,
+        failures: [],
+        results: [{ ...result, commitSha: CANDIDATE_B }],
+      }),
+    ).toThrow(/current candidate/iu);
+    expect(store.eventsFor("run_evidence")).toHaveLength(4);
+    store.close();
+  });
+
+  it("atomically refuses contradictory passing-check evidence", () => {
+    const store = open();
+    createBoundRun(store);
+
+    expect(() =>
+      store.recordStandaloneVerification({
+        runId: "run_evidence",
+        candidateSha: BASE,
+        mergeReady: true,
+        failures: [],
+        results: [
+          {
+            checkId: "unit",
+            required: true,
+            source: "repository-policy",
+            command: "npm test",
+            attempt: 1,
+            commitSha: BASE,
+            treeHashBefore: "d".repeat(40),
+            treeHashAfter: "e".repeat(40),
+            executor: "orchestrator",
+            outcome: "exited",
+            exitCode: 0,
+            status: "passed",
+            coverage: "proven",
+            durationMs: 1,
+            stdoutHash: "f".repeat(16),
+            notes: [],
+          },
+        ],
+      }),
+    ).toThrow(/contradictory/iu);
+    expect(store.standaloneChecks("run_evidence")).toEqual([]);
+    expect(store.eventsFor("run_evidence").map((event) => event.type)).toEqual([
+      "workspace.bound",
+    ]);
+    store.close();
+  });
+
+  it("persists a no-findings approval even when there are no finding rows", () => {
+    let store = open();
+    createBoundRun(store);
+    store.setStandaloneCandidate({
+      runId: "run_evidence",
+      expectedCandidateSha: BASE,
+      candidateSha: CANDIDATE_A,
+    });
+    const outputText = JSON.stringify({
+      verdict: "no_findings",
+      scope_assessment: "within_scope",
+      acceptance_criteria_met: [],
+      findings: [],
+    });
+
+    const recorded = store.recordStandaloneReview({
+      runId: "run_evidence",
+      candidateSha: CANDIDATE_A,
+      role: "local-reviewer",
+      iteration: 1,
+      status: "completed",
+      outputText,
+      verdict: "no_findings",
+      scopeAssessment: "within_scope",
+      accepted: true,
+      explanation: "deterministic cross-check accepted",
+      findings: [],
+    });
+
+    expect(recorded.review.outputDigest).toMatch(/^sha256:[a-f0-9]{64}$/u);
+    store.close();
+    store = open();
+    expect(store.standaloneReviews("run_evidence")).toMatchObject([
+      {
+        candidateSha: CANDIDATE_A,
+        role: "local-reviewer",
+        iteration: 1,
+        verdict: "no_findings",
+        accepted: 1,
+      },
+    ]);
+    expect(store.standaloneFindings("run_evidence")).toEqual([]);
+    store.close();
+  });
+
+  it("refuses review fields that contradict the exact schema-validated output", () => {
+    const store = open();
+    createBoundRun(store);
+    const outputText = JSON.stringify({
+      verdict: "approved",
+      scope_assessment: "within_scope",
+      acceptance_criteria_met: [],
+      findings: [],
+    });
+
+    expect(() =>
+      store.recordStandaloneReview({
+        runId: "run_evidence",
+        candidateSha: BASE,
+        role: "local-reviewer",
+        iteration: 1,
+        status: "completed",
+        outputText,
+        verdict: "no_findings",
+        scopeAssessment: "within_scope",
+        accepted: true,
+        explanation: "contradictory",
+        findings: [],
+      }),
+    ).toThrow(/contradict/iu);
+    expect(store.standaloneReviews("run_evidence")).toEqual([]);
+    expect(store.eventsFor("run_evidence").map((event) => event.type)).toEqual([
+      "workspace.bound",
+    ]);
+    store.close();
+  });
+
+  it("persists findings, pull-request observations, policy decisions, and transition actors", () => {
+    let store = open();
+    createBoundRun(store);
+    store.setStandaloneCandidate({
+      runId: "run_evidence",
+      expectedCandidateSha: BASE,
+      candidateSha: CANDIDATE_A,
+    });
+    const finding = {
+      id: "finding-1",
+      severity: "high" as const,
+      category: "correctness" as const,
+      title: "Incorrect result",
+      evidence: { path: "src/a.ts", start_line: 1, end_line: 2 },
+      claim: "the result is wrong",
+      required_resolution: "return the expected result",
+      confidence: 0.9,
+    };
+    store.recordStandaloneReview({
+      runId: "run_evidence",
+      candidateSha: CANDIDATE_A,
+      role: "pr-reviewer",
+      iteration: 1,
+      status: "completed",
+      outputText: JSON.stringify({
+        verdict: "changes_required",
+        scope_assessment: "within_scope",
+        acceptance_criteria_met: [],
+        findings: [finding],
+      }),
+      verdict: "changes_required",
+      scopeAssessment: "within_scope",
+      accepted: true,
+      explanation: "one blocking finding",
+      findings: [finding],
+    });
+    store.recordStandalonePullRequest({
+      runId: "run_evidence",
+      repo: "acme/platform",
+      number: 17,
+      headSha: CANDIDATE_A,
+      baseSha: BASE,
+      draft: true,
+      url: "https://example.test/acme/platform/pull/17",
+    });
+    store.recordStandalonePullRequest({
+      runId: "run_evidence",
+      repo: "acme/platform",
+      number: 17,
+      headSha: CANDIDATE_A,
+      baseSha: BASE,
+      draft: false,
+      url: "https://example.test/acme/platform/pull/17",
+      mergeSha: CANDIDATE_B,
+    });
+    expect(
+      store.recordStandalonePolicyDecision({
+        runId: "run_evidence",
+        candidateSha: CANDIDATE_A,
+        inputs: { stage: "before-merge" },
+        matched: { rules: ["workflow-state"] },
+        outcome: "accepted",
+        explanation: "issue authority was unchanged",
+      }),
+    ).toBe(1);
+    store.transitionRun("run_evidence", {
+      from: "DISCOVERED",
+      to: "NEEDS_HUMAN",
+      expectedVersion: 1,
+      reason: "review finding remains",
+      actor: "policy",
+    });
+    store.close();
+    store = open();
+
+    expect(store.standaloneFindings("run_evidence")[0]).toMatchObject({
+      findingId: "finding-1",
+      severity: "high",
+      category: "correctness",
+      status: "reported",
+    });
+    expect(store.standalonePullRequest("run_evidence")).toMatchObject({
+      number: 17,
+      headSha: CANDIDATE_A,
+      mergeSha: CANDIDATE_B,
+      draft: 0,
+    });
+    expect(() =>
+      store.recordStandalonePullRequest({
+        runId: "run_evidence",
+        repo: "acme/platform",
+        number: 17,
+        headSha: CANDIDATE_A,
+        baseSha: BASE,
+        draft: false,
+        url: "https://example.test/acme/platform/pull/17",
+        mergeSha: "d".repeat(40),
+      }),
+    ).toThrow(/contradictory/iu);
+    expect(store.standalonePolicyDecisions("run_evidence")).toMatchObject([
+      {
+        seq: 1,
+        candidateSha: CANDIDATE_A,
+        outcome: "accepted",
+        explanation: "issue authority was unchanged",
+      },
+    ]);
+    expect(store.standaloneTransitionHistory("run_evidence")).toMatchObject([
+      {
+        seq: 1,
+        from: "DISCOVERED",
+        to: "NEEDS_HUMAN",
+        reason: "review finding remains",
+        actor: "policy",
+      },
+    ]);
+    store.close();
+  });
+
+  it("rejects reviews, pull requests, and policy evidence for a stale candidate", () => {
+    const store = open();
+    createBoundRun(store);
+    const stale = CANDIDATE_A;
+    const reviewInput = {
+      runId: "run_evidence",
+      candidateSha: stale,
+      role: "local-reviewer" as const,
+      iteration: 1,
+      status: "completed" as const,
+      outputText: JSON.stringify({
+        verdict: "approved",
+        scope_assessment: "within_scope",
+        acceptance_criteria_met: [],
+        findings: [],
+      }),
+      verdict: "approved" as const,
+      scopeAssessment: "within_scope" as const,
+      accepted: true,
+      explanation: "accepted",
+      findings: [],
+    };
+
+    expect(() => store.recordStandaloneReview(reviewInput)).toThrow(/current candidate/iu);
+    expect(() =>
+      store.recordStandalonePullRequest({
+        runId: "run_evidence",
+        repo: "acme/platform",
+        number: 1,
+        headSha: stale,
+        baseSha: BASE,
+        draft: true,
+        url: "https://example.test/1",
+      }),
+    ).toThrow(/current candidate/iu);
+    expect(() =>
+      store.recordStandalonePolicyDecision({
+        runId: "run_evidence",
+        candidateSha: stale,
+        inputs: {},
+        matched: {},
+        outcome: "accepted",
+        explanation: "stale",
+      }),
+    ).toThrow(/current candidate/iu);
+    store.close();
+  });
+
+  it("refuses synthetic pull-request commit identities", () => {
+    const store = open();
+    createBoundRun(store);
+
+    expect(() =>
+      store.recordStandalonePullRequest({
+        runId: "run_evidence",
+        repo: "acme/platform",
+        number: 1,
+        headSha: BASE,
+        baseSha: "base-1",
+        draft: true,
+        url: "https://example.test/1",
+      }),
+    ).toThrow(/Git object id/iu);
+    expect(store.standalonePullRequest("run_evidence")).toBeUndefined();
     store.close();
   });
 });

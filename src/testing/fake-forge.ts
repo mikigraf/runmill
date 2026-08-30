@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   BranchProtection,
   ForgeAdapter,
@@ -36,6 +37,7 @@ export class FakeForgeAdapter implements ForgeAdapter {
   #opts: FakeForgeOptions;
   #pushed = new Set<string>();
   #pushedHeads = new Map<string, string>();
+  #pushedWorkspaces = new Map<string, string>();
   readonly calls: { op: string; args: unknown }[] = [];
 
   constructor(options: FakeForgeOptions = {}) {
@@ -64,6 +66,9 @@ export class FakeForgeAdapter implements ForgeAdapter {
       head = await git(input.workspacePath, ["rev-parse", "HEAD"], { timeoutMs: 30_000 });
       if (head === "") {
         throw new Error("git rev-parse returned an empty commit id");
+      }
+      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(head)) {
+        throw new Error("git rev-parse returned a non-object-id value");
       }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -99,6 +104,7 @@ export class FakeForgeAdapter implements ForgeAdapter {
     // its exact head exists remotely.
     this.#pushed.add(branchKey);
     this.#pushedHeads.set(branchKey, head);
+    this.#pushedWorkspaces.set(branchKey, input.workspacePath);
     for (const [number, pr] of this.#prs) {
       if (pr.url.endsWith(input.branch)) {
         this.#prs.set(number, { ...pr, headSha: head });
@@ -118,7 +124,12 @@ export class FakeForgeAdapter implements ForgeAdapter {
     this.calls.push({ op: "openPullRequest", args: input });
     const branchKey = `${input.repo}#${input.branch}`;
     const pushedHead = this.#pushedHeads.get(branchKey);
-    if (!this.#pushed.has(branchKey) || pushedHead === undefined) {
+    const workspacePath = this.#pushedWorkspaces.get(branchKey);
+    if (
+      !this.#pushed.has(branchKey) ||
+      pushedHead === undefined ||
+      workspacePath === undefined
+    ) {
       throw new ForgeError(
         `cannot open a pull request before ${input.branch} is confirmed on the remote`,
         false,
@@ -132,13 +143,27 @@ export class FakeForgeAdapter implements ForgeAdapter {
       throw new ForgeError(`a pull request already exists for ${input.branch} (422)`, false);
     }
 
+    let baseSha: string;
+    try {
+      baseSha = await git(
+        workspacePath,
+        ["rev-parse", "--verify", `refs/remotes/origin/${input.baseBranch}^{commit}`],
+        { timeoutMs: 30_000 },
+      );
+      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(baseSha)) {
+        throw new Error("git rev-parse returned a non-object-id value");
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new ForgeError(`fake forge could not resolve the pull-request base: ${detail}`, false);
+    }
     const number = this.#nextNumber;
     this.#nextNumber += 1;
     const pr: PullRequest = {
       number,
       url: `https://fake/${input.repo}/pull/${number}/${input.branch}`,
       headSha: pushedHead,
-      baseSha: `base-${number}`,
+      baseSha,
       draft: input.draft,
       state: "open",
     };
@@ -198,7 +223,9 @@ export class FakeForgeAdapter implements ForgeAdapter {
         `pull request head changed from ${input.expectedHeadSha} to ${pr.headSha}`,
       );
     }
-    const mergeSha = `merge-${input.number}`;
+    const mergeSha = createHash(pr.headSha.length === 64 ? "sha256" : "sha1")
+      .update(`${input.repo}\0${input.number}\0${input.method}\0${pr.headSha}`, "utf8")
+      .digest("hex");
     this.#prs.set(input.number, { ...pr, state: "merged", mergeSha });
     this.#maybeLoseResponse("merge");
     return { mergeSha };

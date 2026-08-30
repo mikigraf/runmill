@@ -8,7 +8,7 @@ import {
 import type { CodingAgentAdapter } from "../agent/adapter.js";
 import type { BranchProtection, ForgeAdapter, PullRequest } from "../pr/adapter.js";
 import type { RunmillConfig } from "../config/types.js";
-import type { StateStore } from "../state/store.js";
+import { StateStore } from "../state/store.js";
 import type { Clock } from "../platform/clock.js";
 import type { BacklogIssue, RepositoryTarget } from "../domain/types.js";
 import { WorkspaceManager, type Workspace } from "../workspace/manager.js";
@@ -29,7 +29,7 @@ import {
 } from "../queue/git-lease.js";
 import { RunmillError , errorMessage } from "../errors/runmill-error.js";
 import { renderPullRequestBody } from "./pr-body.js";
-import { snapshotHash } from "../domain/snapshot.js";
+import { createIssueAuthoritySnapshot } from "../domain/snapshot.js";
 import { RunLog } from "../state/run-log.js";
 import { evaluateAutomaticMergeRisk } from "./risk-policy.js";
 import { RunBudget } from "./run-budget.js";
@@ -40,6 +40,8 @@ import {
 } from "./pr-evidence.js";
 import { tryGit, tryGitBytes } from "../platform/git.js";
 import { normalizeRepositoryPath } from "../workspace/path-scope.js";
+import { buildEligibilityPolicy } from "../queue/selector.js";
+import { assessIssueAuthority } from "./issue-authority.js";
 
 export type RunState =
   | "DISCOVERED"
@@ -541,6 +543,141 @@ export class Orchestrator {
     );
   }
 
+  async #revalidateIssueAuthority(input: {
+    runId: string;
+    stage: "before-first-push" | "before-pr-delivery" | "before-merge";
+    initial: BacklogIssue;
+    target: RepositoryTarget;
+    candidateSha: string;
+    claimTransitioned: boolean;
+    assignmentChanged: boolean;
+  }): Promise<{ readonly blocked?: string | undefined }> {
+    const initialSnapshot = createIssueAuthoritySnapshot(input.initial);
+    const recordUnknown = (reason: string): { readonly blocked: string } => {
+      this.#d.store.recordStandalonePolicyDecision({
+        runId: input.runId,
+        candidateSha: input.candidateSha,
+        inputs: {
+          kind: "issue-authority-revalidation",
+          stage: input.stage,
+          initial_fingerprint: initialSnapshot.fingerprint,
+          observed_fingerprint: null,
+          target: input.target,
+        },
+        matched: { rules: [] },
+        outcome: "unknown",
+        explanation: reason,
+      });
+      return { blocked: reason };
+    };
+
+    let persistedInitial: ReturnType<StateStore["standaloneIssueSnapshot"]>;
+    try {
+      persistedInitial = this.#d.store.standaloneIssueSnapshot(input.runId);
+    } catch (cause) {
+      return recordUnknown(
+        `persisted issue authority is malformed at ${input.stage}: ${errorMessage(cause)}`,
+      );
+    }
+    if (persistedInitial === undefined) {
+      return recordUnknown(`persisted issue authority is missing at ${input.stage}`);
+    }
+    if (
+      persistedInitial.issueId !== input.initial.identifier ||
+      persistedInitial.fingerprint !== initialSnapshot.fingerprint ||
+      persistedInitial.body !== initialSnapshot.body
+    ) {
+      return recordUnknown(
+        `persisted issue authority contradicts the claimed input at ${input.stage}`,
+      );
+    }
+
+    let observed: BacklogIssue | undefined;
+    try {
+      observed = await this.#d.backlog.getIssue(input.initial.identifier);
+    } catch (cause) {
+      return recordUnknown(
+        `issue authority could not be re-observed at ${input.stage}: ${errorMessage(cause)}`,
+      );
+    }
+    if (observed === undefined) {
+      return recordUnknown(
+        `issue authority could not be re-observed at ${input.stage}: issue is missing`,
+      );
+    }
+
+    const applied = (operation: string, target: string): boolean => {
+      const effect = this.#d.store.getSideEffect(
+        StateStore.sideEffectKey(input.runId, operation, target),
+      );
+      return (
+        effect?.status === "confirmed" &&
+        effect.remoteId !== "orchestrator:not-applied" &&
+        effect.remoteId !== "operator:not-applied"
+      );
+    };
+    const claimAssignee = this.#d.config.backlog.claimAssignee;
+    const assignmentRequired =
+      claimAssignee !== undefined && input.initial.assigneeId !== claimAssignee;
+    const leasedIssueIds = this.#d.store.activeLeaseIssueIds();
+    leasedIssueIds.delete(input.initial.identifier);
+    let assessment: ReturnType<typeof assessIssueAuthority>;
+    try {
+      assessment = assessIssueAuthority({
+        initial: input.initial,
+        observed,
+        target: input.target,
+        policy: buildEligibilityPolicy({
+          config: this.#d.config,
+          leasedIssueIds,
+        }),
+        claim: {
+          state: this.#d.config.backlog.claimState,
+          stateEffectConfirmed:
+            input.claimTransitioned &&
+            applied("transition-claim", input.initial.identifier),
+          ...(claimAssignee === undefined ? {} : { assignee: claimAssignee }),
+          assignmentEffectConfirmed:
+            !assignmentRequired ||
+            (input.assignmentChanged &&
+              applied(
+                "assign-claim",
+                `${input.initial.identifier}#${claimAssignee ?? ""}`,
+              )),
+        },
+      });
+    } catch (cause) {
+      return recordUnknown(
+        `issue authority evidence was malformed at ${input.stage}: ${errorMessage(cause)}`,
+      );
+    }
+
+    this.#d.store.recordStandalonePolicyDecision({
+      runId: input.runId,
+      candidateSha: input.candidateSha,
+      inputs: {
+        kind: "issue-authority-revalidation",
+        stage: input.stage,
+        initial_fingerprint: assessment.initialFingerprint,
+        observed_fingerprint: assessment.observedFingerprint,
+        normalized_fingerprint: assessment.normalizedFingerprint,
+        target: input.target,
+      },
+      matched: {
+        resolved_target: assessment.decision.target ?? null,
+        rules: assessment.decision.rules.map((rule) => ({
+          rule: rule.rule,
+          passed: rule.passed,
+          reason: rule.reason,
+          code: rule.code ?? null,
+        })),
+      },
+      outcome: assessment.accepted ? "accepted" : "refused",
+      explanation: assessment.reason,
+    });
+    return assessment.accepted ? {} : { blocked: assessment.reason };
+  }
+
   /** Intent, then act, then confirm. Never act first. */
   async #withOutbox<T>(
     runId: string,
@@ -549,6 +686,7 @@ export class Orchestrator {
     target: string,
     assertLease: () => Promise<void>,
     act: () => Promise<T>,
+    recordResult?: ((result: T) => void) | undefined,
   ): Promise<T> {
     const begun = this.#d.store.beginSideEffect({
       runId,
@@ -589,6 +727,7 @@ export class Orchestrator {
       this.#d.store.failSideEffect(key, errorMessage(err));
       throw err;
     }
+    recordResult?.(result);
     // Confirmation is outside the remote-call catch. If this durable write
     // fails, the in-flight row remains ambiguous; it must never be rewritten
     // as though the already-successful remote call itself failed.
@@ -606,6 +745,7 @@ export class Orchestrator {
     const cfg = this.#d.config;
     let held: HeldLease | undefined;
     let workspace: Workspace | undefined;
+    let workspaceBound = false;
     let branch: string | undefined;
     let costUsd = 0;
     let logged = false;
@@ -729,6 +869,13 @@ export class Orchestrator {
         attempt,
       });
       runCreated = true;
+      const issueSnapshot = createIssueAuthoritySnapshot(issue);
+      this.#d.store.recordStandaloneIssueSnapshot({
+        runId,
+        issueId: issue.identifier,
+        fingerprint: issueSnapshot.fingerprint,
+        body: issueSnapshot.body,
+      });
       this.#advance(runId, "ELIGIBILITY_CHECKED");
 
       // -- claim ---------------------------------------------------------
@@ -792,6 +939,13 @@ export class Orchestrator {
         root: this.#d.workspaceRoot,
         isolation: cfg.workspace.gitIsolation,
       });
+      this.#d.store.bindStandaloneWorkspace({
+        runId,
+        path: workspace.path,
+        branch,
+        baseCommit: workspace.baseCommit,
+      });
+      workspaceBound = true;
       this.#advance(runId, "WORKSPACE_READY");
 
       // These files are repository-controlled prompt input. Capture their
@@ -804,21 +958,13 @@ export class Orchestrator {
       const prReviewGuidance = await this.#reviewGuidance(cfg.review.prReviewSkill, workspace);
 
       // -- task packet ---------------------------------------------------
-      const snapshot = snapshotHash(issue);
-      this.#d.store.appendEvent({
-        runId,
-        seq: 1,
-        type: "issue.snapshot",
-        payload: { identifier: issue.identifier, snapshotHash: snapshot },
-      });
-
       const packet = buildTaskPacket({
         runId,
         issue,
         target,
         baseCommit: workspace.baseCommit,
         branch,
-        snapshotHash: snapshot,
+        snapshotHash: issueSnapshot.fingerprint,
         requiredChecks: initialManifest.map((c) => c.id),
         network: cfg.workspace.network,
       });
@@ -876,18 +1022,44 @@ export class Orchestrator {
             forbiddenPaths: packet.constraints.forbidden_paths,
           },
         );
-        if (sha !== undefined) candidateSha = sha;
+        if (sha !== undefined) {
+          this.#d.store.setStandaloneCandidate({
+            runId,
+            expectedCandidateSha: candidateSha,
+            candidateSha: sha,
+          });
+          candidateSha = sha;
+        }
 
         // -- verify ------------------------------------------------------
         this.#advance(runId, "LOCAL_VERIFY");
         const changed = await this.#workspaces.changedFiles(workspace);
-        const verification = await this.#verification.run({
-          workspace,
-          workspaces: this.#workspaces,
-          manifest: resolveManifest({ configured: this.#d.checks, changedPaths: changed }),
+        let verification: Awaited<ReturnType<VerificationEngine["run"]>>;
+        try {
+          verification = await this.#verification.run({
+            workspace,
+            workspaces: this.#workspaces,
+            manifest: resolveManifest({ configured: this.#d.checks, changedPaths: changed }),
+            candidateSha,
+            failOnMissingCheck: cfg.verification.failOnMissingCheck,
+            failOnSkippedCheck: cfg.verification.failOnSkippedCheck,
+          });
+        } catch (cause) {
+          this.#d.store.recordStandaloneVerification({
+            runId,
+            candidateSha,
+            mergeReady: false,
+            failures: [`verification execution failed: ${errorMessage(cause)}`],
+            results: [],
+          });
+          throw cause;
+        }
+        this.#d.store.recordStandaloneVerification({
+          runId,
           candidateSha,
-          failOnMissingCheck: cfg.verification.failOnMissingCheck,
-          failOnSkippedCheck: cfg.verification.failOnSkippedCheck,
+          mergeReady: verification.mergeReady,
+          failures: verification.failures,
+          results: verification.results,
         });
 
         prChecks = verification.results.map((r) => ({
@@ -934,10 +1106,19 @@ export class Orchestrator {
 
         if (reviewResult.status !== "success") {
           const detail = reviewResult.error?.detail;
+          const explanation =
+            `local reviewer returned ${reviewResult.status}` +
+            (detail === undefined ? "" : `: ${detail}`);
+          this.#d.store.recordStandaloneReview({
+            runId,
+            candidateSha,
+            role: "local-reviewer",
+            iteration: iteration + 1,
+            status: "provider-failed",
+            explanation,
+          });
           return finish("NEEDS_HUMAN", {
-            reason:
-              `local reviewer returned ${reviewResult.status}` +
-              (detail === undefined ? "" : `: ${detail}`),
+            reason: explanation,
           });
         }
         const expectedLocalReviewOutput = outputPathFor(workspace.path, "local-reviewer");
@@ -946,12 +1127,47 @@ export class Orchestrator {
           reviewResult.outputRef === "" ||
           reviewResult.outputRef !== expectedLocalReviewOutput
         ) {
+          this.#d.store.recordStandaloneReview({
+            runId,
+            candidateSha,
+            role: "local-reviewer",
+            iteration: iteration + 1,
+            status: "missing-output",
+            explanation: "reviewer produced no structured output at the bound output path",
+          });
           throw RunmillError.fromCatalog("RM-REVIEW-001", {
             whatHappened: "reviewer produced no structured output at the bound output path",
             runId,
           });
         }
-        review = parseReviewJson(readStructuredOutput(reviewResult.outputRef));
+        let reviewOutput: string;
+        try {
+          reviewOutput = readStructuredOutput(reviewResult.outputRef);
+        } catch (cause) {
+          this.#d.store.recordStandaloneReview({
+            runId,
+            candidateSha,
+            role: "local-reviewer",
+            iteration: iteration + 1,
+            status: "invalid-output",
+            explanation: `review output could not be read safely: ${errorMessage(cause)}`,
+          });
+          throw cause;
+        }
+        try {
+          review = parseReviewJson(reviewOutput);
+        } catch (cause) {
+          this.#d.store.recordStandaloneReview({
+            runId,
+            candidateSha,
+            role: "local-reviewer",
+            iteration: iteration + 1,
+            status: "invalid-output",
+            outputText: reviewOutput,
+            explanation: `review output was invalid: ${errorMessage(cause)}`,
+          });
+          throw cause;
+        }
 
         const cross = crossCheckVerdict(
           review,
@@ -959,15 +1175,54 @@ export class Orchestrator {
           cfg.risk.manualApproval.paths,
           packet.acceptance_criteria,
         );
-        if (!cross.accepted) {
-          return finish("NEEDS_HUMAN", { reason: cross.reason ?? "verdict rejected" });
-        }
-
         const blocking = blockingFindings(
           review,
           cfg.review.mergeBlockingSeverities,
           cfg.review.requireAllFindingsResolved,
         );
+        const reviewExplanation =
+          !cross.accepted
+            ? (cross.reason ?? "verdict rejected")
+            : blocking.length > 0
+              ? `${blocking.length} blocking finding(s) require another iteration`
+              : "review and deterministic cross-check accepted the exact candidate";
+        this.#d.store.recordStandaloneReview({
+          runId,
+          candidateSha,
+          role: "local-reviewer",
+          iteration: iteration + 1,
+          status: "completed",
+          outputText: reviewOutput,
+          verdict: review.verdict,
+          scopeAssessment: review.scope_assessment,
+          accepted: cross.accepted,
+          explanation: reviewExplanation,
+          findings: review.findings,
+        });
+        this.#d.store.recordStandalonePolicyDecision({
+          runId,
+          candidateSha,
+          inputs: {
+            kind: "local-review-cross-check",
+            role: "local-reviewer",
+            iteration: iteration + 1,
+            verdict: review.verdict,
+            changed_paths: changed,
+          },
+          matched: {
+            blocking_findings: blocking.map((finding) => finding.id),
+            scope_assessment: review.scope_assessment,
+          },
+          outcome: !cross.accepted
+            ? "refused"
+            : blocking.length > 0
+              ? "withheld"
+              : "accepted",
+          explanation: reviewExplanation,
+        });
+        if (!cross.accepted) {
+          return finish("NEEDS_HUMAN", { reason: cross.reason ?? "verdict rejected" });
+        }
         if (blocking.length === 0) break;
 
         this.#log(`  ${blocking.length} blocking finding(s); dispatching a fix`);
@@ -979,6 +1234,18 @@ export class Orchestrator {
       }
 
       // -- pull request ---------------------------------------------------
+      const beforeFirstPush = await this.#revalidateIssueAuthority({
+        runId,
+        stage: "before-first-push",
+        initial: issue,
+        target,
+        candidateSha,
+        claimTransitioned,
+        assignmentChanged,
+      });
+      if (beforeFirstPush.blocked !== undefined) {
+        return finish("NEEDS_HUMAN", { reason: beforeFirstPush.blocked });
+      }
       this.#advance(runId, "PR_READY");
       budget.assertActive("pushing the candidate branch");
       await input.lease.assertHeld(held);
@@ -1007,6 +1274,16 @@ export class Orchestrator {
           }),
           draft: cfg.github.draftPr,
         }),
+        (opened) =>
+          this.#d.store.recordStandalonePullRequest({
+            runId,
+            repo: target.repo,
+            number: opened.number,
+            headSha: opened.headSha,
+            baseSha: opened.baseSha,
+            draft: opened.draft,
+            url: opened.url,
+          }),
       );
       pullRequestOpened = true;
       this.#advance(runId, "PR_OPEN", `pr #${pr.number}`);
@@ -1020,6 +1297,16 @@ export class Orchestrator {
           `${target.repo}#${pr.number}`,
           assertLease,
           () => this.#d.forge.markReadyForReview({ repo: target.repo, number: pr.number }),
+          () =>
+            this.#d.store.recordStandalonePullRequest({
+              runId,
+              repo: target.repo,
+              number: pr.number,
+              headSha: pr.headSha,
+              baseSha: pr.baseSha,
+              draft: false,
+              url: pr.url,
+            }),
         );
       }
 
@@ -1037,6 +1324,20 @@ export class Orchestrator {
           reason: exactBeforeCi.blocked,
         });
       }
+      if (exactBeforeCi.pullRequest !== undefined) {
+        this.#d.store.recordStandalonePullRequest({
+          runId,
+          repo: target.repo,
+          number: exactBeforeCi.pullRequest.number,
+          headSha: exactBeforeCi.pullRequest.headSha,
+          baseSha: exactBeforeCi.pullRequest.baseSha,
+          draft: exactBeforeCi.pullRequest.draft,
+          url: exactBeforeCi.pullRequest.url,
+          ...(exactBeforeCi.pullRequest.mergeSha === undefined
+            ? {}
+            : { mergeSha: exactBeforeCi.pullRequest.mergeSha }),
+        });
+      }
 
       // -- CI --------------------------------------------------------------
       this.#advance(runId, "CI_WAIT");
@@ -1048,6 +1349,14 @@ export class Orchestrator {
         budget,
       });
       if ("blocked" in ci) {
+        this.#d.store.recordStandalonePolicyDecision({
+          runId,
+          candidateSha,
+          inputs: { kind: "ci-reconciliation", required_contexts: [] },
+          matched: { verdicts: [] },
+          outcome: "refused",
+          explanation: ci.blocked,
+        });
         return finish("NEEDS_HUMAN", {
           prNumber: pr.number,
           prUrl: pr.url,
@@ -1056,6 +1365,23 @@ export class Orchestrator {
       }
       let protection = ci.protection;
       const verdicts = ci.verdicts;
+      this.#d.store.recordStandalonePolicyDecision({
+        runId,
+        candidateSha,
+        inputs: {
+          kind: "ci-reconciliation",
+          required_contexts: protection.requiredChecks,
+        },
+        matched: {
+          verdicts: [...verdicts].map(([context, verdict]) => ({
+            context,
+            state: verdict.state,
+            detail: verdict.detail,
+          })),
+        },
+        outcome: "accepted",
+        explanation: "every required CI context is satisfied for the exact candidate",
+      });
 
       // -- PR review --------------------------------------------------------
       //
@@ -1099,6 +1425,22 @@ export class Orchestrator {
 
       // -- deliver or merge -------------------------------------------------
       if (cfg.autonomy === "pr-only") {
+        const beforeDelivery = await this.#revalidateIssueAuthority({
+          runId,
+          stage: "before-pr-delivery",
+          initial: issue,
+          target,
+          candidateSha,
+          claimTransitioned,
+          assignmentChanged,
+        });
+        if (beforeDelivery.blocked !== undefined) {
+          return finish("NEEDS_HUMAN", {
+            prNumber: pr.number,
+            prUrl: pr.url,
+            reason: beforeDelivery.blocked,
+          });
+        }
         budget.assertActive("delivering the pull request");
         if (cfg.backlog.deliveredState !== undefined) {
           await this.#withOutbox(runId, "backlog", "transition-delivered", issue.identifier, assertLease, () =>
@@ -1137,6 +1479,20 @@ export class Orchestrator {
             branch: target.baseBranch,
           }),
       );
+      this.#d.store.recordStandalonePolicyDecision({
+        runId,
+        candidateSha,
+        inputs: {
+          kind: "branch-protection-write-capability",
+          repo: target.repo,
+          branch: target.baseBranch,
+        },
+        matched: { credential_can_write_protection: canWriteProtection },
+        outcome: canWriteProtection ? "refused" : "accepted",
+        explanation: canWriteProtection
+          ? "merge credential can edit branch protection"
+          : "no-op write probe proved the merge credential cannot edit branch protection",
+      });
       if (canWriteProtection) {
         return finish("NEEDS_HUMAN", {
           prNumber: pr.number,
@@ -1147,6 +1503,37 @@ export class Orchestrator {
         });
       }
 
+      const protectionOutcome: {
+        readonly outcome: "accepted" | "withheld" | "refused";
+        readonly explanation: string;
+      } = protection.requiresApproval
+        ? {
+            outcome: "withheld",
+            explanation: "branch protection requires an approving review",
+          }
+        : protection.usesMergeQueue
+          ? {
+              outcome: "refused",
+              explanation:
+                "branch protection requires a merge queue, but direct queue enrollment is unsupported",
+            }
+          : {
+              outcome: "accepted",
+              explanation: "branch protection permits the configured direct merge path",
+            };
+      this.#d.store.recordStandalonePolicyDecision({
+        runId,
+        candidateSha,
+        inputs: {
+          kind: "branch-protection-merge-requirements",
+          requires_approval: protection.requiresApproval,
+          requires_conversation_resolution: protection.requiresConversationResolution,
+          uses_merge_queue: protection.usesMergeQueue,
+        },
+        matched: { decision: protectionOutcome.outcome },
+        outcome: protectionOutcome.outcome,
+        explanation: protectionOutcome.explanation,
+      });
       if (protection.requiresApproval) {
         return finish("AWAITING_APPROVAL", { prNumber: pr.number, prUrl: pr.url });
       }
@@ -1166,11 +1553,35 @@ export class Orchestrator {
       // operator-owned policy immediately before MERGE_READY. Every rule can
       // only withhold automatic merge; unknown conditions never disappear
       // into a permissive default.
+      const riskChangedPaths = await this.#workspaces.changedFiles(workspace);
       const riskDecision = evaluateAutomaticMergeRisk(cfg.risk, {
-        changedPaths: await this.#workspaces.changedFiles(workspace),
+        changedPaths: riskChangedPaths,
         issueLabels: issue.labels,
         acceptanceCriteria: packet.acceptance_criteria,
         checkManifestPath: cfg.verification.manifest,
+      });
+      const riskReasons =
+        riskDecision.decision === "allow" ? [] : riskDecision.reasons;
+      this.#d.store.recordStandalonePolicyDecision({
+        runId,
+        candidateSha,
+        inputs: {
+          kind: "automatic-merge-risk",
+          changed_paths: riskChangedPaths,
+          issue_labels: issue.labels,
+          check_manifest_path: cfg.verification.manifest ?? null,
+        },
+        matched: { decision: riskDecision.decision, reasons: riskReasons },
+        outcome:
+          riskDecision.decision === "allow"
+            ? "accepted"
+            : riskDecision.decision === "manual-approval"
+              ? "withheld"
+              : "unknown",
+        explanation:
+          riskReasons.length === 0
+            ? `risk policy decided ${riskDecision.decision}`
+            : riskReasons.join("; "),
       });
       if (riskDecision.decision === "unknown") {
         return finish("NEEDS_HUMAN", {
@@ -1204,9 +1615,51 @@ export class Orchestrator {
           reason: exactBeforeMerge.blocked,
         });
       }
+      const mergePullRequest = exactBeforeMerge.pullRequest;
+      if (mergePullRequest === undefined) {
+        return finish("NEEDS_HUMAN", {
+          prNumber: pr.number,
+          prUrl: pr.url,
+          reason: "pull request evidence disappeared before merge",
+        });
+      }
+      this.#d.store.recordStandalonePullRequest({
+        runId,
+        repo: target.repo,
+        number: mergePullRequest.number,
+        headSha: mergePullRequest.headSha,
+        baseSha: mergePullRequest.baseSha,
+        draft: mergePullRequest.draft,
+        url: mergePullRequest.url,
+        ...(mergePullRequest.mergeSha === undefined
+          ? {}
+          : { mergeSha: mergePullRequest.mergeSha }),
+      });
       const mergeability = await this.#d.forge.getMergeability({
         repo: target.repo,
         number: pr.number,
+      });
+      this.#d.store.recordStandalonePolicyDecision({
+        runId,
+        candidateSha,
+        inputs: {
+          kind: "pull-request-mergeability",
+          repo: target.repo,
+          number: pr.number,
+        },
+        matched: {
+          state: mergeability.state,
+          mergeable: mergeability.mergeable,
+          requires_conversation_resolution: protection.requiresConversationResolution,
+        },
+        outcome:
+          mergeability.mergeable && mergeability.state === "clean"
+            ? "accepted"
+            : "refused",
+        explanation:
+          mergeability.mergeable && mergeability.state === "clean"
+            ? "pull request is clean and mergeable"
+            : `pull request is ${mergeability.state}, not clean and mergeable`,
       });
       if (!mergeability.mergeable || mergeability.state !== "clean") {
         return finish("NEEDS_HUMAN", {
@@ -1217,6 +1670,22 @@ export class Orchestrator {
             (protection.requiresConversationResolution
               ? "; required conversation resolution could not be proven"
               : ""),
+        });
+      }
+      const beforeMerge = await this.#revalidateIssueAuthority({
+        runId,
+        stage: "before-merge",
+        initial: issue,
+        target,
+        candidateSha,
+        claimTransitioned,
+        assignmentChanged,
+      });
+      if (beforeMerge.blocked !== undefined) {
+        return finish("NEEDS_HUMAN", {
+          prNumber: pr.number,
+          prUrl: pr.url,
+          reason: beforeMerge.blocked,
         });
       }
       const merged = await this.#withOutbox(
@@ -1231,6 +1700,17 @@ export class Orchestrator {
             number: pr.number,
             method: cfg.github.merge.method,
             expectedHeadSha: candidateSha,
+          }),
+        (result) =>
+          this.#d.store.recordStandalonePullRequest({
+            runId,
+            repo: target.repo,
+            number: mergePullRequest.number,
+            headSha: mergePullRequest.headSha,
+            baseSha: mergePullRequest.baseSha,
+            draft: false,
+            url: mergePullRequest.url,
+            mergeSha: result.mergeSha,
           }),
       );
       this.#advance(runId, "MERGED", merged.mergeSha);
@@ -1282,6 +1762,11 @@ export class Orchestrator {
       // meant the default configuration never reclaimed a single workspace.
       if (workspace !== undefined && isCleanExitRunState(this.#state)) {
         await this.#workspaces.destroy(workspace, this.#d.sourceRepoPath);
+        if (workspaceBound) {
+          this.#d.store.markStandaloneWorkspace(runId, "destroyed");
+        }
+      } else if (workspace !== undefined && workspaceBound) {
+        this.#d.store.markStandaloneWorkspace(runId, "preserved");
       }
       if (held !== undefined && !leaseReleaseAttempted) {
         const heldForRestore = held;
@@ -1393,6 +1878,18 @@ export class Orchestrator {
           blocked: exact.blocked ?? "pull request evidence could not be established",
         };
       }
+      this.#d.store.recordStandalonePullRequest({
+        runId,
+        repo: target.repo,
+        number: exact.pullRequest.number,
+        headSha: exact.pullRequest.headSha,
+        baseSha: exact.pullRequest.baseSha,
+        draft: exact.pullRequest.draft,
+        url: exact.pullRequest.url,
+        ...(exact.pullRequest.mergeSha === undefined
+          ? {}
+          : { mergeSha: exact.pullRequest.mergeSha }),
+      });
 
       const evidenceText = serializePullRequestEvidence(
         buildPullRequestEvidence({
@@ -1435,7 +1932,16 @@ export class Orchestrator {
       input.budget.finishInvocation(result.events);
 
       if (result.status !== "success") {
-        return { blocked: `PR reviewer returned ${result.status}` };
+        const explanation = `PR reviewer returned ${result.status}`;
+        this.#d.store.recordStandaloneReview({
+          runId,
+          candidateSha,
+          role: "pr-reviewer",
+          iteration: attempt + 1,
+          status: "provider-failed",
+          explanation,
+        });
+        return { blocked: explanation };
       }
       const expectedPrReviewOutput = outputPathFor(workspace.path, "pr-reviewer");
       if (
@@ -1443,26 +1949,75 @@ export class Orchestrator {
         result.outputRef === "" ||
         result.outputRef !== expectedPrReviewOutput
       ) {
+        this.#d.store.recordStandaloneReview({
+          runId,
+          candidateSha,
+          role: "pr-reviewer",
+          iteration: attempt + 1,
+          status: "missing-output",
+          explanation: "PR reviewer produced no structured output",
+        });
         return { blocked: "PR reviewer produced no structured output" };
       }
       try {
         if (readFileSync(evidencePath, "utf8") !== evidenceText) {
+          this.#d.store.recordStandaloneReview({
+            runId,
+            candidateSha,
+            role: "pr-reviewer",
+            iteration: attempt + 1,
+            status: "invalid-output",
+            explanation: "PR reviewer modified its orchestrator-owned evidence",
+          });
           return {
             blocked: "PR reviewer modified its orchestrator-owned evidence; refusing the review",
           };
         }
       } catch {
+        this.#d.store.recordStandaloneReview({
+          runId,
+          candidateSha,
+          role: "pr-reviewer",
+          iteration: attempt + 1,
+          status: "invalid-output",
+          explanation: "PR reviewer removed its orchestrator-owned evidence",
+        });
         return {
           blocked: "PR reviewer removed its orchestrator-owned evidence; refusing the review",
         };
       }
 
+      let reviewOutput: string;
       try {
-        review = parseReviewJson(readStructuredOutput(result.outputRef));
+        reviewOutput = readStructuredOutput(result.outputRef);
+      } catch (err) {
+        const explanation = `PR review output could not be read safely: ${errorMessage(err)}`;
+        this.#d.store.recordStandaloneReview({
+          runId,
+          candidateSha,
+          role: "pr-reviewer",
+          iteration: attempt + 1,
+          status: "invalid-output",
+          explanation,
+        });
+        return { blocked: explanation };
+      }
+      try {
+        review = parseReviewJson(reviewOutput);
       } catch (err) {
         // An unparseable review is not an absent review: it is a review whose
         // conclusion is unknown, and unknown is not permission to merge.
-        return { blocked: `PR review output was unparseable: ${errorMessage(err)}` };
+        const explanation = `PR review output was unparseable: ${errorMessage(err)}`;
+        this.#d.store.recordStandaloneReview({
+          runId,
+          candidateSha,
+          role: "pr-reviewer",
+          iteration: attempt + 1,
+          status: "invalid-output",
+          outputText: reviewOutput,
+          explanation,
+        });
+        return { blocked: explanation };
       }
 
       const changed = await this.#workspaces.changedFiles(workspace);
@@ -1472,15 +2027,54 @@ export class Orchestrator {
         cfg.risk.manualApproval.paths,
         input.packet.acceptance_criteria,
       );
-      if (!cross.accepted) {
-        return { blocked: cross.reason ?? "PR review verdict rejected" };
-      }
-
       const blocking = blockingFindings(
         review,
         cfg.review.mergeBlockingSeverities,
         cfg.review.requireAllFindingsResolved,
       );
+      const reviewExplanation =
+        !cross.accepted
+          ? (cross.reason ?? "PR review verdict rejected")
+          : blocking.length > 0
+            ? `${blocking.length} blocking PR-review finding(s) require a fix`
+            : "PR review and deterministic cross-check accepted the exact candidate";
+      this.#d.store.recordStandaloneReview({
+        runId,
+        candidateSha,
+        role: "pr-reviewer",
+        iteration: attempt + 1,
+        status: "completed",
+        outputText: reviewOutput,
+        verdict: review.verdict,
+        scopeAssessment: review.scope_assessment,
+        accepted: cross.accepted,
+        explanation: reviewExplanation,
+        findings: review.findings,
+      });
+      this.#d.store.recordStandalonePolicyDecision({
+        runId,
+        candidateSha,
+        inputs: {
+          kind: "pr-review-cross-check",
+          role: "pr-reviewer",
+          iteration: attempt + 1,
+          verdict: review.verdict,
+          changed_paths: changed,
+        },
+        matched: {
+          blocking_findings: blocking.map((finding) => finding.id),
+          scope_assessment: review.scope_assessment,
+        },
+        outcome: !cross.accepted
+          ? "refused"
+          : blocking.length > 0
+            ? "withheld"
+            : "accepted",
+        explanation: reviewExplanation,
+      });
+      if (!cross.accepted) {
+        return { blocked: cross.reason ?? "PR review verdict rejected" };
+      }
       if (blocking.length === 0) return { review, candidateSha, protection };
 
       this.#log(`  PR review: ${blocking.length} blocking finding(s)`);
@@ -1537,20 +2131,45 @@ export class Orchestrator {
           blocked: "PR fixer produced no change, so the blocking findings still stand",
         };
       }
+      this.#d.store.setStandaloneCandidate({
+        runId,
+        expectedCandidateSha: candidateSha,
+        candidateSha: sha,
+      });
+      candidateSha = sha;
 
       // The change must be re-verified before it goes back onto the PR: a fix
       // is new code, and new code has not been through the coverage contract.
       this.#advance(runId, "LOCAL_VERIFY");
-      const reverified = await this.#verification.run({
-        workspace,
-        workspaces: this.#workspaces,
-        manifest: resolveManifest({
-          configured: this.#d.checks,
-          changedPaths: await this.#workspaces.changedFiles(workspace),
-        }),
-        candidateSha: sha,
-        failOnMissingCheck: cfg.verification.failOnMissingCheck,
-        failOnSkippedCheck: cfg.verification.failOnSkippedCheck,
+      let reverified: Awaited<ReturnType<VerificationEngine["run"]>>;
+      try {
+        reverified = await this.#verification.run({
+          workspace,
+          workspaces: this.#workspaces,
+          manifest: resolveManifest({
+            configured: this.#d.checks,
+            changedPaths: await this.#workspaces.changedFiles(workspace),
+          }),
+          candidateSha,
+          failOnMissingCheck: cfg.verification.failOnMissingCheck,
+          failOnSkippedCheck: cfg.verification.failOnSkippedCheck,
+        });
+      } catch (cause) {
+        this.#d.store.recordStandaloneVerification({
+          runId,
+          candidateSha,
+          mergeReady: false,
+          failures: [`verification execution failed after PR fix: ${errorMessage(cause)}`],
+          results: [],
+        });
+        throw cause;
+      }
+      this.#d.store.recordStandaloneVerification({
+        runId,
+        candidateSha,
+        mergeReady: reverified.mergeReady,
+        failures: reverified.failures,
+        results: reverified.results,
       });
       if (!reverified.mergeReady) {
         return {
@@ -1564,7 +2183,7 @@ export class Orchestrator {
         runId,
         "forge",
         "push-pr-fix",
-        `${target.repo}#${input.branch}@${sha}`,
+        `${target.repo}#${input.branch}@${candidateSha}`,
         () => input.lease.assertHeld(input.held),
         () =>
           this.#d.forge.push({
@@ -1575,7 +2194,6 @@ export class Orchestrator {
       );
       this.#log(`  pushed PR-review fix ${attempt + 1} to #${pr.number}`);
 
-      candidateSha = sha;
       const exactAfterFix = await this.#pullRequestAtCandidate({
         repo: target.repo,
         number: pr.number,
@@ -1584,6 +2202,21 @@ export class Orchestrator {
       if (exactAfterFix.blocked !== undefined) {
         return { blocked: exactAfterFix.blocked };
       }
+      if (exactAfterFix.pullRequest === undefined) {
+        return { blocked: "pull request evidence disappeared after the PR-review fix" };
+      }
+      this.#d.store.recordStandalonePullRequest({
+        runId,
+        repo: target.repo,
+        number: exactAfterFix.pullRequest.number,
+        headSha: exactAfterFix.pullRequest.headSha,
+        baseSha: exactAfterFix.pullRequest.baseSha,
+        draft: exactAfterFix.pullRequest.draft,
+        url: exactAfterFix.pullRequest.url,
+        ...(exactAfterFix.pullRequest.mergeSha === undefined
+          ? {}
+          : { mergeSha: exactAfterFix.pullRequest.mergeSha }),
+      });
 
       // A new commit invalidates the old CI evidence. Wait again and carry
       // only verdicts bound to the fixed candidate into the next review.
@@ -1595,9 +2228,36 @@ export class Orchestrator {
         held: input.held,
         budget: input.budget,
       });
-      if ("blocked" in ci) return { blocked: ci.blocked };
+      if ("blocked" in ci) {
+        this.#d.store.recordStandalonePolicyDecision({
+          runId,
+          candidateSha,
+          inputs: { kind: "ci-reconciliation-after-pr-fix", required_contexts: [] },
+          matched: { verdicts: [] },
+          outcome: "refused",
+          explanation: ci.blocked,
+        });
+        return { blocked: ci.blocked };
+      }
       protection = ci.protection;
       verdicts = ci.verdicts;
+      this.#d.store.recordStandalonePolicyDecision({
+        runId,
+        candidateSha,
+        inputs: {
+          kind: "ci-reconciliation-after-pr-fix",
+          required_contexts: protection.requiredChecks,
+        },
+        matched: {
+          verdicts: [...verdicts].map(([context, verdict]) => ({
+            context,
+            state: verdict.state,
+            detail: verdict.detail,
+          })),
+        },
+        outcome: "accepted",
+        explanation: "every required CI context is satisfied for the fixed exact candidate",
+      });
     }
 
     return {

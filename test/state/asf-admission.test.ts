@@ -1589,7 +1589,6 @@ describe("ASF run ownership fencing", () => {
     expect(() =>
       store.appendEvent({
         runId: "run_fenced_only",
-        seq: 2,
         type: "run.completed",
         payload: {},
       }),

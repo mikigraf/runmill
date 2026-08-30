@@ -34,6 +34,7 @@ const OWNER = "budget-worker-01";
 
 function removeStandaloneLeaseIntentSchema(database: Database.Database): void {
   database.exec(`
+    DROP TABLE reviews;
     DROP INDEX idx_leases_identity;
     DROP INDEX idx_leases_active;
     ALTER TABLE leases DROP COLUMN confirmed_at;
@@ -47,7 +48,7 @@ function removeStandaloneLeaseIntentSchema(database: Database.Database): void {
     ALTER TABLE leases DROP COLUMN phase;
     CREATE UNIQUE INDEX idx_leases_active
       ON leases(issue_id) WHERE released_at IS NULL;
-    DELETE FROM schema_migrations WHERE version = 11;
+    DELETE FROM schema_migrations WHERE version >= 11;
   `);
 }
 

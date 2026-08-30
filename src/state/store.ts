@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { existsSync, lstatSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { Clock } from "../platform/clock.js";
 import { SystemClock } from "../platform/clock.js";
@@ -99,6 +99,11 @@ import {
   type AsfProviderBudgetRole,
   type AsfRunBudgetCheck,
 } from "../asf/budget.js";
+import {
+  findingSchema,
+  reviewSchema,
+  type Finding,
+} from "../review/schema.js";
 import { MIGRATIONS, CURRENT_SCHEMA_VERSION } from "./migrations.js";
 
 export { CURRENT_SCHEMA_VERSION };
@@ -137,6 +142,14 @@ function isJsonObject(
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function canonicalEvidence(value: unknown, field: string): string {
+  try {
+    return canonicalJson(value as JsonValue);
+  } catch (cause) {
+    throw new Error(`${field} must be finite canonicalizable JSON`, { cause });
+  }
+}
+
 const ASF_EVENT_CHECKPOINT_REQUIREMENTS = Object.freeze({
   "repository.lease_acquired": "repository-lease-acquisition",
   "identity.leases_acquired": "identity-lease-acquisition",
@@ -165,6 +178,110 @@ export interface RunRow {
   baseCommit: string | null;
   candidateSha: string | null;
   branch: string | null;
+}
+
+export type StandaloneWorkspaceStatus = "active" | "preserved" | "destroyed";
+
+export interface StandaloneWorkspaceRow {
+  readonly path: string;
+  readonly runId: string;
+  readonly branch: string;
+  readonly status: StandaloneWorkspaceStatus;
+  readonly createdAt: string;
+}
+
+export interface StandaloneIssueSnapshotRow {
+  readonly issueId: string;
+  readonly runId: string;
+  readonly fingerprint: string;
+  readonly body: string;
+  readonly capturedAt: string;
+}
+
+export interface StandaloneCheckRow {
+  readonly runId: string;
+  readonly checkId: string;
+  readonly candidateSha: string;
+  readonly environment: string;
+  readonly attempt: number;
+  readonly origin: string;
+  readonly executor: string;
+  readonly command: string | null;
+  readonly treeHashBefore: string | null;
+  readonly treeHashAfter: string | null;
+  readonly outcome: string | null;
+  readonly exitCode: number | null;
+  readonly exitSignal: string | null;
+  readonly status: string | null;
+  readonly coverage: string | null;
+  readonly reportPath: string | null;
+  readonly startedAt: string | null;
+  readonly completedAt: string | null;
+}
+
+export type StandaloneReviewStatus =
+  | "completed"
+  | "provider-failed"
+  | "missing-output"
+  | "invalid-output";
+
+export interface StandaloneReviewRow {
+  readonly reviewId: string;
+  readonly runId: string;
+  readonly candidateSha: string;
+  readonly role: "local-reviewer" | "pr-reviewer";
+  readonly iteration: number;
+  readonly status: StandaloneReviewStatus;
+  readonly verdict: "approved" | "changes_required" | "no_findings" | null;
+  readonly scopeAssessment: "within_scope" | "out_of_scope" | "unclear" | null;
+  readonly outputDigest: string | null;
+  readonly outputText: string | null;
+  readonly accepted: 0 | 1 | null;
+  readonly explanation: string;
+  readonly at: string;
+}
+
+export interface StandaloneFindingRow {
+  readonly runId: string;
+  readonly reviewId: string;
+  readonly iteration: number;
+  readonly findingId: string;
+  readonly severity: string;
+  readonly category: string | null;
+  readonly evidence: unknown;
+  readonly status: string;
+  readonly resolution: string | null;
+}
+
+export interface StandalonePullRequestRow {
+  readonly runId: string;
+  readonly repo: string;
+  readonly number: number;
+  readonly headSha: string;
+  readonly baseSha: string;
+  readonly mergeSha: string | null;
+  readonly draft: 0 | 1;
+  readonly url: string;
+}
+
+export interface StandalonePolicyDecisionRow {
+  readonly runId: string;
+  readonly seq: number;
+  readonly inputs: unknown;
+  readonly matched: unknown;
+  readonly outcome: "accepted" | "withheld" | "refused" | "unknown";
+  readonly explanation: string;
+  readonly candidateSha: string | null;
+  readonly at: string;
+}
+
+export interface StandaloneTransitionRow {
+  readonly seq: number;
+  readonly from: string;
+  readonly to: string;
+  readonly reason: string | null;
+  readonly actor: string;
+  readonly at: string;
 }
 
 /** ASF-only ownership fields kept out of the existing standalone JSON contract. */
@@ -1566,6 +1683,1113 @@ export class StateStore {
          FROM runs WHERE mode <> 'asf-worker' ORDER BY created_at DESC LIMIT ?`,
       )
       .all(limit) as RunRow[];
+  }
+
+  // -- standalone workflow evidence ------------------------------------
+
+  #requireStandaloneRun(runId: string): RunRow {
+    const mode = this.#db
+      .prepare("SELECT mode FROM runs WHERE run_id = ?")
+      .get(runId) as { mode: string } | undefined;
+    if (mode === undefined) throw new Error(`standalone run ${runId} does not exist`);
+    if (mode.mode === "asf-worker") {
+      throw new Error(`standalone evidence cannot write ASF run ${runId}`);
+    }
+    if (mode.mode !== "standalone") {
+      throw new Error(`standalone evidence cannot write ${mode.mode} run ${runId}`);
+    }
+    const run = this.getRun(runId);
+    if (run === undefined) throw new Error(`standalone run ${runId} disappeared`);
+    return run;
+  }
+
+  #requireCurrentStandaloneCandidate(runId: string, candidateSha: string): RunRow {
+    assertGitObjectId(candidateSha, "standalone candidate");
+    const run = this.#requireStandaloneRun(runId);
+    if (run.candidateSha !== candidateSha) {
+      throw new Error(
+        `evidence candidate ${candidateSha} does not match current candidate ` +
+          `${run.candidateSha ?? "<unbound>"} for ${runId}`,
+      );
+    }
+    return run;
+  }
+
+  #insertStandaloneEvent(input: {
+    runId: string;
+    type: string;
+    payload: unknown;
+    artifactRef?: string | undefined;
+  }): number {
+    this.#requireStandaloneRun(input.runId);
+    if (input.type.trim() === "") throw new Error("standalone event type must not be empty");
+    const seq = (
+      this.#db
+        .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE run_id = ?")
+        .get(input.runId) as { seq: number }
+    ).seq;
+    const inserted = this.#db
+      .prepare(
+        `INSERT INTO events(run_id, seq, type, payload, artifact_ref, at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run(
+        input.runId,
+        seq,
+        input.type,
+        canonicalEvidence(input.payload, "standalone event payload"),
+        input.artifactRef ?? null,
+        this.#clock.now().toISOString(),
+      );
+    if (inserted.changes !== 1) {
+      throw new Error(`standalone event ${input.runId}/${seq} was not inserted`);
+    }
+    return seq;
+  }
+
+  bindStandaloneWorkspace(input: {
+    runId: string;
+    path: string;
+    branch: string;
+    baseCommit: string;
+  }): StandaloneWorkspaceRow {
+    assertGitObjectId(input.baseCommit, "standalone base commit");
+    if (!isAbsolute(input.path) || input.path.includes("\0")) {
+      throw new Error("standalone workspace path must be an absolute non-NUL path");
+    }
+    if (input.branch.trim() === "" || input.branch.includes("\0")) {
+      throw new Error("standalone branch must be non-empty and contain no NUL");
+    }
+    const transaction = this.#db.transaction(() => {
+      const run = this.#requireStandaloneRun(input.runId);
+      if (
+        run.baseCommit !== null ||
+        run.candidateSha !== null ||
+        run.branch !== null ||
+        this.standaloneWorkspace(input.runId) !== undefined
+      ) {
+        throw new Error(`standalone workspace binding for ${input.runId} already exists`);
+      }
+      const at = this.#clock.now().toISOString();
+      const changed = this.#db
+        .prepare(
+          `UPDATE runs
+           SET base_commit = ?, candidate_sha = ?, branch = ?, updated_at = ?
+           WHERE run_id = ? AND mode = 'standalone'
+             AND base_commit IS NULL AND candidate_sha IS NULL AND branch IS NULL`,
+        )
+        .run(
+          input.baseCommit,
+          input.baseCommit,
+          input.branch,
+          at,
+          input.runId,
+        ).changes;
+      if (changed !== 1) {
+        throw new Error(`standalone workspace binding for ${input.runId} affected ${changed} rows`);
+      }
+      const inserted = this.#db
+        .prepare(
+          `INSERT INTO worktrees(path, run_id, branch, status, created_at)
+           VALUES (?,?,?,'active',?)`,
+        )
+        .run(input.path, input.runId, input.branch, at).changes;
+      if (inserted !== 1) {
+        throw new Error(`standalone workspace row for ${input.runId} was not inserted`);
+      }
+      this.#insertStandaloneEvent({
+        runId: input.runId,
+        type: "workspace.bound",
+        payload: {
+          path: input.path,
+          branch: input.branch,
+          base_commit: input.baseCommit,
+          candidate_sha: input.baseCommit,
+          status: "active",
+        },
+      });
+      const workspace = this.standaloneWorkspace(input.runId);
+      if (workspace === undefined) {
+        throw new Error(`standalone workspace row for ${input.runId} disappeared`);
+      }
+      return workspace;
+    });
+    return transaction.immediate();
+  }
+
+  setStandaloneCandidate(input: {
+    runId: string;
+    expectedCandidateSha: string;
+    candidateSha: string;
+  }): void {
+    assertGitObjectId(input.expectedCandidateSha, "expected standalone candidate");
+    assertGitObjectId(input.candidateSha, "standalone candidate");
+    if (input.candidateSha === input.expectedCandidateSha) {
+      throw new Error("standalone candidate transition must change the candidate");
+    }
+    const transaction = this.#db.transaction(() => {
+      const changed = this.#db
+        .prepare(
+          `UPDATE runs SET candidate_sha = ?, updated_at = ?
+           WHERE run_id = ? AND mode = 'standalone' AND candidate_sha = ?`,
+        )
+        .run(
+          input.candidateSha,
+          this.#clock.now().toISOString(),
+          input.runId,
+          input.expectedCandidateSha,
+        ).changes;
+      if (changed !== 1) {
+        const current = this.getRun(input.runId)?.candidateSha ?? "<missing>";
+        throw new Error(
+          `standalone candidate transition for ${input.runId} expected ` +
+            `${input.expectedCandidateSha}, found ${current}`,
+        );
+      }
+      this.#insertStandaloneEvent({
+        runId: input.runId,
+        type: "candidate.bound",
+        payload: {
+          prior_candidate_sha: input.expectedCandidateSha,
+          candidate_sha: input.candidateSha,
+        },
+      });
+    });
+    transaction.immediate();
+  }
+
+  standaloneWorkspace(runId: string): StandaloneWorkspaceRow | undefined {
+    const rows = this.#db
+      .prepare(
+        `SELECT path, run_id AS runId, branch, status, created_at AS createdAt
+         FROM worktrees WHERE run_id = ? ORDER BY created_at, path`,
+      )
+      .all(runId) as StandaloneWorkspaceRow[];
+    if (rows.length > 1) {
+      throw new Error(`standalone run ${runId} has contradictory workspace rows`);
+    }
+    const row = rows[0];
+    if (row === undefined) return undefined;
+    if (
+      row.runId !== runId ||
+      !isAbsolute(row.path) ||
+      row.path.includes("\0") ||
+      row.branch.trim() === "" ||
+      row.branch.includes("\0") ||
+      !["active", "preserved", "destroyed"].includes(row.status)
+    ) {
+      throw new Error(`standalone workspace row for ${runId} is malformed`);
+    }
+    assertTimestamp(row.createdAt, `standalone workspace ${runId} creation time`);
+    return row;
+  }
+
+  markStandaloneWorkspace(runId: string, status: "preserved" | "destroyed"): void {
+    const transaction = this.#db.transaction(() => {
+      this.#requireStandaloneRun(runId);
+      const changed = this.#db
+        .prepare(
+          `UPDATE worktrees SET status = ?
+           WHERE run_id = ? AND status IN ('active','preserved')`,
+        )
+        .run(status, runId).changes;
+      if (changed !== 1) {
+        throw new Error(
+          `standalone workspace status for ${runId} changed ${changed} rows`,
+        );
+      }
+      this.#insertStandaloneEvent({
+        runId,
+        type: "workspace.status",
+        payload: { status },
+      });
+    });
+    transaction.immediate();
+  }
+
+  recordStandaloneIssueSnapshot(input: {
+    runId: string;
+    issueId: string;
+    fingerprint: string;
+    body: string;
+  }): void {
+    if (!/^sha256:[a-f0-9]{64}$/u.test(input.fingerprint)) {
+      throw new Error("standalone issue fingerprint must be a full SHA-256 digest");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(input.body) as unknown;
+    } catch (cause) {
+      throw new Error("standalone issue snapshot body must be JSON", { cause });
+    }
+    if (canonicalEvidence(parsed, "standalone issue snapshot") !== input.body) {
+      throw new Error("standalone issue snapshot body must be canonical JSON");
+    }
+    const actualFingerprint = `sha256:${createHash("sha256")
+      .update(input.body, "utf8")
+      .digest("hex")}`;
+    if (actualFingerprint !== input.fingerprint) {
+      throw new Error("standalone issue fingerprint does not bind the snapshot body");
+    }
+
+    const transaction = this.#db.transaction(() => {
+      const run = this.#requireStandaloneRun(input.runId);
+      if (run.issueId !== input.issueId) {
+        throw new Error(`standalone issue snapshot does not match run ${input.runId}`);
+      }
+      const existing = this.standaloneIssueSnapshot(input.runId);
+      if (existing !== undefined) {
+        if (
+          existing.issueId !== input.issueId ||
+          existing.fingerprint !== input.fingerprint ||
+          existing.body !== input.body
+        ) {
+          throw new Error(`standalone issue snapshot for ${input.runId} is contradictory`);
+        }
+        return;
+      }
+      const inserted = this.#db
+        .prepare(
+          `INSERT INTO issue_snapshots(issue_id, run_id, snapshot_hash, body, captured_at)
+           VALUES (?,?,?,?,?)`,
+        )
+        .run(
+          input.issueId,
+          input.runId,
+          input.fingerprint,
+          input.body,
+          this.#clock.now().toISOString(),
+        ).changes;
+      if (inserted !== 1) {
+        throw new Error(`standalone issue snapshot for ${input.runId} was not inserted`);
+      }
+      this.#insertStandaloneEvent({
+        runId: input.runId,
+        type: "issue.snapshot",
+        payload: {
+          issue_id: input.issueId,
+          authority_fingerprint: input.fingerprint,
+        },
+      });
+    });
+    transaction.immediate();
+  }
+
+  standaloneIssueSnapshot(runId: string): StandaloneIssueSnapshotRow | undefined {
+    const rows = this.#db
+      .prepare(
+        `SELECT issue_id AS issueId, run_id AS runId, snapshot_hash AS fingerprint,
+                body, captured_at AS capturedAt
+         FROM issue_snapshots WHERE run_id = ? ORDER BY issue_id`,
+      )
+      .all(runId) as StandaloneIssueSnapshotRow[];
+    if (rows.length > 1) {
+      throw new Error(`standalone run ${runId} has contradictory issue snapshots`);
+    }
+    const row = rows[0];
+    if (row === undefined) return undefined;
+    if (
+      row.runId !== runId ||
+      row.issueId.trim() === "" ||
+      !/^sha256:[a-f0-9]{64}$/u.test(row.fingerprint)
+    ) {
+      throw new Error(`standalone issue snapshot for ${runId} has a malformed fingerprint`);
+    }
+    assertTimestamp(row.capturedAt, `standalone issue snapshot ${runId} capture time`);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.body) as unknown;
+    } catch (cause) {
+      throw new Error(`standalone issue snapshot for ${runId} has malformed JSON`, {
+        cause,
+      });
+    }
+    if (canonicalEvidence(parsed, "persisted standalone issue snapshot") !== row.body) {
+      throw new Error(`standalone issue snapshot for ${runId} is not canonical JSON`);
+    }
+    const fingerprint = `sha256:${createHash("sha256")
+      .update(row.body, "utf8")
+      .digest("hex")}`;
+    if (fingerprint !== row.fingerprint) {
+      throw new Error(`standalone issue snapshot for ${runId} has a contradictory digest`);
+    }
+    return row;
+  }
+
+  recordStandaloneVerification(input: {
+    runId: string;
+    candidateSha: string;
+    mergeReady: boolean;
+    failures: readonly string[];
+    results: readonly {
+      checkId: string;
+      required: boolean;
+      source: string;
+      command: string;
+      attempt: number;
+      commitSha: string;
+      treeHashBefore: string;
+      treeHashAfter: string;
+      executor: string;
+      outcome: string;
+      exitCode: number | null;
+      status: string;
+      coverage: string;
+      durationMs: number;
+      stdoutHash: string;
+      notes: readonly string[];
+      environment?: string | undefined;
+      exitSignal?: string | null | undefined;
+      reportPath?: string | null | undefined;
+    }[];
+  }): { readonly eventSeq: number } {
+    if (
+      typeof input.mergeReady !== "boolean" ||
+      input.failures.some((failure) => typeof failure !== "string")
+    ) {
+      throw new Error("standalone verification summary is malformed");
+    }
+    const transaction = this.#db.transaction(() => {
+      this.#requireCurrentStandaloneCandidate(input.runId, input.candidateSha);
+      const seen = new Set<string>();
+      const eventResults: unknown[] = [];
+      for (const result of input.results) {
+        if (result.commitSha !== input.candidateSha) {
+          throw new Error(
+            `check ${result.checkId} candidate ${result.commitSha} does not match current ` +
+              `candidate ${input.candidateSha}`,
+          );
+        }
+        if (
+          result.checkId.trim() === "" ||
+          result.checkId.includes("\0") ||
+          typeof result.required !== "boolean" ||
+          result.source.trim() === "" ||
+          result.command.trim() === "" ||
+          !Number.isSafeInteger(result.attempt) ||
+          result.attempt < 1 ||
+          (result.executor !== "orchestrator" && result.executor !== "agent") ||
+          ![
+            "exited",
+            "signaled",
+            "timeout",
+            "aborted",
+            "sandbox-denied",
+          ].includes(result.outcome) ||
+          (result.exitCode !== null && !Number.isSafeInteger(result.exitCode)) ||
+          !["passed", "failed", "not_applicable"].includes(result.status) ||
+          !["proven", "unproven"].includes(result.coverage) ||
+          !Number.isSafeInteger(result.durationMs) ||
+          result.durationMs < 0 ||
+          !/^[a-f0-9]{16}$/u.test(result.stdoutHash) ||
+          result.notes.some((note) => typeof note !== "string")
+        ) {
+          throw new Error(`check evidence for ${result.checkId || "<empty>"} is malformed`);
+        }
+        assertGitObjectId(result.treeHashBefore, `check ${result.checkId} tree before`);
+        assertGitObjectId(result.treeHashAfter, `check ${result.checkId} tree after`);
+        if (
+          result.status === "passed" &&
+          (result.outcome !== "exited" ||
+            result.exitCode !== 0 ||
+            result.treeHashBefore !== result.treeHashAfter)
+        ) {
+          throw new Error(`passing check ${result.checkId} has contradictory process/tree evidence`);
+        }
+        const environment = result.environment ?? "";
+        if (environment.includes("\0")) {
+          throw new Error(`check environment for ${result.checkId} contains NUL`);
+        }
+        const identity = `${result.checkId}\0${environment}`;
+        if (seen.has(identity)) {
+          throw new Error(`verification attempt contains duplicate check ${result.checkId}`);
+        }
+        seen.add(identity);
+        const attempt = (
+          this.#db
+            .prepare(
+              `SELECT COALESCE(MAX(attempt), 0) + 1 AS attempt
+               FROM checks
+               WHERE run_id = ? AND candidate_sha = ? AND check_id = ? AND env = ?`,
+            )
+            .get(input.runId, input.candidateSha, result.checkId, environment) as {
+            attempt: number;
+          }
+        ).attempt;
+        const completed = this.#clock.now();
+        const startedAt = new Date(completed.getTime() - result.durationMs).toISOString();
+        const inserted = this.#db
+          .prepare(
+            `INSERT INTO checks(
+               run_id, check_id, candidate_sha, env, attempt, origin, executor,
+               command, tree_hash_before, tree_hash_after, outcome, exit_code,
+               exit_signal, status, coverage, report_path, started_at, completed_at
+             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          )
+          .run(
+            input.runId,
+            result.checkId,
+            input.candidateSha,
+            environment,
+            attempt,
+            result.source,
+            result.executor,
+            result.command,
+            result.treeHashBefore,
+            result.treeHashAfter,
+            result.outcome,
+            result.exitCode,
+            result.exitSignal ?? null,
+            result.status,
+            result.coverage,
+            result.reportPath ?? null,
+            startedAt,
+            completed.toISOString(),
+          ).changes;
+        if (inserted !== 1) {
+          throw new Error(`check attempt ${result.checkId}/${attempt} was not inserted`);
+        }
+        eventResults.push({ ...result, environment, attempt });
+      }
+      if (
+        input.mergeReady &&
+        (input.failures.length > 0 ||
+          input.results.some((result) => result.status === "failed"))
+      ) {
+        throw new Error("merge-ready verification contradicts its failed evidence");
+      }
+      const eventSeq = this.#insertStandaloneEvent({
+        runId: input.runId,
+        type: "verification.completed",
+        payload: {
+          candidate_sha: input.candidateSha,
+          merge_ready: input.mergeReady,
+          failures: input.failures,
+          results: eventResults,
+        },
+      });
+      return { eventSeq };
+    });
+    return transaction.immediate();
+  }
+
+  standaloneChecks(runId: string): StandaloneCheckRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT run_id AS runId, check_id AS checkId, candidate_sha AS candidateSha,
+                env AS environment, attempt, origin, executor, command,
+                tree_hash_before AS treeHashBefore, tree_hash_after AS treeHashAfter,
+                outcome, exit_code AS exitCode, exit_signal AS exitSignal, status,
+                coverage, report_path AS reportPath, started_at AS startedAt,
+                completed_at AS completedAt
+         FROM checks WHERE run_id = ? ORDER BY rowid`,
+      )
+      .all(runId) as StandaloneCheckRow[];
+    return rows.map((row) => {
+      if (
+        row.runId !== runId ||
+        row.checkId.trim() === "" ||
+        !Number.isSafeInteger(row.attempt) ||
+        row.attempt < 1 ||
+        row.origin.trim() === "" ||
+        (row.executor !== "orchestrator" && row.executor !== "agent") ||
+        row.command === null ||
+        row.command.trim() === "" ||
+        ![
+          "exited",
+          "signaled",
+          "timeout",
+          "aborted",
+          "sandbox-denied",
+        ].includes(row.outcome ?? "") ||
+        (row.exitCode !== null && !Number.isSafeInteger(row.exitCode)) ||
+        !["passed", "failed", "not_applicable"].includes(row.status ?? "") ||
+        !["proven", "unproven"].includes(row.coverage ?? "") ||
+        row.treeHashBefore === null ||
+        row.treeHashAfter === null ||
+        row.startedAt === null ||
+        row.completedAt === null
+      ) {
+        throw new Error(
+          `standalone check ${runId}/${row.checkId}/${row.attempt} is malformed`,
+        );
+      }
+      assertGitObjectId(
+        row.candidateSha,
+        `standalone check ${runId}/${row.checkId} candidate`,
+      );
+      assertGitObjectId(
+        row.treeHashBefore,
+        `standalone check ${runId}/${row.checkId} tree before`,
+      );
+      assertGitObjectId(
+        row.treeHashAfter,
+        `standalone check ${runId}/${row.checkId} tree after`,
+      );
+      assertTimestamp(row.startedAt, `standalone check ${runId}/${row.checkId} start`);
+      assertTimestamp(row.completedAt, `standalone check ${runId}/${row.checkId} completion`);
+      if (
+        row.status === "passed" &&
+        (row.outcome !== "exited" ||
+          row.exitCode !== 0 ||
+          row.treeHashBefore !== row.treeHashAfter)
+      ) {
+        throw new Error(
+          `standalone check ${runId}/${row.checkId}/${row.attempt} is contradictory`,
+        );
+      }
+      return row;
+    });
+  }
+
+  recordStandaloneReview(input: {
+    runId: string;
+    candidateSha: string;
+    role: "local-reviewer" | "pr-reviewer";
+    iteration: number;
+    status: StandaloneReviewStatus;
+    outputText?: string | undefined;
+    verdict?: "approved" | "changes_required" | "no_findings" | undefined;
+    scopeAssessment?: "within_scope" | "out_of_scope" | "unclear" | undefined;
+    accepted?: boolean | undefined;
+    explanation: string;
+    findings?: readonly Finding[] | undefined;
+  }): { readonly review: StandaloneReviewRow; readonly eventSeq: number } {
+    if (!Number.isSafeInteger(input.iteration) || input.iteration < 1) {
+      throw new Error("standalone review iteration must be a positive safe integer");
+    }
+    if (input.explanation.trim() === "") {
+      throw new Error("standalone review explanation must not be empty");
+    }
+    if (
+      input.outputText !== undefined &&
+      Buffer.byteLength(input.outputText, "utf8") > 1024 * 1024
+    ) {
+      throw new Error("standalone review output exceeds 1 MiB");
+    }
+    const findings = input.findings ?? [];
+    if (input.status === "completed") {
+      if (
+        input.outputText === undefined ||
+        input.verdict === undefined ||
+        input.scopeAssessment === undefined ||
+        input.accepted === undefined
+      ) {
+        throw new Error("completed standalone review evidence is incomplete");
+      }
+      let parsedOutput: unknown;
+      try {
+        parsedOutput = JSON.parse(input.outputText) as unknown;
+      } catch (cause) {
+        throw new Error("completed standalone review output must be JSON", { cause });
+      }
+      if (
+        parsedOutput === null ||
+        typeof parsedOutput !== "object" ||
+        Array.isArray(parsedOutput)
+      ) {
+        throw new Error("completed standalone review output must be an object");
+      }
+      const validatedOutput = reviewSchema.safeParse(parsedOutput);
+      if (!validatedOutput.success) {
+        throw new Error("completed standalone review output does not match the review schema");
+      }
+      const output = validatedOutput.data;
+      if (
+        output.verdict !== input.verdict ||
+        output.scope_assessment !== input.scopeAssessment ||
+        canonicalEvidence(output.findings, "review output findings") !==
+          canonicalEvidence(findings, "stored review findings")
+      ) {
+        throw new Error("completed standalone review fields contradict its exact output");
+      }
+    } else if (
+      input.verdict !== undefined ||
+      input.scopeAssessment !== undefined ||
+      input.accepted !== undefined ||
+      findings.length > 0
+    ) {
+      throw new Error("incomplete standalone review cannot carry a verdict or findings");
+    }
+    const outputDigest =
+      input.outputText === undefined
+        ? null
+        : `sha256:${createHash("sha256").update(input.outputText, "utf8").digest("hex")}`;
+    const reviewId = createHash("sha256")
+      .update(
+        `${input.runId}\0${input.candidateSha}\0${input.role}\0${input.iteration}`,
+        "utf8",
+      )
+      .digest("hex")
+      .slice(0, 32);
+
+    const transaction = this.#db.transaction(() => {
+      this.#requireCurrentStandaloneCandidate(input.runId, input.candidateSha);
+      const at = this.#clock.now().toISOString();
+      const inserted = this.#db
+        .prepare(
+          `INSERT INTO reviews(
+             review_id, run_id, candidate_sha, role, iteration, status, verdict,
+             scope_assessment, output_digest, output_text, accepted, explanation, at
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          reviewId,
+          input.runId,
+          input.candidateSha,
+          input.role,
+          input.iteration,
+          input.status,
+          input.verdict ?? null,
+          input.scopeAssessment ?? null,
+          outputDigest,
+          input.outputText ?? null,
+          input.accepted === undefined ? null : input.accepted ? 1 : 0,
+          input.explanation,
+          at,
+        ).changes;
+      if (inserted !== 1) {
+        throw new Error(`standalone review ${reviewId} was not inserted`);
+      }
+
+      const findingIds = new Set<string>();
+      for (const finding of findings) {
+        if (
+          finding.id.trim() === "" ||
+          finding.id.includes("\0") ||
+          findingIds.has(finding.id)
+        ) {
+          throw new Error(`standalone review ${reviewId} has a duplicate or empty finding id`);
+        }
+        findingIds.add(finding.id);
+        const evidence = canonicalEvidence(finding, `review finding ${finding.id}`);
+        const findingInserted = this.#db
+          .prepare(
+            `INSERT INTO findings(
+               run_id, review_id, iteration, finding_id, severity, category,
+               evidence, status, resolution
+             ) VALUES (?,?,?,?,?,?,?,'reported',NULL)`,
+          )
+          .run(
+            input.runId,
+            reviewId,
+            input.iteration,
+            finding.id,
+            finding.severity,
+            finding.category,
+            evidence,
+          ).changes;
+        if (findingInserted !== 1) {
+          throw new Error(`standalone finding ${finding.id} was not inserted`);
+        }
+      }
+      const eventSeq = this.#insertStandaloneEvent({
+        runId: input.runId,
+        type: input.role === "local-reviewer" ? "review.completed" : "pr_review.completed",
+        payload: {
+          review_id: reviewId,
+          candidate_sha: input.candidateSha,
+          role: input.role,
+          iteration: input.iteration,
+          status: input.status,
+          verdict: input.verdict ?? null,
+          output_digest: outputDigest,
+          finding_count: findings.length,
+          accepted: input.accepted ?? null,
+          explanation: input.explanation,
+        },
+      });
+      const review = this.#db
+        .prepare(
+          `SELECT review_id AS reviewId, run_id AS runId,
+                  candidate_sha AS candidateSha, role, iteration, status, verdict,
+                  scope_assessment AS scopeAssessment, output_digest AS outputDigest,
+                  output_text AS outputText, accepted, explanation, at
+           FROM reviews WHERE review_id = ?`,
+        )
+        .get(reviewId) as StandaloneReviewRow | undefined;
+      if (review === undefined) throw new Error(`standalone review ${reviewId} disappeared`);
+      return { review: this.#validateStandaloneReview(review), eventSeq };
+    });
+    return transaction.immediate();
+  }
+
+  #validateStandaloneReview(row: StandaloneReviewRow): StandaloneReviewRow {
+    if (!/^[a-f0-9]{32}$/u.test(row.reviewId)) {
+      throw new Error(`standalone review ${row.reviewId} has a malformed identity`);
+    }
+    assertGitObjectId(row.candidateSha, `standalone review ${row.reviewId} candidate`);
+    assertTimestamp(row.at, `standalone review ${row.reviewId} timestamp`);
+    if (
+      !Number.isSafeInteger(row.iteration) ||
+      row.iteration < 1 ||
+      (row.role !== "local-reviewer" && row.role !== "pr-reviewer") ||
+      ![
+        "completed",
+        "provider-failed",
+        "missing-output",
+        "invalid-output",
+      ].includes(row.status) ||
+      row.explanation.trim() === ""
+    ) {
+      throw new Error(`standalone review ${row.reviewId} is malformed`);
+    }
+    if ((row.outputText === null) !== (row.outputDigest === null)) {
+      throw new Error(`standalone review ${row.reviewId} has incomplete output binding`);
+    }
+    if (row.outputText !== null && row.outputDigest !== null) {
+      if (Buffer.byteLength(row.outputText, "utf8") > 1024 * 1024) {
+        throw new Error(`standalone review ${row.reviewId} output exceeds 1 MiB`);
+      }
+      const digest = `sha256:${createHash("sha256")
+        .update(row.outputText, "utf8")
+        .digest("hex")}`;
+      if (digest !== row.outputDigest) {
+        throw new Error(`standalone review ${row.reviewId} has a contradictory output digest`);
+      }
+    }
+    if (row.status === "completed") {
+      if (
+        row.outputText === null ||
+        row.verdict === null ||
+        row.scopeAssessment === null ||
+        (row.accepted !== 0 && row.accepted !== 1)
+      ) {
+        throw new Error(`completed standalone review ${row.reviewId} is incomplete`);
+      }
+      let parsedOutput: unknown;
+      try {
+        parsedOutput = JSON.parse(row.outputText) as unknown;
+      } catch (cause) {
+        throw new Error(`completed standalone review ${row.reviewId} has malformed JSON`, {
+          cause,
+        });
+      }
+      const validatedOutput = reviewSchema.safeParse(parsedOutput);
+      if (
+        !validatedOutput.success ||
+        validatedOutput.data.verdict !== row.verdict ||
+        validatedOutput.data.scope_assessment !== row.scopeAssessment
+      ) {
+        throw new Error(`completed standalone review ${row.reviewId} is contradictory`);
+      }
+    } else if (
+      row.verdict !== null ||
+      row.scopeAssessment !== null ||
+      row.accepted !== null
+    ) {
+      throw new Error(`incomplete standalone review ${row.reviewId} carries a verdict`);
+    }
+    return row;
+  }
+
+  standaloneReviews(runId: string): StandaloneReviewRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT review_id AS reviewId, run_id AS runId,
+                candidate_sha AS candidateSha, role, iteration, status, verdict,
+                scope_assessment AS scopeAssessment, output_digest AS outputDigest,
+                output_text AS outputText, accepted, explanation, at
+         FROM reviews WHERE run_id = ? ORDER BY at, rowid`,
+      )
+      .all(runId) as StandaloneReviewRow[];
+    return rows.map((row) => this.#validateStandaloneReview(row));
+  }
+
+  standaloneFindings(runId: string): StandaloneFindingRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT run_id AS runId, review_id AS reviewId, iteration,
+                finding_id AS findingId, severity, category, evidence, status, resolution
+         FROM findings WHERE run_id = ? ORDER BY rowid`,
+      )
+      .all(runId) as (Omit<StandaloneFindingRow, "evidence"> & {
+      evidence: string;
+    })[];
+    return rows.map((row) => {
+      if (
+        !Number.isSafeInteger(row.iteration) ||
+        row.iteration < 1 ||
+        row.findingId.trim() === "" ||
+        row.status.trim() === ""
+      ) {
+        throw new Error(`standalone finding ${row.reviewId}/${row.findingId} is malformed`);
+      }
+      let evidence: unknown;
+      try {
+        evidence = JSON.parse(row.evidence) as unknown;
+      } catch (cause) {
+        throw new Error(
+          `standalone finding ${row.reviewId}/${row.findingId} has malformed JSON`,
+          { cause },
+        );
+      }
+      if (canonicalEvidence(evidence, "persisted standalone finding") !== row.evidence) {
+        throw new Error(
+          `standalone finding ${row.reviewId}/${row.findingId} is not canonical JSON`,
+        );
+      }
+      const validated = findingSchema.safeParse(evidence);
+      if (
+        !validated.success ||
+        validated.data.id !== row.findingId ||
+        validated.data.severity !== row.severity ||
+        validated.data.category !== row.category
+      ) {
+        throw new Error(
+          `standalone finding ${row.reviewId}/${row.findingId} is contradictory`,
+        );
+      }
+      return { ...row, evidence: validated.data };
+    });
+  }
+
+  recordStandalonePullRequest(input: {
+    runId: string;
+    repo: string;
+    number: number;
+    headSha: string;
+    baseSha: string;
+    draft: boolean;
+    url: string;
+    mergeSha?: string | undefined;
+  }): void {
+    assertGitObjectId(input.headSha, "pull request head");
+    assertGitObjectId(input.baseSha, "pull request base");
+    if (input.mergeSha !== undefined) {
+      assertGitObjectId(input.mergeSha, "pull request merge commit");
+    }
+    if (!Number.isSafeInteger(input.number) || input.number < 1) {
+      throw new Error("pull request number must be a positive safe integer");
+    }
+    if (
+      input.repo.trim() === "" ||
+      input.repo.includes("\0") ||
+      input.url.trim() === "" ||
+      input.url.includes("\0")
+    ) {
+      throw new Error("pull request evidence contains an empty identity field");
+    }
+    const transaction = this.#db.transaction(() => {
+      const run = this.#requireCurrentStandaloneCandidate(input.runId, input.headSha);
+      if (run.repo.toLowerCase() !== input.repo.toLowerCase()) {
+        throw new Error(`pull request repository does not match run ${input.runId}`);
+      }
+      const existing = this.standalonePullRequest(input.runId);
+      if (
+        existing !== undefined &&
+        (existing.repo.toLowerCase() !== input.repo.toLowerCase() ||
+          existing.number !== input.number ||
+          existing.url !== input.url ||
+          (existing.mergeSha !== null &&
+            input.mergeSha !== undefined &&
+            existing.mergeSha !== input.mergeSha))
+      ) {
+        throw new Error(`pull request identity for ${input.runId} is contradictory`);
+      }
+      const changed = this.#db
+        .prepare(
+          `INSERT INTO pull_requests(
+             run_id, repo, number, head_sha, base_sha, merge_sha, draft, url
+           ) VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(run_id) DO UPDATE SET
+             head_sha = excluded.head_sha,
+             base_sha = excluded.base_sha,
+             merge_sha = COALESCE(excluded.merge_sha, pull_requests.merge_sha),
+             draft = excluded.draft`,
+        )
+        .run(
+          input.runId,
+          input.repo,
+          input.number,
+          input.headSha,
+          input.baseSha,
+          input.mergeSha ?? null,
+          input.draft ? 1 : 0,
+          input.url,
+        ).changes;
+      if (changed !== 1) {
+        throw new Error(
+          `standalone pull request observation for ${input.runId} changed ${changed} rows`,
+        );
+      }
+      this.#insertStandaloneEvent({
+        runId: input.runId,
+        type: input.mergeSha === undefined ? "pull_request.observed" : "pull_request.merged",
+        payload: {
+          repo: input.repo,
+          number: input.number,
+          head_sha: input.headSha,
+          base_sha: input.baseSha,
+          merge_sha: input.mergeSha ?? null,
+          draft: input.draft,
+          url: input.url,
+        },
+      });
+    });
+    transaction.immediate();
+  }
+
+  standalonePullRequest(runId: string): StandalonePullRequestRow | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT run_id AS runId, repo, number, head_sha AS headSha,
+                base_sha AS baseSha, merge_sha AS mergeSha, draft, url
+         FROM pull_requests WHERE run_id = ?`,
+      )
+      .get(runId) as StandalonePullRequestRow | undefined;
+    if (row === undefined) return undefined;
+    if (
+      !Number.isSafeInteger(row.number) ||
+      row.number < 1 ||
+      (row.draft !== 0 && row.draft !== 1) ||
+      row.repo.trim() === "" ||
+      row.url.trim() === ""
+    ) {
+      throw new Error(`standalone pull request evidence for ${runId} is malformed`);
+    }
+    assertGitObjectId(row.headSha, "persisted pull request head");
+    assertGitObjectId(row.baseSha, "persisted pull request base");
+    if (row.mergeSha !== null) {
+      assertGitObjectId(row.mergeSha, "persisted pull request merge commit");
+    }
+    return row;
+  }
+
+  recordStandalonePolicyDecision(input: {
+    runId: string;
+    candidateSha: string;
+    inputs: unknown;
+    matched: unknown;
+    outcome: "accepted" | "withheld" | "refused" | "unknown";
+    explanation: string;
+  }): number {
+    if (input.explanation.trim() === "") {
+      throw new Error("standalone policy decision explanation must not be empty");
+    }
+    const serializedInputs = canonicalEvidence(input.inputs, "policy decision inputs");
+    const serializedMatched = canonicalEvidence(input.matched, "policy decision matches");
+    const transaction = this.#db.transaction(() => {
+      this.#requireCurrentStandaloneCandidate(input.runId, input.candidateSha);
+      const seq = (
+        this.#db
+          .prepare(
+            `SELECT COALESCE(MAX(seq), 0) + 1 AS seq
+             FROM policy_decisions WHERE run_id = ?`,
+          )
+          .get(input.runId) as { seq: number }
+      ).seq;
+      const inserted = this.#db
+        .prepare(
+          `INSERT INTO policy_decisions(
+             run_id, seq, inputs, matched, outcome, explanation, identity, at
+           ) VALUES (?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          input.runId,
+          seq,
+          serializedInputs,
+          serializedMatched,
+          input.outcome,
+          input.explanation,
+          input.candidateSha,
+          this.#clock.now().toISOString(),
+        ).changes;
+      if (inserted !== 1) {
+        throw new Error(`standalone policy decision ${input.runId}/${seq} was not inserted`);
+      }
+      this.#insertStandaloneEvent({
+        runId: input.runId,
+        type: "policy.decision",
+        payload: {
+          seq,
+          candidate_sha: input.candidateSha,
+          outcome: input.outcome,
+          explanation: input.explanation,
+        },
+      });
+      return seq;
+    });
+    return transaction.immediate();
+  }
+
+  standalonePolicyDecisions(runId: string): StandalonePolicyDecisionRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT run_id AS runId, seq, inputs, matched, outcome, explanation,
+                identity AS candidateSha, at
+         FROM policy_decisions WHERE run_id = ? ORDER BY seq`,
+      )
+      .all(runId) as (Omit<StandalonePolicyDecisionRow, "inputs" | "matched"> & {
+      inputs: string;
+      matched: string;
+    })[];
+    return rows.map((row) => {
+      if (
+        row.runId !== runId ||
+        !Number.isSafeInteger(row.seq) ||
+        row.seq < 1 ||
+        row.explanation.trim() === "" ||
+        !["accepted", "withheld", "refused", "unknown"].includes(row.outcome)
+      ) {
+        throw new Error(
+          `standalone policy decision ${runId}/${row.seq} is malformed`,
+        );
+      }
+      assertTimestamp(row.at, `standalone policy decision ${runId}/${row.seq} time`);
+      if (row.candidateSha !== null) {
+        assertGitObjectId(
+          row.candidateSha,
+          `standalone policy decision ${runId}/${row.seq} candidate`,
+        );
+      }
+      let parsedInputs: unknown;
+      let parsedMatched: unknown;
+      try {
+        parsedInputs = JSON.parse(row.inputs) as unknown;
+        parsedMatched = JSON.parse(row.matched) as unknown;
+      } catch (cause) {
+        throw new Error(
+          `standalone policy decision ${runId}/${row.seq} has malformed JSON`,
+          { cause },
+        );
+      }
+      if (
+        canonicalEvidence(parsedInputs, "persisted policy decision inputs") !== row.inputs ||
+        canonicalEvidence(parsedMatched, "persisted policy decision matches") !== row.matched
+      ) {
+        throw new Error(
+          `standalone policy decision ${runId}/${row.seq} is not canonical JSON`,
+        );
+      }
+      return {
+        ...row,
+        inputs: parsedInputs,
+        matched: parsedMatched,
+      } as StandalonePolicyDecisionRow;
+    });
+  }
+
+  standaloneTransitionHistory(runId: string): StandaloneTransitionRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT seq, from_state AS "from", to_state AS "to", reason, actor, at
+         FROM state_transitions WHERE run_id = ? ORDER BY seq`,
+      )
+      .all(runId) as StandaloneTransitionRow[];
+    return rows.map((row) => {
+      if (
+        !Number.isSafeInteger(row.seq) ||
+        row.seq < 1 ||
+        row.from.trim() === "" ||
+        row.to.trim() === "" ||
+        row.actor.trim() === ""
+      ) {
+        throw new Error(`standalone transition ${runId}/${row.seq} is malformed`);
+      }
+      assertTimestamp(row.at, `standalone transition ${runId}/${row.seq} time`);
+      return row;
+    });
   }
 
   // -- ASF Work Order admission -----------------------------------------
@@ -10851,31 +12075,14 @@ export class StateStore {
 
   appendEvent(input: {
     runId: string;
-    seq: number;
     type: string;
     payload: unknown;
     artifactRef?: string;
-  }): void {
-    const inserted = this.#db
-      .prepare(
-        `INSERT INTO events(run_id, seq, type, payload, artifact_ref, at)
-         SELECT ?,?,?,?,?,?
-         FROM runs WHERE run_id = ? AND mode <> 'asf-worker'`,
-      )
-      .run(
-        input.runId,
-        input.seq,
-        input.type,
-        JSON.stringify(input.payload),
-        input.artifactRef ?? null,
-        this.#clock.now().toISOString(),
-        input.runId,
-      );
-    if (inserted.changes !== 1) {
-      throw new Error(
-        `legacy appendEvent cannot write ASF or missing run ${input.runId}`,
-      );
-    }
+  }): number {
+    const transaction = this.#db.transaction(() =>
+      this.#insertStandaloneEvent(input),
+    );
+    return transaction.immediate();
   }
 
   eventsFor(runId: string): { seq: number; type: string; payload: unknown }[] {

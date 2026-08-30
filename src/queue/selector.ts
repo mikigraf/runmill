@@ -1,7 +1,11 @@
 import type { BacklogAdapter } from "../backlog/adapter.js";
 import type { RunmillConfig } from "../config/types.js";
 import type { BacklogIssue, RepositoryTarget } from "../domain/types.js";
-import { evaluateEligibility, type EligibilityDecision } from "./eligibility.js";
+import {
+  evaluateEligibility,
+  type EligibilityDecision,
+  type EligibilityPolicy,
+} from "./eligibility.js";
 import { orderIssues } from "./ordering.js";
 
 export interface SelectedCandidate {
@@ -29,6 +33,29 @@ export interface SelectNextInput {
   readonly capacityAvailable?: boolean | undefined;
 }
 
+/** One policy constructor shared by initial selection and pre-delivery revalidation. */
+export function buildEligibilityPolicy(input: {
+  readonly config: RunmillConfig;
+  readonly leasedIssueIds: ReadonlySet<string>;
+  readonly capacityAvailable?: boolean | undefined;
+}): EligibilityPolicy {
+  const { config } = input;
+  return {
+    eligibleStates: config.backlog.eligibleStates,
+    includeLabels: config.backlog.includeLabels,
+    excludeLabels: config.backlog.excludeLabels,
+    repositoryRules: config.github.repositories,
+    capacityAvailable: input.capacityAvailable ?? true,
+    leasedIssueIds: input.leasedIssueIds,
+    allowUnassigned: config.backlog.allowUnassigned,
+    claimAssignee: config.backlog.claimAssignee,
+    maxEstimate: config.backlog.maxEstimate,
+    readinessOverrideLabel: config.backlog.includeLabels.includes("agent-ready")
+      ? "agent-ready"
+      : undefined,
+  };
+}
+
 /**
  * Deterministically choose the next issue to work on.
  *
@@ -45,20 +72,7 @@ export async function selectNext(input: SelectNextInput): Promise<SelectionResul
     states: config.backlog.eligibleStates,
   });
 
-  const policy = {
-    eligibleStates: config.backlog.eligibleStates,
-    includeLabels: config.backlog.includeLabels,
-    excludeLabels: config.backlog.excludeLabels,
-    repositoryRules: config.github.repositories,
-    capacityAvailable: input.capacityAvailable ?? true,
-    leasedIssueIds: input.leasedIssueIds,
-    allowUnassigned: config.backlog.allowUnassigned,
-    claimAssignee: config.backlog.claimAssignee,
-    maxEstimate: config.backlog.maxEstimate,
-    readinessOverrideLabel: config.backlog.includeLabels.includes("agent-ready")
-      ? "agent-ready"
-      : undefined,
-  };
+  const policy = buildEligibilityPolicy(input);
 
   const eligible: SelectedCandidate[] = [];
   const rejected: RejectedCandidate[] = [];

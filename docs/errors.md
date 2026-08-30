@@ -525,7 +525,7 @@ A check in the resolved manifest has no runnable command and no remote result. M
 **Fix (pick one)**
 
 - Add the command to .runmill/checks.yaml
-- `runmill policy explain <run-id>` — Show the resolved manifest
+- `runmill config validate` — Validate the configured repository checks
 
 Recoverable: the run can continue once resolved.
 

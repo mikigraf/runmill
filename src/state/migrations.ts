@@ -869,6 +869,38 @@ export const MIGRATIONS: readonly Migration[] = [
         ON leases(issue_id, run_id, generation, phase);
     `,
   },
+  {
+    version: 12,
+    name: "standalone_review_evidence",
+    up: `
+      -- Checks, findings, pull requests, worktrees, snapshots, policy
+      -- decisions, and run lineage already existed in v1. Reviews were the
+      -- sole missing standalone evidence relation; keep this migration
+      -- additive rather than duplicating the other journals.
+      CREATE TABLE reviews (
+        review_id        TEXT PRIMARY KEY,
+        run_id           TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+        candidate_sha    TEXT NOT NULL,
+        role             TEXT NOT NULL
+          CHECK (role IN ('local-reviewer', 'pr-reviewer')),
+        iteration        INTEGER NOT NULL CHECK (iteration > 0),
+        status           TEXT NOT NULL
+          CHECK (status IN ('completed', 'provider-failed', 'missing-output', 'invalid-output')),
+        verdict          TEXT
+          CHECK (verdict IS NULL OR verdict IN ('approved', 'changes_required', 'no_findings')),
+        scope_assessment TEXT
+          CHECK (scope_assessment IS NULL OR scope_assessment IN ('within_scope', 'out_of_scope', 'unclear')),
+        output_digest    TEXT,
+        output_text      TEXT,
+        accepted         INTEGER CHECK (accepted IS NULL OR accepted IN (0, 1)),
+        explanation      TEXT NOT NULL,
+        at               TEXT NOT NULL,
+        UNIQUE (run_id, candidate_sha, role, iteration)
+      );
+      CREATE INDEX idx_reviews_run_candidate
+        ON reviews(run_id, candidate_sha, role, iteration);
+    `,
+  },
 ];
 
 export const CURRENT_SCHEMA_VERSION = MIGRATIONS.reduce(

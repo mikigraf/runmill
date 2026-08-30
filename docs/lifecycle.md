@@ -96,6 +96,14 @@ adapter does not recognize quarantines the run rather than being parsed best-eff
 misreading a tool call or a terminal result is worse than stopping
 ([`RM-PROVIDER-001`](./errors.md#rm-provider-001)).
 
+The task packet and SQLite journal bind a canonical snapshot of every issue field Runmill uses or
+may need to audit, including routing, dependencies, assignment, rank, dates, terminal flags, and
+labels. The binding is a full SHA-256 fingerprint. Immediately before the first push and again
+before PR delivery or merge, Runmill re-reads the issue, removes only its exact durably confirmed
+claim-state and claim-assignee changes, reruns eligibility and repository resolution, and compares
+the complete fingerprint. Missing, malformed, changed, canceled, completed, or retargeted issue
+authority stops in `NEEDS_HUMAN` before the next mutation.
+
 The packet's path constraints are enforcement inputs, not prompt advice. Before every candidate
 checkpoint, Runmill computes the complete Git diff, normalizes every repository-relative path, and
 requires each path to match `allowed_paths` and none to match `forbidden_paths`. Forbidden rules win
@@ -218,11 +226,16 @@ drain-and-exit behavior.
 
 ## Observability
 
-Every run emits an ordered event log with a monotonic sequence number. `runmill inspect` renders
-state, transitions, events, check results with their evidence, and pending effects.
+Every run emits an ordered event log whose sequence number is allocated transactionally by the
+store. `runmill inspect` renders state; transition reasons and actors; workspace lifecycle; issue
+snapshot; candidate-bound check attempts; review outputs and findings; PR head/base/merge identity;
+persisted policy decisions; events; lease state; and pending effects. The JSON contract is additive:
+an absent singular observation is `null`, while absent collections are empty arrays.
 
 ```bash
 runmill inspect <run-id> --json | jq '.checks[] | {checkId, status, coverage, treeHashBefore, treeHashAfter}'
+runmill inspect <run-id> --json | jq '.reviews[] | {role, iteration, candidateSha, status, verdict}'
+runmill inspect <run-id> --json | jq '{issueSnapshot, workspace, pullRequest, findings, policyDecisions, transitions}'
 ```
 
 ## See also

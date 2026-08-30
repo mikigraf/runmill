@@ -456,7 +456,7 @@ export const ERROR_CATALOG = {
       "result. Merge-readiness fails closed rather than assuming coverage.",
     fixes: [
       { description: "Add the command to .runmill/checks.yaml" },
-      { description: "Show the resolved manifest", command: "runmill policy explain <run-id>" },
+      { description: "Validate the configured repository checks", command: "runmill config validate" },
     ],
     recoverable: true,
   },

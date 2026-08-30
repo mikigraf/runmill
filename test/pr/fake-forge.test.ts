@@ -13,6 +13,8 @@ const input = {
   branch: "runmill/ENG-1",
   workspacePath: "/workspace",
 };
+const CANDIDATE_SHA = "c".repeat(40);
+const BASE_SHA = "b".repeat(40);
 
 beforeEach(() => {
   gitMock.mockReset();
@@ -20,8 +22,18 @@ beforeEach(() => {
 });
 
 describe("FakeForgeAdapter push", () => {
-  it("does not record a branch or candidate head when Git rejects the push", async () => {
+  it("refuses a synthetic candidate identity before attempting a push", async () => {
     gitMock.mockResolvedValue("candidate-sha");
+    const adapter = new FakeForgeAdapter();
+
+    await expect(adapter.push(input)).rejects.toThrow(/non-object-id/iu);
+
+    expect(tryGitMock).not.toHaveBeenCalled();
+    expect(adapter.wasPushed(input.repo, input.branch)).toBe(false);
+  });
+
+  it("does not record a branch or candidate head when Git rejects the push", async () => {
+    gitMock.mockResolvedValue(CANDIDATE_SHA);
     tryGitMock.mockResolvedValue({
       ok: false,
       stdout: "",
@@ -53,7 +65,7 @@ describe("FakeForgeAdapter push", () => {
   });
 
   it("records the applied state before simulating a lost push response", async () => {
-    gitMock.mockResolvedValue("candidate-sha");
+    gitMock.mockResolvedValueOnce(CANDIDATE_SHA).mockResolvedValueOnce(BASE_SHA);
     tryGitMock.mockResolvedValue({ ok: true, stdout: "", stderr: "", code: 0 });
     const adapter = new FakeForgeAdapter({ applyThenTimeout: new Set(["push"]) });
 
@@ -71,13 +83,14 @@ describe("FakeForgeAdapter push", () => {
       body: "test",
       draft: true,
     });
-    expect(pullRequest.headSha).toBe("candidate-sha");
+    expect(pullRequest.headSha).toBe(CANDIDATE_SHA);
+    expect(pullRequest.baseSha).toBe(BASE_SHA);
   });
 });
 
 describe("FakeForgeAdapter lost mutation responses", () => {
   async function pushed(adapter: InstanceType<typeof FakeForgeAdapter>): Promise<void> {
-    gitMock.mockResolvedValue("candidate-sha");
+    gitMock.mockResolvedValueOnce(CANDIDATE_SHA).mockResolvedValueOnce(BASE_SHA);
     tryGitMock.mockResolvedValue({ ok: true, stdout: "", stderr: "", code: 0 });
     await adapter.push(input);
   }
@@ -90,6 +103,17 @@ describe("FakeForgeAdapter lost mutation responses", () => {
     body: "test",
     draft: true,
   };
+
+  it("refuses a synthetic base identity without creating a pull request", async () => {
+    gitMock.mockResolvedValueOnce(CANDIDATE_SHA).mockResolvedValueOnce("base-1");
+    tryGitMock.mockResolvedValue({ ok: true, stdout: "", stderr: "", code: 0 });
+    const adapter = new FakeForgeAdapter();
+    await adapter.push(input);
+
+    await expect(adapter.openPullRequest(pullRequestInput)).rejects.toThrow(/non-object-id/iu);
+
+    expect(adapter.openPullRequests()).toEqual([]);
+  });
 
   it("applies pull-request creation before losing its response", async () => {
     const adapter = new FakeForgeAdapter({
@@ -130,13 +154,13 @@ describe("FakeForgeAdapter lost mutation responses", () => {
         repo: input.repo,
         number: pr.number,
         method: "squash",
-        expectedHeadSha: "candidate-sha",
+        expectedHeadSha: CANDIDATE_SHA,
       }),
     ).rejects.toMatchObject({ retryable: true });
 
     expect(await adapter.getPullRequest({ repo: input.repo, number: pr.number })).toMatchObject({
       state: "merged",
-      mergeSha: `merge-${pr.number}`,
+      mergeSha: expect.stringMatching(/^[a-f0-9]{40}$/u),
     });
   });
 });

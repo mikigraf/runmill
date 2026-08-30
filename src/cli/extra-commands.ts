@@ -785,7 +785,7 @@ function registerInspect(program: Command, ctx: CommandContext): void {
   program
     .command("inspect")
     .argument("<run-id>", "run to inspect")
-    .description("Show a run's state, transitions, checks, and pending effects")
+    .description("Show a run's state, evidence, decisions, and pending effects")
     .action((runId: string) => {
       const store = StateStore.open(join(ctx.dataDir(), "runmill.db"));
       try {
@@ -798,8 +798,15 @@ function registerInspect(program: Command, ctx: CommandContext): void {
           process.exit(ctx.exitCodes.ok);
         }
 
-        const transitions = store.transitionHistory(runId);
+        const transitions = store.standaloneTransitionHistory(runId);
         const events = store.eventsFor(runId);
+        const checks = store.standaloneChecks(runId);
+        const reviews = store.standaloneReviews(runId);
+        const findings = store.standaloneFindings(runId);
+        const pullRequest = store.standalonePullRequest(runId);
+        const workspace = store.standaloneWorkspace(runId);
+        const issueSnapshot = store.standaloneIssueSnapshot(runId);
+        const policyDecisions = store.standalonePolicyDecisions(runId);
         const pending = store
           .pendingSideEffects()
           .filter((e) => e.runId === runId);
@@ -812,10 +819,61 @@ function registerInspect(program: Command, ctx: CommandContext): void {
             `  provider     ${run.provider}`,
             `  branch       ${run.branch ?? "-"}`,
             `  base commit  ${run.baseCommit ?? "-"}`,
+            `  candidate    ${run.candidateSha ?? "-"}`,
             `  lease        ${lease === undefined ? "released" : `${lease.phase}, generation ${lease.generation}, expires ${lease.expiresAt}`}`,
+            `  workspace    ${workspace === undefined ? "-" : `${workspace.status} ${workspace.path}`}`,
+            `  issue        ${issueSnapshot?.fingerprint ?? "-"}`,
+            `  pull request ${pullRequest === undefined ? "-" : `#${pullRequest.number} ${pullRequest.headSha}${pullRequest.mergeSha === null ? "" : ` → ${pullRequest.mergeSha}`}`}`,
             "",
             "  transitions",
-            ...transitions.map((t) => `    ${t.at}  ${t.from} → ${t.to}`),
+            ...transitions.map(
+              (t) =>
+                `    ${t.at}  ${t.from} → ${t.to}  actor=${t.actor}` +
+                (t.reason === null ? "" : `  reason=${t.reason}`),
+            ),
+            ...(checks.length === 0
+              ? []
+              : [
+                  "",
+                  "  checks",
+                  ...checks.map(
+                    (check) =>
+                      `    ${check.checkId}  candidate=${check.candidateSha} ` +
+                      `attempt=${check.attempt}  ${check.status ?? "unknown"} ` +
+                      `(${check.coverage ?? "unknown"})`,
+                  ),
+                ]),
+            ...(reviews.length === 0
+              ? []
+              : [
+                  "",
+                  "  reviews",
+                  ...reviews.map(
+                    (review) =>
+                      `    ${review.role}#${review.iteration}  candidate=${review.candidateSha} ` +
+                      `${review.status}  verdict=${review.verdict ?? "unknown"}`,
+                  ),
+                ]),
+            ...(findings.length === 0
+              ? []
+              : [
+                  "",
+                  "  findings",
+                  ...findings.map(
+                    (finding) =>
+                      `    ${finding.severity}  ${finding.findingId}  ${finding.status}`,
+                  ),
+                ]),
+            ...(policyDecisions.length === 0
+              ? []
+              : [
+                  "",
+                  "  policy decisions",
+                  ...policyDecisions.map(
+                    (decision) =>
+                      `    ${decision.seq}  ${decision.outcome}  ${decision.explanation}`,
+                  ),
+                ]),
             ...(events.length === 0
               ? []
               : [
@@ -834,7 +892,20 @@ function registerInspect(program: Command, ctx: CommandContext): void {
                   ),
                 ]),
           ].join("\n"),
-          { run, transitions, events, pending, lease },
+          {
+            run,
+            transitions,
+            events,
+            pending,
+            lease,
+            checks,
+            reviews,
+            findings,
+            pullRequest: pullRequest ?? null,
+            workspace: workspace ?? null,
+            issueSnapshot: issueSnapshot ?? null,
+            policyDecisions,
+          },
         );
       } finally {
         store.close();
@@ -916,37 +987,41 @@ function registerPolicy(program: Command, ctx: CommandContext): void {
           process.exit(ctx.exitCodes.ok);
         }
 
-        const terminal: Record<string, string> = {
-          PR_DELIVERED:
-            "Delivered a pull request. `pr-only` never merges by design.",
-          COMPLETED: "Every gate passed and the change was merged.",
-          NEEDS_HUMAN:
-            "A gate could not be satisfied deterministically, so it escalated.",
-          AWAITING_APPROVAL: "Branch protection requires an approving review.",
-          QUARANTINED: "Something happened that policy could not classify.",
-        };
+        const policyDecisions = store.standalonePolicyDecisions(runId);
+        const explanation =
+          policyDecisions.length === 0
+            ? "unknown"
+            : policyDecisions.some((decision) => decision.outcome === "refused")
+              ? "refused"
+              : policyDecisions.some((decision) => decision.outcome === "unknown")
+                ? "unknown"
+                : policyDecisions.some((decision) => decision.outcome === "withheld")
+                  ? "withheld"
+                  : "accepted";
 
         ctx.emit(
-          [
-            `${runId}  ${run.issueId}  ${run.state}`,
-            "",
-            `  ${terminal[run.state] ?? "Run is still in progress."}`,
-            "",
-            "  Gates, in the order they are evaluated:",
-            "    1. lease held with the current fencing generation",
-            "    2. local checks: discovered, executed, fresh, no undeclared skip",
-            "    3. review verdict, cross-checked against risk-escalating paths",
-            "    4. branch protection readable (unreadable is refused, not assumed empty)",
-            "    5. every required GitHub context satisfied",
-            "    6. merge credential provably cannot edit branch protection",
-            "    7. autonomy mode permits the classified risk",
-            "",
-            `  Detail:  runmill inspect ${runId}`,
-          ].join("\n"),
+          policyDecisions.length === 0
+            ? [
+                `${runId}  ${run.issueId}  ${run.state}`,
+                "",
+                "  Policy outcome is unknown: this run has no persisted policy evidence.",
+                "  Runmill will not reconstruct authority from its current configuration.",
+              ].join("\n")
+            : [
+                `${runId}  ${run.issueId}  ${run.state}  policy=${explanation}`,
+                "",
+                ...policyDecisions.map(
+                  (decision) =>
+                    `  ${decision.seq}. ${decision.outcome}: ${decision.explanation}`,
+                ),
+                "",
+                `  Detail:  runmill inspect ${runId}`,
+              ].join("\n"),
           {
             runId,
             state: run.state,
-            explanation: terminal[run.state] ?? "in progress",
+            explanation,
+            policyDecisions,
           },
         );
       } finally {
