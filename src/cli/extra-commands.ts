@@ -141,6 +141,7 @@ function registerLeases(program: Command, ctx: CommandContext): void {
                 ...active.map(
                   (lease) =>
                     `  ${lease.issueId}  run=${lease.runId} generation=${lease.generation} ` +
+                    `phase=${lease.phase} intent=${lease.pendingIntent ?? "none"} ` +
                     `expires=${lease.expiresAt}`,
                 ),
               ].join("\n"),
@@ -165,11 +166,18 @@ function registerLeases(program: Command, ctx: CommandContext): void {
         const lease = store.getLease(issueId);
         if (lease === undefined)
           ctx.fail(new Error(`no active local lease for ${issueId}`));
+        if (lease.refName === null || lease.refName !== leaseRefName(issueId)) {
+          ctx.fail(
+            new Error(
+              `local lease ${issueId} has no exact ref identity; preserve it for manual inspection`,
+            ),
+          );
+        }
 
         const remote = await tryGit(ctx.repoRoot(), [
           "ls-remote",
           "origin",
-          leaseRefName(issueId),
+          lease.refName,
         ]);
         if (!remote.ok) {
           ctx.fail(
@@ -189,7 +197,12 @@ function registerLeases(program: Command, ctx: CommandContext): void {
           );
         }
 
-        store.releaseLease(issueId, lease.runId);
+        store.resolveLeaseAbsent({
+          issueId,
+          runId: lease.runId,
+          generation: lease.generation,
+          refName: lease.refName,
+        });
         ctx.emit(
           `Cleared the local lease for ${issueId}; the remote ref was absent.`,
           { resolved: true, issueId, runId: lease.runId },
@@ -799,7 +812,7 @@ function registerInspect(program: Command, ctx: CommandContext): void {
             `  provider     ${run.provider}`,
             `  branch       ${run.branch ?? "-"}`,
             `  base commit  ${run.baseCommit ?? "-"}`,
-            `  lease        ${lease === undefined ? "released" : `held, generation ${lease.generation}, expires ${lease.expiresAt}`}`,
+            `  lease        ${lease === undefined ? "released" : `${lease.phase}, generation ${lease.generation}, expires ${lease.expiresAt}`}`,
             "",
             "  transitions",
             ...transitions.map((t) => `    ${t.at}  ${t.from} → ${t.to}`),

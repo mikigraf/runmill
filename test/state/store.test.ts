@@ -124,6 +124,72 @@ describe("StateStore.open", () => {
     expect(readdirSync(dir).sort()).toEqual(beforeFiles);
   });
 
+  it("migrates legacy active leases to unresolved acquiring state", () => {
+    const path = join(dir, "runmill.db");
+    const legacy = new Database(path);
+    const priorMigrations = MIGRATIONS.filter((migration) => migration.version <= 10);
+    for (const migration of priorMigrations) {
+      legacy.exec(migration.up);
+      legacy
+        .prepare(
+          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?,?,?)",
+        )
+        .run(migration.version, migration.name, "2026-08-06T09:00:00.000Z");
+      legacy.pragma(`user_version = ${migration.version}`);
+    }
+    legacy
+      .prepare(
+        `INSERT INTO runs(
+           run_id, issue_id, repo, provider, state, state_version, attempt,
+           created_at, updated_at
+         ) VALUES (?,?,?,?,?,1,1,?,?)`,
+      )
+      .run(
+        "run_legacy_lease",
+        "ENG-LEGACY",
+        "acme/platform",
+        "codex",
+        "CLAIMED",
+        "2026-08-06T09:00:00.000Z",
+        "2026-08-06T09:00:00.000Z",
+      );
+    legacy
+      .prepare(
+        `INSERT INTO leases(
+           issue_id, run_id, repo, generation, ref_name, acquired_at,
+           expires_at, heartbeat_at, host_id, pid, released_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,NULL)`,
+      )
+      .run(
+        "ENG-LEGACY",
+        "run_legacy_lease",
+        "acme/platform",
+        1,
+        "refs/runmill/leases/ENG-LEGACY",
+        "2026-08-06T09:00:00.000Z",
+        "2026-08-06T09:20:00.000Z",
+        "2026-08-06T09:00:00.000Z",
+        "legacy-host",
+        42,
+      );
+    legacy.close();
+
+    const migrated = StateStore.open(path, { clock });
+
+    expect(migrated.getLease("ENG-LEGACY")).toMatchObject({
+      phase: "acquiring",
+      pendingIntent: "acquire",
+      objectId: null,
+      expectedObjectId: null,
+      intendedObjectId: null,
+      observedObjectId: null,
+      intentAt: "2026-08-06T09:00:00.000Z",
+      observedAt: null,
+      confirmedAt: null,
+    });
+    migrated.close();
+  });
+
   it("backs the database up before migrating an existing file", () => {
     // An existing file at version 0: the audit record is real and must be
     // copied before any DDL touches it.
@@ -318,31 +384,124 @@ describe("side-effect outbox", () => {
   it("records intent BEFORE the remote call", () => {
     const store = open();
     store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    const key = store.intendSideEffect({
+    const begun = store.beginSideEffect({
       runId: "run_1",
       system: "backlog",
       operation: "claim-issue",
       target: "ENG-1",
     });
+    expect(begun.disposition).toBe("new");
     expect(store.pendingSideEffects()).toHaveLength(1);
-    expect(store.pendingSideEffects()[0]).toMatchObject({ key, status: "intended" });
+    expect(store.pendingSideEffects()[0]).toMatchObject({
+      key: begun.key,
+      status: "intended",
+    });
     store.close();
   });
 
-  it("derives a deterministic key from (run, operation, target)", () => {
+  it("returns pending without reopening or changing a duplicate intent", () => {
     const store = open();
     store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    const a = store.intendSideEffect({ runId: "run_1", system: "backlog", operation: "claim-issue", target: "ENG-1" });
-    const b = store.intendSideEffect({ runId: "run_1", system: "backlog", operation: "claim-issue", target: "ENG-1" });
-    expect(b).toBe(a);
+    const input = {
+      runId: "run_1",
+      system: "backlog",
+      operation: "claim-issue",
+      target: "ENG-1",
+    };
+    const first = store.beginSideEffect(input);
+    clock.advanceMinutes(5);
+    const duplicate = store.beginSideEffect(input);
+
+    expect(first.disposition).toBe("new");
+    expect(duplicate).toMatchObject({
+      key: first.key,
+      disposition: "pending",
+      effect: {
+        status: "intended",
+        intendedAt: "2026-08-06T10:00:00.000Z",
+        updatedAt: "2026-08-06T10:00:00.000Z",
+      },
+    });
     expect(store.pendingSideEffects()).toHaveLength(1);
     store.close();
+  });
+
+  it("returns confirmed without reopening a completed duplicate", () => {
+    const store = open();
+    store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
+    const input = {
+      runId: "run_1",
+      system: "github",
+      operation: "open-pr",
+      target: "acme/platform#runmill/ENG-1",
+    };
+    const first = store.beginSideEffect(input);
+    store.markSideEffectInFlight(first.key);
+    store.confirmSideEffect(first.key, "42");
+    const before = store.getSideEffect(first.key);
+    clock.advanceMinutes(5);
+
+    const duplicate = store.beginSideEffect(input);
+
+    expect(duplicate).toMatchObject({
+      key: first.key,
+      disposition: "confirmed",
+      effect: { status: "confirmed", remoteId: "42" },
+    });
+    expect(store.getSideEffect(first.key)).toEqual(before);
+    store.close();
+  });
+
+  it("refuses a deterministic-key binding contradiction", () => {
+    const store = open();
+    store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
+    store.beginSideEffect({
+      runId: "run_1",
+      system: "backlog",
+      operation: "claim-issue",
+      target: "ENG-1",
+    });
+
+    expect(() =>
+      store.beginSideEffect({
+        runId: "run_1",
+        system: "forge",
+        operation: "claim-issue",
+        target: "ENG-1",
+      }),
+    ).toThrow(/binding/iu);
+    store.close();
+  });
+
+  it("serializes duplicate begin calls across store connections", () => {
+    const path = join(dir, "runmill.db");
+    const firstStore = open();
+    firstStore.createRun({
+      runId: "run_1",
+      issueId: "ENG-1",
+      repo: "acme/platform",
+      provider: "codex",
+    });
+    const secondStore = StateStore.open(path, { clock });
+    const input = {
+      runId: "run_1",
+      system: "backlog",
+      operation: "claim-issue",
+      target: "ENG-1",
+    };
+
+    expect(firstStore.beginSideEffect(input).disposition).toBe("new");
+    expect(secondStore.beginSideEffect(input).disposition).toBe("pending");
+    expect(firstStore.pendingSideEffects()).toHaveLength(1);
+    expect(secondStore.pendingSideEffects()).toHaveLength(1);
+    secondStore.close();
+    firstStore.close();
   });
 
   it("moves intended -> in_flight -> confirmed and drops out of pending", () => {
     const store = open();
     store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    const key = store.intendSideEffect({ runId: "run_1", system: "github", operation: "open-pr", target: "acme/platform#-" });
+    const key = store.beginSideEffect({ runId: "run_1", system: "github", operation: "open-pr", target: "acme/platform#-" }).key;
     store.markSideEffectInFlight(key);
     expect(store.pendingSideEffects()[0]?.status).toBe("in_flight");
     store.confirmSideEffect(key, "42");
@@ -356,7 +515,7 @@ describe("side-effect outbox", () => {
     // recovery sweep until a reconcile query proves what actually happened.
     const store = open();
     store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    const key = store.intendSideEffect({ runId: "run_1", system: "github", operation: "merge", target: "acme/platform#7" });
+    const key = store.beginSideEffect({ runId: "run_1", system: "github", operation: "merge", target: "acme/platform#7" }).key;
     store.markSideEffectInFlight(key);
     store.failSideEffect(key, "timeout, outcome unknown");
     const pending = store.pendingSideEffects();
@@ -368,12 +527,12 @@ describe("side-effect outbox", () => {
   it("records an operator-verified outcome and removes it from pending", () => {
     const store = open();
     store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    const key = store.intendSideEffect({
+    const key = store.beginSideEffect({
       runId: "run_1",
       system: "github",
       operation: "merge",
       target: "acme/platform#7",
-    });
+    }).key;
     store.markSideEffectInFlight(key);
     store.failSideEffect(key, "timeout, outcome unknown");
 
@@ -392,7 +551,7 @@ describe("side-effect outbox", () => {
   it("survives a crash: intent written before the call is visible on reopen", () => {
     const a = open();
     a.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    a.intendSideEffect({ runId: "run_1", system: "backlog", operation: "claim-issue", target: "ENG-1" });
+    a.beginSideEffect({ runId: "run_1", system: "backlog", operation: "claim-issue", target: "ENG-1" });
     a.close(); // simulates process death after intent, before the remote call
 
     const b = open();
@@ -400,6 +559,27 @@ describe("side-effect outbox", () => {
     expect(pending).toHaveLength(1);
     expect(pending[0]).toMatchObject({ operation: "claim-issue", status: "intended" });
     b.close();
+  });
+
+  it("requires every status transition to affect exactly one legal row", () => {
+    const store = open();
+    store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
+    const key = store.beginSideEffect({
+      runId: "run_1",
+      system: "github",
+      operation: "merge",
+      target: "acme/platform#7",
+    }).key;
+
+    expect(() => store.confirmSideEffect(key)).toThrow(/transition/iu);
+    store.markSideEffectInFlight(key);
+    expect(() => store.markSideEffectInFlight(key)).toThrow(/transition/iu);
+    store.failSideEffect(key, "response lost");
+    expect(() => store.failSideEffect(key, "again")).toThrow(/transition/iu);
+    store.resolveSideEffect(key, "not-applied");
+    expect(() => store.confirmSideEffect(key)).toThrow(/transition/iu);
+    expect(() => store.markSideEffectInFlight("missing")).toThrow(/transition/iu);
+    store.close();
   });
 });
 
@@ -433,14 +613,222 @@ describe("durable budget ledger", () => {
 });
 
 describe("leases", () => {
+  const OBJECT_A = "a".repeat(40);
+  const OBJECT_B = "b".repeat(40);
+
+  function beginAcquisition(
+    store: StateStore,
+    runId: string,
+    issueId = "ENG-1",
+    objectId = OBJECT_A,
+  ): void {
+    store.beginLeaseAcquisition({
+      issueId,
+      runId,
+      repo: "acme/platform",
+      generation: 1,
+      refName: `refs/runmill/leases/${issueId}`,
+      objectId,
+      acquiredAt: "2026-08-06T10:00:00.000Z",
+      expiresAt: "2026-08-06T10:20:00.000Z",
+      heartbeatAt: "2026-08-06T10:00:00.000Z",
+      hostId: "host-1",
+      pid: 123,
+    });
+  }
+
+  function confirmHeld(
+    store: StateStore,
+    runId: string,
+    issueId = "ENG-1",
+    objectId = OBJECT_A,
+  ): void {
+    expect(
+      store.reconcileLeaseObservation({
+        issueId,
+        runId,
+        generation: 1,
+        refName: `refs/runmill/leases/${issueId}`,
+        objectId,
+        observedObjectId: objectId,
+      }),
+    ).toMatchObject({ outcome: "intended", phase: "held" });
+  }
+
   it("allows only one active lease per issue", () => {
     const store = open();
     store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
     store.createRun({ runId: "run_2", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    store.recordLease({ issueId: "ENG-1", runId: "run_1", generation: 1, repo: "acme/platform", expiresAt: "2026-08-06T10:20:00Z" });
+    beginAcquisition(store, "run_1");
     expect(() =>
-      store.recordLease({ issueId: "ENG-1", runId: "run_2", generation: 1, repo: "acme/platform", expiresAt: "2026-08-06T10:20:00Z" }),
+      beginAcquisition(store, "run_2"),
     ).toThrow();
+    store.close();
+  });
+
+  it("persists acquisition intent before it can be confirmed held", () => {
+    const store = open();
+    store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
+
+    beginAcquisition(store, "run_1");
+
+    expect(store.getLease("ENG-1")).toMatchObject({
+      issueId: "ENG-1",
+      runId: "run_1",
+      repo: "acme/platform",
+      generation: 1,
+      refName: "refs/runmill/leases/ENG-1",
+      objectId: OBJECT_A,
+      phase: "acquiring",
+      pendingIntent: "acquire",
+      expectedObjectId: null,
+      intendedObjectId: OBJECT_A,
+      observedObjectId: null,
+      observedAt: null,
+    });
+    store.close();
+  });
+
+  it.each([
+    { label: "exact intended object", observed: OBJECT_A, outcome: "intended", phase: "held" },
+    { label: "exact absence", observed: null, outcome: "absent", phase: "released" },
+    {
+      label: "contradictory object",
+      observed: OBJECT_B,
+      outcome: "contradictory",
+      phase: "acquiring",
+    },
+  ] as const)("reconciles acquisition after observing $label", ({ observed, outcome, phase }) => {
+    const store = open();
+    store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
+    beginAcquisition(store, "run_1");
+
+    expect(
+      store.reconcileLeaseObservation({
+        issueId: "ENG-1",
+        runId: "run_1",
+        generation: 1,
+        refName: "refs/runmill/leases/ENG-1",
+        objectId: OBJECT_A,
+        observedObjectId: observed,
+      }),
+    ).toMatchObject({ outcome, phase });
+    const record = store.getLeaseRecord("ENG-1", "run_1", 1);
+    expect(record).toMatchObject({
+      phase,
+      observedObjectId: observed,
+      observedAt: "2026-08-06T10:00:00.000Z",
+      pendingIntent: phase === "acquiring" ? "acquire" : null,
+    });
+    expect(store.activeLeaseIssueIds().has("ENG-1")).toBe(phase !== "released");
+    store.close();
+  });
+
+  it.each([
+    { label: "exact absence", observed: null, outcome: "absent", phase: "released" },
+    { label: "unchanged expected object", observed: OBJECT_A, outcome: "expected", phase: "held" },
+    {
+      label: "a fenced object",
+      observed: OBJECT_B,
+      outcome: "contradictory",
+      phase: "releasing",
+    },
+  ] as const)("reconciles release after observing $label", ({ observed, outcome, phase }) => {
+    const store = open();
+    store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
+    beginAcquisition(store, "run_1");
+    confirmHeld(store, "run_1");
+    store.beginLeaseRelease({
+      issueId: "ENG-1",
+      runId: "run_1",
+      generation: 1,
+      refName: "refs/runmill/leases/ENG-1",
+      objectId: OBJECT_A,
+    });
+    expect(store.getLease("ENG-1")).toMatchObject({
+      phase: "releasing",
+      pendingIntent: "release",
+      expectedObjectId: OBJECT_A,
+      intendedObjectId: null,
+      observedAt: null,
+      confirmedAt: null,
+    });
+
+    expect(
+      store.reconcileLeaseObservation({
+        issueId: "ENG-1",
+        runId: "run_1",
+        generation: 1,
+        refName: "refs/runmill/leases/ENG-1",
+        objectId: OBJECT_A,
+        observedObjectId: observed,
+      }),
+    ).toMatchObject({ outcome, phase });
+    expect(store.getLeaseRecord("ENG-1", "run_1", 1)).toMatchObject({
+      phase,
+      pendingIntent: phase === "releasing" ? "release" : null,
+      observedObjectId: observed,
+    });
+    store.close();
+  });
+
+  it("retains acquisition and release intent across process crashes", () => {
+    const first = open();
+    first.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
+    beginAcquisition(first, "run_1");
+    first.close();
+
+    const acquisitionRecovery = open();
+    expect(acquisitionRecovery.getLease("ENG-1")).toMatchObject({
+      phase: "acquiring",
+      pendingIntent: "acquire",
+    });
+    confirmHeld(acquisitionRecovery, "run_1");
+    acquisitionRecovery.beginLeaseRelease({
+      issueId: "ENG-1",
+      runId: "run_1",
+      generation: 1,
+      refName: "refs/runmill/leases/ENG-1",
+      objectId: OBJECT_A,
+    });
+    acquisitionRecovery.close();
+
+    const releaseRecovery = open();
+    expect(releaseRecovery.getLease("ENG-1")).toMatchObject({
+      phase: "releasing",
+      pendingIntent: "release",
+      expectedObjectId: OBJECT_A,
+      intendedObjectId: null,
+    });
+    releaseRecovery.close();
+  });
+
+  it("refuses stale or contradictory lease identity transitions", () => {
+    const store = open();
+    store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
+    beginAcquisition(store, "run_1");
+    confirmHeld(store, "run_1");
+
+    expect(() =>
+      store.beginLeaseRelease({
+        issueId: "ENG-1",
+        runId: "run_1",
+        generation: 1,
+        refName: "refs/runmill/leases/ENG-1",
+        objectId: OBJECT_B,
+      }),
+    ).toThrow(/transition/iu);
+    expect(() =>
+      store.reconcileLeaseObservation({
+        issueId: "ENG-1",
+        runId: "run_1",
+        generation: 2,
+        refName: "refs/runmill/leases/ENG-1",
+        objectId: OBJECT_A,
+        observedObjectId: OBJECT_A,
+      }),
+    ).toThrow(/identity/iu);
+    expect(store.getLease("ENG-1")).toMatchObject({ phase: "held" });
     store.close();
   });
 
@@ -448,10 +836,25 @@ describe("leases", () => {
     const store = open();
     store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
     store.createRun({ runId: "run_2", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    store.recordLease({ issueId: "ENG-1", runId: "run_1", generation: 1, repo: "acme/platform", expiresAt: "2026-08-06T10:20:00Z" });
-    store.releaseLease("ENG-1", "run_1");
+    beginAcquisition(store, "run_1");
+    confirmHeld(store, "run_1");
+    store.beginLeaseRelease({
+      issueId: "ENG-1",
+      runId: "run_1",
+      generation: 1,
+      refName: "refs/runmill/leases/ENG-1",
+      objectId: OBJECT_A,
+    });
+    store.reconcileLeaseObservation({
+      issueId: "ENG-1",
+      runId: "run_1",
+      generation: 1,
+      refName: "refs/runmill/leases/ENG-1",
+      objectId: OBJECT_A,
+      observedObjectId: null,
+    });
     expect(() =>
-      store.recordLease({ issueId: "ENG-1", runId: "run_2", generation: 2, repo: "acme/platform", expiresAt: "2026-08-06T10:20:00Z" }),
+      beginAcquisition(store, "run_2", "ENG-1", OBJECT_B),
     ).not.toThrow();
     store.close();
   });
@@ -459,7 +862,7 @@ describe("leases", () => {
   it("reports the set of actively leased issues for eligibility", () => {
     const store = open();
     store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    store.recordLease({ issueId: "ENG-1", runId: "run_1", generation: 1, repo: "acme/platform", expiresAt: "2026-08-06T10:20:00Z" });
+    beginAcquisition(store, "run_1");
     expect([...store.activeLeaseIssueIds()]).toEqual(["ENG-1"]);
     store.close();
   });
@@ -467,7 +870,8 @@ describe("leases", () => {
   it("heartbeat extends expiry and records the moment", () => {
     const store = open();
     store.createRun({ runId: "run_1", issueId: "ENG-1", repo: "acme/platform", provider: "codex" });
-    store.recordLease({ issueId: "ENG-1", runId: "run_1", generation: 1, repo: "acme/platform", expiresAt: "2026-08-06T10:20:00Z" });
+    beginAcquisition(store, "run_1");
+    confirmHeld(store, "run_1");
     clock.advanceMinutes(5);
     store.heartbeatLease("ENG-1", "run_1", "2026-08-06T10:25:00Z");
     const lease = store.getLease("ENG-1");

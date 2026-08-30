@@ -859,12 +859,12 @@ describe("effects", () => {
       repo: "acme/widget",
       provider: "codex",
     });
-    const key = store.intendSideEffect({
+    const key = store.beginSideEffect({
       runId: "run_effect",
       system: "github",
       operation: "merge",
       target: "acme/widget#17",
-    });
+    }).key;
     store.markSideEffectInFlight(key);
     store.failSideEffect(key, "connection closed after request");
     store.close();
@@ -920,13 +920,27 @@ describe("leases", () => {
     const store = StateStore.open(join(data, "runmill.db"), { clock: new SystemClock() });
     const runId = `run_${issueId}`;
     store.createRun({ runId, issueId, repo: "acme/widget", provider: "codex" });
-    store.recordLease({
+    const objectId = "a".repeat(40);
+    store.beginLeaseAcquisition({
       issueId,
       runId,
       repo: "acme/widget",
       generation: 1,
-      expiresAt: "2026-08-21T10:00:00.000Z",
       refName: leaseRefName(issueId),
+      objectId,
+      acquiredAt: "2026-08-21T09:40:00.000Z",
+      expiresAt: "2026-08-21T10:00:00.000Z",
+      heartbeatAt: "2026-08-21T09:40:00.000Z",
+      hostId: "test-host",
+      pid: 123,
+    });
+    store.reconcileLeaseObservation({
+      issueId,
+      runId,
+      generation: 1,
+      refName: leaseRefName(issueId),
+      objectId,
+      observedObjectId: objectId,
     });
     store.close();
     return origin;

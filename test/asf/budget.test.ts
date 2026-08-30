@@ -32,6 +32,25 @@ const DIGEST_C = `sha256:${"c".repeat(64)}`;
 const DIGEST_D = `sha256:${"d".repeat(64)}`;
 const OWNER = "budget-worker-01";
 
+function removeStandaloneLeaseIntentSchema(database: Database.Database): void {
+  database.exec(`
+    DROP INDEX idx_leases_identity;
+    DROP INDEX idx_leases_active;
+    ALTER TABLE leases DROP COLUMN confirmed_at;
+    ALTER TABLE leases DROP COLUMN observed_at;
+    ALTER TABLE leases DROP COLUMN intent_at;
+    ALTER TABLE leases DROP COLUMN pending_intent;
+    ALTER TABLE leases DROP COLUMN observed_object_id;
+    ALTER TABLE leases DROP COLUMN intended_object_id;
+    ALTER TABLE leases DROP COLUMN expected_object_id;
+    ALTER TABLE leases DROP COLUMN object_id;
+    ALTER TABLE leases DROP COLUMN phase;
+    CREATE UNIQUE INDEX idx_leases_active
+      ON leases(issue_id) WHERE released_at IS NULL;
+    DELETE FROM schema_migrations WHERE version = 11;
+  `);
+}
+
 let directory: string;
 let clock: FakeClock;
 const stores = new Set<StateStore>();
@@ -727,6 +746,7 @@ describe("durable ASF provider budgets", () => {
     // Recreate the exact pre-v9 crash window: reconciliation was durably
     // resolved, but the old provider ledger could only retain `reserved`.
     const legacy = new Database(databasePath());
+    removeStandaloneLeaseIntentSchema(legacy);
     const providerV5 = MIGRATIONS.find((migration) => migration.version === 5);
     if (providerV5 === undefined) throw new Error("provider v5 migration missing");
     legacy.pragma("foreign_keys = OFF");

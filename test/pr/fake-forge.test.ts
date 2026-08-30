@@ -74,3 +74,69 @@ describe("FakeForgeAdapter push", () => {
     expect(pullRequest.headSha).toBe("candidate-sha");
   });
 });
+
+describe("FakeForgeAdapter lost mutation responses", () => {
+  async function pushed(adapter: InstanceType<typeof FakeForgeAdapter>): Promise<void> {
+    gitMock.mockResolvedValue("candidate-sha");
+    tryGitMock.mockResolvedValue({ ok: true, stdout: "", stderr: "", code: 0 });
+    await adapter.push(input);
+  }
+
+  const pullRequestInput = {
+    repo: input.repo,
+    branch: input.branch,
+    baseBranch: "main",
+    title: "test",
+    body: "test",
+    draft: true,
+  };
+
+  it("applies pull-request creation before losing its response", async () => {
+    const adapter = new FakeForgeAdapter({
+      applyThenTimeout: new Set(["openPullRequest"]),
+    });
+    await pushed(adapter);
+
+    await expect(adapter.openPullRequest(pullRequestInput)).rejects.toMatchObject({
+      retryable: true,
+    });
+
+    expect(adapter.openPullRequests()).toHaveLength(1);
+  });
+
+  it("applies mark-ready before losing its response", async () => {
+    const adapter = new FakeForgeAdapter();
+    await pushed(adapter);
+    const pr = await adapter.openPullRequest(pullRequestInput);
+    adapter.setOptions({ applyThenTimeout: new Set(["markReadyForReview"]) });
+
+    await expect(
+      adapter.markReadyForReview({ repo: input.repo, number: pr.number }),
+    ).rejects.toMatchObject({ retryable: true });
+
+    expect(await adapter.getPullRequest({ repo: input.repo, number: pr.number })).toMatchObject({
+      draft: false,
+    });
+  });
+
+  it("applies merge before losing its response", async () => {
+    const adapter = new FakeForgeAdapter();
+    await pushed(adapter);
+    const pr = await adapter.openPullRequest({ ...pullRequestInput, draft: false });
+    adapter.setOptions({ applyThenTimeout: new Set(["merge"]) });
+
+    await expect(
+      adapter.merge({
+        repo: input.repo,
+        number: pr.number,
+        method: "squash",
+        expectedHeadSha: "candidate-sha",
+      }),
+    ).rejects.toMatchObject({ retryable: true });
+
+    expect(await adapter.getPullRequest({ repo: input.repo, number: pr.number })).toMatchObject({
+      state: "merged",
+      mergeSha: `merge-${pr.number}`,
+    });
+  });
+});

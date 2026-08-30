@@ -53,6 +53,25 @@ const DIGEST_B = `sha256:${"b".repeat(64)}`;
 const DIGEST_C = `sha256:${"c".repeat(64)}`;
 const DIGEST_D = `sha256:${"d".repeat(64)}`;
 const OBSERVATION_A = sha256Digest({ observation: "applied" });
+
+function removeStandaloneLeaseIntentSchema(database: Database.Database): void {
+  database.exec(`
+    DROP INDEX idx_leases_identity;
+    DROP INDEX idx_leases_active;
+    ALTER TABLE leases DROP COLUMN confirmed_at;
+    ALTER TABLE leases DROP COLUMN observed_at;
+    ALTER TABLE leases DROP COLUMN intent_at;
+    ALTER TABLE leases DROP COLUMN pending_intent;
+    ALTER TABLE leases DROP COLUMN observed_object_id;
+    ALTER TABLE leases DROP COLUMN intended_object_id;
+    ALTER TABLE leases DROP COLUMN expected_object_id;
+    ALTER TABLE leases DROP COLUMN object_id;
+    ALTER TABLE leases DROP COLUMN phase;
+    CREATE UNIQUE INDEX idx_leases_active
+      ON leases(issue_id) WHERE released_at IS NULL;
+    DELETE FROM schema_migrations WHERE version = 11;
+  `);
+}
 const OBSERVATION_B = sha256Digest({ observation: "different" });
 
 let directory: string;
@@ -1233,6 +1252,7 @@ describe("ASF completion delivery-policy binding", () => {
     close(store);
 
     const legacy = new Database(databasePath());
+    removeStandaloneLeaseIntentSchema(legacy);
     legacy
       .prepare(
         `UPDATE asf_evidence_bundles
@@ -1289,6 +1309,7 @@ describe("ASF completion delivery-policy binding", () => {
     close(store);
 
     const legacy = new Database(databasePath());
+    removeStandaloneLeaseIntentSchema(legacy);
     legacy
       .prepare(
         `UPDATE asf_terminal_evidence_bundles

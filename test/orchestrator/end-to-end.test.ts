@@ -344,25 +344,25 @@ describe.skip("end-to-end: issue to governed pull request (pending qualified san
       repo: "acme/platform",
       provider: "codex",
     });
-    const key = store.intendSideEffect({
+    const key = store.beginSideEffect({
       runId: "run_ambiguous",
       system: "github",
       operation: "merge",
       target: "acme/platform#9",
-    });
+    }).key;
     store.markSideEffectInFlight(key);
     store.failSideEffect(key, "response lost");
 
     const { orchestrator, forge, backlog } = makeOrchestrator({});
-    const outcome = await orchestrator.run({
-      runId: "run_blocked",
-      issue: ISSUE,
-      target: TARGET,
-      lease: lease("run_blocked"),
-    });
+    await expect(
+      orchestrator.run({
+        runId: "run_blocked",
+        issue: ISSUE,
+        target: TARGET,
+        lease: lease("run_blocked"),
+      }),
+    ).rejects.toMatchObject({ code: "RM-STATE-002" });
 
-    expect(outcome.finalState).toBe("NEEDS_HUMAN");
-    expect(outcome.reason).toContain("RM-STATE-002");
     expect(store.getRun("run_blocked")).toBeUndefined();
     expect(forge.calls).toHaveLength(0);
     expect(backlog.calls).toHaveLength(0);
@@ -424,11 +424,8 @@ describe.skip("end-to-end: issue to governed pull request (pending qualified san
 
   it("clears the lease in the state store, not only the git ref", async () => {
     // The ref and the store are two records of the same fact, and selection
-    // reads the store. recordLease was called on claim and releaseLease was
-    // called nowhere, so every issue that was ever claimed stayed "actively
-    // leased" forever: a run that escalated could never be retried, and
-    // `runmill resume` reported success while the next run answered
-    // "not-leased: issue is actively leased by another run".
+    // reads the store. Both acquisition and release therefore need exact,
+    // durable confirmation before selection may trust the local row.
     const { orchestrator: o1 } = makeOrchestrator({});
     await o1.run({
       runId: "run_store_lease",
@@ -573,6 +570,267 @@ verification:
 });
 
 describe("end-to-end refusal boundaries", () => {
+  it("propagates a pre-run refusal instead of manufacturing an outcome for a missing run", async () => {
+    store.createRun({
+      runId: "run_prior",
+      issueId: "ENG-9",
+      repo: "acme/platform",
+      provider: "codex",
+    });
+    const effect = store.beginSideEffect({
+      runId: "run_prior",
+      system: "forge",
+      operation: "merge",
+      target: "acme/platform#9",
+    });
+    store.markSideEffectInFlight(effect.key);
+    store.failSideEffect(effect.key, "response lost");
+    const { orchestrator, forge, backlog } = makeOrchestrator({});
+
+    await expect(
+      orchestrator.run({
+        runId: "run_blocked_before_creation",
+        issue: ISSUE,
+        target: TARGET,
+        lease: lease("run_blocked_before_creation"),
+      }),
+    ).rejects.toMatchObject({ code: "RM-STATE-002" });
+
+    expect(store.getRun("run_blocked_before_creation")).toBeUndefined();
+    expect(forge.calls).toHaveLength(0);
+    expect(backlog.calls).toHaveLength(0);
+  });
+
+  it("never converts a failed terminal CAS into a second terminal state", async () => {
+    const originalTransition = store.transitionRun.bind(store);
+    const attemptedStates: string[] = [];
+    Object.defineProperty(store, "transitionRun", {
+      configurable: true,
+      value: (
+        runId: string,
+        options: Parameters<StateStore["transitionRun"]>[1],
+      ): void => {
+        attemptedStates.push(options.to);
+        if (options.to === "COMPLETED") {
+          throw new Error("terminal state storage unavailable");
+        }
+        originalTransition(runId, options);
+      },
+    });
+    const cfg = { ...config(), autonomy: "observe" as const };
+    const { orchestrator } = makeOrchestrator({ cfg });
+
+    await expect(
+      orchestrator.run({
+        runId: "run_terminal_write_failure",
+        issue: ISSUE,
+        target: TARGET,
+        lease: lease("run_terminal_write_failure"),
+      }),
+    ).rejects.toThrow(/terminal state storage unavailable/iu);
+
+    expect(attemptedStates).toEqual(["ELIGIBILITY_CHECKED", "COMPLETED"]);
+    expect(store.getRun("run_terminal_write_failure")).toMatchObject({
+      state: "ELIGIBILITY_CHECKED",
+      stateVersion: 2,
+    });
+  });
+
+  it("confirms a lost acquisition response from the exact remote object before claiming", async () => {
+    let leaseAtMutation: ReturnType<StateStore["getLease"]> = undefined;
+    class StopAfterLeaseBacklog extends FakeBacklogAdapter {
+      override async transitionState(input: {
+        identifier: string;
+        toState: string;
+      }): Promise<void> {
+        leaseAtMutation = store.getLease(input.identifier);
+        throw new BacklogMutationNotStartedError(
+          "transitionState",
+          "stop after observing the durable lease",
+        );
+      }
+    }
+    const backlog = new StopAfterLeaseBacklog([ISSUE]);
+    const runLease = lease("run_lost_acquire_response");
+    const publish = runLease.publishAcquire.bind(runLease);
+    Object.defineProperty(runLease, "publishAcquire", {
+      configurable: true,
+      value: async (
+        prepared: Parameters<GitRefLease["publishAcquire"]>[0],
+      ): Promise<void> => {
+        await publish(prepared);
+        throw new Error("acquire response lost");
+      },
+    });
+    const { orchestrator } = makeOrchestrator({ backlog });
+
+    const outcome = await orchestrator.run({
+      runId: "run_lost_acquire_response",
+      issue: ISSUE,
+      target: TARGET,
+      lease: runLease,
+    });
+
+    expect(outcome.finalState).toBe("QUARANTINED");
+    expect(leaseAtMutation).toMatchObject({
+      phase: "held",
+      pendingIntent: null,
+      observedObjectId: expect.any(String),
+    });
+  });
+
+  it("retains an acquisition intent when exact remote observation is unavailable", async () => {
+    const runLease = lease("run_unknown_acquire");
+    Object.defineProperty(runLease, "observeObjectId", {
+      configurable: true,
+      value: async (): Promise<string | undefined> => {
+        throw new Error("remote observation unavailable");
+      },
+    });
+    const { orchestrator, backlog } = makeOrchestrator({});
+
+    const outcome = await orchestrator.run({
+      runId: "run_unknown_acquire",
+      issue: ISSUE,
+      target: TARGET,
+      lease: runLease,
+    });
+
+    expect(outcome.finalState).toBe("QUARANTINED");
+    expect(backlog.calls).toHaveLength(0);
+    expect(store.getLease(ISSUE.identifier)).toMatchObject({
+      phase: "acquiring",
+      pendingIntent: "acquire",
+      observedAt: null,
+    });
+  });
+
+  it("retains the distributed fence while an external mutation is ambiguous", async () => {
+    const backlog = new FakeBacklogAdapter([ISSUE], {
+      applyThenTimeout: new Set(["transitionState"]),
+    });
+    const runLease = lease("run_ambiguous_claim");
+    const { orchestrator } = makeOrchestrator({ backlog });
+
+    const outcome = await orchestrator.run({
+      runId: "run_ambiguous_claim",
+      issue: ISSUE,
+      target: TARGET,
+      lease: runLease,
+    });
+
+    expect(outcome.finalState).toBe("QUARANTINED");
+    expect(store.pendingSideEffects()).toContainEqual(
+      expect.objectContaining({
+        runId: "run_ambiguous_claim",
+        operation: "transition-claim",
+        status: "failed",
+      }),
+    );
+    expect(store.getLease(ISSUE.identifier)).toMatchObject({
+      runId: "run_ambiguous_claim",
+      phase: "held",
+      pendingIntent: null,
+    });
+    expect(await lease("observer").read(ISSUE.identifier)).toMatchObject({
+      runId: "run_ambiguous_claim",
+      generation: 1,
+    });
+    expect(backlog.peek(ISSUE.identifier)).toMatchObject({ state: "In Progress" });
+  });
+
+  it("retains the distributed fence when backlog ownership restoration cannot apply", async () => {
+    class UnrestorableBacklog extends FakeBacklogAdapter {
+      override async transitionState(input: {
+        identifier: string;
+        toState: string;
+      }): Promise<void> {
+        if (input.toState === ISSUE.state) {
+          throw new BacklogMutationNotStartedError(
+            "transitionState",
+            "the prior workflow state no longer exists",
+          );
+        }
+        return super.transitionState(input);
+      }
+
+      override async assign(): Promise<void> {
+        throw new BacklogMutationNotStartedError(
+          "assign",
+          "the automation assignee no longer exists",
+        );
+      }
+    }
+    const base = config();
+    const cfg = {
+      ...base,
+      backlog: { ...base.backlog, claimAssignee: "runmill-bot" },
+    };
+    const backlog = new UnrestorableBacklog([ISSUE]);
+    const { orchestrator } = makeOrchestrator({ backlog, cfg });
+
+    const outcome = await orchestrator.run({
+      runId: "run_unrestorable_claim",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_unrestorable_claim"),
+    });
+
+    expect(outcome.finalState).toBe("QUARANTINED");
+    expect(store.pendingSideEffects()).toHaveLength(0);
+    expect(backlog.peek(ISSUE.identifier)).toMatchObject({ state: "In Progress" });
+    expect(store.getLease(ISSUE.identifier)).toMatchObject({
+      runId: "run_unrestorable_claim",
+      phase: "held",
+    });
+    expect(await lease("observer").read(ISSUE.identifier)).toMatchObject({
+      runId: "run_unrestorable_claim",
+    });
+  });
+
+  it("confirms a lost release response from exact remote absence", async () => {
+    class StopAfterLeaseBacklog extends FakeBacklogAdapter {
+      override async transitionState(): Promise<void> {
+        throw new BacklogMutationNotStartedError(
+          "transitionState",
+          "stop before workspace creation",
+        );
+      }
+    }
+    const runLease = lease("run_lost_release_response");
+    const publish = runLease.publishRelease.bind(runLease);
+    Object.defineProperty(runLease, "publishRelease", {
+      configurable: true,
+      value: async (
+        held: Parameters<GitRefLease["publishRelease"]>[0],
+      ): Promise<void> => {
+        await publish(held);
+        throw new Error("release response lost");
+      },
+    });
+    const { orchestrator } = makeOrchestrator({
+      backlog: new StopAfterLeaseBacklog([ISSUE]),
+    });
+
+    const outcome = await orchestrator.run({
+      runId: "run_lost_release_response",
+      issue: ISSUE,
+      target: TARGET,
+      lease: runLease,
+    });
+
+    expect(outcome.finalState).toBe("QUARANTINED");
+    expect(store.getLease(ISSUE.identifier)).toBeUndefined();
+    expect(
+      store.getLeaseRecord(ISSUE.identifier, "run_lost_release_response", 1),
+    ).toMatchObject({
+      phase: "released",
+      pendingIntent: null,
+      observedObjectId: null,
+      observedAt: expect.any(String),
+    });
+  });
+
   it.each(["ancestor", "target"] as const)(
     "refuses a planted runtime-input %s symlink before any provider call",
     async (kind) => {

@@ -22,7 +22,11 @@ import { buildTaskPacket, renderIssueDocument } from "../agent/task-packet.js";
 import { outputPathFor, readStructuredOutput } from "../agent/output-contract.js";
 import { parseReviewJson, blockingFindings, crossCheckVerdict, type Review } from "../review/schema.js";
 import { reconcileChecks, type CheckMapping, type ReconcileVerdict } from "../pr/reconcile.js";
-import { GitRefLease, type HeldLease } from "../queue/git-lease.js";
+import {
+  GitRefLease,
+  LeaseConflictError,
+  type HeldLease,
+} from "../queue/git-lease.js";
 import { RunmillError , errorMessage } from "../errors/runmill-error.js";
 import { renderPullRequestBody } from "./pr-body.js";
 import { snapshotHash } from "../domain/snapshot.js";
@@ -113,6 +117,16 @@ export interface RunOutcome {
   readonly costUsd: number;
   readonly agentInvocations?: number | undefined;
   readonly reason?: string | undefined;
+}
+
+class TerminalStatePersistenceError extends Error {
+  constructor(runId: string, state: RunState, cause: unknown) {
+    super(
+      `terminal state ${state} for ${runId} could not be persisted: ${errorMessage(cause)}`,
+      { cause },
+    );
+    this.name = "TerminalStatePersistenceError";
+  }
 }
 
 /**
@@ -386,19 +400,145 @@ export class Orchestrator {
   }
 
 
-  /**
-   * Hand the issue back, in both places that record who holds it.
-   *
-   * The git ref is the distributed lock and the store row is what selection
-   * reads. Releasing only the ref leaves the issue locally ineligible even
-   * after the remote ownership boundary is gone.
-   */
-  async #releaseLease(lease: GitRefLease, held: HeldLease, issueId: string, runId: string): Promise<void> {
+  /** Journal, publish, and exactly observe acquisition before granting authority. */
+  async #acquireLease(input: {
+    lease: GitRefLease;
+    issueId: string;
+    runId: string;
+    repo: string;
+    priorStateId: string;
+    priorAssigneeId?: string | undefined;
+  }): Promise<HeldLease> {
+    const prepared = await input.lease.prepareAcquire(input.issueId, {
+      priorStateId: input.priorStateId,
+      ...(input.priorAssigneeId === undefined
+        ? {}
+        : { priorAssigneeId: input.priorAssigneeId }),
+    });
+    this.#d.store.beginLeaseAcquisition({
+      issueId: input.issueId,
+      runId: input.runId,
+      repo: input.repo,
+      generation: prepared.generation,
+      refName: prepared.refName,
+      objectId: prepared.objectId,
+      acquiredAt: prepared.acquiredAt,
+      expiresAt: prepared.expiresAt,
+      heartbeatAt: prepared.heartbeatAt,
+      hostId: prepared.hostId,
+      pid: prepared.pid,
+      ...(prepared.bootId === undefined ? {} : { bootId: prepared.bootId }),
+      ...(prepared.priorStateId === undefined
+        ? {}
+        : { priorStateId: prepared.priorStateId }),
+      ...(prepared.priorAssigneeId === undefined
+        ? {}
+        : { priorAssigneeId: prepared.priorAssigneeId }),
+    });
+
+    let mutationError: unknown;
     try {
-      await lease.release(held);
-    } finally {
-      this.#d.store.releaseLease(issueId, runId);
+      await input.lease.publishAcquire(prepared);
+    } catch (error) {
+      mutationError = error;
     }
+
+    let observedObjectId: string | undefined;
+    try {
+      observedObjectId = await input.lease.observeObjectId(input.issueId);
+    } catch (observationError) {
+      throw new Error(
+        `lease acquisition outcome for ${input.issueId} is unknown; its durable ` +
+          "acquiring intent must be reconciled manually",
+        { cause: mutationError ?? observationError },
+      );
+    }
+    const reconciled = this.#d.store.reconcileLeaseObservation({
+      issueId: input.issueId,
+      runId: input.runId,
+      generation: prepared.generation,
+      refName: prepared.refName,
+      objectId: prepared.objectId,
+      observedObjectId: observedObjectId ?? null,
+    });
+    if (reconciled.outcome === "intended") {
+      if (mutationError !== undefined) {
+        this.#log(
+          `lease acquisition response was lost; exact ref observation confirmed ${prepared.objectId}`,
+        );
+      }
+      return prepared;
+    }
+    if (reconciled.outcome === "absent") {
+      throw new Error(
+        `could not claim issue ${input.issueId}: the exact remote lease ref is absent` +
+          (mutationError === undefined ? "" : `; ${errorMessage(mutationError)}`),
+        mutationError === undefined ? undefined : { cause: mutationError },
+      );
+    }
+
+    const current = await input.lease.read(input.issueId).catch(() => undefined);
+    throw new LeaseConflictError(
+      `issue ${input.issueId} is fenced by a contradictory lease object ` +
+        `${observedObjectId ?? "unknown"}`,
+      current?.runId,
+      current?.generation,
+    );
+  }
+
+  /** Journal, publish, and exactly observe release before clearing ownership. */
+  async #releaseLease(
+    lease: GitRefLease,
+    held: HeldLease,
+    issueId: string,
+    runId: string,
+  ): Promise<void> {
+    await lease.assertHeld(held);
+    this.#d.store.beginLeaseRelease({
+      issueId,
+      runId,
+      generation: held.generation,
+      refName: held.refName,
+      objectId: held.objectId,
+    });
+
+    let mutationError: unknown;
+    try {
+      await lease.publishRelease(held);
+    } catch (error) {
+      mutationError = error;
+    }
+
+    let observedObjectId: string | undefined;
+    try {
+      observedObjectId = await lease.observeObjectId(issueId);
+    } catch (observationError) {
+      throw new Error(
+        `lease release outcome for ${issueId} is unknown; its durable releasing ` +
+          "intent must be reconciled manually",
+        { cause: mutationError ?? observationError },
+      );
+    }
+    const reconciled = this.#d.store.reconcileLeaseObservation({
+      issueId,
+      runId,
+      generation: held.generation,
+      refName: held.refName,
+      objectId: held.objectId,
+      observedObjectId: observedObjectId ?? null,
+    });
+    if (reconciled.outcome === "absent") return;
+    if (reconciled.outcome === "expected") {
+      throw new Error(
+        `lease release for ${issueId} did not apply; the exact expected object remains` +
+          (mutationError === undefined ? "" : `; ${errorMessage(mutationError)}`),
+        mutationError === undefined ? undefined : { cause: mutationError },
+      );
+    }
+    throw new LeaseConflictError(
+      `lease release for ${issueId} was fenced by contradictory object ` +
+        `${observedObjectId ?? "unknown"}`,
+    );
   }
 
   /** Intent, then act, then confirm. Never act first. */
@@ -410,7 +550,21 @@ export class Orchestrator {
     assertLease: () => Promise<void>,
     act: () => Promise<T>,
   ): Promise<T> {
-    const key = this.#d.store.intendSideEffect({ runId, system, operation, target });
+    const begun = this.#d.store.beginSideEffect({
+      runId,
+      system,
+      operation,
+      target,
+    });
+    if (begun.disposition !== "new") {
+      throw RunmillError.fromCatalog("RM-STATE-002", {
+        whatHappened:
+          `external effect ${operation} → ${target} is already ${begun.disposition}; ` +
+          "automatic continuation is disabled until its exact outcome is reconciled",
+        runId,
+      });
+    }
+    const { key } = begun;
     try {
       // The intent must exist before the fence: a crash after a successful
       // fence is still observable. If the fence itself refuses, however, the
@@ -422,10 +576,9 @@ export class Orchestrator {
       throw err;
     }
     this.#d.store.markSideEffectInFlight(key);
+    let result: T;
     try {
-      const result = await act();
-      this.#d.store.confirmSideEffect(key);
-      return result;
+      result = await act();
     } catch (err) {
       if (err instanceof BacklogMutationNotStartedError) {
         this.#d.store.resolveSideEffect(key, "not-applied", "orchestrator");
@@ -436,6 +589,11 @@ export class Orchestrator {
       this.#d.store.failSideEffect(key, errorMessage(err));
       throw err;
     }
+    // Confirmation is outside the remote-call catch. If this durable write
+    // fails, the in-flight row remains ambiguous; it must never be rewritten
+    // as though the already-successful remote call itself failed.
+    this.#d.store.confirmSideEffect(key);
+    return result;
   }
 
   async run(input: {
@@ -454,6 +612,8 @@ export class Orchestrator {
     let claimTransitioned = false;
     let assignmentChanged = false;
     let pullRequestOpened = false;
+    let runCreated = false;
+    let leaseReleaseAttempted = false;
     const budget = new RunBudget({
       clock: this.#d.clock,
       maxWallMs: cfg.budgets.maxWallMinutesPerIssue * 60_000,
@@ -488,9 +648,8 @@ export class Orchestrator {
       if (state !== this.#state) {
         try {
           this.#advance(runId, state, extra.reason);
-        } catch {
-          // The run row may not exist yet (failure during createRun). The
-          // outcome is still returned truthfully.
+        } catch (cause) {
+          throw new TerminalStatePersistenceError(runId, state, cause);
         }
       }
       const outcome: RunOutcome = {
@@ -569,6 +728,7 @@ export class Orchestrator {
         provider: cfg.providers.implementer.implementation,
         attempt,
       });
+      runCreated = true;
       this.#advance(runId, "ELIGIBILITY_CHECKED");
 
       // -- claim ---------------------------------------------------------
@@ -580,17 +740,13 @@ export class Orchestrator {
       }
 
       budget.assertActive("claiming the issue");
-      held = await input.lease.acquire(issue.identifier, {
-        priorStateId: issue.state,
-        ...(issue.assigneeId === undefined ? {} : { priorAssigneeId: issue.assigneeId }),
-      });
-      this.#d.store.recordLease({
+      held = await this.#acquireLease({
+        lease: input.lease,
         issueId: issue.identifier,
         runId,
         repo: target.repo,
-        generation: held.generation,
-        expiresAt: held.expiresAt,
-        refName: held.refName,
+        priorStateId: issue.state,
+        ...(issue.assigneeId === undefined ? {} : { priorAssigneeId: issue.assigneeId }),
       });
       this.#advance(runId, "CLAIMED");
 
@@ -958,6 +1114,7 @@ export class Orchestrator {
             body: `runmill opened ${pr.url} for this issue.\n\nRun: ${runId}`,
           }),
         );
+        leaseReleaseAttempted = true;
         await this.#releaseLease(input.lease, held, issue.identifier, runId);
         held = undefined;
         return finish("PR_DELIVERED", { prNumber: pr.number, prUrl: pr.url });
@@ -965,10 +1122,21 @@ export class Orchestrator {
 
       // guarded-merge and continuous
       budget.assertActive("checking merge authority");
-      const canWriteProtection = await this.#d.forge.canWriteBranchProtection({
-        repo: target.repo,
-        branch: target.baseBranch,
-      });
+      // The production capability check attempts a no-op protection write.
+      // It is still a remote mutation attempt, so journal and fence it like
+      // every other effect instead of hiding it inside an observation path.
+      const canWriteProtection = await this.#withOutbox(
+        runId,
+        "forge",
+        "probe-protection-write",
+        `${target.repo}#${target.baseBranch}`,
+        assertLease,
+        () =>
+          this.#d.forge.canWriteBranchProtection({
+            repo: target.repo,
+            branch: target.baseBranch,
+          }),
+      );
       if (canWriteProtection) {
         return finish("NEEDS_HUMAN", {
           prNumber: pr.number,
@@ -1077,6 +1245,7 @@ export class Orchestrator {
       }
       this.#advance(runId, "BACKLOG_UPDATED");
 
+      leaseReleaseAttempted = true;
       await this.#releaseLease(input.lease, held, issue.identifier, runId);
       held = undefined;
       this.#advance(runId, "CLEANUP");
@@ -1086,6 +1255,9 @@ export class Orchestrator {
         mergeSha: merged.mergeSha,
       });
     } catch (err) {
+      if (err instanceof TerminalStatePersistenceError || !runCreated) {
+        throw err;
+      }
       // RunmillError's message is `CODE Title`, which names the category and
       // not the event. "Review output did not match the schema" is the same
       // sentence whether the reviewer emitted the wrong shape or emitted
@@ -1111,13 +1283,22 @@ export class Orchestrator {
       if (workspace !== undefined && isCleanExitRunState(this.#state)) {
         await this.#workspaces.destroy(workspace, this.#d.sourceRepoPath);
       }
-      if (held !== undefined) {
+      if (held !== undefined && !leaseReleaseAttempted) {
         const heldForRestore = held;
+        let unresolvedEffects = this.#d.store
+          .pendingSideEffects()
+          .some((effect) => effect.runId === runId);
+        let releaseSafe = !unresolvedEffects;
         // Before a PR exists, a failed attempt should be selectable again.
         // Restore the workflow ownership while the lease still fences us. If
-        // either request has an ambiguous outcome its outbox row remains
-        // pending and globally blocks a retry until an operator reconciles it.
-        if (claimTransitioned && !pullRequestOpened && !isCleanExitRunState(this.#state)) {
+        // the triggering mutation was ambiguous, retain the distributed fence:
+        // a local outbox row cannot stop another host from selecting the issue.
+        if (
+          !unresolvedEffects &&
+          claimTransitioned &&
+          !pullRequestOpened &&
+          !isCleanExitRunState(this.#state)
+        ) {
           try {
             if (assignmentChanged) {
               await this.#withOutbox(
@@ -1146,14 +1327,32 @@ export class Orchestrator {
                 }),
             );
           } catch (restoreError) {
+            releaseSafe = false;
             this.#log(`could not restore backlog ownership: ${errorMessage(restoreError)}`);
           }
         }
-        try {
-          await this.#releaseLease(input.lease, held, issue.identifier, runId);
-        } catch {
-          // A lost lease is already someone else's; the store row is cleared
-          // regardless, because a run that is over must not keep the issue.
+        // A restoration request can itself have an ambiguous outcome. Re-read
+        // the journal after compensation before deciding whether release is
+        // safe; only an exact absence proof may later clear a retained fence.
+        unresolvedEffects = this.#d.store
+          .pendingSideEffects()
+          .some((effect) => effect.runId === runId);
+        releaseSafe = releaseSafe && !unresolvedEffects;
+        if (!releaseSafe) {
+          this.#log(
+            `retaining the lease for ${issue.identifier}: an external effect or ownership ` +
+              "restoration has not been proven complete",
+          );
+        } else {
+          try {
+            leaseReleaseAttempted = true;
+            await this.#releaseLease(input.lease, held, issue.identifier, runId);
+          } catch (releaseError) {
+            this.#log(
+              `lease release remains unresolved and continues to fence the issue: ` +
+                errorMessage(releaseError),
+            );
+          }
         }
       }
     }

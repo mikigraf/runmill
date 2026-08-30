@@ -155,6 +155,7 @@ export class FakeForgeAdapter implements ForgeAdapter {
     this.calls.push({ op: "markReadyForReview", args: input });
     const pr = this.#prs.get(input.number);
     if (pr !== undefined) this.#prs.set(input.number, { ...pr, draft: false });
+    this.#maybeLoseResponse("markReadyForReview");
   }
 
   async listChecks(input: { repo: string; ref: string }): Promise<RemoteCheck[]> {

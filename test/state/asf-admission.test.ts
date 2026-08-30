@@ -1595,7 +1595,7 @@ describe("ASF run ownership fencing", () => {
       }),
     ).toThrow(/cannot write ASF/u);
     expect(() =>
-      store.intendSideEffect({
+      store.beginSideEffect({
         runId: "run_fenced_only",
         system: "github",
         operation: "open-pr",
@@ -1603,12 +1603,18 @@ describe("ASF run ownership fencing", () => {
       }),
     ).toThrow(RunmillError);
     expect(() =>
-      store.recordLease({
+      store.beginLeaseAcquisition({
         issueId: "ENG-123",
         runId: "run_fenced_only",
         repo: "acme/payments",
         generation: 1,
+        refName: "refs/runmill/leases/ENG-123",
+        objectId: "a".repeat(40),
+        acquiredAt: "2026-08-21T10:00:00.000Z",
         expiresAt: "2026-08-21T10:10:00.000Z",
+        heartbeatAt: "2026-08-21T10:00:00.000Z",
+        hostId: "host-a",
+        pid: 123,
       }),
     ).toThrow(RunmillError);
 

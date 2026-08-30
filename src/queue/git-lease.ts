@@ -39,6 +39,96 @@ export interface HeldLease extends LeaseRecord {
   readonly objectId: string;
 }
 
+const LEASE_RECORD_KEYS = new Set([
+  "issueId",
+  "runId",
+  "repo",
+  "generation",
+  "acquiredAt",
+  "expiresAt",
+  "heartbeatAt",
+  "hostId",
+  "pid",
+  "bootId",
+  "priorStateId",
+  "priorAssigneeId",
+]);
+
+function parseLeaseRecord(
+  value: unknown,
+  expectedIssueId: string,
+  expectedRepo: string,
+): LeaseRecord {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`lease record for ${expectedIssueId} is not an object`);
+  }
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !LEASE_RECORD_KEYS.has(key))) {
+    throw new Error(`lease record for ${expectedIssueId} contains unknown fields`);
+  }
+  const optionalString = (field: string): string | undefined => {
+    const candidate = record[field];
+    if (candidate === undefined) return undefined;
+    if (typeof candidate !== "string" || candidate === "") {
+      throw new Error(`lease record ${field} is malformed`);
+    }
+    return candidate;
+  };
+  const timestamp = (field: string): string => {
+    const candidate = optionalString(field);
+    if (candidate === undefined || !Number.isFinite(Date.parse(candidate))) {
+      throw new Error(`lease record ${field} is not an ISO-8601 timestamp`);
+    }
+    return candidate;
+  };
+  const runId = record["runId"];
+  const generation = record["generation"];
+  const hostId = record["hostId"];
+  const pid = record["pid"];
+  if (
+    record["issueId"] !== expectedIssueId ||
+    record["repo"] !== expectedRepo ||
+    typeof runId !== "string" ||
+    runId === "" ||
+    typeof generation !== "number" ||
+    !Number.isSafeInteger(generation) ||
+    generation < 1 ||
+    typeof hostId !== "string" ||
+    hostId === "" ||
+    typeof pid !== "number" ||
+    !Number.isSafeInteger(pid) ||
+    pid < 1
+  ) {
+    throw new Error(`lease record for ${expectedIssueId} has contradictory identity`);
+  }
+  const acquiredAt = timestamp("acquiredAt");
+  const expiresAt = timestamp("expiresAt");
+  const heartbeatAt = timestamp("heartbeatAt");
+  if (
+    Date.parse(heartbeatAt) < Date.parse(acquiredAt) ||
+    Date.parse(expiresAt) <= Date.parse(heartbeatAt)
+  ) {
+    throw new Error(`lease record for ${expectedIssueId} has contradictory timestamps`);
+  }
+  const bootId = optionalString("bootId");
+  const priorStateId = optionalString("priorStateId");
+  const priorAssigneeId = optionalString("priorAssigneeId");
+  return {
+    issueId: expectedIssueId,
+    runId,
+    repo: expectedRepo,
+    generation,
+    acquiredAt,
+    expiresAt,
+    heartbeatAt,
+    hostId,
+    pid,
+    ...(bootId === undefined ? {} : { bootId }),
+    ...(priorStateId === undefined ? {} : { priorStateId }),
+    ...(priorAssigneeId === undefined ? {} : { priorAssigneeId }),
+  };
+}
+
 export class LeaseConflictError extends Error {
   readonly code = "RM-LEASE-001";
   readonly heldBy: string | undefined;
@@ -100,16 +190,33 @@ export class GitRefLease {
     return this.#git("commit-tree", EMPTY_TREE, "-m", JSON.stringify(record));
   }
 
-  async #remoteObjectId(issueId: string): Promise<string | undefined> {
+  /** Exact read-only observation used to reconcile a journaled mutation. */
+  async observeObjectId(issueId: string): Promise<string | undefined> {
     const out = await this.#remoteGit("ls-remote", this.#remote, leaseRefName(issueId));
     if (out === "") return undefined;
-    const first = out.split("\n")[0];
-    return first?.split(/\s+/)[0];
+    const lines = out.split("\n").filter((line) => line !== "");
+    if (lines.length !== 1) {
+      throw new Error(
+        `remote lease observation for ${issueId} returned ${lines.length} refs`,
+      );
+    }
+    const fields = lines[0]?.trim().split(/\s+/u) ?? [];
+    const objectId = fields[0];
+    const refName = fields[1];
+    if (
+      fields.length !== 2 ||
+      objectId === undefined ||
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(objectId) ||
+      refName !== leaseRefName(issueId)
+    ) {
+      throw new Error(`remote lease observation for ${issueId} was malformed`);
+    }
+    return objectId;
   }
 
   /** Read the current lease record from the remote, or undefined if unheld. */
   async read(issueId: string): Promise<HeldLease | undefined> {
-    const objectId = await this.#remoteObjectId(issueId);
+    const objectId = await this.observeObjectId(issueId);
     if (objectId === undefined) return undefined;
 
     // Bring the object local so it can be read. A forced fetch into a local
@@ -117,7 +224,11 @@ export class GitRefLease {
     const localRef = `refs/runmill/remote-leases/${issueId}`;
     await this.#remoteGit("fetch", "--quiet", this.#remote, `+${leaseRefName(issueId)}:${localRef}`);
     const message = await this.#git("log", "-1", "--format=%B", objectId);
-    const record = JSON.parse(message) as LeaseRecord;
+    const record = parseLeaseRecord(
+      JSON.parse(message) as unknown,
+      issueId,
+      this.#remote,
+    );
     return { ...record, refName: leaseRefName(issueId), objectId };
   }
 
@@ -157,16 +268,10 @@ export class GitRefLease {
     issueId: string,
     extra: { priorStateId?: string; priorAssigneeId?: string } = {},
   ): Promise<HeldLease> {
-    const record = this.#buildRecord(issueId, 1, extra);
-    const objectId = await this.#writeRecord(record);
+    const prepared = await this.prepareAcquire(issueId, extra);
 
     try {
-      await this.#remoteGit(
-        "push",
-        "--no-verify",
-        this.#remote,
-        `${objectId}:${leaseRefName(issueId)}`,
-      );
+      await this.publishAcquire(prepared);
     } catch (cause) {
       // A rejected push is only evidence of contention if the ref is actually
       // there. It is equally the shape of a read-only credential, a remote that
@@ -188,7 +293,44 @@ export class GitRefLease {
       );
     }
 
+    const observed = await this.observeObjectId(issueId);
+    if (observed === prepared.objectId) return prepared;
+    if (observed === undefined) {
+      throw new Error(
+        `lease push for ${issueId} reported success but the exact remote ref is absent`,
+      );
+    }
+    const current = await this.read(issueId);
+    throw new LeaseConflictError(
+      `lease for ${issueId} resolved to object ${observed}, not intended object ` +
+        prepared.objectId,
+      current?.runId,
+      current?.generation,
+    );
+  }
+
+  /** Build the exact local lease object without touching the remote. */
+  async prepareAcquire(
+    issueId: string,
+    extra: { priorStateId?: string; priorAssigneeId?: string } = {},
+  ): Promise<HeldLease> {
+    const record = this.#buildRecord(issueId, 1, extra);
+    const objectId = await this.#writeRecord(record);
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(objectId)) {
+      throw new Error(`Git produced a malformed lease object id for ${issueId}`);
+    }
     return { ...record, refName: leaseRefName(issueId), objectId };
+  }
+
+  /** Publish only a previously prepared acquisition object. */
+  async publishAcquire(prepared: HeldLease): Promise<void> {
+    this.#assertPreparedIdentity(prepared);
+    await this.#remoteGit(
+      "push",
+      "--no-verify",
+      this.#remote,
+      `${prepared.objectId}:${prepared.refName}`,
+    );
   }
 
   /** Compare-and-swap the ref, failing if anyone else moved it. */
@@ -284,6 +426,25 @@ export class GitRefLease {
   /** Release, but only if this run still owns the current generation. */
   async release(held: HeldLease): Promise<void> {
     await this.assertHeld(held);
+    await this.publishRelease(held);
+    const observed = await this.observeObjectId(held.issueId);
+    if (observed === undefined) return;
+    if (observed === held.objectId) {
+      throw new Error(
+        `lease release for ${held.issueId} reported success but the expected ref still exists`,
+      );
+    }
+    const current = await this.read(held.issueId);
+    throw new LeaseConflictError(
+      `lease release for ${held.issueId} was fenced by object ${observed}`,
+      current?.runId,
+      current?.generation,
+    );
+  }
+
+  /** Apply only the exact CAS deletion; callers observe and reconcile it. */
+  async publishRelease(held: HeldLease): Promise<void> {
+    this.#assertPreparedIdentity(held);
     const ref = leaseRefName(held.issueId);
     await this.#remoteGit(
       "push",
@@ -292,5 +453,20 @@ export class GitRefLease {
       this.#remote,
       `:${ref}`,
     );
+  }
+
+  #assertPreparedIdentity(held: HeldLease): void {
+    if (
+      held.runId !== this.#opts.runId ||
+      held.refName !== leaseRefName(held.issueId) ||
+      held.repo !== this.#remote ||
+      held.hostId !== this.#opts.hostId ||
+      held.pid !== this.#opts.pid ||
+      !Number.isSafeInteger(held.generation) ||
+      held.generation < 1 ||
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(held.objectId)
+    ) {
+      throw new Error(`lease handle for ${held.issueId} has a contradictory identity`);
+    }
   }
 }

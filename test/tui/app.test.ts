@@ -31,6 +31,8 @@ describe("OpenTUI presentation", () => {
           status: "intended",
           remoteId: null,
           lastError: null,
+          intendedAt: "2026-08-09T10:00:00Z",
+          updatedAt: "2026-08-09T10:00:00Z",
         },
       ],
     };

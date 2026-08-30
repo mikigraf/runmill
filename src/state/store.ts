@@ -515,14 +515,53 @@ export interface AsfDurableRunSnapshot extends AsfRunCursorSnapshot {
   readonly admission: AsfAdmissionRecord;
 }
 
+export type LeasePhase = "acquiring" | "held" | "releasing" | "released";
+export type LeasePendingIntent = "acquire" | "release";
+export type LeaseObservationOutcome =
+  | "absent"
+  | "intended"
+  | "expected"
+  | "contradictory";
+
 export interface LeaseRow {
-  issueId: string;
-  runId: string;
-  repo: string;
-  generation: number;
-  expiresAt: string;
-  heartbeatAt: string | null;
-  releasedAt: string | null;
+  readonly issueId: string;
+  readonly runId: string;
+  readonly repo: string;
+  readonly generation: number;
+  readonly refName: string | null;
+  readonly objectId: string | null;
+  readonly phase: LeasePhase;
+  readonly expectedObjectId: string | null;
+  readonly intendedObjectId: string | null;
+  readonly observedObjectId: string | null;
+  readonly pendingIntent: LeasePendingIntent | null;
+  readonly acquiredAt: string;
+  readonly expiresAt: string;
+  readonly heartbeatAt: string | null;
+  readonly intentAt: string | null;
+  readonly observedAt: string | null;
+  readonly confirmedAt: string | null;
+  readonly releasedAt: string | null;
+}
+
+const LEASE_ROW_SELECT = `SELECT issue_id AS issueId, run_id AS runId, repo, generation,
+  ref_name AS refName, object_id AS objectId, phase,
+  expected_object_id AS expectedObjectId, intended_object_id AS intendedObjectId,
+  observed_object_id AS observedObjectId, pending_intent AS pendingIntent,
+  acquired_at AS acquiredAt, expires_at AS expiresAt, heartbeat_at AS heartbeatAt,
+  intent_at AS intentAt, observed_at AS observedAt, confirmed_at AS confirmedAt,
+  released_at AS releasedAt`;
+
+function assertGitObjectId(value: string, field: string): void {
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(value)) {
+    throw new Error(`${field} must be an exact lowercase Git object id`);
+  }
+}
+
+function assertTimestamp(value: string, field: string): void {
+  if (!Number.isFinite(Date.parse(value))) {
+    throw new Error(`${field} must be an ISO-8601 timestamp`);
+  }
 }
 
 export type SideEffectStatus =
@@ -540,6 +579,14 @@ export interface SideEffectRow {
   status: SideEffectStatus;
   remoteId: string | null;
   lastError: string | null;
+  intendedAt: string;
+  updatedAt: string;
+}
+
+export interface BeginSideEffectResult {
+  readonly key: string;
+  readonly disposition: "new" | "pending" | "confirmed";
+  readonly effect: SideEffectRow;
 }
 
 export interface BudgetLedgerRow {
@@ -10858,79 +10905,104 @@ export class StateStore {
   }
 
   /**
-   * Record the intent to perform an external mutation.
+   * Atomically claim authorization for one exact external mutation.
    *
-   * Called BEFORE the remote call. A crash between this row and the remote
-   * response leaves a durable record naming the run and the operation. New
-   * runs block until an operator verifies the remote outcome and resolves it.
+   * Only `new` authorizes the caller to execute it. A duplicate pending or
+   * confirmed row is returned without changing status, timestamps, or audit
+   * evidence; a deterministic-key collision with different bindings refuses.
    */
-  intendSideEffect(input: {
+  beginSideEffect(input: {
     runId: string;
     system: string;
     operation: string;
     target: string;
-  }): string {
+  }): BeginSideEffectResult {
     this.#assertNotAsfRun(input.runId, "legacy side-effect intent");
     const key = StateStore.sideEffectKey(
       input.runId,
       input.operation,
       input.target,
     );
-    const at = this.#clock.now().toISOString();
-    this.#db
-      .prepare(
-        `INSERT INTO side_effects(key, run_id, system, operation, target, status, intended_at, updated_at)
-         VALUES (?,?,?,?,?,'intended',?,?)
-         ON CONFLICT(key) DO NOTHING`,
-      )
-      .run(
-        key,
-        input.runId,
-        input.system,
-        input.operation,
-        input.target,
-        at,
-        at,
-      );
-    return key;
-  }
+    const transaction = this.#db.transaction((): BeginSideEffectResult => {
+      const existing = this.getSideEffect(key);
+      if (existing !== undefined) {
+        if (
+          existing.runId !== input.runId ||
+          existing.system !== input.system ||
+          existing.operation !== input.operation ||
+          existing.target !== input.target
+        ) {
+          throw new Error(
+            `side effect key ${key} has a contradictory immutable binding`,
+          );
+        }
+        return {
+          key,
+          disposition:
+            existing.status === "confirmed" ? "confirmed" : "pending",
+          effect: existing,
+        };
+      }
 
-  #setSideEffectStatus(
-    key: string,
-    status: SideEffectStatus,
-    patch: { remoteId?: string; lastError?: string } = {},
-  ): void {
-    this.#db
-      .prepare(
-        `UPDATE side_effects
-         SET status = ?, remote_id = COALESCE(?, remote_id),
-             last_error = COALESCE(?, last_error), updated_at = ?
-         WHERE key = ?`,
-      )
-      .run(
-        status,
-        patch.remoteId ?? null,
-        patch.lastError ?? null,
-        this.#clock.now().toISOString(),
-        key,
-      );
+      const at = this.#clock.now().toISOString();
+      const inserted = this.#db
+        .prepare(
+          `INSERT INTO side_effects(
+             key, run_id, system, operation, target, status, intended_at, updated_at
+           ) VALUES (?,?,?,?,?,'intended',?,?)`,
+        )
+        .run(
+          key,
+          input.runId,
+          input.system,
+          input.operation,
+          input.target,
+          at,
+          at,
+        );
+      if (inserted.changes !== 1) {
+        throw new Error(`side effect ${key} intent insert affected ${inserted.changes} rows`);
+      }
+      const effect = this.getSideEffect(key);
+      if (effect === undefined) {
+        throw new Error(`side effect ${key} disappeared after intent insert`);
+      }
+      return { key, disposition: "new", effect };
+    });
+    return transaction.immediate();
   }
 
   markSideEffectInFlight(key: string): void {
-    this.#setSideEffectStatus(key, "in_flight");
+    const changed = this.#db
+      .prepare(
+        `UPDATE side_effects SET status = 'in_flight', updated_at = ?
+         WHERE key = ? AND status = 'intended'`,
+      )
+      .run(this.#clock.now().toISOString(), key).changes;
+    this.#assertSideEffectTransition(key, "intended", "in_flight", changed);
   }
 
   confirmSideEffect(key: string, remoteId?: string): void {
-    this.#setSideEffectStatus(
-      key,
-      "confirmed",
-      remoteId === undefined ? {} : { remoteId },
-    );
+    const changed = this.#db
+      .prepare(
+        `UPDATE side_effects
+         SET status = 'confirmed', remote_id = COALESCE(?, remote_id), updated_at = ?
+         WHERE key = ? AND status = 'in_flight'`,
+      )
+      .run(remoteId ?? null, this.#clock.now().toISOString(), key).changes;
+    this.#assertSideEffectTransition(key, "in_flight", "confirmed", changed);
   }
 
   /** A failed effect stays pending: failure does not prove the effect did not land. */
   failSideEffect(key: string, lastError: string): void {
-    this.#setSideEffectStatus(key, "failed", { lastError });
+    const changed = this.#db
+      .prepare(
+        `UPDATE side_effects
+         SET status = 'failed', last_error = ?, updated_at = ?
+         WHERE key = ? AND status = 'in_flight'`,
+      )
+      .run(lastError, this.#clock.now().toISOString(), key).changes;
+    this.#assertSideEffectTransition(key, "in_flight", "failed", changed);
   }
 
   /** Record an operator/reconciler conclusion for an ambiguous prior effect. */
@@ -10939,28 +11011,50 @@ export class StateStore {
     outcome: "applied" | "not-applied",
     resolver: "operator" | "orchestrator" = "operator",
   ): void {
-    const existing = this.getSideEffect(key);
-    if (existing === undefined)
-      throw new Error(`side effect ${key} does not exist`);
-    if (!this.pendingSideEffects().some((effect) => effect.key === key)) {
+    const changed = this.#db
+      .prepare(
+        `UPDATE side_effects
+         SET status = 'confirmed', remote_id = ?, last_error = ?, updated_at = ?
+         WHERE key = ? AND status IN ('intended','in_flight','failed')`,
+      )
+      .run(
+        `${resolver}:${outcome}`,
+        `${resolver} resolved outcome as ${outcome}`,
+        this.#clock.now().toISOString(),
+        key,
+      ).changes;
+    if (changed !== 1) {
+      const existing = this.getSideEffect(key);
+      if (existing === undefined) {
+        throw new Error(`side effect ${key} does not exist`);
+      }
       throw new Error(
         `side effect ${key} is already resolved as ${existing.status}`,
       );
     }
-    // `confirmed` is the terminal outbox status. Preserve how that conclusion
-    // was reached in the audit fields instead of extending the persisted enum
-    // (and making older databases unreadable without a table rebuild).
-    this.#setSideEffectStatus(key, "confirmed", {
-      remoteId: `${resolver}:${outcome}`,
-      lastError: `${resolver} resolved outcome as ${outcome}`,
-    });
+  }
+
+  #assertSideEffectTransition(
+    key: string,
+    from: SideEffectStatus,
+    to: SideEffectStatus,
+    changed: number,
+  ): void {
+    if (changed !== 1) {
+      const actual = this.getSideEffect(key)?.status ?? "missing";
+      throw new Error(
+        `side effect ${key} transition ${from} -> ${to} affected ${changed} rows; ` +
+          `actual status is ${actual}`,
+      );
+    }
   }
 
   getSideEffect(key: string): SideEffectRow | undefined {
     return this.#db
       .prepare(
         `SELECT key, run_id AS runId, system, operation, target, status,
-                remote_id AS remoteId, last_error AS lastError
+                remote_id AS remoteId, last_error AS lastError,
+                intended_at AS intendedAt, updated_at AS updatedAt
          FROM side_effects WHERE key = ?`,
       )
       .get(key) as SideEffectRow | undefined;
@@ -10971,7 +11065,8 @@ export class StateStore {
     return this.#db
       .prepare(
         `SELECT key, run_id AS runId, system, operation, target, status,
-                remote_id AS remoteId, last_error AS lastError
+                remote_id AS remoteId, last_error AS lastError,
+                intended_at AS intendedAt, updated_at AS updatedAt
          FROM side_effects
          WHERE status IN ('intended','in_flight','failed')
          ORDER BY intended_at`,
@@ -11240,70 +11335,330 @@ export class StateStore {
 
   // -- leases ------------------------------------------------------------
 
-  recordLease(input: {
+  beginLeaseAcquisition(input: {
     issueId: string;
     runId: string;
     repo: string;
     generation: number;
+    refName: string;
+    objectId: string;
+    acquiredAt: string;
     expiresAt: string;
-    refName?: string;
-    hostId?: string;
-    pid?: number;
+    heartbeatAt: string;
+    hostId: string;
+    pid: number;
     bootId?: string;
     priorStateId?: string;
     priorAssigneeId?: string;
   }): void {
-    this.#assertNotAsfRun(input.runId, "legacy issue lease");
-    const at = this.#clock.now().toISOString();
-    this.#db
-      .prepare(
-        `INSERT INTO leases(issue_id, run_id, repo, generation, ref_name, acquired_at,
-                            expires_at, heartbeat_at, host_id, pid, boot_id,
-                            prior_state_id, prior_assignee_id, released_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,
-      )
-      .run(
-        input.issueId,
-        input.runId,
-        input.repo,
-        input.generation,
-        input.refName ?? null,
-        at,
-        input.expiresAt,
-        at,
-        input.hostId ?? null,
-        input.pid ?? null,
-        input.bootId ?? null,
-        input.priorStateId ?? null,
-        input.priorAssigneeId ?? null,
-      );
+    this.#assertNotAsfRun(input.runId, "standalone issue lease acquisition");
+    if (!Number.isSafeInteger(input.generation) || input.generation < 1) {
+      throw new Error("lease generation must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(input.pid) || input.pid < 1) {
+      throw new Error("lease PID must be a positive safe integer");
+    }
+    if (
+      input.issueId === "" ||
+      input.runId === "" ||
+      input.repo === "" ||
+      input.hostId === ""
+    ) {
+      throw new Error("lease identity fields must be non-empty");
+    }
+    if (input.refName !== `refs/runmill/leases/${input.issueId}`) {
+      throw new Error("lease ref does not match its exact issue identity");
+    }
+    assertGitObjectId(input.objectId, "lease object");
+    assertTimestamp(input.acquiredAt, "lease acquiredAt");
+    assertTimestamp(input.heartbeatAt, "lease heartbeatAt");
+    assertTimestamp(input.expiresAt, "lease expiresAt");
+    if (
+      Date.parse(input.heartbeatAt) < Date.parse(input.acquiredAt) ||
+      Date.parse(input.expiresAt) <= Date.parse(input.heartbeatAt)
+    ) {
+      throw new Error("lease timestamps do not describe a positive live interval");
+    }
+
+    const transaction = this.#db.transaction(() => {
+      const active = this.getLease(input.issueId);
+      if (active !== undefined) {
+        throw new Error(
+          `issue ${input.issueId} already has local lease ${active.runId} in ` +
+            `${active.phase}; reconcile it before acquiring another`,
+        );
+      }
+      const run = this.#db
+        .prepare(
+          "SELECT issue_id AS issueId, repo, mode FROM runs WHERE run_id = ?",
+        )
+        .get(input.runId) as
+        | { issueId: string; repo: string; mode: string }
+        | undefined;
+      if (
+        run === undefined ||
+        run.mode === "asf-worker" ||
+        run.issueId !== input.issueId ||
+        run.repo.toLowerCase() !== input.repo.toLowerCase()
+      ) {
+        throw new Error(
+          `lease acquisition binding does not match standalone run ${input.runId}`,
+        );
+      }
+
+      const intentAt = this.#clock.now().toISOString();
+      const inserted = this.#db
+        .prepare(
+          `INSERT INTO leases(
+             issue_id, run_id, repo, generation, ref_name, acquired_at,
+             expires_at, heartbeat_at, host_id, pid, boot_id,
+             prior_state_id, prior_assignee_id, released_at,
+             phase, object_id, expected_object_id, intended_object_id,
+             observed_object_id, pending_intent, intent_at, observed_at, confirmed_at
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,
+                     'acquiring',?,NULL,?,NULL,'acquire',?,NULL,NULL)`,
+        )
+        .run(
+          input.issueId,
+          input.runId,
+          input.repo,
+          input.generation,
+          input.refName,
+          input.acquiredAt,
+          input.expiresAt,
+          input.heartbeatAt,
+          input.hostId,
+          input.pid,
+          input.bootId ?? null,
+          input.priorStateId ?? null,
+          input.priorAssigneeId ?? null,
+          input.objectId,
+          input.objectId,
+          intentAt,
+        );
+      if (inserted.changes !== 1) {
+        throw new Error(
+          `lease acquisition intent for ${input.issueId} affected ${inserted.changes} rows`,
+        );
+      }
+    });
+    transaction.immediate();
   }
 
   getLease(issueId: string): LeaseRow | undefined {
     return this.#db
       .prepare(
-        `SELECT issue_id AS issueId, run_id AS runId, repo, generation,
-                expires_at AS expiresAt, heartbeat_at AS heartbeatAt, released_at AS releasedAt
-         FROM leases WHERE issue_id = ? AND released_at IS NULL`,
+        `${LEASE_ROW_SELECT}
+         FROM leases WHERE issue_id = ? AND phase <> 'released'`,
       )
       .get(issueId) as LeaseRow | undefined;
   }
 
-  heartbeatLease(issueId: string, runId: string, newExpiresAt: string): void {
-    this.#db
+  getLeaseRecord(
+    issueId: string,
+    runId: string,
+    generation: number,
+  ): LeaseRow | undefined {
+    return this.#db
       .prepare(
-        `UPDATE leases SET heartbeat_at = ?, expires_at = ?
-         WHERE issue_id = ? AND run_id = ? AND released_at IS NULL`,
+        `${LEASE_ROW_SELECT}
+         FROM leases
+         WHERE issue_id = ? AND run_id = ? AND generation = ?
+         ORDER BY acquired_at DESC, rowid DESC LIMIT 1`,
       )
-      .run(this.#clock.now().toISOString(), newExpiresAt, issueId, runId);
+      .get(issueId, runId, generation) as LeaseRow | undefined;
   }
 
-  releaseLease(issueId: string, runId: string): void {
-    this.#db
+  beginLeaseRelease(input: {
+    issueId: string;
+    runId: string;
+    generation: number;
+    refName: string;
+    objectId: string;
+  }): void {
+    assertGitObjectId(input.objectId, "lease release object");
+    const changed = this.#db
       .prepare(
-        "UPDATE leases SET released_at = ? WHERE issue_id = ? AND run_id = ? AND released_at IS NULL",
+        `UPDATE leases
+         SET phase = 'releasing', expected_object_id = ?, intended_object_id = NULL,
+             observed_object_id = NULL, pending_intent = 'release', intent_at = ?,
+             observed_at = NULL, confirmed_at = NULL
+         WHERE issue_id = ? AND run_id = ? AND generation = ?
+           AND ref_name = ? AND object_id = ?
+           AND phase = 'held' AND pending_intent IS NULL`,
       )
-      .run(this.#clock.now().toISOString(), issueId, runId);
+      .run(
+        input.objectId,
+        this.#clock.now().toISOString(),
+        input.issueId,
+        input.runId,
+        input.generation,
+        input.refName,
+        input.objectId,
+      ).changes;
+    this.#assertLeaseTransition(input.issueId, "held", "releasing", changed);
+  }
+
+  reconcileLeaseObservation(input: {
+    issueId: string;
+    runId: string;
+    generation: number;
+    refName: string;
+    objectId: string;
+    /** `null` is a successful exact observation that the ref is absent. */
+    observedObjectId: string | null;
+  }): { outcome: LeaseObservationOutcome; phase: LeasePhase } {
+    assertGitObjectId(input.objectId, "lease identity object");
+    if (input.observedObjectId !== null) {
+      assertGitObjectId(input.observedObjectId, "observed lease object");
+    }
+    const transaction = this.#db.transaction(() => {
+      const row = this.getLease(input.issueId);
+      if (
+        row === undefined ||
+        row.runId !== input.runId ||
+        row.generation !== input.generation ||
+        row.refName !== input.refName ||
+        row.objectId !== input.objectId
+      ) {
+        throw new Error(
+          `lease observation identity does not match active lease ${input.issueId}`,
+        );
+      }
+
+      let outcome: LeaseObservationOutcome;
+      let phase: LeasePhase;
+      let pendingIntent: LeasePendingIntent | null;
+      if (row.phase === "acquiring" && row.pendingIntent === "acquire") {
+        if (input.observedObjectId === null) {
+          outcome = "absent";
+          phase = "released";
+          pendingIntent = null;
+        } else if (
+          row.intendedObjectId !== null &&
+          input.observedObjectId === row.intendedObjectId
+        ) {
+          outcome = "intended";
+          phase = "held";
+          pendingIntent = null;
+        } else {
+          outcome = "contradictory";
+          phase = "acquiring";
+          pendingIntent = "acquire";
+        }
+      } else if (row.phase === "releasing" && row.pendingIntent === "release") {
+        if (input.observedObjectId === null) {
+          outcome = "absent";
+          phase = "released";
+          pendingIntent = null;
+        } else if (
+          row.expectedObjectId !== null &&
+          input.observedObjectId === row.expectedObjectId
+        ) {
+          outcome = "expected";
+          phase = "held";
+          pendingIntent = null;
+        } else {
+          outcome = "contradictory";
+          phase = "releasing";
+          pendingIntent = "release";
+        }
+      } else {
+        throw new Error(
+          `lease ${input.issueId} has no pending intent to reconcile from phase ${row.phase}`,
+        );
+      }
+
+      const observedAt = this.#clock.now().toISOString();
+      const changed = this.#db
+        .prepare(
+          `UPDATE leases
+           SET observed_object_id = ?, observed_at = ?, phase = ?, pending_intent = ?,
+               confirmed_at = CASE WHEN ? = 'contradictory' THEN confirmed_at ELSE ? END,
+               released_at = CASE WHEN ? = 'released' THEN ? ELSE released_at END
+           WHERE issue_id = ? AND run_id = ? AND generation = ?
+             AND ref_name = ? AND object_id = ? AND phase = ? AND pending_intent = ?`,
+        )
+        .run(
+          input.observedObjectId,
+          observedAt,
+          phase,
+          pendingIntent,
+          outcome,
+          observedAt,
+          phase,
+          observedAt,
+          input.issueId,
+          input.runId,
+          input.generation,
+          input.refName,
+          input.objectId,
+          row.phase,
+          row.pendingIntent,
+        ).changes;
+      this.#assertLeaseTransition(input.issueId, row.phase, phase, changed);
+      return { outcome, phase };
+    });
+    return transaction.immediate();
+  }
+
+  /** Operator reconciliation after an exact remote observation of absence. */
+  resolveLeaseAbsent(input: {
+    issueId: string;
+    runId: string;
+    generation: number;
+    refName: string;
+  }): void {
+    const at = this.#clock.now().toISOString();
+    const changed = this.#db
+      .prepare(
+        `UPDATE leases
+         SET phase = 'released', observed_object_id = NULL, observed_at = ?,
+             pending_intent = NULL, confirmed_at = ?, released_at = ?
+         WHERE issue_id = ? AND run_id = ? AND generation = ?
+           AND ref_name = ? AND phase <> 'released'`,
+      )
+      .run(
+        at,
+        at,
+        at,
+        input.issueId,
+        input.runId,
+        input.generation,
+        input.refName,
+      ).changes;
+    if (changed !== 1) {
+      throw new Error(
+        `lease ${input.issueId} absent reconciliation affected ${changed} rows`,
+      );
+    }
+  }
+
+  heartbeatLease(issueId: string, runId: string, newExpiresAt: string): void {
+    assertTimestamp(newExpiresAt, "lease expiresAt");
+    const changed = this.#db
+      .prepare(
+        `UPDATE leases SET heartbeat_at = ?, expires_at = ?
+         WHERE issue_id = ? AND run_id = ?
+           AND phase = 'held' AND pending_intent IS NULL`,
+      )
+      .run(this.#clock.now().toISOString(), newExpiresAt, issueId, runId).changes;
+    this.#assertLeaseTransition(issueId, "held", "held", changed);
+  }
+
+  #assertLeaseTransition(
+    issueId: string,
+    from: LeasePhase,
+    to: LeasePhase,
+    changed: number,
+  ): void {
+    if (changed !== 1) {
+      const actual = this.getLease(issueId)?.phase ?? "missing";
+      throw new Error(
+        `lease ${issueId} transition ${from} -> ${to} affected ${changed} rows; ` +
+          `actual phase is ${actual}`,
+      );
+    }
   }
 
   // -- onboarding funnel (local only, never transmitted) -----------------
@@ -11355,7 +11710,7 @@ export class StateStore {
       .prepare(
         `SELECT l.issue_id AS issueId
          FROM leases l JOIN runs r ON r.run_id = l.run_id
-         WHERE l.released_at IS NULL AND r.mode <> 'asf-worker'`,
+         WHERE l.phase <> 'released' AND r.mode <> 'asf-worker'`,
       )
       .all() as { issueId: string }[];
     return new Set(rows.map((r) => r.issueId));

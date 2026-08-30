@@ -69,17 +69,38 @@ interface LeaseRecord {
 disk is gone still leaves behind, on the server, everything needed to put the issue back the way
 it was found.
 
+## Durable mutation protocol
+
+The remote ref is the distributed lock; the local database is the crash journal. Runmill never
+infers one from an unacknowledged write to the other. Each local lease row has one of four phases:
+
+- `acquiring` — the exact object and create intent were committed before `git push`.
+- `held` — `git ls-remote` returned exactly the intended object for the exact lease ref.
+- `releasing` — the exact expected object and delete intent were committed before the CAS delete.
+- `released` — an exact observation proved the remote ref absent.
+
+An unavailable or malformed observation leaves the intent pending. A different object is
+contradictory evidence and also leaves the local fence active. Legacy active rows are migrated to
+unresolved `acquiring` rows because they do not contain enough evidence to claim that a remote
+write completed.
+
 ## The four operations
 
 ### acquire — the atomic claim
 
 ```ts
-await this.#git("push", this.#remote, `${objectId}:${leaseRefName(issueId)}`);
+const prepared = await lease.prepareAcquire(issueId);
+store.beginLeaseAcquisition({ ...prepared, repo: target.repo }); // durable `acquiring` intent
+await lease.publishAcquire(prepared);
+const observed = await lease.observeObjectId(issueId);
+store.reconcileLeaseObservation({ ...prepared, observedObjectId: observed ?? null });
 ```
 
 Succeeds only if the ref did not exist. On rejection, runmill reads the existing record and raises
 `LeaseConflictError` naming the current holder — a contended issue reports *who* has it, not just
-that the claim failed.
+that the claim failed. Authority is granted only after exact observation returns the object that
+was prepared and journaled. If the push applied but its response was lost, that observation safely
+confirms the acquisition without issuing a second push.
 
 ### heartbeat — available primitive, not a daemon timer
 
@@ -141,14 +162,19 @@ paused. Use the explicit manual procedure under Operating notes.
 
 ### release — CAS-guarded deletion
 
-`release` calls `assertHeld` first, then deletes the ref with `--force-with-lease`. A run that
-lost its lease cannot delete the lease its successor now holds.
+Release calls `assertHeld`, commits a `releasing` intent with the exact expected object, and then
+deletes the ref with `--force-with-lease`. A run that lost its lease cannot delete the lease its
+successor now holds. Exact absence completes release even when the push response was lost. If the
+expected object remains, the row returns to `held`; a different object or unavailable observation
+remains fenced for manual reconciliation.
 
 ## What this does and does not protect
 
 **Does:** two workers cannot both start the same issue; every orchestrator-owned external mutation
 is fenced; a worker cannot mutate anything after ownership moves; an ordinary failed attempt before
-PR creation restores its prior backlog state and assignee while it still holds the lease.
+PR creation restores its prior backlog state and assignee while it still holds the lease. If any
+external mutation has an ambiguous outcome, Runmill retains the remote lease as well as the local
+outbox row: a database on one host cannot fence a worker on another host.
 
 **Does not:** the preview does not automatically recover a lease after process death. It is not a
 general-purpose lock service, and it says nothing about two workers touching the same *files* from
@@ -178,6 +204,11 @@ runmill leases resolve ENG-123 --confirm-remote-cleared
 The final command refuses unless `git ls-remote` proves that exact remote ref is absent. Until both
 remote and local records are reconciled, issue selection remains blocked. This is intentionally
 slower than silently stealing work and racing a paused process.
+
+If `runmill effects list` also reports an ambiguous mutation, inspect that named remote system and
+resolve the effect first. Restore backlog ownership only when the observed result requires it, then
+delete the exact lease ref and clear the local lease row. Never clear the distributed fence merely
+because a client call returned an error: the request may have applied before its response was lost.
 
 ## See also
 

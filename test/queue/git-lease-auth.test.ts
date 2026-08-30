@@ -25,6 +25,9 @@ describe("Git-ref lease GitHub authentication", () => {
 
     gitMock.mockImplementation(async (_cwd: string, args: string[], options: any) => {
       if (args.includes("commit-tree")) return "a".repeat(40);
+      if (args.includes("ls-remote")) {
+        return `${"a".repeat(40)}\trefs/runmill/leases/ENG-42`;
+      }
       if (args.includes("push")) {
         helper = options.env.GIT_ASKPASS;
         const argv = ["git", ...args].join("\0");

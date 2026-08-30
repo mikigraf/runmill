@@ -834,6 +834,41 @@ export const MIGRATIONS: readonly Migration[] = [
         ADD COLUMN canonical_envelope_digest TEXT;
     `,
   },
+  {
+    version: 11,
+    name: "standalone_lease_intents",
+    up: `
+      -- A local row written only after the remote push could not distinguish
+      -- "not started" from "lease acquired, response lost". Persist the
+      -- current intent and exact ref observation around each remote mutation.
+      ALTER TABLE leases ADD COLUMN phase TEXT NOT NULL DEFAULT 'acquiring'
+        CHECK (phase IN ('acquiring', 'held', 'releasing', 'released'));
+      ALTER TABLE leases ADD COLUMN object_id TEXT;
+      ALTER TABLE leases ADD COLUMN expected_object_id TEXT;
+      ALTER TABLE leases ADD COLUMN intended_object_id TEXT;
+      ALTER TABLE leases ADD COLUMN observed_object_id TEXT;
+      ALTER TABLE leases ADD COLUMN pending_intent TEXT
+        CHECK (pending_intent IS NULL OR pending_intent IN ('acquire', 'release'));
+      ALTER TABLE leases ADD COLUMN intent_at TEXT;
+      ALTER TABLE leases ADD COLUMN observed_at TEXT;
+      ALTER TABLE leases ADD COLUMN confirmed_at TEXT;
+
+      -- A legacy active row has no exact remote object evidence. It therefore
+      -- remains unresolved acquisition intent rather than being promoted to a
+      -- held lease. Released history is safe to retain as released history.
+      UPDATE leases
+      SET phase = CASE WHEN released_at IS NULL THEN 'acquiring' ELSE 'released' END,
+          pending_intent = CASE WHEN released_at IS NULL THEN 'acquire' ELSE NULL END,
+          intent_at = acquired_at,
+          confirmed_at = released_at;
+
+      DROP INDEX idx_leases_active;
+      CREATE UNIQUE INDEX idx_leases_active
+        ON leases(issue_id) WHERE phase <> 'released';
+      CREATE INDEX idx_leases_identity
+        ON leases(issue_id, run_id, generation, phase);
+    `,
+  },
 ];
 
 export const CURRENT_SCHEMA_VERSION = MIGRATIONS.reduce(

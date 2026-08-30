@@ -165,15 +165,18 @@ Three cases:
   `runmill gc` removes only workspaces with an exact `COMPLETED` or `PR_DELIVERED` state record;
   unknown and orphaned-looking directories are preserved. It does not resume the agent session.
 - **Mid-mutation** — new runs stop. Check GitHub or the backlog, then use `runmill effects resolve`
-  with the outcome you observed. Runmill never retries an ambiguous mutation blindly.
+  with the outcome you observed. Runmill never retries an ambiguous mutation blindly, and it keeps
+  the Git lease so a different host cannot act while the outcome remains unknown.
 - **Lease lost** — the run is fenced out and stops. Another worker owns the issue now, and the
   correct behavior is to do nothing rather than race.
 
-Before a pull request exists, an ordinary failed run restores the issue's prior state and assignee
-under the same lease, then releases it, so a fresh attempt can be selected. A hard process crash can
-leave both the remote lease ref and local row behind. Recovery is deliberately manual in this
-preview: verify the worker is dead, restore the issue state/assignee, delete the exact remote lease
-ref, then run:
+Before a pull request exists, an ordinary failed run with no ambiguous external effect restores the
+issue's prior state and assignee under the same lease, then releases it, so a fresh attempt can be
+selected. An ambiguous effect or hard process crash can leave both the remote lease ref and local
+row behind. The row reports `acquiring`, `held`, or `releasing` and its pending intent; none is
+silently treated as released. Recovery is deliberately manual in this preview: verify the worker is
+dead, reconcile any pending effect, restore the issue state/assignee when required, delete the exact
+remote lease ref, then run:
 
 ```bash
 runmill leases resolve <issue> --confirm-remote-cleared

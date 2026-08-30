@@ -46,6 +46,40 @@ function lease(cwd: string, runId: string): GitRefLease {
   return new GitRefLease({ cwd, runId, clock, ttlMinutes: 20, hostId: `host-${runId}`, pid: 1234 });
 }
 
+describe("GitRefLease journaled mutation primitives", () => {
+  it("prepares the exact acquisition object without publishing the remote ref", async () => {
+    const owner = lease(workA, "run_a");
+
+    const prepared = await owner.prepareAcquire("ENG-1", {
+      priorStateId: "Todo",
+      priorAssigneeId: "human-1",
+    });
+
+    expect(prepared).toMatchObject({
+      issueId: "ENG-1",
+      runId: "run_a",
+      generation: 1,
+      refName: "refs/runmill/leases/ENG-1",
+      priorStateId: "Todo",
+      priorAssigneeId: "human-1",
+    });
+    expect(await owner.observeObjectId("ENG-1")).toBeUndefined();
+
+    await owner.publishAcquire(prepared);
+    expect(await owner.observeObjectId("ENG-1")).toBe(prepared.objectId);
+  });
+
+  it("separates release publication from exact absence observation", async () => {
+    const owner = lease(workA, "run_a");
+    const prepared = await owner.prepareAcquire("ENG-1");
+    await owner.publishAcquire(prepared);
+
+    await owner.publishRelease(prepared);
+
+    expect(await owner.observeObjectId("ENG-1")).toBeUndefined();
+  });
+});
+
 describe("GitRefLease.acquire — when the push fails for a reason that is not contention", () => {
   /**
    * A push can fail because someone else holds the lease, or because the
