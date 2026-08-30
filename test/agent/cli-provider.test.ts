@@ -26,7 +26,10 @@ import {
   defaultPrompt,
   type CliProviderOptions,
 } from "../../src/agent/cli-provider.js";
-import { ResumeNotPermittedError } from "../../src/agent/adapter.js";
+import {
+  ResumeNotPermittedError,
+  SessionResumeUnsupportedError,
+} from "../../src/agent/adapter.js";
 import { UnknownEventError } from "../../src/agent/events.js";
 import { outputPathFor } from "../../src/agent/output-contract.js";
 import type { AgentRunRequest } from "../../src/agent/adapter.js";
@@ -152,7 +155,7 @@ describe("dialect definitions", () => {
     expect(CODEX_DIALECT.capabilities.sessionResume).toBe(false);
     expect(CODEX_DIALECT.capabilities.turnLimits).toBe(false);
     expect(CODEX_DIALECT.capabilities.toolAllowDeny).toBe(false);
-    expect(CLAUDE_DIALECT.capabilities.sessionResume).toBe(true);
+    expect(CLAUDE_DIALECT.capabilities.sessionResume).toBe(false);
     expect(CLAUDE_DIALECT.capabilities.turnLimits).toBe(true);
     expect(CLAUDE_DIALECT.capabilities.toolAllowDeny).toBe(true);
     expect(CLAUDE_DIALECT.capabilities.costReporting).toBe(true);
@@ -569,7 +572,25 @@ echo '{"type":"task_complete"}'
   );
 
   it("exposes the dialect's capabilities", async () => {
-    expect((await adapter(CLAUDE_DIALECT).capabilities()).sessionResume).toBe(true);
+    expect((await adapter(CLAUDE_DIALECT).capabilities()).sessionResume).toBe(false);
+  });
+
+  it("refuses implementer resume without starting a replacement session", async () => {
+    let starts = 0;
+    const sandbox = backend({
+      start: async () => {
+        starts += 1;
+        throw new Error("resume started a fresh provider session");
+      },
+    });
+
+    await expect(
+      providerAdapter({ dialect: CLAUDE_DIALECT, sandbox }).resume({
+        ...request({ role: "implementer" }),
+        sessionId: "s1",
+      }),
+    ).rejects.toBeInstanceOf(SessionResumeUnsupportedError);
+    expect(starts).toBe(0);
   });
 
   it("refuses to resume any role but the implementer", async () => {
@@ -1266,17 +1287,184 @@ exit 0
       const result = await (
         await providerAdapter({
           dialect: CODEX_DIALECT,
-          sandbox: scriptedSandbox({ stdoutChunks: ['{"type":"task_complete"}'] }),
+          sandbox: scriptedSandbox({
+            stdoutChunks: ['{"type":"task_started"}\n{"type":"task_complete"}'],
+          }),
         }).start(
           request({ workingDirectory: dir }),
         )
       ).result;
-      expect(result.events.map((event) => event.type)).toEqual(["result"]);
+      expect(result.events.map((event) => event.type)).toEqual(["session.started", "result"]);
       expect(result.status).toBe("success");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it.each([
+    {
+      name: "missing start",
+      chunks: ['{"type":"task_complete"}\n'],
+      detail: /start event/iu,
+    },
+    {
+      name: "duplicate start",
+      chunks: [
+        '{"type":"task_started"}\n',
+        '{"type":"task_started"}\n',
+        '{"type":"task_complete"}\n',
+      ],
+      detail: /start event/iu,
+    },
+    {
+      name: "missing terminal",
+      chunks: ['{"type":"task_started"}\n'],
+      detail: /terminal event/iu,
+    },
+    {
+      name: "duplicate terminal",
+      chunks: [
+        '{"type":"task_started"}\n',
+        '{"type":"task_complete"}\n',
+        '{"type":"task_complete"}\n',
+      ],
+      detail: /duplicate terminal/iu,
+    },
+  ])("fails closed on a $name protocol", async ({ chunks, detail }) => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
+    try {
+      const result = await (
+        await providerAdapter({
+          dialect: CODEX_DIALECT,
+          sandbox: scriptedSandbox({ stdoutChunks: chunks }),
+        }).start(request({ workingDirectory: dir }))
+      ).result;
+
+      expect(result.status).toBe("failure");
+      expect(result.error).toMatchObject({ class: "provider_internal", retryable: false });
+      expect(result.error?.detail).toMatch(detail);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when an exit-zero provider emits a failure terminal", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
+    try {
+      const result = await (
+        await providerAdapter({
+          dialect: CLAUDE_DIALECT,
+          sandbox: scriptedSandbox({
+            stdoutChunks: [
+              '{"type":"system","subtype":"init"}\n',
+              '{"type":"result","is_error":true}\n',
+            ],
+          }),
+        }).start(request({ workingDirectory: dir }))
+      ).result;
+
+      expect(result.status).toBe("failure");
+      expect(result.error).toMatchObject({ class: "provider_internal", retryable: false });
+      expect(result.error?.detail).toMatch(/failure terminal/iu);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on contradictory terminal events", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
+    try {
+      const result = await (
+        await providerAdapter({
+          dialect: CLAUDE_DIALECT,
+          sandbox: scriptedSandbox({
+            stdoutChunks: [
+              '{"type":"system","subtype":"init"}\n',
+              '{"type":"result","is_error":false}\n',
+              '{"type":"result","is_error":true}\n',
+            ],
+          }),
+        }).start(request({ workingDirectory: dir }))
+      ).result;
+
+      expect(result.status).toBe("failure");
+      expect(result.error?.detail).toMatch(/contradictory terminal/iu);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when a provider line exceeds the one-mebibyte protocol limit", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
+    try {
+      const result = await (
+        await providerAdapter({
+          dialect: CODEX_DIALECT,
+          sandbox: scriptedSandbox({
+            stdoutChunks: [
+              '{"type":"task_started"}\n',
+              `${"x".repeat(1024 * 1024 + 1)}\n`,
+              '{"type":"task_complete"}\n',
+            ],
+          }),
+        }).start(request({ workingDirectory: dir }))
+      ).result;
+
+      expect(result.status).toBe("failure");
+      expect(result.error?.detail).toMatch(/line.*1 MiB/iu);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when aggregate provider output exceeds 16 mebibytes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
+    const progressLine = `${"x".repeat(512 * 1024)}\n`;
+    try {
+      const result = await (
+        await providerAdapter({
+          dialect: CODEX_DIALECT,
+          sandbox: scriptedSandbox({
+            stdoutChunks: [
+              '{"type":"task_started"}\n',
+              ...Array.from({ length: 33 }, () => progressLine),
+              '{"type":"task_complete"}\n',
+            ],
+          }),
+        }).start(request({ workingDirectory: dir }))
+      ).result;
+
+      expect(result.status).toBe("failure");
+      expect(result.error?.detail).toMatch(/16 MiB/iu);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed after 10,000 retained provider events", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
+    const messages = Array.from(
+      { length: 9_999 },
+      (_, index) =>
+        `{"msg":{"type":"agent_message","message":"message-${String(index)}"}}\n`,
+    );
+    try {
+      const result = await (
+        await providerAdapter({
+          dialect: CODEX_DIALECT,
+          sandbox: scriptedSandbox({
+            stdoutChunks: ['{"type":"task_started"}\n', ...messages, '{"type":"task_complete"}\n'],
+          }),
+        }).start(request({ workingDirectory: dir }))
+      ).result;
+
+      expect(result.status).toBe("failure");
+      expect(result.events).toHaveLength(10_000);
+      expect(result.error?.detail).toMatch(/10,000 events/iu);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it("FAILS CLOSED on an event shape the dialect does not recognise", async () => {
     // The load-bearing guarantee. Misreading a tool call or a terminal result
@@ -1474,6 +1662,87 @@ exit 0
     }
   }, 30_000);
 
+  it("streams normalized events before process completion", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
+    type Execution = Awaited<ReturnType<SandboxBackend["start"]>>;
+    type ExecutionResult = Awaited<Execution["result"]>;
+    let emitStdout!: (chunk: Buffer) => void;
+    let finish!: (result: ExecutionResult) => void;
+    const pending = new Promise<ExecutionResult>((resolve) => {
+      finish = resolve;
+    });
+    const sandbox = backend({
+      start: async (input) => {
+        emitStdout = (chunk) => input.onStdout?.(chunk);
+        return { ...completedExecution("", input.command), result: pending };
+      },
+    });
+    try {
+      const session = await providerAdapter({ dialect: CODEX_DIALECT, sandbox }).start(
+        request({ workingDirectory: dir }),
+      );
+      const iterator = session.events[Symbol.asyncIterator]();
+
+      emitStdout(Buffer.from('{"type":"task_started"}\n'));
+      await expect(iterator.next()).resolves.toMatchObject({
+        done: false,
+        value: { type: "session.started", seq: 1 },
+      });
+
+      emitStdout(Buffer.from('{"type":"task_complete"}\n'));
+      finish({
+        outcome: "exited",
+        exitCode: 0,
+        signal: null,
+        stdout: "",
+        stderr: "",
+        durationMs: 1,
+      });
+      await expect(session.result).resolves.toMatchObject({ status: "success" });
+      await expect(iterator.next()).resolves.toMatchObject({
+        done: false,
+        value: { type: "result", seq: 2 },
+      });
+      await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans disposable provider state when sandbox completion rejects", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
+    let preparedPath = "";
+    const sandbox = backend({
+      prepareDisposableHome: () => {
+        preparedPath = mkdtempSync(join(tmpdir(), "runmill-provider-rejected-home-"));
+        return {
+          path: preparedPath,
+          cleanup: () => rmSync(preparedPath, { recursive: true, force: true }),
+        };
+      },
+      start: async (input) => ({
+        ...completedExecution("", input.command),
+        result: Promise.reject(new Error("containment acknowledgement missing")),
+      }),
+    });
+    try {
+      const session = await providerAdapter({ dialect: CODEX_DIALECT, sandbox }).start(
+        request({ workingDirectory: dir }),
+      );
+
+      await expect(session.result).resolves.toMatchObject({
+        status: "failure",
+        outputRef: undefined,
+        error: { class: "provider_internal", retryable: false },
+      });
+      expect(existsSync(preparedPath)).toBe(false);
+      await expect(session.sessionId).resolves.toContain("run_1");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      if (preparedPath !== "") rmSync(preparedPath, { recursive: true, force: true });
+    }
+  });
+
   it(
     "cancels a pre-aborted request before preparing HOME or starting the sandbox",
     async () => {
@@ -1558,7 +1827,7 @@ exit 0
         await providerAdapter({
           dialect: CODEX_DIALECT,
           sandbox: scriptedSandbox({
-            stdoutChunks: ['{"type":"task_complete"}\n'],
+            stdoutChunks: ['{"type":"task_started"}\n', '{"type":"task_complete"}\n'],
             beforeResult: () => writeFileSync(outPath, '{"verdict":"approved"}\n'),
           }),
         }).start(
@@ -1570,6 +1839,109 @@ exit 0
       rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it.each([
+    {
+      name: "non-zero exit",
+      result: {
+        outcome: "exited" as const,
+        exitCode: 1,
+        signal: null,
+        stdout: "",
+        stderr: "provider failed",
+        durationMs: 1,
+      },
+    },
+    {
+      name: "timeout",
+      result: {
+        outcome: "timeout" as const,
+        exitCode: null,
+        signal: "TIMEOUT",
+        stdout: "",
+        stderr: "",
+        durationMs: 1,
+      },
+    },
+    {
+      name: "output limit",
+      result: {
+        outcome: "sandbox-denied" as const,
+        exitCode: null,
+        signal: "OUTPUT_LIMIT",
+        stdout: "",
+        stderr: "sandbox output limit exceeded",
+        durationMs: 1,
+      },
+    },
+  ])("discards structured output after a $name", async ({ result: sandboxResult }) => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
+    const outPath = outputPathFor(dir, "local-reviewer") as string;
+    try {
+      const result = await (
+        await providerAdapter({
+          dialect: CODEX_DIALECT,
+          sandbox: scriptedSandbox({
+            stdoutChunks: ['{"type":"task_started"}\n', '{"type":"task_complete"}\n'],
+            beforeResult: () => writeFileSync(outPath, '{"verdict":"approved"}\n'),
+            result: sandboxResult,
+          }),
+        }).start(request({ workingDirectory: dir, role: "local-reviewer" }))
+      ).result;
+
+      expect(result.status).not.toBe("success");
+      expect(result.outputRef).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a structured review file larger than one mebibyte", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
+    const outPath = outputPathFor(dir, "local-reviewer") as string;
+    try {
+      const result = await (
+        await providerAdapter({
+          dialect: CODEX_DIALECT,
+          sandbox: scriptedSandbox({
+            stdoutChunks: ['{"type":"task_started"}\n', '{"type":"task_complete"}\n'],
+            beforeResult: () => writeFileSync(outPath, "x".repeat(1024 * 1024 + 1)),
+          }),
+        }).start(request({ workingDirectory: dir, role: "local-reviewer" }))
+      ).result;
+
+      expect(result.status).toBe("failure");
+      expect(result.outputRef).toBeUndefined();
+      expect(result.error?.detail).toMatch(/structured output.*1 MiB/iu);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a non-regular structured review target", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runmill-stream-"));
+    const outPath = outputPathFor(dir, "local-reviewer") as string;
+    try {
+      const result = await (
+        await providerAdapter({
+          dialect: CODEX_DIALECT,
+          sandbox: scriptedSandbox({
+            stdoutChunks: ['{"type":"task_started"}\n', '{"type":"task_complete"}\n'],
+            beforeResult: () => {
+              rmSync(outPath, { force: true });
+              mkdirSync(outPath);
+            },
+          }),
+        }).start(request({ workingDirectory: dir, role: "local-reviewer" }))
+      ).result;
+
+      expect(result.status).toBe("failure");
+      expect(result.outputRef).toBeUndefined();
+      expect(result.error?.detail).toMatch(/regular file/iu);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it("leaves outputRef undefined when a role that owes output produced none", async () => {
     // The orchestrator turns this into RM-REVIEW-001 rather than treating a
@@ -1584,7 +1956,9 @@ exit 0
       const result = await (
         await providerAdapter({
           dialect: CODEX_DIALECT,
-          sandbox: scriptedSandbox({ stdoutChunks: ['{"type":"task_complete"}\n'] }),
+          sandbox: scriptedSandbox({
+            stdoutChunks: ['{"type":"task_started"}\n', '{"type":"task_complete"}\n'],
+          }),
         }).start(
           request({ workingDirectory: dir, role: "local-reviewer" }),
         )
@@ -1628,7 +2002,9 @@ describe("model selection", () => {
       const sandbox = backend({
         start: async (input) => {
           capturedArgs = [...input.args];
-          input.onStdout?.(Buffer.from('{"type":"task_complete"}\n'));
+          input.onStdout?.(
+            Buffer.from('{"type":"task_started"}\n{"type":"task_complete"}\n'),
+          );
           return completedExecution("", input.command);
         },
       });

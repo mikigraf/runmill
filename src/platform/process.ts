@@ -9,6 +9,7 @@ import { fstatSync } from "node:fs";
  * is set once and generously.
  */
 const MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+export const DEFAULT_LOCAL_COMMAND_TIMEOUT_MS = 2 * 60_000;
 
 /**
  * A bounded tail of a byte stream.
@@ -304,6 +305,7 @@ export async function run(
 ): Promise<RunResult> {
   const result = await runCapturedProcess(command, args, {
     ...options,
+    timeoutMs: options.timeoutMs ?? DEFAULT_LOCAL_COMMAND_TIMEOUT_MS,
     maxOutputBytes: MAX_BUFFER_BYTES,
     detached: true,
   });
@@ -323,6 +325,7 @@ export async function runBytes(
 ): Promise<RunBytesResult> {
   const result = await runCapturedProcess(command, args, {
     ...options,
+    timeoutMs: options.timeoutMs ?? DEFAULT_LOCAL_COMMAND_TIMEOUT_MS,
     maxOutputBytes: options.maxOutputBytes,
     detached: true,
   });
@@ -348,6 +351,7 @@ export async function runWithInput(
 ): Promise<RunResult> {
   const result = await runCapturedProcess(command, args, {
     ...options,
+    timeoutMs: options.timeoutMs ?? DEFAULT_LOCAL_COMMAND_TIMEOUT_MS,
     maxOutputBytes: MAX_BUFFER_BYTES,
     input,
     detached: options.detached !== false,

@@ -102,7 +102,7 @@ export interface CodingAgentAdapter {
   authStatus(): Promise<AuthStatus>;
   capabilities(): Promise<ProviderCapabilities>;
   start(request: AgentRunRequest): Promise<AgentSession>;
-  /** Only the implementer role may resume; reviewers always start fresh. */
+  /** Reviewers are always fresh; an implementer may resume only when the capability is verified. */
   resume(request: AgentRunRequest & { sessionId: string }): Promise<AgentSession>;
 }
 
@@ -113,6 +113,16 @@ export class ResumeNotPermittedError extends Error {
         `silently break reviewer independence`,
     );
     this.name = "ResumeNotPermittedError";
+  }
+}
+
+export class SessionResumeUnsupportedError extends Error {
+  constructor(provider: string) {
+    super(
+      `provider "${provider}" does not support a verified session-resume protocol; ` +
+        "refusing to start a fresh session under a resume request",
+    );
+    this.name = "SessionResumeUnsupportedError";
   }
 }
 

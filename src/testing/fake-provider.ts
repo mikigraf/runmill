@@ -9,12 +9,15 @@ import type {
   ProviderCapabilities,
   ProviderInstallation,
 } from "../agent/adapter.js";
-import { assertResumable } from "../agent/adapter.js";
+import { assertResumable, SessionResumeUnsupportedError } from "../agent/adapter.js";
 import type { AgentEvent, AgentEventBody } from "../agent/events.js";
 import { assertKnownEvent } from "../agent/events.js";
 import type { Clock } from "../platform/clock.js";
 import { SystemClock } from "../platform/clock.js";
-import { outputPathFor } from "../agent/output-contract.js";
+import {
+  prepareStructuredOutput,
+  readStructuredOutput,
+} from "../agent/output-contract.js";
 import { BASE_CAPABILITIES } from "../agent/cli-provider.js";
 
 /** A scripted action the fake agent performs inside its workspace. */
@@ -128,18 +131,34 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
   async capabilities(): Promise<ProviderCapabilities> {
     // Derived from the same base every real dialect uses, so a test gating on
     // a capability cannot pass against the fake and fail against a provider.
-    return { ...BASE_CAPABILITIES, sessionResume: true, costReporting: true };
+    return { ...BASE_CAPABILITIES, costReporting: true };
   }
 
   async resume(request: AgentRunRequest & { sessionId: string }): Promise<AgentSession> {
     assertResumable(request.role);
-    return this.start(request);
+    throw new SessionResumeUnsupportedError(this.name);
   }
 
   async start(request: AgentRunRequest): Promise<AgentSession> {
+    if (request.signal?.aborted === true) {
+      const sessionId = `fake-${request.runId}-${request.role}-${request.attempt}`;
+      const result = Promise.resolve<AgentRunResult>({
+        status: "cancelled",
+        sessionId,
+        events: [],
+      });
+      return {
+        sessionId: Promise.resolve(sessionId),
+        events: (async function* () {
+          await result;
+        })(),
+        result,
+        respondToPermission: async () => undefined,
+        abort: async () => undefined,
+      };
+    }
     this.startedRequests.push(request);
-    const expectedOutput = outputPathFor(request.workingDirectory, request.role);
-    if (expectedOutput !== undefined) rmSync(expectedOutput, { force: true });
+    const expectedOutput = prepareStructuredOutput(request.workingDirectory, request.role);
     if (existsSync(request.taskPacketPath)) {
       this.capturedPackets.push(JSON.parse(readFileSync(request.taskPacketPath, "utf8")));
       const issueDoc = join(dirname(request.taskPacketPath), "issue.md");
@@ -275,8 +294,23 @@ export class FakeProviderAdapter implements CodingAgentAdapter {
       let outputRef = "";
       if (output !== undefined && expectedOutput !== undefined) {
         outputRef = expectedOutput;
-        mkdirSync(dirname(outputRef), { recursive: true });
         writeFileSync(outputRef, JSON.stringify(output, null, 2));
+        try {
+          readStructuredOutput(outputRef);
+        } catch {
+          emit({ type: "error", class: "provider_internal", retryable: false });
+          emit({ type: "result", status: "failure", outputRef: "" });
+          return {
+            status: "failure",
+            sessionId,
+            events,
+            error: {
+              class: "provider_internal",
+              retryable: false,
+              detail: "structured output violated the production output contract",
+            },
+          };
+        }
       }
 
       emit({ type: "result", status: "success", outputRef });

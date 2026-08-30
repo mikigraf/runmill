@@ -726,6 +726,84 @@ describe("end-to-end refusal boundaries", () => {
     expect(outcome.reason).toMatch(/no structured output/i);
   }, 90_000);
 
+  it("refuses local-review output when the reviewer process failed", async () => {
+    class FailedReviewerWithOutput extends FakeProviderAdapter {
+      override async start(request: Parameters<FakeProviderAdapter["start"]>[0]) {
+        const session = await super.start(request);
+        if (request.role !== "local-reviewer") return session;
+        return {
+          ...session,
+          result: session.result.then((result) => ({
+            ...result,
+            status: "failure" as const,
+            error: {
+              class: "provider_internal",
+              retryable: false,
+              detail: "reviewer process failed after writing output",
+            },
+          })),
+        };
+      }
+    }
+
+    const provider = new FailedReviewerWithOutput({
+      byRole: {
+        implementer: [
+          { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
+        ],
+        "local-reviewer": [{ kind: "say", text: "reviewing" }],
+      },
+      outputByRole: { "local-reviewer": GOOD_REVIEW },
+    });
+    const { orchestrator, forge } = makeOrchestrator({ provider });
+
+    const outcome = await orchestrator.run({
+      runId: "run_failed_local_review",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_failed_local_review"),
+    });
+
+    expect(outcome.finalState).toBe("NEEDS_HUMAN");
+    expect(outcome.reason).toMatch(/local reviewer returned failure/iu);
+    expect(forge.openPullRequests()).toHaveLength(0);
+  }, 90_000);
+
+  it("refuses a reviewer output reference outside its bound workspace path", async () => {
+    const planted = join(root, "planted-review.json");
+    writeFileSync(planted, JSON.stringify(GOOD_REVIEW));
+    class ReviewerWithUnboundOutput extends FakeProviderAdapter {
+      override async start(request: Parameters<FakeProviderAdapter["start"]>[0]) {
+        const session = await super.start(request);
+        if (request.role !== "local-reviewer") return session;
+        return {
+          ...session,
+          result: session.result.then((result) => ({ ...result, outputRef: planted })),
+        };
+      }
+    }
+
+    const provider = new ReviewerWithUnboundOutput({
+      byRole: {
+        implementer: [
+          { kind: "write", path: "greeting.ts", content: "export const greet = () => 'hi';\n" },
+        ],
+      },
+    });
+    const { orchestrator, forge } = makeOrchestrator({ provider });
+
+    const outcome = await orchestrator.run({
+      runId: "run_unbound_local_review",
+      issue: ISSUE,
+      target: TARGET,
+      lease: lease("run_unbound_local_review"),
+    });
+
+    expect(outcome.finalState).toBe("QUARANTINED");
+    expect(outcome.reason).toMatch(/bound output path/iu);
+    expect(forge.openPullRequests()).toHaveLength(0);
+  }, 90_000);
+
   it.skip("quarantines on a malformed review rather than treating it as a pass (pending qualified sandbox execution)", async () => {
     const provider = new FakeProviderAdapter({
       byRole: {

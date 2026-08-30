@@ -1,6 +1,6 @@
-import { readFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { errorMessage, RunmillError } from "../errors/runmill-error.js";
 import type {
   AgentRunRequest,
@@ -11,14 +11,17 @@ import type {
   ProviderCapabilities,
   ProviderInstallation,
 } from "./adapter.js";
-import { assertResumable } from "./adapter.js";
+import { assertResumable, SessionResumeUnsupportedError } from "./adapter.js";
 import type { AgentEvent, AgentEventBody } from "./events.js";
-import { UnknownEventError } from "./events.js";
 import type { Clock } from "../platform/clock.js";
 import { SystemClock } from "../platform/clock.js";
 import type { SandboxBackend } from "../workspace/sandbox.js";
 import { run } from "../platform/process.js";
-import { outputPathFor, outputContractFor } from "./output-contract.js";
+import {
+  outputContractFor,
+  prepareStructuredOutput,
+  readStructuredOutput,
+} from "./output-contract.js";
 import { LOCAL_REVIEW_SKILL, PR_REVIEW_SKILL } from "../review/default-skills.js";
 import { createProviderSessionHome } from "./provider-home.js";
 
@@ -150,7 +153,6 @@ export const CLAUDE_DIALECT: ProviderDialect = {
   versionArgs: ["--version"],
   capabilities: {
     ...BASE_CAPABILITIES,
-    sessionResume: true,
     turnLimits: true,
     toolAllowDeny: true,
     costReporting: true,
@@ -236,6 +238,8 @@ export interface ProviderExecutionStatus {
 const READINESS_MARKER = "RUNMILL_READY";
 const READINESS_TIMEOUT_MS = 30_000;
 const PROVIDER_OUTPUT_LIMIT_BYTES = 16 * 1024 * 1024;
+const PROVIDER_LINE_LIMIT_BYTES = 1024 * 1024;
+const PROVIDER_EVENT_LIMIT = 10_000;
 const PROVIDER_SUBPROCESSES = [
   "/bin/sh",
   "/bin/cat",
@@ -254,13 +258,67 @@ function providerSubprocesses(request: AgentRunRequest): string[] {
   return [...new Set([...PROVIDER_SUBPROCESSES, ...configured])];
 }
 
+/** A replayable live stream with one fixed retained-event ceiling. */
+class BoundedEventStream<T> implements AsyncIterable<T> {
+  readonly #limit: number;
+  readonly #events: T[] = [];
+  readonly #waiters = new Set<() => void>();
+  #closed = false;
+
+  constructor(limit: number) {
+    this.#limit = limit;
+  }
+
+  push(event: T): boolean {
+    if (this.#closed || this.#events.length >= this.#limit) return false;
+    this.#events.push(event);
+    this.#wake();
+    return true;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#wake();
+  }
+
+  snapshot(): readonly T[] {
+    return [...this.#events];
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<T, void, unknown> {
+    let index = 0;
+    while (true) {
+      if (index < this.#events.length) {
+        const event = this.#events[index];
+        index += 1;
+        if (event !== undefined) yield event;
+        continue;
+      }
+      if (this.#closed) return;
+      await new Promise<void>((resolve) => {
+        const wake = (): void => {
+          this.#waiters.delete(wake);
+          resolve();
+        };
+        this.#waiters.add(wake);
+        if (this.#closed || index < this.#events.length) wake();
+      });
+    }
+  }
+
+  #wake(): void {
+    for (const wake of [...this.#waiters]) wake();
+  }
+}
+
 /**
  * Runs a real coding-agent CLI and normalizes its output.
  *
- * The stream is parsed strictly: a line that is not JSON, or an event whose
- * discriminant this dialect does not recognise, does not get a best-effort
- * interpretation — misreading a tool call or a terminal result is worse than
- * stopping, so the session fails closed and the run quarantines.
+ * Human-readable provider banners are ignored, while JSON events are mapped
+ * only by the selected dialect. A dialect that encounters an unknown
+ * authority-bearing discriminant throws, because misreading a tool call or a
+ * terminal result is worse than stopping.
  */
 export class CliProviderAdapter implements CodingAgentAdapter {
   readonly #dialect: ProviderDialect;
@@ -477,7 +535,7 @@ export class CliProviderAdapter implements CodingAgentAdapter {
 
   async resume(request: AgentRunRequest & { sessionId: string }): Promise<AgentSession> {
     assertResumable(request.role);
-    return this.start(request);
+    throw new SessionResumeUnsupportedError(this.name);
   }
 
   async start(request: AgentRunRequest): Promise<AgentSession> {
@@ -509,39 +567,64 @@ export class CliProviderAdapter implements CodingAgentAdapter {
         : this.#dialect.modelArgs(this.#model)),
     ];
 
-    const events: AgentEvent[] = [];
+    const eventStream = new BoundedEventStream<AgentEvent>(PROVIDER_EVENT_LIMIT);
     let seq = 0;
     let sessionIdResolve!: (id: string) => void;
     const sessionIdPromise = new Promise<string>((resolve) => {
       sessionIdResolve = resolve;
     });
     const sessionId = `${this.#dialect.name}-${request.runId}-${request.role}-${request.attempt}`;
+    let startCount = 0;
+    let startSequence: number | undefined;
+    const terminalEvents: { readonly kind: "success" | "failure"; readonly seq: number }[] = [];
+    let protocolError: Error | undefined;
+    let localOutputLimited = false;
+    let execution: Awaited<ReturnType<SandboxBackend["start"]>> | undefined;
+    let internalAbortRequested = false;
+    let cancellationRequested = false;
+
+    const requestInternalAbort = (): void => {
+      internalAbortRequested = true;
+      if (execution !== undefined) void execution.abort().catch(() => undefined);
+    };
+
+    const failProtocol = (error: Error): void => {
+      if (protocolError === undefined) protocolError = error;
+      requestInternalAbort();
+    };
 
     const emit = (body: AgentEventBody): void => {
-      seq += 1;
-      events.push({
-        seq,
+      const nextSeq = seq + 1;
+      const event = {
+        seq: nextSeq,
         ts: this.#clock.now().toISOString(),
         runId: request.runId,
         sessionId,
         role: request.role,
         attempt: request.attempt,
         ...body,
-      });
-      if (body.type === "session.started") sessionIdResolve(sessionId);
+      } as AgentEvent;
+      if (!eventStream.push(event)) {
+        failProtocol(new Error("provider emitted more than 10,000 events"));
+        return;
+      }
+      seq = nextSeq;
+      if (body.type === "session.started") {
+        startCount += 1;
+        if (startSequence === undefined) startSequence = seq;
+        sessionIdResolve(sessionId);
+      }
+      if (body.type === "result") {
+        terminalEvents.push({ kind: body.status, seq });
+      } else if (body.type === "error") {
+        terminalEvents.push({ kind: "failure", seq });
+      }
     };
 
     // A previous reviewer attempt must never satisfy the current output
     // contract. The file is agent-writable by design, so freshness is created
     // here, before the role starts, rather than inferred from its existence.
-    const expectedOutput = outputPathFor(request.workingDirectory, request.role);
-    if (expectedOutput !== undefined) {
-      rmSync(expectedOutput, { force: true });
-      mkdirSync(dirname(expectedOutput), { recursive: true });
-      // Bubblewrap can grant an individual file without making its parent
-      // directory writable only when the bind source already exists.
-      writeFileSync(expectedOutput, "", { mode: 0o600 });
-    }
+    const expectedOutput = prepareStructuredOutput(request.workingDirectory, request.role);
     const readOnlyReviewer =
       request.role === "local-reviewer" || request.role === "pr-reviewer";
 
@@ -563,30 +646,93 @@ export class CliProviderAdapter implements CodingAgentAdapter {
       preparedHome.cleanup();
       throw error;
     }
-    let buffer = "";
-    let parseError: Error | undefined;
-    const onStdout = (chunk: Buffer): void => {
-      buffer += chunk.toString();
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (line.trim() === "") continue;
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        try {
-          const body = this.#dialect.mapLine(parsed);
-          if (body !== undefined) emit(body);
-        } catch (error) {
-          if (error instanceof UnknownEventError) parseError = error;
-        }
+    const cleanupProviderState = (): boolean => {
+      let failed = false;
+      try {
+        providerHome.cleanup();
+      } catch {
+        failed = true;
+      }
+      try {
+        preparedHome.cleanup();
+      } catch {
+        failed = true;
+      }
+      return !failed;
+    };
+    let lineChunks: Buffer[] = [];
+    let lineBytes = 0;
+    let observedOutputBytes = 0;
+
+    const observeOutput = (chunk: Buffer): boolean => {
+      observedOutputBytes += chunk.length;
+      if (observedOutputBytes <= PROVIDER_OUTPUT_LIMIT_BYTES) return true;
+      localOutputLimited = true;
+      requestInternalAbort();
+      return false;
+    };
+
+    const parseLine = (): void => {
+      if (lineBytes === 0 || protocolError !== undefined || localOutputLimited) {
+        lineChunks = [];
+        lineBytes = 0;
+        return;
+      }
+      const bytes = Buffer.concat(lineChunks, lineBytes);
+      lineChunks = [];
+      lineBytes = 0;
+      const line = bytes.toString("utf8");
+      if (line.trim() === "") return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        // Provider CLIs can interleave banners and progress text with JSONL.
+        // Those lines carry no protocol authority and remain observations only.
+        return;
+      }
+      try {
+        const body = this.#dialect.mapLine(parsed);
+        if (body !== undefined) emit(body);
+      } catch (error) {
+        failProtocol(error instanceof Error ? error : new Error(String(error)));
       }
     };
 
-    let execution: Awaited<ReturnType<SandboxBackend["start"]>>;
+    const appendLineBytes = (bytes: Buffer): boolean => {
+      if (bytes.length === 0) return true;
+      if (lineBytes + bytes.length > PROVIDER_LINE_LIMIT_BYTES) {
+        lineChunks = [];
+        lineBytes = 0;
+        localOutputLimited = true;
+        failProtocol(new Error("provider output line exceeded the 1 MiB limit"));
+        return false;
+      }
+      lineChunks.push(bytes);
+      lineBytes += bytes.length;
+      return true;
+    };
+
+    const onStdout = (chunk: Buffer): void => {
+      if (!observeOutput(chunk) || protocolError !== undefined) return;
+      let offset = 0;
+      while (offset < chunk.length) {
+        const newline = chunk.indexOf(0x0a, offset);
+        if (newline === -1) {
+          appendLineBytes(chunk.subarray(offset));
+          return;
+        }
+        if (!appendLineBytes(chunk.subarray(offset, newline))) return;
+        parseLine();
+        if (protocolError !== undefined || localOutputLimited) return;
+        offset = newline + 1;
+      }
+    };
+
+    const onStderr = (chunk: Buffer): void => {
+      observeOutput(chunk);
+    };
+
     try {
       const preparedDependencies = (request.preparedDependencyPaths ?? []).map((path) =>
         this.#sandbox.prepareDependencyCheckout(path),
@@ -599,6 +745,7 @@ export class CliProviderAdapter implements CodingAgentAdapter {
         subprocesses: providerSubprocesses(request),
         maxOutputBytes: PROVIDER_OUTPUT_LIMIT_BYTES,
         onStdout,
+        onStderr,
         policy: {
           // The entire disposable HOME is writable. Both CLIs keep caches and
           // session state beside their authentication config and may fail
@@ -620,121 +767,169 @@ export class CliProviderAdapter implements CodingAgentAdapter {
         timeoutMs: request.timeoutMs,
         preparedDependencyPaths: preparedDependencies.map((prepared) => prepared.path),
       });
+      if (internalAbortRequested) void execution.abort().catch(() => undefined);
     } catch (error) {
-      try {
-        providerHome.cleanup();
-      } finally {
-        preparedHome.cleanup();
+      const cleaned = cleanupProviderState();
+      if (!(error instanceof RunmillError)) {
+        eventStream.close();
+        throw error;
       }
-      if (!(error instanceof RunmillError)) throw error;
       sessionIdResolve(sessionId);
+      eventStream.close();
       const result = Promise.resolve<AgentRunResult>({
         status: "failure",
         sessionId,
-        events,
+        events: eventStream.snapshot(),
         error: {
           class: "provider_internal",
           retryable: false,
-          detail: errorMessage(error),
+          detail: cleaned ? errorMessage(error) : "disposable provider state could not be removed",
         },
       });
       return {
         sessionId: sessionIdPromise,
-        events: (async function* () {
-          await result;
-          for (const event of events) yield event;
-        })(),
+        events: eventStream,
         result,
         respondToPermission: async () => undefined,
         abort: async () => undefined,
       };
     }
+    if (execution === undefined) {
+      eventStream.close();
+      throw new Error("sandbox backend returned no execution handle");
+    }
+    const activeExecution = execution;
     const abortFromSignal = (): void => {
-      void execution.abort();
+      cancellationRequested = true;
+      void activeExecution.abort().catch(() => undefined);
     };
     request.signal?.addEventListener("abort", abortFromSignal, { once: true });
     if (request.signal?.aborted === true) abortFromSignal();
 
-    const result = execution.result.then((sandboxResult): AgentRunResult => {
+    const failure = (
+      detail: string,
+      errorClass = "provider_internal",
+      retryable = false,
+    ): AgentRunResult => ({
+      status: "failure",
+      sessionId,
+      events: eventStream.snapshot(),
+      error: { class: errorClass, retryable, detail },
+    });
+
+    const result = (async (): Promise<AgentRunResult> => {
+      let agentResult: AgentRunResult;
       try {
-        if (buffer !== "") onStdout(Buffer.from("\n"));
+        const sandboxResult = await activeExecution.result;
+        if (lineBytes > 0) parseLine();
         sessionIdResolve(sessionId);
 
-        if (parseError !== undefined) {
-          return {
-            status: "failure",
+        const outputLimit =
+          localOutputLimited ||
+          sandboxResult.signal === "OUTPUT_LIMIT" ||
+          /sandbox output limit exceeded/iu.test(sandboxResult.stderr);
+        const hasSuccessTerminal = terminalEvents.some((terminal) => terminal.kind === "success");
+        const hasFailureTerminal = terminalEvents.some((terminal) => terminal.kind === "failure");
+
+        if (
+          cancellationRequested ||
+          request.signal?.aborted === true ||
+          (sandboxResult.outcome === "aborted" && !internalAbortRequested)
+        ) {
+          agentResult = {
+            status: "cancelled",
             sessionId,
-            events,
-            error: {
-              class: "provider_internal",
-              retryable: false,
-              detail: parseError.message,
-            },
+            events: eventStream.snapshot(),
           };
-        }
-
-        // Structured output is resolved from the shared role contract, not
-        // from a per-request flag: the contract is the single definition of
-        // which roles produce output and where it lands.
-        let outputRef: string | undefined;
-        if (expectedOutput !== undefined) {
-          try {
-            const contents = readFileSync(expectedOutput, "utf8");
-            outputRef = contents.trim() === "" ? undefined : expectedOutput;
-          } catch {
-            outputRef = undefined;
+        } else if (sandboxResult.outcome === "timeout") {
+          agentResult = {
+            status: "timeout",
+            sessionId,
+            events: eventStream.snapshot(),
+          };
+        } else if (outputLimit) {
+          agentResult = failure(
+            protocolError?.message ?? "provider output exceeded the 16 MiB limit",
+          );
+        } else if (protocolError !== undefined) {
+          agentResult = failure(protocolError.message);
+        } else if (hasSuccessTerminal && hasFailureTerminal) {
+          agentResult = failure("provider emitted contradictory terminal events");
+        } else if (hasFailureTerminal) {
+          agentResult = failure("provider emitted a failure terminal event");
+        } else if (sandboxResult.outcome !== "exited" || sandboxResult.exitCode !== 0) {
+          const stderr = sandboxResult.stderr;
+          agentResult = failure(
+            lastMeaningfulLines(stderr) ?? "provider process did not exit successfully",
+            classifyStderr(stderr),
+            isRetryable(stderr),
+          );
+        } else if (terminalEvents.length === 0) {
+          agentResult = failure("provider emitted no terminal event");
+        } else if (terminalEvents.length > 1) {
+          agentResult = failure("provider emitted duplicate terminal events");
+        } else if (startCount !== 1) {
+          agentResult = failure(
+            startCount === 0
+              ? "provider emitted no start event"
+              : "provider emitted more than one start event",
+          );
+        } else if (
+          startSequence === undefined ||
+          startSequence >= (terminalEvents[0]?.seq ?? 0)
+        ) {
+          agentResult = failure("provider terminal event contradicted event ordering");
+        } else {
+          let outputRef: string | undefined;
+          let outputError: Error | undefined;
+          if (expectedOutput !== undefined) {
+            try {
+              const contents = readStructuredOutput(expectedOutput);
+              outputRef = contents.trim() === "" ? undefined : expectedOutput;
+            } catch (error) {
+              outputError =
+                error instanceof Error ? error : new Error("structured output could not be read");
+            }
           }
+          agentResult =
+            outputError === undefined
+              ? {
+                  status: "success",
+                  sessionId,
+                  events: eventStream.snapshot(),
+                  outputRef,
+                }
+              : failure(outputError.message);
         }
-
-        if (sandboxResult.outcome === "aborted" || request.signal?.aborted === true) {
-          return { status: "cancelled", sessionId, events };
-        }
-        if (sandboxResult.outcome === "timeout") {
-          return { status: "timeout", sessionId, events };
-        }
-
-        return {
-          status:
-            sandboxResult.outcome === "exited" && sandboxResult.exitCode === 0
-              ? "success"
-              : "failure",
-          sessionId,
-          events,
-          outputRef,
-          error:
-            sandboxResult.outcome === "exited" && sandboxResult.exitCode === 0
-              ? undefined
-              : (() => {
-                  const stderr = sandboxResult.stderr;
-                  return {
-                    class: classifyStderr(stderr),
-                    retryable: isRetryable(stderr),
-                    detail: lastMeaningfulLines(stderr),
-                  };
-                })(),
-        };
-      } finally {
-        request.signal?.removeEventListener("abort", abortFromSignal);
-        try {
-          providerHome.cleanup();
-        } finally {
-          preparedHome.cleanup();
-        }
+      } catch (error) {
+        sessionIdResolve(sessionId);
+        agentResult = failure(
+          error instanceof RunmillError
+            ? errorMessage(error)
+            : "sandbox execution completion could not be proven",
+        );
       }
-    });
+
+      request.signal?.removeEventListener("abort", abortFromSignal);
+      if (!cleanupProviderState()) {
+        agentResult = failure("disposable provider state could not be removed");
+      }
+      eventStream.close();
+      return agentResult;
+    })();
 
     return {
       sessionId: sessionIdPromise,
-      events: (async function* () {
-        await result.catch(() => undefined);
-        for (const event of events) yield event;
-      })(),
+      events: eventStream,
       result,
       respondToPermission: async () => {
         // Permissions are granted up front via explicit tool allowlists, so a
         // mid-run request is not expected. Nothing to answer.
       },
-      abort: () => execution.abort(),
+      abort: async () => {
+        cancellationRequested = true;
+        await activeExecution.abort();
+      },
     };
   }
 }

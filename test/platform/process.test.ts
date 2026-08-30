@@ -3,6 +3,7 @@ import type { ChildProcess } from "node:child_process";
 import {
   armKillTimer,
   BoundedCapture,
+  DEFAULT_LOCAL_COMMAND_TIMEOUT_MS,
   run,
   runBytes,
   runOrThrow,
@@ -56,6 +57,10 @@ describe("BoundedCapture", () => {
 });
 
 describe("run", () => {
+  it("uses a bounded two-minute local-command default", () => {
+    expect(DEFAULT_LOCAL_COMMAND_TIMEOUT_MS).toBe(120_000);
+  });
+
   it("captures stdout without throwing on success", async () => {
     const result = await run("/bin/echo", ["hi"]);
     expect(result.ok).toBe(true);

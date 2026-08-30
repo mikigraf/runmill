@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { outputContractFor, outputPathFor } from "../../src/agent/output-contract.js";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  outputContractFor,
+  outputPathFor,
+  prepareStructuredOutput,
+  readStructuredOutput,
+} from "../../src/agent/output-contract.js";
 import { CliProviderAdapter, CODEX_DIALECT, CLAUDE_DIALECT, defaultPrompt } from "../../src/agent/cli-provider.js";
 import type { AgentRunRequest } from "../../src/agent/adapter.js";
 import { createTestSandboxBackend } from "../../src/workspace/sandbox.js";
@@ -48,6 +56,43 @@ describe("output contract", () => {
   it("says nothing about output for roles that produce none", () => {
     expect(defaultPrompt(request("implementer"))).not.toContain("structured output");
   });
+
+  it("replaces stale review output with a fresh mode-scoped target", () => {
+    const workspace = mkdtempSync(join(tmpdir(), "runmill-output-contract-"));
+    const stale = outputPathFor(workspace, "local-reviewer") as string;
+    try {
+      mkdirSync(join(workspace, ".runmill", "run"), { recursive: true });
+      writeFileSync(stale, '{"verdict":"approved"}\n');
+
+      expect(prepareStructuredOutput(workspace, "local-reviewer")).toBe(stale);
+      expect(readStructuredOutput(stale)).toBe("");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds structured review reads to one mebibyte", () => {
+    const workspace = mkdtempSync(join(tmpdir(), "runmill-output-contract-"));
+    try {
+      const path = prepareStructuredOutput(workspace, "local-reviewer") as string;
+      writeFileSync(path, "x".repeat(1024 * 1024 + 1));
+      expect(() => readStructuredOutput(path)).toThrow(/1 MiB/iu);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses non-regular structured review targets", () => {
+    const workspace = mkdtempSync(join(tmpdir(), "runmill-output-contract-"));
+    try {
+      const path = prepareStructuredOutput(workspace, "local-reviewer") as string;
+      rmSync(path);
+      mkdirSync(path);
+      expect(() => readStructuredOutput(path)).toThrow(/regular file/iu);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("provider capability parity", () => {
@@ -56,7 +101,7 @@ describe("provider capability parity", () => {
     const codex = await new CliProviderAdapter({ dialect: CODEX_DIALECT, sandbox }).capabilities();
     const claude = await new CliProviderAdapter({ dialect: CLAUDE_DIALECT, sandbox }).capabilities();
     expect(codex.sessionResume).toBe(false);
-    expect(claude.sessionResume).toBe(true);
+    expect(claude.sessionResume).toBe(false);
     expect(claude.costReporting).toBe(true);
   });
 

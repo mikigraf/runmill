@@ -19,6 +19,7 @@ import {
   type CheckSpec,
 } from "../verification/engine.js";
 import { buildTaskPacket, renderIssueDocument } from "../agent/task-packet.js";
+import { outputPathFor, readStructuredOutput } from "../agent/output-contract.js";
 import { parseReviewJson, blockingFindings, crossCheckVerdict, type Review } from "../review/schema.js";
 import { reconcileChecks, type CheckMapping, type ReconcileVerdict } from "../pr/reconcile.js";
 import { GitRefLease, type HeldLease } from "../queue/git-lease.js";
@@ -775,13 +776,26 @@ export class Orchestrator {
         const reviewResult = await reviewSession.result;
         accountUsage(reviewResult.events);
 
-        if (reviewResult.outputRef === undefined || reviewResult.outputRef === "") {
+        if (reviewResult.status !== "success") {
+          const detail = reviewResult.error?.detail;
+          return finish("NEEDS_HUMAN", {
+            reason:
+              `local reviewer returned ${reviewResult.status}` +
+              (detail === undefined ? "" : `: ${detail}`),
+          });
+        }
+        const expectedLocalReviewOutput = outputPathFor(workspace.path, "local-reviewer");
+        if (
+          reviewResult.outputRef === undefined ||
+          reviewResult.outputRef === "" ||
+          reviewResult.outputRef !== expectedLocalReviewOutput
+        ) {
           throw RunmillError.fromCatalog("RM-REVIEW-001", {
-            whatHappened: "reviewer produced no structured output",
+            whatHappened: "reviewer produced no structured output at the bound output path",
             runId,
           });
         }
-        review = parseReviewJson(readFileSync(reviewResult.outputRef, "utf8"));
+        review = parseReviewJson(readStructuredOutput(reviewResult.outputRef));
 
         const cross = crossCheckVerdict(
           review,
@@ -1224,7 +1238,12 @@ export class Orchestrator {
       if (result.status !== "success") {
         return { blocked: `PR reviewer returned ${result.status}` };
       }
-      if (result.outputRef === undefined || result.outputRef === "") {
+      const expectedPrReviewOutput = outputPathFor(workspace.path, "pr-reviewer");
+      if (
+        result.outputRef === undefined ||
+        result.outputRef === "" ||
+        result.outputRef !== expectedPrReviewOutput
+      ) {
         return { blocked: "PR reviewer produced no structured output" };
       }
       try {
@@ -1240,7 +1259,7 @@ export class Orchestrator {
       }
 
       try {
-        review = parseReviewJson(readFileSync(result.outputRef, "utf8"));
+        review = parseReviewJson(readStructuredOutput(result.outputRef));
       } catch (err) {
         // An unparseable review is not an absent review: it is a review whose
         // conclusion is unknown, and unknown is not permission to merge.
