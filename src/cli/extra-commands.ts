@@ -4,15 +4,17 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  lstatSync,
   readdirSync,
   rmSync,
+  type Dirent,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { SCHEMA_FILENAME, writeSchemaBeside } from "../config/schema-asset.js";
 import { createConfiguration, type DiscoveredSetup } from "../config/create.js";
 import { RunmillError, errorMessage } from "../errors/runmill-error.js";
 import { CredentialStore, type CredentialName } from "../credentials/store.js";
-import { StateStore } from "../state/store.js";
+import { StateStore, type RunRow } from "../state/store.js";
 import { recordDoctorFailure, recordMilestone } from "../state/funnel.js";
 import {
   SKILL_FILES,
@@ -36,6 +38,7 @@ import {
 import { renderDoctor } from "./render.js";
 import { assertSandboxSelection } from "../workspace/sandbox.js";
 import type { SandboxBackend } from "../workspace/sandbox.js";
+import { isCleanExitRunState } from "../orchestrator/orchestrator.js";
 
 export interface InitDoctorInput {
   readonly repoRoot: string;
@@ -265,15 +268,7 @@ function registerEffects(program: Command, ctx: CommandContext): void {
 
 // -- gc --------------------------------------------------------------------
 
-/** Run states after which a workspace is no longer needed. */
-const TERMINAL_STATES = new Set([
-  "COMPLETED",
-  "PR_DELIVERED",
-  "NEEDS_HUMAN",
-  "QUARANTINED",
-  "AWAITING_APPROVAL",
-  "ABORTED",
-]);
+const VERIFICATION_WORKSPACE = /^(.+)-verify-[0-9a-f]{12}$/u;
 
 /**
  * Reconcile workspaces left behind by crashed runs.
@@ -284,9 +279,9 @@ const TERMINAL_STATES = new Set([
  * possible moment — right after a crash — and sent them looking for something
  * that was never real.
  *
- * Deliberately conservative: a workspace whose run is still in flight is
- * reported, never removed. A live run's working tree is the only copy of work
- * in progress, and deleting it to tidy up is not a trade worth making.
+ * Deliberately conservative: deletion requires an exact state record proving
+ * a clean exit. Missing, malformed, ambiguous, or non-clean evidence is
+ * reported and preserved because the tree may be the only copy of the work.
  */
 function registerGc(program: Command, ctx: CommandContext): void {
   program
@@ -298,43 +293,116 @@ function registerGc(program: Command, ctx: CommandContext): void {
     .action(async (cmdOpts: { dryRun?: boolean }) => {
       const dry = cmdOpts.dryRun === true;
       const runsRoot = join(ctx.dataDir(), "runs");
-      const store = StateStore.open(join(ctx.dataDir(), "runmill.db"));
+      const storePath = join(ctx.dataDir(), "runmill.db");
+      let store: StateStore | undefined;
+      let storeUnavailable = false;
+      try {
+        store = StateStore.openExistingReadOnly(storePath);
+      } catch {
+        storeUnavailable = true;
+      }
 
       try {
-        const byId = new Map(store.listRuns(1000).map((r) => [r.runId, r]));
         const removed: string[] = [];
         const kept: { path: string; reason: string }[] = [];
-
-        // `git worktree prune` clears verification checkouts whose directories
-        // are already gone. Safe regardless of run state.
-        const pruned = await tryGit(ctx.repoRoot(), ["worktree", "prune"]);
-
-        const entries = existsSync(runsRoot)
-          ? readdirSync(runsRoot, { withFileTypes: true }).filter((e) =>
-              e.isDirectory(),
-            )
-          : [];
+        let entries: Dirent[] = [];
+        if (existsSync(runsRoot)) {
+          try {
+            const rootInfo = lstatSync(runsRoot);
+            if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+              kept.push({
+                path: runsRoot,
+                reason: "runs root is not a plain directory",
+              });
+            } else {
+              entries = readdirSync(runsRoot, { withFileTypes: true });
+            }
+          } catch {
+            kept.push({
+              path: runsRoot,
+              reason: "runs root changed or became unreadable while it was inspected",
+            });
+          }
+        }
 
         for (const entry of entries) {
           const path = join(runsRoot, entry.name);
-          // Verification checkouts are named <run>-verify-<sha> and belong to
-          // whichever run owns the prefix.
-          const runId = entry.name.split("-verify-")[0] ?? entry.name;
-          const row = byId.get(runId);
+          let initial: ReturnType<typeof lstatSync>;
+          try {
+            initial = lstatSync(path);
+          } catch {
+            kept.push({ path, reason: "workspace entry changed while it was inspected" });
+            continue;
+          }
+          if (initial.isSymbolicLink() || !initial.isDirectory()) {
+            kept.push({ path, reason: "workspace entry is not a plain directory" });
+            continue;
+          }
+
+          if (store === undefined) {
+            kept.push({
+              path,
+              reason: storeUnavailable
+                ? "state database is unavailable or incompatible; workspace ownership is unknown"
+                : "state database is missing; workspace ownership is unknown",
+            });
+            continue;
+          }
+
+          let runId = entry.name;
+          let row: RunRow | undefined;
+          try {
+            // Exact names win. Only an otherwise-unmatched name with one strict
+            // trailing lowercase digest may be a verification child.
+            row = store.getRun(runId);
+            if (row === undefined) {
+              const verification = VERIFICATION_WORKSPACE.exec(entry.name);
+              const primaryRunId = verification?.[1];
+              if (primaryRunId !== undefined && primaryRunId !== "") {
+                runId = primaryRunId;
+                row = store.getRun(primaryRunId);
+              }
+            }
+          } catch {
+            kept.push({
+              path,
+              reason: "exact run lookup failed; workspace ownership is unknown",
+            });
+            continue;
+          }
 
           if (row === undefined) {
-            // No record at all: the database was reset or the run never got
-            // far enough to be recorded. Nothing can resume it.
-            if (!dry) rmSync(path, { recursive: true, force: true });
-            removed.push(path);
+            kept.push({ path, reason: "no exact run record owns this workspace" });
             continue;
           }
-          if (TERMINAL_STATES.has(row.state)) {
-            if (!dry) rmSync(path, { recursive: true, force: true });
-            removed.push(path);
+          if (!isCleanExitRunState(row.state)) {
+            kept.push({
+              path,
+              reason: `run ${runId} is in preserved state ${row.state}`,
+            });
             continue;
           }
-          kept.push({ path, reason: `run ${runId} is still in ${row.state}` });
+
+          if (!dry) {
+            let current: ReturnType<typeof lstatSync>;
+            try {
+              current = lstatSync(path);
+            } catch {
+              kept.push({ path, reason: "workspace entry changed before removal" });
+              continue;
+            }
+            if (
+              current.isSymbolicLink() ||
+              !current.isDirectory() ||
+              current.dev !== initial.dev ||
+              current.ino !== initial.ino
+            ) {
+              kept.push({ path, reason: "workspace identity changed before removal" });
+              continue;
+            }
+            rmSync(path, { recursive: true, force: true });
+          }
+          removed.push(path);
         }
 
         const lines = [
@@ -347,26 +415,20 @@ function registerGc(program: Command, ctx: CommandContext): void {
         if (kept.length > 0) {
           lines.push(
             "",
-            `Kept ${kept.length} — a live run's working tree is the only copy of it:`,
+            `Kept ${kept.length} — removal requires an exact run in a proven clean-exit state:`,
           );
           for (const k of kept) lines.push(`  ${k.path}\n    ${k.reason}`);
-        }
-        if (!pruned.ok) {
-          lines.push(
-            "",
-            `  note: git worktree prune did not run (${ctx.repoRoot()} may not be a repository)`,
-          );
         }
 
         ctx.emit(lines.join("\n"), {
           dryRun: dry,
           removed,
           kept,
-          worktreePruned: pruned.ok,
+          worktreePruned: false,
         });
         process.exit(ctx.exitCodes.ok);
       } finally {
-        store.close();
+        store?.close();
       }
     });
 }

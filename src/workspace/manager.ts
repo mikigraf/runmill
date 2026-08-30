@@ -1034,9 +1034,4 @@ export class WorkspaceManager {
     }
     rmSync(workspace.path, { recursive: true, force: true });
   }
-
-  /** Reconcile worktrees and stale run directories after a crash. */
-  async prune(sourceRepo: string): Promise<void> {
-    await runGit(sourceRepo, ["worktree", "prune"]);
-  }
 }

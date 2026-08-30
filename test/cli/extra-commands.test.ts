@@ -24,8 +24,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerExtraCommands, type CommandContext } from "../../src/cli/extra-commands.js";
-import { StateStore } from "../../src/state/store.js";
+import { CURRENT_SCHEMA_VERSION, StateStore } from "../../src/state/store.js";
 import { SystemClock } from "../../src/platform/clock.js";
+import { FakeClock } from "../../src/testing/fake-clock.js";
 import { renderCreatedConfig } from "../../src/config/create.js";
 import { writeSchemaBeside } from "../../src/config/schema-asset.js";
 import {
@@ -544,6 +545,39 @@ describe("skills", () => {
 });
 
 describe("gc", () => {
+  function plantPrunableWorktreeMetadata(label: string): string {
+    const git = (...args: string[]): void => {
+      execFileSync(
+        "git",
+        ["--no-lazy-fetch", "--no-replace-objects", ...args],
+        { cwd: repo, stdio: "pipe" },
+      );
+    };
+    git("init", "--initial-branch=main");
+    writeFileSync(join(repo, "tracked.txt"), "fixture\n");
+    git("add", "--", "tracked.txt");
+    git(
+      "-c",
+      "user.name=Runmill Test",
+      "-c",
+      "user.email=runmill@example.invalid",
+      "commit",
+      "-m",
+      "fixture",
+    );
+    const checkout = join(data, `${label}-checkout`);
+    git("worktree", "add", "--detach", checkout, "HEAD");
+    rmSync(checkout, { recursive: true, force: true });
+    git("config", "gc.worktreePruneExpire", "now");
+
+    const metadataRoot = join(repo, ".git", "worktrees");
+    const metadataEntry = readdirSync(metadataRoot)[0];
+    if (metadataEntry === undefined) throw new Error("fixture worktree metadata was not created");
+    const metadata = join(metadataRoot, metadataEntry);
+    writeFileSync(join(metadata, "runmill-marker"), "unchanged\n");
+    return metadata;
+  }
+
   function seedRun(runId: string, state: string): void {
     const store = StateStore.open(join(data, "runmill.db"), { clock: new SystemClock() });
     store.createRun({
@@ -552,12 +586,14 @@ describe("gc", () => {
       repo: "acme/widget",
       provider: "codex",
     });
-    store.transitionRun(runId, { from: "DISCOVERED", to: state, expectedVersion: 1 });
+    if (state !== "DISCOVERED") {
+      store.transitionRun(runId, { from: "DISCOVERED", to: state, expectedVersion: 1 });
+    }
     store.close();
     mkdirSync(join(data, "runs", runId), { recursive: true });
   }
 
-  it("removes workspaces for runs that reached a terminal state", async () => {
+  it("removes workspaces for runs that reached a clean-exit state", async () => {
     seedRun("run_done", "PR_DELIVERED");
     const h = harness();
     expect(await h.run(["gc"])).toBe(0);
@@ -575,27 +611,217 @@ describe("gc", () => {
     expect(payload.kept).toHaveLength(1);
   });
 
-  it("removes a workspace with no run record at all", async () => {
-    // The database was reset, or the run never got far enough to be recorded.
-    // Nothing can resume it.
+  it("keeps a workspace with no run record because ownership is unknown", async () => {
     mkdirSync(join(data, "runs", "run_orphan"), { recursive: true });
     const h = harness();
     await h.run(["gc"]);
-    expect(existsSync(join(data, "runs", "run_orphan"))).toBe(false);
+    expect(existsSync(join(data, "runs", "run_orphan"))).toBe(true);
+    const payload = h.emitted[0]?.data as { kept: { reason: string }[] };
+    expect(payload.kept[0]?.reason).toMatch(/no exact run record/iu);
   });
 
   it("--dry-run reports without removing anything", async () => {
     seedRun("run_done", "COMPLETED");
+    const database = join(data, "runmill.db");
+    const databaseBefore = readFileSync(database);
+    const dataFilesBefore = readdirSync(data).sort();
+    const metadata = plantPrunableWorktreeMetadata("dry-run");
     const h = harness();
     await h.run(["gc", "--dry-run"]);
     expect(existsSync(join(data, "runs", "run_done"))).toBe(true);
+    expect(readFileSync(database)).toEqual(databaseBefore);
+    expect(readdirSync(data).sort()).toEqual(dataFilesBefore);
+    expect(readFileSync(join(metadata, "runmill-marker"), "utf8")).toBe("unchanged\n");
     expect(h.emitted[0]?.human).toMatch(/Would remove/);
+    expect((h.emitted[0]?.data as { worktreePruned: boolean }).worktreePruned).toBe(false);
   });
 
   it("succeeds when there is nothing to reconcile", async () => {
     const h = harness();
     expect(await h.run(["gc"])).toBe(0);
     expect(h.emitted[0]?.human).toContain("(none)");
+  });
+
+  it.each([
+    "DISCOVERED",
+    "ELIGIBILITY_CHECKED",
+    "CLAIMED",
+    "WORKSPACE_READY",
+    "TASK_PACKET_READY",
+    "IMPLEMENTING",
+    "LOCAL_VERIFY",
+    "LOCAL_REVIEW",
+    "FIXING",
+    "PR_READY",
+    "PUSHED",
+    "PR_OPEN",
+    "CI_WAIT",
+    "PR_REVIEW",
+    "MERGE_READY",
+    "AWAITING_APPROVAL",
+    "MERGED",
+    "BACKLOG_UPDATED",
+    "CLEANUP",
+    "NEEDS_HUMAN",
+    "QUARANTINED",
+    "ABORTED",
+    "FUTURE_STATE_FROM_NEWER_BINARY",
+  ])("preserves a workspace in non-clean state %s", async (state) => {
+    const runId = `run_keep_${state.toLowerCase()}`;
+    seedRun(runId, state);
+
+    const h = harness();
+    await h.run(["gc"]);
+
+    expect(existsSync(join(data, "runs", runId))).toBe(true);
+    const payload = h.emitted[0]?.data as { kept: { reason: string }[] };
+    expect(payload.kept[0]?.reason).toContain(state);
+  });
+
+  it("classifies every directory with an exact lookup even beyond the newest 1,000 runs", async () => {
+    const clock = new FakeClock("2026-08-01T00:00:00Z");
+    const store = StateStore.open(join(data, "runmill.db"), { clock });
+    store.createRun({
+      runId: "run_old_clean",
+      issueId: "ENG-OLD",
+      repo: "acme/widget",
+      provider: "codex",
+    });
+    store.transitionRun("run_old_clean", {
+      from: "DISCOVERED",
+      to: "COMPLETED",
+      expectedVersion: 1,
+    });
+    for (let index = 0; index < 1_001; index += 1) {
+      clock.advanceMs(1);
+      store.createRun({
+        runId: `run_new_${String(index).padStart(4, "0")}`,
+        issueId: `ENG-${String(index)}`,
+        repo: "acme/widget",
+        provider: "codex",
+      });
+    }
+    store.close();
+    mkdirSync(join(data, "runs", "run_old_clean"), { recursive: true });
+
+    await harness().run(["gc"]);
+
+    expect(existsSync(join(data, "runs", "run_old_clean"))).toBe(false);
+  });
+
+  it("recognizes only a strict trailing lowercase verification suffix", async () => {
+    seedRun("run_parent", "COMPLETED");
+    const strict = "run_parent-verify-012345abcdef";
+    const uppercase = "run_parent-verify-012345ABCDEf";
+    const short = "run_parent-verify-012345abcde";
+    const trailing = "run_parent-verify-012345abcdef-extra";
+    for (const name of [strict, uppercase, short, trailing]) {
+      mkdirSync(join(data, "runs", name), { recursive: true });
+    }
+
+    await harness().run(["gc"]);
+
+    expect(existsSync(join(data, "runs", strict))).toBe(false);
+    for (const name of [uppercase, short, trailing]) {
+      expect(existsSync(join(data, "runs", name))).toBe(true);
+    }
+  });
+
+  it("resolves an exact primary run before interpreting a verification-looking name", async () => {
+    seedRun("run_parent", "IMPLEMENTING");
+    seedRun("run_parent-verify-012345abcdef", "COMPLETED");
+    seedRun("run_clean_parent", "COMPLETED");
+    seedRun("run_clean_parent-verify-fedcba654321", "IMPLEMENTING");
+
+    await harness().run(["gc"]);
+
+    expect(existsSync(join(data, "runs", "run_parent"))).toBe(true);
+    expect(existsSync(join(data, "runs", "run_parent-verify-012345abcdef"))).toBe(false);
+    expect(existsSync(join(data, "runs", "run_clean_parent"))).toBe(false);
+    expect(existsSync(join(data, "runs", "run_clean_parent-verify-fedcba654321"))).toBe(true);
+  });
+
+  it("keeps every directory and creates no database when state is missing", async () => {
+    const workspace = join(data, "runs", "run_unknown");
+    mkdirSync(workspace, { recursive: true });
+    const database = join(data, "runmill.db");
+
+    const h = harness();
+    await h.run(["gc"]);
+
+    expect(existsSync(workspace)).toBe(true);
+    expect(existsSync(database)).toBe(false);
+    const payload = h.emitted[0]?.data as {
+      kept: { reason: string }[];
+      worktreePruned: boolean;
+    };
+    expect(payload.kept[0]?.reason).toMatch(/state database is missing/iu);
+    expect(payload.worktreePruned).toBe(false);
+  });
+
+  it("keeps every directory and does not migrate an incompatible state database", async () => {
+    seedRun("run_incompatible", "COMPLETED");
+    const database = join(data, "runmill.db");
+    const writer = StateStore.open(database);
+    writer.forceSchemaVersionForTest(CURRENT_SCHEMA_VERSION + 1);
+    writer.close();
+    const before = readFileSync(database);
+    const filesBefore = readdirSync(data).sort();
+
+    const h = harness();
+    await h.run(["gc"]);
+
+    expect(existsSync(join(data, "runs", "run_incompatible"))).toBe(true);
+    expect(readFileSync(database)).toEqual(before);
+    expect(readdirSync(data).sort()).toEqual(filesBefore);
+    const payload = h.emitted[0]?.data as { kept: { reason: string }[] };
+    expect(payload.kept[0]?.reason).toMatch(/unavailable or incompatible/iu);
+  });
+
+  it("never changes source worktree metadata and always reports worktreePruned false", async () => {
+    seedRun("run_done", "COMPLETED");
+    const metadata = plantPrunableWorktreeMetadata("real-gc");
+
+    const h = harness();
+    await h.run(["gc"]);
+
+    expect(readFileSync(join(metadata, "runmill-marker"), "utf8")).toBe("unchanged\n");
+    expect((h.emitted[0]?.data as { worktreePruned: boolean }).worktreePruned).toBe(false);
+  });
+
+  it("keeps symlinks and reports them instead of following or removing them", async () => {
+    const outside = join(data, "outside");
+    const link = join(data, "runs", "run_link");
+    mkdirSync(outside, { recursive: true });
+    mkdirSync(join(data, "runs"), { recursive: true });
+    writeFileSync(join(outside, "secret"), "preserved\n");
+    symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir");
+
+    const h = harness();
+    await h.run(["gc"]);
+
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(outside, "secret"), "utf8")).toBe("preserved\n");
+    const payload = h.emitted[0]?.data as { kept: { reason: string }[] };
+    expect(payload.kept[0]?.reason).toMatch(/not a plain directory/iu);
+  });
+
+  it("never traverses a symlinked runs root", async () => {
+    const outside = join(repo, "outside-runs");
+    const runsRoot = join(data, "runs");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "run_unknown"), "preserved\n");
+    symlinkSync(outside, runsRoot, process.platform === "win32" ? "junction" : "dir");
+
+    const h = harness();
+    await h.run(["gc"]);
+
+    expect(lstatSync(runsRoot).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(outside, "run_unknown"), "utf8")).toBe("preserved\n");
+    const payload = h.emitted[0]?.data as { kept: { reason: string }[] };
+    expect(payload.kept).toEqual([
+      { path: runsRoot, reason: "runs root is not a plain directory" },
+    ]);
   });
 });
 

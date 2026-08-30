@@ -162,7 +162,8 @@ Three cases:
 - **Mid-agent** — the workspace is preserved on any non-clean exit, deliberately, so it can be
   inspected. `COMPLETED` and `PR_DELIVERED` clean up eagerly; `NEEDS_HUMAN`, `QUARANTINED`, and
   `AWAITING_APPROVAL` keep their trees, because there the tree is the evidence.
-  `runmill gc` removes terminal/orphaned workspaces. It does not resume the agent session.
+  `runmill gc` removes only workspaces with an exact `COMPLETED` or `PR_DELIVERED` state record;
+  unknown and orphaned-looking directories are preserved. It does not resume the agent session.
 - **Mid-mutation** — new runs stop. Check GitHub or the backlog, then use `runmill effects resolve`
   with the outcome you observed. Runmill never retries an ambiguous mutation blindly.
 - **Lease lost** — the run is fenced out and stops. Another worker owns the issue now, and the

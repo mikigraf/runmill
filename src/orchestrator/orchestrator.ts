@@ -1108,7 +1108,7 @@ export class Orchestrator {
       // can inspect it. PR_DELIVERED is a clean exit — it is how every
       // successful run ends in `pr-only`, the default mode — so omitting it
       // meant the default configuration never reclaimed a single workspace.
-      if (workspace !== undefined && CLEAN_EXITS.has(this.#state)) {
+      if (workspace !== undefined && isCleanExitRunState(this.#state)) {
         await this.#workspaces.destroy(workspace, this.#d.sourceRepoPath);
       }
       if (held !== undefined) {
@@ -1117,7 +1117,7 @@ export class Orchestrator {
         // Restore the workflow ownership while the lease still fences us. If
         // either request has an ambiguous outcome its outbox row remains
         // pending and globally blocks a retry until an operator reconciles it.
-        if (claimTransitioned && !pullRequestOpened && !CLEAN_EXITS.has(this.#state)) {
+        if (claimTransitioned && !pullRequestOpened && !isCleanExitRunState(this.#state)) {
           try {
             if (assignmentChanged) {
               await this.#withOutbox(
@@ -1452,7 +1452,15 @@ const MAX_REVIEW_GUIDANCE_BYTES = 64 * 1024;
  * Everything else — NEEDS_HUMAN, QUARANTINED, AWAITING_APPROVAL — keeps its
  * workspace, because the tree is the evidence for whatever has to be decided.
  */
-const CLEAN_EXITS: ReadonlySet<string> = new Set(["COMPLETED", "PR_DELIVERED"]);
+export const CLEAN_EXIT_RUN_STATES = Object.freeze([
+  "COMPLETED",
+  "PR_DELIVERED",
+] as const);
+const CLEAN_EXIT_RUN_STATE_SET: ReadonlySet<string> = new Set(CLEAN_EXIT_RUN_STATES);
+
+export function isCleanExitRunState(state: string): boolean {
+  return CLEAN_EXIT_RUN_STATE_SET.has(state);
+}
 
 function slugify(text: string): string {
   return text

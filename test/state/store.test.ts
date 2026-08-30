@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
 import Database from "better-sqlite3";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -64,6 +71,57 @@ describe("StateStore.open", () => {
       expect(err).toBeInstanceOf(RunmillError);
       expect((err as RunmillError).code).toBe("RM-STATE-001");
     }
+  });
+
+  it("does not create a database or parent directory for a missing read-only store", () => {
+    const path = join(dir, "missing", "runmill.db");
+
+    expect(StateStore.openExistingReadOnly(path, { clock })).toBeUndefined();
+    expect(existsSync(path)).toBe(false);
+    expect(existsSync(join(dir, "missing"))).toBe(false);
+  });
+
+  it("opens an existing current database read-only without changing its files", () => {
+    const path = join(dir, "runmill.db");
+    const writer = open();
+    writer.createRun({
+      runId: "run_read_only",
+      issueId: "ENG-RO",
+      repo: "acme/widget",
+      provider: "codex",
+    });
+    writer.close();
+    const beforeFiles = readdirSync(dir).sort();
+    const beforeDatabase = readFileSync(path);
+
+    const reader = StateStore.openExistingReadOnly(path, { clock });
+    expect(reader?.getRun("run_read_only")?.state).toBe("DISCOVERED");
+    expect(() =>
+      reader?.createRun({
+        runId: "run_forbidden_write",
+        issueId: "ENG-W",
+        repo: "acme/widget",
+        provider: "codex",
+      }),
+    ).toThrow(/readonly/iu);
+    reader?.close();
+
+    expect(readFileSync(path)).toEqual(beforeDatabase);
+    expect(readdirSync(dir).sort()).toEqual(beforeFiles);
+  });
+
+  it("refuses an incompatible read-only schema without migrating or backing it up", () => {
+    const path = join(dir, "runmill.db");
+    const writer = open();
+    writer.forceSchemaVersionForTest(CURRENT_SCHEMA_VERSION - 1);
+    writer.close();
+    const beforeFiles = readdirSync(dir).sort();
+    const beforeDatabase = readFileSync(path);
+
+    expect(() => StateStore.openExistingReadOnly(path, { clock })).toThrow(/schema version/iu);
+
+    expect(readFileSync(path)).toEqual(beforeDatabase);
+    expect(readdirSync(dir).sort()).toEqual(beforeFiles);
   });
 
   it("backs the database up before migrating an existing file", () => {

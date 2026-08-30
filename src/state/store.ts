@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { Clock } from "../platform/clock.js";
@@ -1143,6 +1143,54 @@ export class StateStore {
     const store = new StateStore(db, clock);
     try {
       store.#migrate(path, existedBefore);
+      return store;
+    } catch (error) {
+      db.close();
+      throw error;
+    }
+  }
+
+  /**
+   * Open only an already-existing, current-schema database for observation.
+   *
+   * Unlike `open()`, this never creates parent directories, creates a database,
+   * changes journal mode, backs up, or migrates. Destructive maintenance uses
+   * this boundary so missing or incompatible evidence preserves resources.
+   */
+  static openExistingReadOnly(
+    path: string,
+    options: StateStoreOptions = {},
+  ): StateStore | undefined {
+    if (!existsSync(path)) return undefined;
+    const initial = lstatSync(path);
+    if (initial.isSymbolicLink() || !initial.isFile()) {
+      throw new Error(`state database is not a regular file: ${path}`);
+    }
+
+    const clock = options.clock ?? new SystemClock();
+    const db = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      const opened = lstatSync(path);
+      if (
+        opened.isSymbolicLink() ||
+        !opened.isFile() ||
+        opened.dev !== initial.dev ||
+        opened.ino !== initial.ino
+      ) {
+        throw new Error(`state database identity changed while opening: ${path}`);
+      }
+      db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+      db.pragma("foreign_keys = ON");
+      db.pragma("query_only = ON");
+      const store = new StateStore(db, clock);
+      const observed = store.#userVersion();
+      if (observed !== CURRENT_SCHEMA_VERSION) {
+        throw RunmillError.fromCatalog("RM-STATE-001", {
+          whatHappened:
+            `Database at ${path} is at schema version ${observed}; read-only maintenance ` +
+            `requires exactly ${CURRENT_SCHEMA_VERSION} and will not migrate it.`,
+        });
+      }
       return store;
     } catch (error) {
       db.close();
