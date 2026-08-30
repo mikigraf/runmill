@@ -114,6 +114,7 @@ Deterministic code owns pushes, pull requests, issue transitions, and merges. St
 | Coding agents                     | Codex CLI and Claude Code with a subscription session. Provider API keys are not yet supported inside the sandbox.                             |
 | Agent roles                       | Either provider can implement or review. The reviewer always starts with fresh context.                                                        |
 | Node.js                           | 22 or 24                                                                                                                                       |
+| Git                               | 2.45 or newer; exact policy reads require fail-closed `--no-lazy-fetch` support.                                                               |
 | Host utilities/read-only flows   | macOS on arm64/x64 and Linux on arm64/x64                                                                                                      |
 | Agent execution backend           | Currently fails closed on every host. Darwin awaits lifecycle containment; Linux awaits complete descriptor-bound bubblewrap qualification.    |
 | Provider network                  | `proxy` currently permits unrestricted egress; hostname filtering is not implemented. `network_allowlist` is rejected until it is enforceable. |
@@ -196,10 +197,10 @@ Runmill is available under the [MIT License](./LICENSE).
 | `runmill next`                                                   | Show the next issue and explain every rejection                                                                 |
 | `runmill prepare <issue>`                                        | Score whether an issue is ready                                                                                 |
 | `runmill run [issue]`                                            | Process one issue                                                                                               |
-| `runmill start`                                                  | Start the background delivery loop                                                                              |
+| `runmill start`                                                  | Start the background delivery loop (refuses to create one in `observe` mode)                                    |
 | `runmill status`                                                 | Inspect the background daemon                                                                                   |
 | `runmill stop`                                                   | Request a safe stop at the next run boundary                                                                    |
-| `runmill daemon`                                                 | Run foreground, one-shot, polling, and breaker modes                                                            |
+| `runmill daemon`                                                 | Run foreground, one-shot, polling, and breaker modes (refuses to start in `observe` mode)                       |
 | `runmill tui`                                                    | Open the terminal interface                                                                                     |
 | `runmill list --needs-attention`                                 | Find runs waiting for a person                                                                                  |
 | `runmill inspect <run-id>`                                       | Show transitions, evidence, and pending effects                                                                 |

@@ -481,6 +481,23 @@ export class CliProviderAdapter implements CodingAgentAdapter {
   }
 
   async start(request: AgentRunRequest): Promise<AgentSession> {
+    if (request.signal?.aborted === true) {
+      const sessionId = `${this.#dialect.name}-${request.runId}-${request.role}-${request.attempt}`;
+      const result = Promise.resolve<AgentRunResult>({
+        status: "cancelled",
+        sessionId,
+        events: [],
+      });
+      return {
+        sessionId: Promise.resolve(sessionId),
+        events: (async function* () {
+          await result;
+        })(),
+        result,
+        respondToPermission: async () => undefined,
+        abort: async () => undefined,
+      };
+    }
     return this.#startWithPrompt(request, this.#promptBuilder(request));
   }
 

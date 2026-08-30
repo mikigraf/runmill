@@ -20,6 +20,7 @@ import {
 import {
   createCandidateCommit,
   git as runGit,
+  immutableGitReadArgs,
   resolveCandidateCommitProvenance,
   type CandidateCommitProvenance,
 } from "../platform/git.js";
@@ -306,13 +307,24 @@ export async function checkVerificationDependencies(ctx: DoctorContext): Promise
   }
 }
 
-async function tryRun(cmd: string, args: string[], cwd?: string): Promise<{ ok: boolean; out: string }> {
-  const result = await run(cmd, args, cwd === undefined ? {} : { cwd });
+const DOCTOR_PROCESS_TIMEOUT_MS = 15_000;
+
+type DoctorCommandRunner = (
+  cmd: string,
+  args: string[],
+  cwd?: string,
+) => Promise<{ ok: boolean; out: string }>;
+
+const tryRun: DoctorCommandRunner = async (cmd, args, cwd) => {
+  const result = await run(cmd, args, {
+    ...(cwd === undefined ? {} : { cwd }),
+    timeoutMs: DOCTOR_PROCESS_TIMEOUT_MS,
+  });
   return {
     ok: result.ok,
     out: (result.ok ? result.stdout : result.stderr || result.stdout).trim(),
   };
-}
+};
 
 function safeRemote(value: string): string {
   return value.replace(
@@ -321,14 +333,17 @@ function safeRemote(value: string): string {
   );
 }
 
-export async function checkGit(): Promise<CheckResult> {
-  const r = await tryRun("git", ["--version"]);
+export async function checkGit(execute: DoctorCommandRunner = tryRun): Promise<CheckResult> {
+  // The global option was added in Git 2.45. Probing the capability, rather
+  // than trusting a version-shaped string, also fails closed for vendor builds
+  // that omit immutable partial-clone reads.
+  const r = await execute("git", immutableGitReadArgs(["--version"]));
   return {
     id: "git",
     status: r.ok ? "pass" : "fail",
-    observed: r.ok ? r.out : "not found",
-    expected: "git >= 2.30",
-    remediation: r.ok ? undefined : "Install git",
+    observed: r.ok ? r.out : r.out || "git not found or immutable object reads unsupported",
+    expected: "git >= 2.45 with immutable object-read controls",
+    remediation: r.ok ? undefined : "Install Git 2.45 or newer",
   };
 }
 
@@ -770,6 +785,14 @@ function providerCheckId(target: ProviderCheckTarget): string {
   return `provider:${target.implementation}${target.model === undefined ? "" : `:${target.model}`}`;
 }
 
+function providerRequestCheckId(target: ProviderCheckTarget): string {
+  return `${providerCheckId(target)}:request`;
+}
+
+function providerIsolationCheckId(target: ProviderCheckTarget): string {
+  return `provider:${target.implementation}:credential-isolation`;
+}
+
 function createProviderDoctorAdapter(
   target: ProviderCheckTarget,
   sandbox: SandboxBackend,
@@ -852,7 +875,7 @@ export async function checkProviderExecution(
   sandbox?: SandboxBackend,
 ): Promise<CheckResult> {
   const target = normalizeProviderTarget(input);
-  const id = `${providerCheckId(target)}:request`;
+  const id = providerRequestCheckId(target);
   if (target.implementation !== "codex" && target.implementation !== "claude") {
     return {
       id,
@@ -1027,7 +1050,19 @@ export async function runAllChecks(
     ctx.checkPrefix === undefined ||
     id.startsWith(ctx.checkPrefix) ||
     ctx.checkPrefix.startsWith(`${id}:`);
-  const selectedTargets = targets.filter((target) => wants(providerCheckId(target)));
+  const providerCheckRequested = (target: ProviderCheckTarget): boolean => {
+    if (ctx.checkPrefix === undefined) return true;
+    return [
+      providerCheckId(target),
+      providerRequestCheckId(target),
+      providerIsolationCheckId(target),
+    ].some((id) => id.startsWith(ctx.checkPrefix));
+  };
+  const providerExecutionRequested = (target: ProviderCheckTarget): boolean =>
+    ctx.checkPrefix === undefined || providerRequestCheckId(target).startsWith(ctx.checkPrefix);
+  const providerIsolationRequested = (target: ProviderCheckTarget): boolean =>
+    ctx.checkPrefix === undefined || providerIsolationCheckId(target).startsWith(ctx.checkPrefix);
+  const selectedTargets = targets.filter(providerCheckRequested);
   // Every probe is independent, so wall time is the slowest one rather than
   // the sum. Promise.all preserves order, so the rendered output is identical.
   const [
@@ -1062,7 +1097,9 @@ export async function runAllChecks(
           : undefined;
       const auth = await checkProvider(target, adapter, ctx.sandbox);
       if (auth.status !== "pass" || adapter === undefined) return [auth];
-      return [auth, await checkProviderExecution(target, adapter)];
+      return providerExecutionRequested(target)
+        ? [auth, await checkProviderExecution(target, adapter)]
+        : [auth];
     })),
     wants("sandbox")
       ? ctx.sandbox === undefined
@@ -1086,6 +1123,7 @@ export async function runAllChecks(
   const providerChecks = providers.flatMap((results, index) => {
     const target = selectedTargets[index];
     if (target === undefined || results[0]?.status !== "pass") return results;
+    if (!providerIsolationRequested(target)) return results;
     if (isolationWarnings.has(target.implementation)) return results;
     isolationWarnings.add(target.implementation);
     return [...results, checkProviderCredentialIsolation(target.implementation)];

@@ -5,7 +5,7 @@ import { run, runWithInput } from "../platform/process.js";
 export type CredentialName = "linear" | "github" | "runmill-policy";
 
 const SERVICE = "runmill";
-const KEYCHAIN_WRITE_TIMEOUT_MS = 15_000;
+const CREDENTIAL_PROCESS_TIMEOUT_MS = 15_000;
 
 /**
  * Credential storage.
@@ -37,19 +37,45 @@ export class CredentialStore {
     if (fromEnv !== undefined && fromEnv !== "") return fromEnv;
 
     if (platform() === "darwin") {
-      const keychain = await run("security", [
-        "find-generic-password",
-        "-s",
-        `${SERVICE}:${name}`,
-        "-w",
-      ]);
-      if (keychain.ok && keychain.stdout.trim() !== "") return keychain.stdout.trim();
+      const keychain = await run(
+        "security",
+        ["find-generic-password", "-s", `${SERVICE}:${name}`, "-w"],
+        { timeoutMs: CREDENTIAL_PROCESS_TIMEOUT_MS },
+      );
+      if (keychain.ok) {
+        const value = keychain.stdout.trim();
+        if (value !== "") return value;
+        throw new Error(`macOS keychain returned an empty ${name} credential`);
+      }
+      // errSecItemNotFound is the only definitive absence. A locked keychain,
+      // timeout, denial, or I/O error must not silently select a lower-priority
+      // credential belonging to a different account.
+      if (keychain.code !== 44) {
+        const reason =
+          keychain.code === null ? "timed out or could not start" : `exited ${keychain.code}`;
+        throw new Error(`could not read ${name} from the macOS keychain (${reason})`);
+      }
     }
 
     // GitHub has a well-known local source that is already authenticated.
     if (name === "github") {
-      const gh = await run("gh", ["auth", "token"]);
-      if (gh.ok && gh.stdout.trim() !== "") return gh.stdout.trim();
+      const gh = await run("gh", ["auth", "token"], {
+        timeoutMs: CREDENTIAL_PROCESS_TIMEOUT_MS,
+      });
+      if (gh.ok) {
+        const value = gh.stdout.trim();
+        if (value !== "") return value;
+        throw new Error("`gh auth token` succeeded without returning a GitHub credential");
+      }
+      const detail = `${gh.stderr}\n${gh.stdout}`;
+      const definitivelyAbsent =
+        (gh.code === 1 &&
+          /not logged|not authenticated|no (?:oauth )?token|no accounts?/iu.test(detail)) ||
+        (gh.code === null && /\bENOENT\b|not found/iu.test(detail));
+      if (!definitivelyAbsent) {
+        const reason = gh.code === null ? "timed out or could not start" : `exited ${gh.code}`;
+        throw new Error(`could not read GitHub credential from \`gh auth token\` (${reason})`);
+      }
     }
 
     return undefined;
@@ -94,7 +120,7 @@ export class CredentialStore {
       detached: true,
       // A locked keychain can otherwise leave setup waiting on an OS prompt
       // that this deliberately non-interactive child can never answer.
-      timeoutMs: KEYCHAIN_WRITE_TIMEOUT_MS,
+      timeoutMs: CREDENTIAL_PROCESS_TIMEOUT_MS,
     });
     if (!result.ok) {
       const rawDetail =
@@ -113,8 +139,23 @@ export class CredentialStore {
   }
 
   async remove(name: CredentialName): Promise<void> {
-    if (platform() !== "darwin") return;
+    const envName = this.#envOverrides[name];
+    if (process.env[envName] !== undefined && process.env[envName] !== "") {
+      throw new Error(
+        `the active ${name} credential is supplied by $${envName}; unset $${envName} before logout`,
+      );
+    }
+    if (platform() !== "darwin") {
+      throw new Error(
+        `keychain removal is only implemented on macOS; unset $${envName} instead`,
+      );
+    }
     // Deleting is idempotent: nothing stored is not an error.
-    await run("security", ["delete-generic-password", "-s", `${SERVICE}:${name}`]);
+    const result = await run("security", ["delete-generic-password", "-s", `${SERVICE}:${name}`], {
+      timeoutMs: CREDENTIAL_PROCESS_TIMEOUT_MS,
+    });
+    if (result.ok || result.code === 44) return;
+    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${String(result.code)}`;
+    throw new Error(`could not remove ${name} from the macOS keychain: ${detail}`);
   }
 }

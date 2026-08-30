@@ -21,6 +21,7 @@ import {
   type VerificationOutcome,
 } from "../verification/engine.js";
 import { createNativeSandboxBackend } from "../workspace/sandbox.js";
+import { gitEnvironment, immutableGitReadArgs } from "../platform/git.js";
 
 export interface DemoResult {
   readonly issue: Pick<BacklogIssue, "identifier" | "title">;
@@ -92,7 +93,12 @@ class DemoVerificationEngine extends VerificationEngine {
 }
 
 function git(cwd: string, ...args: string[]): void {
-  execFileSync("git", args, { cwd, stdio: "ignore" });
+  execFileSync("git", immutableGitReadArgs(args), {
+    cwd,
+    env: gitEnvironment(),
+    stdio: "ignore",
+    timeout: 30_000,
+  });
 }
 
 /** Run one complete, credential-free delivery loop entirely under a temp dir. */
@@ -103,10 +109,16 @@ export async function runDemo(onEvent?: (message: string) => void): Promise<Demo
   let store: StateStore | undefined;
 
   try {
-    execFileSync("git", ["init", "--bare", "--quiet", "--initial-branch", "main", origin], {
+    execFileSync(
+      "git",
+      immutableGitReadArgs(["init", "--bare", "--quiet", "--initial-branch", "main", origin]),
+      { env: gitEnvironment(), stdio: "ignore", timeout: 30_000 },
+    );
+    execFileSync("git", immutableGitReadArgs(["clone", "--quiet", origin, source]), {
+      env: gitEnvironment(),
       stdio: "ignore",
+      timeout: 30_000,
     });
-    execFileSync("git", ["clone", "--quiet", origin, source], { stdio: "ignore" });
     git(source, "config", "user.email", "demo@runmill.local");
     git(source, "config", "user.name", "runmill demo");
     writeFileSync(join(source, "README.md"), "# Demo service\n");

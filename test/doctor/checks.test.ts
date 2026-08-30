@@ -6,7 +6,7 @@
  * binary read as present, a sandbox assumed rather than proven, an unsupported
  * platform sailing through.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   mkdtempSync,
   rmSync,
@@ -47,6 +47,8 @@ import {
 const nativeSandbox = () => createTestSandboxBackend();
 
 let dir: string;
+let operatorGitConfig: string;
+let previousGlobalGitConfig: string | undefined;
 
 function writeInstalledNodeProject(
   options: { stale?: boolean; install?: boolean; version?: string } = {},
@@ -115,18 +117,39 @@ function fakeProvider(
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "runmill-doctor-"));
+  previousGlobalGitConfig = process.env["GIT_CONFIG_GLOBAL"];
+  operatorGitConfig = join(dir, "operator.gitconfig");
+  writeFileSync(operatorGitConfig, "");
+  process.env["GIT_CONFIG_GLOBAL"] = operatorGitConfig;
 });
 
 afterEach(() => {
+  if (previousGlobalGitConfig === undefined) delete process.env["GIT_CONFIG_GLOBAL"];
+  else process.env["GIT_CONFIG_GLOBAL"] = previousGlobalGitConfig;
   rmSync(dir, { recursive: true, force: true });
 });
 
 describe("checkGit", () => {
-  it("passes on a host with git and reports the version it found", async () => {
+  it("requires immutable object-read support and reports the version it found", async () => {
     const r = await checkGit();
     expect(r.id).toBe("git");
     expect(r.status).toBe("pass");
     expect(r.observed).toMatch(/git version/);
+    expect(r.expected).toContain("2.45");
+  });
+
+  it("fails when Git does not understand the immutable-read global options", async () => {
+    const r = await checkGit(async (_command, args) => {
+      expect(args.slice(0, 2)).toEqual(["--no-lazy-fetch", "--no-replace-objects"]);
+      return { ok: false, out: "unknown option: --no-lazy-fetch" };
+    });
+
+    expect(r).toMatchObject({
+      id: "git",
+      status: "fail",
+      expected: expect.stringContaining("2.45"),
+      remediation: expect.stringContaining("2.45"),
+    });
   });
 });
 
@@ -430,6 +453,7 @@ describe("checkVerificationDependencies", () => {
     const origin = join(dir, "origin.git");
     execFileSync("git", ["init", "-q", "--bare", "-b", "main", origin]);
     execFileSync("git", ["remote", "add", "origin", origin], { cwd: dir });
+    writeFileSync(operatorGitConfig, '[protocol "file"]\n\tallow = always\n');
     execFileSync("git", ["push", "-q", "-u", "origin", "main"], { cwd: dir });
 
     const policy = join(dir, "policy.yaml");
@@ -1043,6 +1067,43 @@ describe("runAllChecks", () => {
     expect(results.some((result) => result.id === "provider:codex:fast:request")).toBe(true);
     expect(results.some((result) => result.id === "provider:codex:review:request")).toBe(true);
   }, 60_000);
+
+  it("returns a model-pinned prerequisite for the implementation-wide isolation check", async () => {
+    execFileSync("git", ["init", "-q", "."], { cwd: dir });
+    const results = await runAllChecks(
+      {
+        repoRoot: dir,
+        checkPrefix: "provider:codex:credential-isolation",
+        sandbox: nativeSandbox(),
+        providerAdapterFactory: () => fakeProvider({ authenticated: false }),
+      },
+      [{ implementation: "codex", model: "fast" }],
+    );
+
+    expect(results).toEqual([
+      expect.objectContaining({ id: "provider:codex:fast", status: "fail" }),
+    ]);
+  }, 60_000);
+
+  it.each([
+    "provider:codex:typo",
+    "provider:codex:credential-isolation",
+  ])("does not dispatch a provider request for scoped check %s", async (checkPrefix) => {
+    const adapter = fakeProvider();
+    const execution = vi.spyOn(adapter, "sandboxExecutionStatus");
+    const results = await runAllChecks(
+      {
+        repoRoot: dir,
+        checkPrefix,
+        sandbox: nativeSandbox(),
+        providerAdapterFactory: () => adapter,
+      },
+      [{ implementation: "codex" }],
+    );
+
+    expect(execution).not.toHaveBeenCalled();
+    if (checkPrefix.endsWith(":typo")) expect(results).toEqual([]);
+  });
 
   it("gives every check a unique id, so --check <id> is unambiguous", async () => {
     execFileSync("git", ["init", "-q", "."], { cwd: dir });

@@ -11,7 +11,7 @@ import type { CheckResult } from "../../src/doctor/checks.js";
 import packageJson from "../../package.json" with { type: "json" };
 
 const CHECKS: CheckResult[] = [
-  { id: "git", status: "pass", observed: "git version 2.50.1", expected: "git >= 2.30" },
+  { id: "git", status: "pass", observed: "git version 2.50.1", expected: "git >= 2.45" },
   {
     id: "sandbox:mechanism",
     status: "fail",

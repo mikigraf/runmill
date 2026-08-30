@@ -2,12 +2,15 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod";
@@ -34,6 +37,8 @@ const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_CONTROL_PATH_BYTES = 4_096;
 const CONTROL_CONNECTION_TIMEOUT_MS = 10_000;
+const MAX_REGISTRY_BYTES = 64 * 1024;
+const MAX_OWNER_BYTES = 4 * 1024;
 const AUTHENTICATED_CONTROL_REQUEST_SCHEMA = "asf.authenticated-control-request/v1" as const;
 
 export type DaemonPhase = "starting" | "watching" | "idle" | "running" | "stopping";
@@ -60,6 +65,14 @@ export interface DaemonSnapshot {
   readonly pendingEffects: number;
   readonly activeLeases: number;
   readonly logs: readonly DaemonLogLine[];
+}
+
+/** Definitive evidence that no daemon registry exists at the selected path. */
+export class NoDaemonRegisteredError extends Error {
+  constructor() {
+    super("No Runmill daemon is registered. Start one with `runmill start`.");
+    this.name = "NoDaemonRegisteredError";
+  }
 }
 
 export interface RunDetail {
@@ -278,11 +291,30 @@ function validateAsfRuntimePaths(paths: RuntimePaths): RuntimePaths {
 }
 
 export function readDaemonRegistry(path = daemonRuntimePaths().registry): DaemonRegistry {
+  let source: string;
+  try {
+    const info = lstatSync(path);
+    if (!info.isFile() || info.size > MAX_REGISTRY_BYTES) {
+      throw new Error("registry is not a bounded regular file");
+    }
+    source = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new NoDaemonRegisteredError();
+    }
+    throw new Error("The Runmill daemon registry could not be read safely.", { cause: error });
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(path, "utf8"));
-  } catch {
-    throw new Error("No Runmill daemon is registered. Start one with `runmill start`.");
+    parsed = JSON.parse(source);
+  } catch (error) {
+    throw new Error(
+      "The Runmill daemon registry is invalid or belongs to an incompatible version.",
+      { cause: error },
+    );
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("The Runmill daemon registry is invalid or belongs to an incompatible version.");
   }
   const value = parsed as Partial<DaemonRegistry>;
   if (
@@ -304,9 +336,122 @@ export function readDaemonRegistry(path = daemonRuntimePaths().registry): Daemon
   return value as DaemonRegistry;
 }
 
-function pidIsAlive(pid: number): boolean {
+type PidStatus = "alive" | "dead" | "unknown";
+
+function pidStatus(pid: number): PidStatus {
   try {
     process.kill(pid, 0);
+    return "alive";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "dead";
+    // EPERM proves a process occupies the PID but not that it is ours. Any
+    // other result is likewise contradictory evidence and must fail closed.
+    return "unknown";
+  }
+}
+
+interface DaemonOwnership {
+  readonly path: string;
+  readonly token: string;
+}
+
+interface DaemonOwnerRecord {
+  readonly protocolVersion: 1;
+  readonly pid: number;
+  readonly token: string;
+}
+
+function daemonOwnershipPath(paths: RuntimePaths): string {
+  return `${paths.registry}.owner`;
+}
+
+function readDaemonOwner(path: string): DaemonOwnerRecord {
+  let parsed: unknown;
+  try {
+    if (!lstatSync(path).isDirectory()) throw new Error("owner path is not a directory");
+    const recordPath = join(path, "owner.json");
+    const info = lstatSync(recordPath);
+    if (!info.isFile() || info.size > MAX_OWNER_BYTES) {
+      throw new Error("owner record is not a bounded regular file");
+    }
+    parsed = JSON.parse(readFileSync(recordPath, "utf8"));
+  } catch (error) {
+    throw new Error("The Runmill daemon ownership record is unreadable or invalid.", {
+      cause: error,
+    });
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("The Runmill daemon ownership record is unreadable or invalid.");
+  }
+  const owner = parsed as Partial<DaemonOwnerRecord>;
+  if (
+    owner.protocolVersion !== PROTOCOL_VERSION ||
+    !Number.isSafeInteger(owner.pid) ||
+    (owner.pid ?? 0) <= 0 ||
+    typeof owner.token !== "string" ||
+    !/^[0-9a-f-]{36}$/iu.test(owner.token)
+  ) {
+    throw new Error("The Runmill daemon ownership record is unreadable or invalid.");
+  }
+  return owner as DaemonOwnerRecord;
+}
+
+function acquireDaemonOwnership(paths: RuntimePaths): DaemonOwnership {
+  const path = daemonOwnershipPath(paths);
+  const token = randomUUID();
+  const temporary = `${path}.${process.pid}.${token}.tmp`;
+  mkdirSync(temporary, { mode: 0o700 });
+  writeFileSync(
+    join(temporary, "owner.json"),
+    `${JSON.stringify({ protocolVersion: PROTOCOL_VERSION, pid: process.pid, token })}\n`,
+    { mode: 0o600 },
+  );
+
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        renameSync(temporary, path);
+        return { path, token };
+      } catch (error) {
+        if (!existsSync(path)) throw error;
+      }
+
+      const existing = readDaemonOwner(path);
+      if (pidStatus(existing.pid) !== "dead") {
+        throw new Error(
+          `Runmill daemon startup is already owned by process ${existing.pid}.`,
+        );
+      }
+
+      // Move the exact stale owner aside before deleting it. If another
+      // starter replaced the owner between inspection and rename, the token
+      // mismatch is detected and its ownership is restored rather than lost.
+      const quarantine = `${path}.${token}.stale`;
+      try {
+        renameSync(path, quarantine);
+      } catch (error) {
+        if (!existsSync(path)) continue;
+        throw error;
+      }
+      const moved = readDaemonOwner(quarantine);
+      if (moved.token !== existing.token) {
+        if (!existsSync(path)) renameSync(quarantine, path);
+        throw new Error("Runmill daemon ownership changed during stale-owner recovery.");
+      }
+      rmSync(quarantine, { recursive: true });
+    }
+    throw new Error("Runmill daemon ownership could not be acquired deterministically.");
+  } finally {
+    if (existsSync(temporary)) rmSync(temporary, { recursive: true });
+  }
+}
+
+function releaseDaemonOwnership(ownership: DaemonOwnership): boolean {
+  try {
+    const owner = readDaemonOwner(ownership.path);
+    if (owner.token !== ownership.token) return false;
+    rmSync(ownership.path, { recursive: true });
     return true;
   } catch {
     return false;
@@ -349,36 +494,51 @@ export class DaemonControlServer {
   readonly #server: Server;
   readonly #paths: RuntimePaths;
   readonly #connections: Set<ControlConnectionState>;
+  readonly #ownership: DaemonOwnership;
   #closed = false;
 
   private constructor(
     server: Server,
     paths: RuntimePaths,
     connections: Set<ControlConnectionState>,
+    ownership: DaemonOwnership,
   ) {
     this.#server = server;
     this.#paths = paths;
     this.#connections = connections;
+    this.#ownership = ownership;
   }
 
   static async start(options: ControlServerOptions): Promise<DaemonControlServer> {
     const paths = options.paths ?? daemonRuntimePaths();
     mkdirSync(paths.directory, { recursive: true, mode: 0o700 });
-
-    if (existsSync(paths.registry)) {
-      try {
-        const registered = readDaemonRegistry(paths.registry);
-        if (pidIsAlive(registered.pid)) {
-          throw new Error(
-            `Runmill daemon ${registered.pid} is already registered for ${registered.repoRoot}.`,
-          );
-        }
-      } catch (error) {
-        if (error instanceof Error && /already registered/.test(error.message)) throw error;
-      }
+    if (!lstatSync(paths.directory).isDirectory()) {
+      throw new Error("The Runmill daemon runtime path is not a regular directory.");
     }
-    removeIfExists(paths.socket);
-    removeIfExists(paths.registry);
+    const ownership = acquireDaemonOwnership(paths);
+
+    try {
+      if (existsSync(paths.registry)) {
+        try {
+          const registered = readDaemonRegistry(paths.registry);
+          if (pidStatus(registered.pid) !== "dead") {
+            throw new Error(
+              `Runmill daemon ${registered.pid} is already registered for ${registered.repoRoot}.`,
+            );
+          }
+        } catch (error) {
+          // A file that disappeared between exists/read is definitive absence.
+          // Invalid, unreadable, contradictory, or live state must not be
+          // overwritten by a second daemon.
+          if (!(error instanceof NoDaemonRegisteredError)) throw error;
+        }
+      }
+      removeIfExists(paths.socket);
+      removeIfExists(paths.registry);
+    } catch (error) {
+      releaseDaemonOwnership(ownership);
+      throw error;
+    }
 
     const connections = new Set<ControlConnectionState>();
     const server = createServer((socket) => {
@@ -387,15 +547,15 @@ export class DaemonControlServer {
       socket.once("close", () => connections.delete(state));
       DaemonControlServer.#serve(state, options.handle, options.controlAuthentication);
     });
-    await new Promise<void>((resolve, reject) => {
-      const onError = (error: Error): void => reject(error);
-      server.once("error", onError);
-      server.listen(paths.socket, () => {
-        server.off("error", onError);
-        resolve();
-      });
-    });
     try {
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error): void => reject(error);
+        server.once("error", onError);
+        server.listen(paths.socket, () => {
+          server.off("error", onError);
+          resolve();
+        });
+      });
       chmodSync(paths.socket, 0o600);
       const registry: DaemonRegistry = {
         protocolVersion: PROTOCOL_VERSION,
@@ -409,12 +569,15 @@ export class DaemonControlServer {
       writeFileSync(temporary, `${JSON.stringify(registry, null, 2)}\n`, { mode: 0o600 });
       renameSync(temporary, paths.registry);
     } catch (error) {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (server.listening) {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
       removeIfExists(paths.socket);
+      releaseDaemonOwnership(ownership);
       throw error;
     }
 
-    return new DaemonControlServer(server, paths, connections);
+    return new DaemonControlServer(server, paths, connections, ownership);
   }
 
   static #serve(
@@ -479,12 +642,22 @@ export class DaemonControlServer {
       if (!connection.handling) connection.socket.destroy();
     }
     await new Promise<void>((resolve) => this.#server.close(() => resolve()));
-    removeIfExists(this.#paths.socket);
+    // The ownership directory stays present until runtime discovery files are
+    // gone, so no concurrent starter can unlink a live socket. If ownership
+    // was replaced or corrupted, leave all paths untouched and fail closed.
     try {
-      const registered = readDaemonRegistry(this.#paths.registry);
-      if (registered.pid === process.pid) removeIfExists(this.#paths.registry);
-    } catch {
-      // Already gone or replaced.
+      const owner = readDaemonOwner(this.#ownership.path);
+      if (owner.token === this.#ownership.token) {
+        removeIfExists(this.#paths.socket);
+        try {
+          const registered = readDaemonRegistry(this.#paths.registry);
+          if (registered.pid === process.pid) removeIfExists(this.#paths.registry);
+        } catch {
+          // Already gone or replaced.
+        }
+      }
+    } finally {
+      releaseDaemonOwnership(this.#ownership);
     }
   }
 }

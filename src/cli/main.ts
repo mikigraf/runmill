@@ -67,7 +67,7 @@ import {
   findRepositoryRoot,
 } from "../platform/paths.js";
 import { repositoryIdentity } from "../workspace/repository-identity.js";
-import { fetchTrustedBase } from "../workspace/manager.js";
+import { fetchTrustedBase, observeTrustedBase } from "../workspace/manager.js";
 import {
   createNativeSandboxBackend,
   type SandboxBackend,
@@ -76,6 +76,7 @@ import { runDemo } from "./demo.js";
 import {
   asfDaemonRuntimePaths,
   DaemonControlServer,
+  NoDaemonRegisteredError,
   type ControlRequest,
   type DaemonLogLine,
   type DaemonPhase,
@@ -246,20 +247,19 @@ async function buildOrchestrator(
     });
   }
 
-  // Observe the configured remote on every ordinary run. The fetch updates a
-  // Runmill-owned ref, never the operator's local branch, and the returned SHA
-  // binds both policy discovery and the workspace to one immutable base.
-  const sourceBaseRef =
-    process.env["RUNMILL_DEMO"] === "1"
-      ? target.baseBranch
-      : (
-          await fetchTrustedBase(
-            sourceRepo,
-            target.baseBranch,
-            adapters.gitCredential?.repositoryUrl(target.repo) ?? "origin",
-            adapters.gitCredential,
-          )
-        ).commit;
+  // Bind policy discovery to the current remote base. Executing modes fetch
+  // into a Runmill-owned ref; observe mode uses a read-only remote observation
+  // and refuses if that exact commit is not already available locally.
+  const sourceBaseRef = process.env["RUNMILL_DEMO"] === "1"
+    ? target.baseBranch
+    : (
+        await (cfg.autonomy === "observe" ? observeTrustedBase : fetchTrustedBase)(
+          sourceRepo,
+          target.baseBranch,
+          adapters.gitCredential?.repositoryUrl(target.repo) ?? "origin",
+          adapters.gitCredential,
+        )
+      ).commit;
 
   const configured: CheckSpec[] = cfg.verification.commands.map((c) => ({
     id: c.id,
@@ -418,11 +418,26 @@ async function waitForDetachedDaemon(
 }
 
 function daemonIsUnavailable(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    (/No Runmill daemon is registered/.test(error.message) ||
-      /Cannot connect to Runmill daemon/.test(error.message))
-  );
+  return error instanceof NoDaemonRegisteredError;
+}
+
+async function refuseRegisteredDaemon(
+  message: (snapshot: DaemonSnapshot) => string,
+): Promise<void> {
+  try {
+    const running = await requestDaemon<DaemonSnapshot>(
+      { type: "snapshot" },
+      undefined,
+      300,
+    );
+    throw new Error(message(running));
+  } catch (error) {
+    // Only an absent registry proves there is no older automation to account
+    // for. A timeout, invalid registry, protocol error, or unreachable socket
+    // remains contradictory evidence and must stop startup.
+    if (error instanceof NoDaemonRegisteredError) return;
+    throw error;
+  }
 }
 
 async function launchTui(registry: string | undefined): Promise<number> {
@@ -534,7 +549,6 @@ export function buildProgram(): Command {
         let sandbox: SandboxBackend | undefined;
         try {
           const loadedConfig = loadOrExit(opts, repoRoot).config;
-          sandbox = createNativeSandboxBackend(loadedConfig.workspace.sandbox);
           const providers = loadedConfig.providers;
           backlogProvider = loadedConfig.backlog.provider;
           // Observe mode never dispatches an agent. Do not spend a provider
@@ -543,6 +557,9 @@ export function buildProgram(): Command {
             loadedConfig.autonomy === "observe"
               ? []
               : [providers.implementer, resolveReviewerAgent(loadedConfig)];
+          // Backend refusal must not discard the successfully parsed provider
+          // and backlog identities used by the rest of the diagnostic.
+          sandbox = createNativeSandboxBackend(loadedConfig.workspace.sandbox);
         } catch {
           // doctor must still run without a valid config; the config check
           // itself is what reports that.
@@ -568,23 +585,48 @@ export function buildProgram(): Command {
         );
         if (cmdOpts.check !== undefined) {
           const prefix = cmdOpts.check;
-          const matched = results.filter((r) => r.id.startsWith(prefix));
-          if (matched.length === 0) {
-            // A filter that matches nothing used to report `overall: PASS`,
-            // which told a developer their setup was fine when nothing had
-            // been checked at all.
-            emit(
-              opts,
-              `No check matches "${prefix}".\n  Available: ${results.map((r) => r.id).join(", ")}`,
-              {
+          const direct = results.filter((result) => result.id.startsWith(prefix));
+          if (direct.length > 0) {
+            results = direct;
+          } else {
+            const prerequisiteIds = new Set<string>();
+            if ("sandbox:deny-credential-read".startsWith(prefix)) {
+              prerequisiteIds.add("sandbox:mechanism");
+            }
+            for (const target of providerTargets) {
+              const baseId =
+                `provider:${target.implementation}` +
+                (target.model === undefined ? "" : `:${target.model}`);
+              if (`${baseId}:request`.startsWith(prefix)) prerequisiteIds.add(baseId);
+              if (
+                `provider:${target.implementation}:credential-isolation`.startsWith(prefix)
+              ) {
+                for (const prerequisite of providerTargets) {
+                  if (prerequisite.implementation !== target.implementation) continue;
+                  prerequisiteIds.add(
+                    `provider:${prerequisite.implementation}` +
+                      (prerequisite.model === undefined ? "" : `:${prerequisite.model}`),
+                  );
+                }
+              }
+            }
+            const blockedBy = results.filter((result) => prerequisiteIds.has(result.id));
+            if (blockedBy.length > 0) {
+              results = blockedBy;
+              // The requested leaf is known, but a categorical/prerequisite
+              // failure prevents it from running honestly.
+            } else {
+              // A filter that matches nothing used to report `overall: PASS`,
+              // which told a developer their setup was fine when nothing had
+              // been checked at all.
+              emit(opts, `No check matches "${prefix}".`, {
                 overall: "fail",
                 checks: [],
                 reason: `no check matches "${prefix}"`,
-              },
-            );
-            process.exit(EXIT.configInvalid);
+              });
+              process.exit(EXIT.configInvalid);
+            }
           }
-          results = matched;
         }
 
         recordMilestone(dataDir(), "first_doctor_run_at", new Date());
@@ -712,7 +754,9 @@ export function buildProgram(): Command {
         const { config: cfg } = loadOrExit(opts, process.cwd());
         const adapters = await buildAdapters(
           cfg,
-          cfg.autonomy === "observe" ? { need: ["backlog"] } : {},
+          cfg.autonomy === "observe"
+            ? { need: ["backlog"], needGitCredential: true }
+            : {},
         );
         const backlog = adapters.backlog;
         const store = StateStore.open(join(dataDir(), "runmill.db"));
@@ -766,8 +810,8 @@ export function buildProgram(): Command {
           );
           recordMilestone(dataDir(), "first_run_started_at", new Date());
           const runId = `run_${Date.now().toString(36)}`;
-          const keepAwake = startKeepAwake();
-          if (opts.quiet !== true && opts.json !== true) {
+          const keepAwake = cfg.autonomy === "observe" ? undefined : startKeepAwake();
+          if (keepAwake !== undefined && opts.quiet !== true && opts.json !== true) {
             const prefix = keepAwake.active ? "  " : "  warning: ";
             process.stdout.write(`${prefix}${keepAwake.message}\n`);
           }
@@ -780,7 +824,7 @@ export function buildProgram(): Command {
               lease: lease(runId),
             });
           } finally {
-            keepAwake.release();
+            keepAwake?.release();
           }
           if (outcome.prNumber !== undefined) {
             recordMilestone(dataDir(), "first_pr_opened_at", new Date());
@@ -836,18 +880,17 @@ export function buildProgram(): Command {
           throw new Error("--poll-seconds must be a positive number");
         }
         const loaded = loadOrExit(opts, process.cwd());
-        try {
-          const running = await requestDaemon<DaemonSnapshot>(
-            { type: "snapshot" },
-            undefined,
-            300,
+        if (loaded.config.autonomy === "observe") {
+          await refuseRegisteredDaemon(
+            (running) =>
+              `Runmill is already running (pid ${running.daemon.pid}) for ${running.daemon.repoRoot}.`,
           );
-          throw new Error(
-            `Runmill is already running (pid ${running.daemon.pid}) for ${running.daemon.repoRoot}.`,
-          );
-        } catch (error) {
-          if (error instanceof Error && /already running/.test(error.message))
-            throw error;
+          emit(opts, "autonomy is `observe`; no delivery loop was started.", {
+            running: false,
+            reason: "autonomy is observe",
+          });
+          process.exitCode = EXIT.ok;
+          return;
         }
         const detached = detachDaemon(loaded.path, {
           pollSeconds: cmdOpts.pollSeconds,
@@ -1447,21 +1490,15 @@ export function buildProgram(): Command {
             cmdOpts.detach === true &&
             process.env["RUNMILL_DAEMON_CHILD"] !== "1"
           ) {
-            try {
-              const running = await requestDaemon<DaemonSnapshot>(
-                { type: "snapshot" },
-                undefined,
-                300,
+            if (cfg.autonomy === "observe") {
+              await refuseRegisteredDaemon(
+                (running) =>
+                  `Runmill daemon ${running.daemon.pid} is already active for ${running.daemon.repoRoot}.`,
               );
-              throw new Error(
-                `Runmill daemon ${running.daemon.pid} is already active for ${running.daemon.repoRoot}.`,
-              );
-            } catch (error) {
-              if (
-                error instanceof Error &&
-                /already active/.test(error.message)
-              )
-                throw error;
+              emit(opts, "autonomy is `observe`; no daemon was started.", {
+                ran: false,
+              });
+              process.exit(EXIT.ok);
             }
             const detached = detachDaemon(loaded.path, cmdOpts);
             await waitForDetachedDaemon(detached.pid, detached.logPath);
@@ -1476,12 +1513,11 @@ export function buildProgram(): Command {
             return;
           }
           if (cfg.autonomy === "observe") {
-            emit(opts, "autonomy is `observe`; the daemon has nothing to do.", {
+            emit(opts, "autonomy is `observe`; no daemon was started.", {
               ran: false,
             });
             process.exit(EXIT.ok);
           }
-
           const adapters = await buildAdapters(cfg);
           const store = StateStore.open(join(dataDir(), "runmill.db"));
           const clock = new SystemClock();

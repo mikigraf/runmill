@@ -43,7 +43,7 @@ export interface AdapterSet {
   readonly forge: ForgeAdapter;
   /** The one backend instance selected at the composition root. */
   readonly sandbox: SandboxBackend;
-  /** Host-only Git transport using the exact token resolved for the forge. */
+  /** Host-only Git transport using the resolved GitHub token; it may exist without a live forge. */
   readonly gitCredential?: GitHubGitCredential | undefined;
   /** Which boundary resolved to a live implementation. */
   readonly live: { backlog: boolean; provider: boolean; reviewProvider: boolean; forge: boolean };
@@ -70,6 +70,8 @@ export interface BuildAdaptersOptions {
    * billable inference — that `next` and `prepare` never use.
    */
   readonly need?: readonly Boundary[] | undefined;
+  /** Resolve host Git authentication without constructing a live forge adapter. */
+  readonly needGitCredential?: boolean | undefined;
   /** Test/embedding seam; production resolves from workspace.sandbox exactly once. */
   readonly sandbox?: SandboxBackend | undefined;
 }
@@ -91,7 +93,7 @@ export function resolveReviewerAgent(config: RunmillConfig): {
 }
 
 /**
- * Resolve the three external boundaries.
+ * Resolve only the requested external boundaries.
  *
  * Each resolves independently: a real Linear credential with no GitHub token
  * still gives a live backlog. Nothing silently degrades — a boundary that
@@ -261,14 +263,19 @@ export async function buildAdapters(
   let forge: ForgeAdapter;
   let forgeLive = false;
   let gitCredential: GitHubGitCredential | undefined;
-  const token = wants("forge") && !externalEffectsDenied
-    ? await credentials.get("github")
-    : undefined;
+  const token =
+    (wants("forge") || options.needGitCredential === true) &&
+    !externalEffectsDenied &&
+    !demo
+      ? await credentials.get("github")
+      : undefined;
+  if (token !== undefined) {
+    gitCredential = new GitHubGitCredential({ token });
+  }
   if (!wants("forge") || externalEffectsDenied) {
     forge = new FakeForgeAdapter();
   } else if (token !== undefined && !demo) {
     forge = new GitHubForgeAdapter({ token });
-    gitCredential = new GitHubGitCredential({ token });
     forgeLive = true;
   } else if (demo) {
     forge = new FakeForgeAdapter();

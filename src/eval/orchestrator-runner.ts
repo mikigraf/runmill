@@ -20,6 +20,7 @@ import { WorkspaceManager, type Workspace } from "../workspace/manager.js";
 import { validateInstalledDependencies } from "../workspace/dependencies.js";
 import { errorMessage, RunmillError } from "../errors/runmill-error.js";
 import { VerificationEngine } from "../verification/engine.js";
+import { gitEnvironment, immutableGitReadArgs } from "../platform/git.js";
 
 export interface OrchestratorRunnerOptions {
   readonly config: RunmillConfig;
@@ -196,8 +197,8 @@ export function prepareRepository(
     if (sourceRepoRoot !== undefined) {
       execFileSync(
         "git",
-        ["clone", "--no-hardlinks", "--quiet", sourceRepoRoot, target],
-        { stdio: "ignore" },
+        immutableGitReadArgs(["clone", "--no-hardlinks", "--quiet", sourceRepoRoot, target]),
+        { env: gitEnvironment(), stdio: "ignore", timeout: 30_000 },
       );
       cloned = true;
     } else {
@@ -212,10 +213,12 @@ export function prepareRepository(
   }
 
   const gitOutput = (...args: string[]): string => {
-    return execFileSync("git", args, {
+    return execFileSync("git", immutableGitReadArgs(args), {
       cwd: target,
       encoding: "utf8",
+      env: gitEnvironment(),
       stdio: ["ignore", "pipe", "ignore"],
+      timeout: 30_000,
     }).trim();
   };
   const git = (...args: string[]): void => {
@@ -265,7 +268,11 @@ export function prepareRepository(
   // "'origin' does not appear to be a git repository" and the suite would
   // measure the fixture rather than the harness.
   const origin = join(workspaceRoot, "origin.git");
-  execFileSync("git", ["init", "-q", "--bare", "-b", baseBranch, origin], { stdio: "ignore" });
+  execFileSync(
+    "git",
+    immutableGitReadArgs(["init", "-q", "--bare", "-b", baseBranch, origin]),
+    { env: gitEnvironment(), stdio: "ignore", timeout: 30_000 },
+  );
   try {
     git("remote", "add", "origin", origin);
   } catch {
@@ -277,10 +284,12 @@ export function prepareRepository(
 }
 
 function repositoryHead(path: string): string {
-  return execFileSync("git", ["rev-parse", "HEAD"], {
+  return execFileSync("git", immutableGitReadArgs(["rev-parse", "HEAD"]), {
     cwd: path,
     encoding: "utf8",
+    env: gitEnvironment(),
     stdio: ["ignore", "pipe", "ignore"],
+    timeout: 30_000,
   }).trim();
 }
 
@@ -329,10 +338,16 @@ export function resolveEvaluationDependencySource(
 
 function gitRepositoryRoot(path: string): string | undefined {
   try {
-    return execFileSync("git", ["-C", path, "rev-parse", "--show-toplevel"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
+    return execFileSync(
+      "git",
+      immutableGitReadArgs(["-C", path, "rev-parse", "--show-toplevel"]),
+      {
+        encoding: "utf8",
+        env: gitEnvironment(),
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 30_000,
+      },
+    ).trim();
   } catch {
     return undefined;
   }
@@ -366,8 +381,13 @@ class EvaluationWorkspaceManager extends WorkspaceManager {
     const committed = await this.changedFiles(this.#workspace);
     const untracked = execFileSync(
       "git",
-      ["ls-files", "--others", "--exclude-standard"],
-      { cwd: this.#workspace.path, encoding: "utf8" },
+      immutableGitReadArgs(["ls-files", "--others", "--exclude-standard"]),
+      {
+        cwd: this.#workspace.path,
+        encoding: "utf8",
+        env: gitEnvironment(),
+        timeout: 30_000,
+      },
     )
       .trim()
       .split("\n")

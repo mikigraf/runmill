@@ -1,5 +1,12 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +15,7 @@ import {
   DaemonControlServer,
   daemonRuntimePaths,
   parseControlRequest,
+  readDaemonRegistry,
   requestDaemon,
   type RuntimePaths,
 } from "../../src/daemon/control.js";
@@ -188,6 +196,42 @@ describe("daemon control channel", () => {
     );
   });
 
+  it("distinguishes an invalid registry from no registered daemon", () => {
+    const runtime = paths();
+    mkdirSync(runtime.directory, { recursive: true });
+    writeFileSync(runtime.registry, "{not-json\n", { mode: 0o600 });
+
+    expect(() => readDaemonRegistry(runtime.registry)).toThrow(/registry is invalid/u);
+  });
+
+  it("refuses a symlinked registry instead of following it", () => {
+    if (process.platform === "win32") return;
+    const runtime = paths();
+    const target = join(runtime.directory, "redirected.json");
+    writeFileSync(target, "{}\n", { mode: 0o600 });
+    symlinkSync(target, runtime.registry);
+
+    expect(() => readDaemonRegistry(runtime.registry)).toThrow(/could not be read safely/u);
+    expect(readFileSync(target, "utf8")).toBe("{}\n");
+  });
+
+  it("refuses to overwrite an invalid or incompatible registry", async () => {
+    const runtime = paths();
+    mkdirSync(runtime.directory, { recursive: true });
+    writeFileSync(runtime.registry, "{not-json\n", { mode: 0o600 });
+
+    await expect(
+      DaemonControlServer.start({
+        paths: runtime,
+        repoRoot: "/replacement",
+        configPath: "/replacement/runmill.yaml",
+        startedAt: "2026-08-29T10:00:00.000Z",
+        handle: () => ({}),
+      }),
+    ).rejects.toThrow(/registry is invalid/u);
+    expect(readFileSync(runtime.registry, "utf8")).toBe("{not-json\n");
+  });
+
   it("resolves the registry outside the repository", () => {
     expect(daemonRuntimePaths({}, "/home/dev")).toEqual({
       directory: "/home/dev/.runmill",
@@ -245,6 +289,95 @@ describe("daemon control channel", () => {
         handle: () => ({}),
       }),
     ).rejects.toThrow(/already registered/);
+  });
+
+  it("fails closed when PID liveness cannot be determined", async () => {
+    const runtime = paths();
+    mkdirSync(runtime.directory, { recursive: true });
+    writeFileSync(
+      runtime.registry,
+      `${JSON.stringify({
+        protocolVersion: 1,
+        pid: 424_242,
+        socketPath: runtime.socket,
+        startedAt: "2026-08-29T10:00:00.000Z",
+        repoRoot: "/unknown-owner",
+        configPath: "/unknown-owner/runmill.yaml",
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+    });
+    try {
+      await expect(
+        DaemonControlServer.start({
+          paths: runtime,
+          repoRoot: "/replacement",
+          configPath: "/replacement/runmill.yaml",
+          startedAt: "2026-08-29T10:01:00.000Z",
+          handle: () => ({}),
+        }),
+      ).rejects.toThrow(/already registered/u);
+      expect(readDaemonRegistry(runtime.registry).repoRoot).toBe("/unknown-owner");
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it("grants startup ownership to exactly one concurrent server", async () => {
+    const runtime = paths();
+    const options = {
+      paths: runtime,
+      repoRoot: "/repo",
+      configPath: "/repo/runmill.yaml",
+      startedAt: "2026-08-29T10:00:00.000Z",
+      handle: () => ({}),
+    };
+
+    const results = await Promise.allSettled([
+      DaemonControlServer.start(options),
+      DaemonControlServer.start(options),
+    ]);
+    const started = results.filter(
+      (result): result is PromiseFulfilledResult<DaemonControlServer> =>
+        result.status === "fulfilled",
+    );
+    const refused = results.filter((result) => result.status === "rejected");
+    expect(started).toHaveLength(1);
+    expect(refused).toHaveLength(1);
+    openServers.push(started[0]?.value as DaemonControlServer);
+  });
+
+  it("reconciles a valid registry only after its recorded PID is definitively dead", async () => {
+    const runtime = paths();
+    mkdirSync(runtime.directory, { recursive: true });
+    writeFileSync(
+      runtime.registry,
+      `${JSON.stringify({
+        protocolVersion: 1,
+        pid: Number.MAX_SAFE_INTEGER,
+        socketPath: runtime.socket,
+        startedAt: "2026-08-29T10:00:00.000Z",
+        repoRoot: "/crashed",
+        configPath: "/crashed/runmill.yaml",
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    const server = await DaemonControlServer.start({
+      paths: runtime,
+      repoRoot: "/replacement",
+      configPath: "/replacement/runmill.yaml",
+      startedAt: "2026-08-29T10:01:00.000Z",
+      handle: () => ({}),
+    });
+    openServers.push(server);
+
+    expect(readDaemonRegistry(runtime.registry)).toMatchObject({
+      pid: process.pid,
+      repoRoot: "/replacement",
+    });
   });
 
   it("dispatches at most one request per control connection", async () => {

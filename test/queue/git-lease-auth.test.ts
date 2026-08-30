@@ -12,6 +12,7 @@ const { FakeClock } = await import("../../src/testing/fake-clock.js");
 beforeEach(() => {
   gitMock.mockReset();
   tryGitMock.mockReset();
+  tryGitMock.mockResolvedValue({ ok: false, stdout: "", stderr: "", code: 1 });
 });
 
 describe("Git-ref lease GitHub authentication", () => {

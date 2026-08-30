@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { RunmillError } from "../errors/runmill-error.js";
+import { gitEnvironment, immutableGitReadArgs } from "../platform/git.js";
 import type { CheckSpec } from "./engine.js";
 import { SUPPORTED_REPORT_FORMATS } from "./report.js";
 
@@ -240,9 +241,17 @@ export function mergeCheckSources(
 function gitSync(repoRoot: string, args: readonly string[]): string {
   // Manifest loading happens during config resolution, which is synchronous.
   // argv form, never a shell string: args contain caller-supplied paths/refs.
-  return execFileSync("git", args, {
+  return execFileSync("git", immutableGitReadArgs(args), {
     cwd: repoRoot,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
+    timeout: 30_000,
+    // A policy read is observation, never permission to hydrate a partial
+    // clone or substitute a local replacement object. Missing exact
+    // commit/tree/blob evidence must fail closed without changing the
+    // repository or consulting a remote credential helper.
+    env: gitEnvironment({
+      env: { GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" },
+    }),
   });
 }

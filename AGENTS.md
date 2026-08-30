@@ -10,9 +10,10 @@ npm ci
 npm run check
 ```
 
-Use Node 22 or 24. `npm test` is offline and excludes `test/live/`. Run live suites only when the
-task explicitly requires real credentials and remotes. Run `npm run package:check` after changing
-package metadata, build output, the CLI entrypoint, or bundled fixtures.
+Use Node 22 or 24 and Git 2.45 or newer. `npm test` is offline and excludes `test/live/`. Run live
+suites only when the task explicitly requires real credentials and remotes. Run
+`npm run package:check` after changing package metadata, build output, the CLI entrypoint, or
+bundled fixtures.
 
 ## Architectural invariants
 

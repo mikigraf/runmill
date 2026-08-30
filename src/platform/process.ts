@@ -1,15 +1,12 @@
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { fstatSync } from "node:fs";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
 
 /**
  * Output ceiling for captured subprocess results.
  *
- * Node's `execFile` default is 1 MB and it SIGTERMs the child on overflow, so
- * a large `git diff --name-only` would fail as a generic error. Everything
- * funnels through here, so the ceiling is set once and generously.
+ * Captured subprocess output is bounded so an unexpected producer cannot
+ * exhaust the orchestrator. Everything funnels through here, so the ceiling
+ * is set once and generously.
  */
 const MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 
@@ -35,16 +32,21 @@ export class BoundedCapture {
   push(chunk: Buffer): void {
     this.#chunks.push(chunk);
     this.#bytes += chunk.length;
+    if (this.#bytes > this.#max) this.#truncated = true;
     while (this.#chunks.length > 1 && this.#bytes - (this.#chunks[0]?.length ?? 0) >= this.#max) {
       this.#bytes -= this.#chunks.shift()?.length ?? 0;
-      this.#truncated = true;
     }
   }
 
-  text(): string {
-    if (this.#chunks.length === 0) return "";
+  bytes(): Buffer {
+    if (this.#chunks.length === 0) return Buffer.alloc(0);
     const joined = Buffer.concat(this.#chunks);
-    const tail = joined.length > this.#max ? joined.subarray(joined.length - this.#max) : joined;
+    return joined.length > this.#max ? joined.subarray(joined.length - this.#max) : joined;
+  }
+
+  text(): string {
+    const tail = this.bytes();
+    if (tail.length === 0) return "";
     return this.#truncated ? `[...truncated...]\n${tail.toString("utf8")}` : tail.toString("utf8");
   }
 }
@@ -75,16 +77,224 @@ export interface RunBytesOptions extends RunOptions {
 }
 
 export interface RunWithInputOptions extends RunOptions {
-  /** Start a new session so interactive tools cannot reopen the caller's TTY. */
+  /** Start a new session so interactive tools cannot reopen the caller's TTY. Defaults true. */
   readonly detached?: boolean | undefined;
   /** Stop the child process tree when the caller's operation is cancelled. */
   readonly signal?: AbortSignal | undefined;
 }
 
+interface CapturedProcessOptions extends RunOptions {
+  readonly maxOutputBytes: number;
+  readonly input?: string | undefined;
+  readonly detached: boolean;
+  readonly signal?: AbortSignal | undefined;
+}
+
+interface CapturedProcessResult {
+  readonly ok: boolean;
+  readonly stdout: BoundedCapture;
+  readonly stderr: string;
+  readonly code: number | null;
+}
+
+/**
+ * Capture a subprocess behind one bounded lifecycle implementation.
+ *
+ * The direct child gets an owned process group when `detached` is true. A
+ * timeout, cancellation, or output overflow kills that group immediately.
+ * Direct-child exit and pipe closure are deliberately separate states: a
+ * descendant can inherit a pipe after the child exits, so pipe drain has its
+ * own deadline and never leaves the caller waiting forever.
+ */
+function runCapturedProcess(
+  command: string,
+  args: readonly string[],
+  options: CapturedProcessOptions,
+): Promise<CapturedProcessResult> {
+  if (!Number.isSafeInteger(options.maxOutputBytes) || options.maxOutputBytes <= 0) {
+    throw new Error("captured process output limit must be a positive safe integer");
+  }
+  if (
+    options.timeoutMs !== undefined &&
+    (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0)
+  ) {
+    throw new Error("captured process timeout must be a positive safe integer");
+  }
+  return new Promise((resolve) => {
+    if (options.signal?.aborted === true) {
+      resolve({
+        ok: false,
+        stdout: new BoundedCapture(options.maxOutputBytes),
+        stderr: "command cancelled",
+        code: null,
+      });
+      return;
+    }
+
+    const stdout = new BoundedCapture(options.maxOutputBytes);
+    const stderr = new BoundedCapture(options.maxOutputBytes);
+    let child: ChildProcess;
+    try {
+      child = spawn(command, [...args], {
+        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        ...(options.env === undefined ? {} : { env: options.env }),
+        detached: options.detached,
+        windowsHide: true,
+        stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      resolve({
+        ok: false,
+        stdout,
+        stderr: error instanceof Error ? error.message : String(error),
+        code: null,
+      });
+      return;
+    }
+
+    let settled = false;
+    let exited = false;
+    let exitCode: number | null = null;
+    let spawnError: Error | undefined;
+    let timedOut = false;
+    let cancelled = false;
+    let outputLimited = false;
+    let drainTimedOut = false;
+    let terminationTimedOut = false;
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timeoutTimer: NodeJS.Timeout | undefined;
+    let terminationTimer: NodeJS.Timeout | undefined;
+    let drainTimer: NodeJS.Timeout | undefined;
+
+    const clearTimers = (): void => {
+      if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+      if (terminationTimer !== undefined) clearTimeout(terminationTimer);
+      if (drainTimer !== undefined) clearTimeout(drainTimer);
+      timeoutTimer = undefined;
+      terminationTimer = undefined;
+      drainTimer = undefined;
+    };
+
+    const onAbort = (): void => {
+      if (settled || exited || cancelled) return;
+      cancelled = true;
+      requestStop();
+    };
+
+    const finish = (code: number | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      options.signal?.removeEventListener("abort", onAbort);
+      const failure = [
+        stderr.text(),
+        ...(timedOut ? [`command timed out after ${String(options.timeoutMs)} ms`] : []),
+        ...(cancelled ? ["command cancelled"] : []),
+        ...(outputLimited
+          ? [`command output exceeded ${String(options.maxOutputBytes)} bytes`]
+          : []),
+        ...(spawnError === undefined ? [] : [spawnError.message]),
+        ...(terminationTimedOut ? ["command did not exit after process-tree termination"] : []),
+        ...(drainTimedOut ? ["command output pipes did not close after the process exited"] : []),
+      ]
+        .filter((part) => part !== "")
+        .join("\n");
+      resolve({
+        ok:
+          code === 0 &&
+          !timedOut &&
+          !cancelled &&
+          !outputLimited &&
+          !terminationTimedOut &&
+          !drainTimedOut &&
+          spawnError === undefined,
+        stdout,
+        stderr: failure,
+        code,
+      });
+    };
+
+    const requestStop = (): void => {
+      if (settled || exited || terminationTimer !== undefined) return;
+      terminateTree(child);
+      // SIGKILL normally produces `exit` promptly. Keep the caller bounded if
+      // the kernel cannot reap the process (for example, uninterruptible I/O).
+      terminationTimer = setTimeout(() => {
+        terminationTimedOut = true;
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.unref();
+        finish(exitCode);
+      }, KILL_GRACE_MS);
+      terminationTimer.unref();
+    };
+
+    const observe = (capture: BoundedCapture, stream: "stdout" | "stderr", chunk: Buffer): void => {
+      capture.push(chunk);
+      if (stream === "stdout") stdoutBytes += chunk.length;
+      else stderrBytes += chunk.length;
+      if (
+        !outputLimited &&
+        (stdoutBytes > options.maxOutputBytes || stderrBytes > options.maxOutputBytes)
+      ) {
+        outputLimited = true;
+        requestStop();
+      }
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => observe(stdout, "stdout", chunk));
+    child.stderr?.on("data", (chunk: Buffer) => observe(stderr, "stderr", chunk));
+    child.on("error", (error) => {
+      spawnError = error;
+    });
+
+    child.on("exit", (code) => {
+      exited = true;
+      exitCode = code;
+      if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+      timeoutTimer = undefined;
+      if (terminationTimer !== undefined) clearTimeout(terminationTimer);
+      terminationTimer = undefined;
+      options.signal?.removeEventListener("abort", onAbort);
+      drainTimer = setTimeout(() => {
+        drainTimedOut = true;
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish(exitCode);
+      }, KILL_GRACE_MS);
+      drainTimer.unref();
+    });
+
+    child.on("close", (code) => {
+      // A spawn error can close without an `exit` event. All other closes are
+      // terminal too, and close proves the stdio handles have drained.
+      finish(code ?? exitCode);
+    });
+
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted === true) onAbort();
+
+    if (options.timeoutMs !== undefined && options.timeoutMs > 0) {
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        requestStop();
+      }, options.timeoutMs);
+    }
+
+    if (options.input !== undefined) {
+      // EPIPE only means the command declined more input. Its exit and stderr
+      // remain the authoritative result; it must not become an unhandled event.
+      child.stdin?.on("error", () => undefined);
+      child.stdin?.end(options.input);
+    }
+  });
+}
+
 /**
  * Run a command and capture its output, without throwing on a non-zero exit.
  *
- * `execFile`, never a shell: arguments are passed as an array so no caller can
+ * `spawn`, never a shell: arguments are passed as an array so no caller can
  * accidentally build an injectable command string.
  */
 export async function run(
@@ -92,23 +302,17 @@ export async function run(
   args: readonly string[],
   options: RunOptions = {},
 ): Promise<RunResult> {
-  try {
-    const { stdout, stderr } = await execFileAsync(command, [...args], {
-      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-      ...(options.env === undefined ? {} : { env: options.env }),
-      ...(options.timeoutMs === undefined ? {} : { timeout: options.timeoutMs }),
-      maxBuffer: MAX_BUFFER_BYTES,
-    });
-    return { ok: true, stdout: stdout.toString(), stderr: stderr.toString(), code: 0 };
-  } catch (err) {
-    const e = err as { stdout?: string; stderr?: string; code?: number; message?: string };
-    return {
-      ok: false,
-      stdout: e.stdout ?? "",
-      stderr: e.stderr ?? e.message ?? "",
-      code: typeof e.code === "number" ? e.code : null,
-    };
-  }
+  const result = await runCapturedProcess(command, args, {
+    ...options,
+    maxOutputBytes: MAX_BUFFER_BYTES,
+    detached: true,
+  });
+  return {
+    ok: result.ok,
+    stdout: result.stdout.text(),
+    stderr: result.stderr,
+    code: result.code,
+  };
 }
 
 /** Run a command while preserving stdout as exact, size-bounded bytes. */
@@ -117,39 +321,17 @@ export async function runBytes(
   args: readonly string[],
   options: RunBytesOptions,
 ): Promise<RunBytesResult> {
-  try {
-    const { stdout, stderr } = await execFileAsync(command, [...args], {
-      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-      ...(options.env === undefined ? {} : { env: options.env }),
-      ...(options.timeoutMs === undefined ? {} : { timeout: options.timeoutMs }),
-      encoding: "buffer",
-      maxBuffer: options.maxOutputBytes,
-    });
-    return {
-      ok: true,
-      stdout: Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout),
-      stderr: stderr.toString(),
-      code: 0,
-    };
-  } catch (err) {
-    const e = err as {
-      stdout?: Buffer | string;
-      stderr?: Buffer | string;
-      code?: number;
-      message?: string;
-    };
-    return {
-      ok: false,
-      stdout:
-        e.stdout === undefined
-          ? Buffer.alloc(0)
-          : Buffer.isBuffer(e.stdout)
-            ? e.stdout
-            : Buffer.from(e.stdout),
-      stderr: e.stderr?.toString() ?? e.message ?? "",
-      code: typeof e.code === "number" ? e.code : null,
-    };
-  }
+  const result = await runCapturedProcess(command, args, {
+    ...options,
+    maxOutputBytes: options.maxOutputBytes,
+    detached: true,
+  });
+  return {
+    ok: result.ok,
+    stdout: result.stdout.bytes(),
+    stderr: result.stderr,
+    code: result.code,
+  };
 }
 
 /**
@@ -164,122 +346,18 @@ export async function runWithInput(
   input: string,
   options: RunWithInputOptions = {},
 ): Promise<RunResult> {
-  return new Promise((resolve) => {
-    if (options.signal?.aborted === true) {
-      resolve({
-        ok: false,
-        stdout: "",
-        stderr: "command cancelled",
-        code: null,
-      });
-      return;
-    }
-    const stdout = new BoundedCapture(MAX_BUFFER_BYTES);
-    const stderr = new BoundedCapture(MAX_BUFFER_BYTES);
-    let child: ChildProcess;
-    try {
-      child = spawn(command, [...args], {
-        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-        ...(options.env === undefined ? {} : { env: options.env }),
-        detached: options.detached === true,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (error) {
-      resolve({
-        ok: false,
-        stdout: "",
-        stderr: error instanceof Error ? error.message : String(error),
-        code: null,
-      });
-      return;
-    }
-
-    let spawnError: Error | undefined;
-    let timedOut = false;
-    let cancelled = false;
-    let terminal = false;
-    let settled = false;
-    let exitCode: number | null = null;
-    let drainTimedOut = false;
-    let drainTimer: NodeJS.Timeout | undefined;
-    const abort = (): void => {
-      if (cancelled || terminal) return;
-      cancelled = true;
-      terminateTree(child);
-    };
-    options.signal?.addEventListener("abort", abort, { once: true });
-    const cancelTimer =
-      options.timeoutMs === undefined
-        ? () => undefined
-        : armKillTimer(child, options.timeoutMs, () => {
-            timedOut = true;
-          });
-
-    const finish = (code: number | null): void => {
-      if (settled) return;
-      settled = true;
-      terminal = true;
-      cancelTimer();
-      if (drainTimer !== undefined) clearTimeout(drainTimer);
-      options.signal?.removeEventListener("abort", abort);
-      const failure = [
-        stderr.text(),
-        ...(timedOut ? [`command timed out after ${String(options.timeoutMs)} ms`] : []),
-        ...(cancelled ? ["command cancelled"] : []),
-        ...(spawnError === undefined ? [] : [spawnError.message]),
-        ...(drainTimedOut
-          ? ["command output pipes did not close after the process exited"]
-          : []),
-      ]
-        .filter((part) => part !== "")
-        .join("\n");
-      resolve({
-        ok:
-          code === 0 &&
-          !timedOut &&
-          !cancelled &&
-          !drainTimedOut &&
-          spawnError === undefined,
-        stdout: stdout.text(),
-        stderr: failure,
-        code,
-      });
-    };
-
-    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.on("error", (error) => {
-      spawnError = error;
-    });
-    child.on("exit", (code) => {
-      terminal = true;
-      exitCode = code;
-      cancelTimer();
-      options.signal?.removeEventListener("abort", abort);
-      // A descendant can inherit stdout/stderr and keep `close` from ever
-      // arriving after the direct child exits. Numeric PID/PGID signalling is
-      // no longer safe at this point, so bound the drain, destroy only our pipe
-      // handles, and report the incomplete drain as a failure.
-      drainTimer = setTimeout(() => {
-        drainTimedOut = true;
-        child.stdout?.destroy();
-        child.stderr?.destroy();
-        finish(exitCode);
-      }, KILL_GRACE_MS);
-      drainTimer.unref();
-    });
-    child.on("close", (code) => {
-      finish(code ?? exitCode);
-    });
-
-    // A command may reject input before consuming it. EPIPE is an ordinary
-    // command failure reported through close/stderr, not an unhandled event.
-    child.stdin?.on("error", () => undefined);
-    child.stdin?.end(input);
-    // Close the small check-to-listener race if the caller aborted while the
-    // child was being spawned and its stdio handlers were installed.
-    if (options.signal !== undefined && options.signal.aborted) abort();
+  const result = await runCapturedProcess(command, args, {
+    ...options,
+    maxOutputBytes: MAX_BUFFER_BYTES,
+    input,
+    detached: options.detached !== false,
   });
+  return {
+    ok: result.ok,
+    stdout: result.stdout.text(),
+    stderr: result.stderr,
+    code: result.code,
+  };
 }
 
 /** Same, but a non-zero exit throws with the stderr attached. */

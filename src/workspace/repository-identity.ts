@@ -10,7 +10,9 @@ export function parseGitHubRepository(remote: string): string | undefined {
     path = scp[1];
   } else {
     try {
-      const url = new URL(trimmed.replace(/^git\+/, ""));
+      if (/^git\+/iu.test(trimmed)) return undefined;
+      const url = new URL(trimmed);
+      if (url.protocol !== "https:" && url.protocol !== "ssh:") return undefined;
       if (url.hostname.toLowerCase() !== "github.com") return undefined;
       path = url.pathname.replace(/^\//, "");
     } catch {

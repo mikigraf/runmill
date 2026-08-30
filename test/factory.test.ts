@@ -249,6 +249,30 @@ describe("scoping which boundaries resolve", () => {
       "https://github.com/acme/platform.git",
     );
   });
+
+  it("resolves read-only Git auth without constructing a live forge", async () => {
+    const requested: string[] = [];
+    const credentials = new (class extends CredentialStore {
+      override async get(name: Parameters<CredentialStore["get"]>[0]): Promise<string | undefined> {
+        requested.push(name);
+        return name === "github" ? "github_pat_read_only_observation" : undefined;
+      }
+    })();
+
+    const adapters = await buildAdapters(CONFIG, {
+      credentials,
+      need: [],
+      needGitCredential: true,
+    });
+
+    expect(requested).toEqual(["github"]);
+    expect(adapters.gitCredential?.repositoryUrl("acme/platform")).toBe(
+      "https://github.com/acme/platform.git",
+    );
+    expect(adapters.live.forge).toBe(false);
+    expect(adapters.forge.name).toBe("fake");
+    expect(adapters.live.provider).toBe(false);
+  });
 });
 
 describe("RUNMILL_DEMO as an explicit signal", () => {

@@ -39,7 +39,7 @@ function selected(overrides: Partial<BacklogIssue> = {}) {
 describe("renderDoctor", () => {
   it("shows only the observation for a passing check", () => {
     const out = renderDoctor([
-      { id: "git", status: "pass", observed: "git version 2.50.1", expected: "git >= 2.30" },
+      { id: "git", status: "pass", observed: "git version 2.50.1", expected: "git >= 2.45" },
     ]);
     expect(out).toContain("✓");
     expect(out).toContain("git version 2.50.1");

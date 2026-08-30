@@ -118,10 +118,211 @@ function createRuntimeInput(workspacePath: string, name: string, content: string
 }
 
 export interface TrustedBase {
-  /** A Runmill-owned ref which keeps the fetched object reachable locally. */
+  /** Immutable ref used for policy/workspace reads; a fetched run uses a Runmill-owned ref. */
   readonly ref: string;
-  /** Exact commit resolved immediately after the fetch. */
+  /** Exact commit resolved immediately after the remote fetch or observation. */
   readonly commit: string;
+}
+
+const IMMUTABLE_OBJECT_READ_ENV = {
+  GIT_NO_LAZY_FETCH: "1",
+  GIT_NO_REPLACE_OBJECTS: "1",
+} as const;
+const BASE_OBSERVATION_TIMEOUT_MS = 30_000;
+const BASE_FETCH_TIMEOUT_MS = 5 * 60_000;
+const URL_REWRITE_PATTERN = "^url\\..*\\.insteadof$";
+
+type GitTransportProtocol = "https" | "ssh" | "file";
+
+interface QualifiedGitRemote {
+  readonly target: string;
+  readonly protocol: GitTransportProtocol;
+}
+
+function remoteProtocol(target: string): GitTransportProtocol | undefined {
+  if (isAbsolute(target)) return "file";
+  // URI and remote-helper spellings must be classified before SCP syntax.
+  // Otherwise `git+https://...` or `ext::...` looks like the SCP form
+  // `host:path` and could reach a custom remote helper under an ssh grant.
+  if (/^[a-z][a-z0-9+.-]*:(?:\/\/|:)/iu.test(target)) {
+    try {
+      const protocol = new URL(target).protocol.toLowerCase();
+      if (protocol === "https:") return "https";
+      if (protocol === "ssh:") return "ssh";
+      if (protocol === "file:") return "file";
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+  if (/^(?:[^@\s/:]+@)?[^:\s/]+:[^\s]+$/u.test(target)) return "ssh";
+  try {
+    const protocol = new URL(target).protocol.toLowerCase();
+    if (protocol === "https:") return "https";
+    if (protocol === "ssh:") return "ssh";
+    if (protocol === "file:") return "file";
+  } catch {
+    // A remote name is resolved from Git config below.
+  }
+  return undefined;
+}
+
+type GitConfigScope = "system" | "global" | "local" | "worktree";
+type GitProtocolPolicy = "always" | "user" | "never";
+
+async function optionalScopedGitConfig(
+  root: string,
+  key: string,
+  scope: GitConfigScope,
+  timeoutMs: number,
+): Promise<GitProtocolPolicy | undefined> {
+  const result = await tryGit(root, ["config", `--${scope}`, "--get", key], { timeoutMs });
+  if (result.ok) {
+    const value = result.stdout.replace(/\r?\n$/u, "").trim().toLowerCase();
+    if (value === "always" || value === "user" || value === "never") return value;
+    throw new Error(`Git ${scope} transport policy ${key} is invalid`);
+  }
+  if (result.code === 1 && result.stderr.trim() === "") return undefined;
+  throw new Error(`could not read ${scope} Git transport policy ${key}`);
+}
+
+async function protocolPolicy(
+  root: string,
+  protocol: GitTransportProtocol,
+  timeoutMs: number,
+): Promise<{ readonly operator: GitProtocolPolicy; readonly repository?: GitProtocolPolicy }> {
+  const read = (key: string, scope: GitConfigScope) =>
+    optionalScopedGitConfig(root, key, scope, timeoutMs);
+  const key = `protocol.${protocol}.allow`;
+  const [systemSpecific, globalSpecific, systemFallback, globalFallback] = await Promise.all([
+    read(key, "system"),
+    read(key, "global"),
+    read("protocol.allow", "system"),
+    read("protocol.allow", "global"),
+  ]);
+  const operator =
+    globalSpecific ??
+    systemSpecific ??
+    globalFallback ??
+    systemFallback ??
+    (protocol === "file" ? "user" : "always");
+
+  const [localSpecific, worktreeSpecific, localFallback, worktreeFallback] = await Promise.all([
+    read(key, "local"),
+    read(key, "worktree"),
+    read("protocol.allow", "local"),
+    read("protocol.allow", "worktree"),
+  ]);
+  const repository =
+    worktreeSpecific ?? localSpecific ?? worktreeFallback ?? localFallback;
+  return {
+    operator,
+    ...(repository === undefined ? {} : { repository }),
+  };
+}
+
+async function assertNoGitUrlRewrite(
+  root: string,
+  target: string,
+  timeoutMs: number,
+): Promise<void> {
+  for (const scope of ["system", "global", "local", "worktree"] as const) {
+    const result = await tryGit(
+      root,
+      ["config", `--${scope}`, "--get-regexp", URL_REWRITE_PATTERN],
+      { timeoutMs },
+    );
+    if (!result.ok) {
+      if (result.code === 1 && result.stderr.trim() === "") continue;
+      throw new Error(`could not verify ${scope} Git URL rewrite policy`);
+    }
+    for (const line of result.stdout.split(/\r?\n/u).filter((value) => value !== "")) {
+      const match = line.match(/^[^\t ]+[\t ](.*)$/u);
+      if (match?.[1] === undefined) {
+        throw new Error(`could not parse ${scope} Git URL rewrite policy`);
+      }
+      if (target.startsWith(match[1])) {
+        throw new Error(
+          `qualified Git remote ${JSON.stringify(target)} is affected by url.*.insteadOf policy`,
+        );
+      }
+    }
+  }
+}
+
+async function qualifyGitRemote(
+  root: string,
+  remote: string,
+  timeoutMs: number,
+): Promise<QualifiedGitRemote> {
+  let target = remote;
+  let protocol = remoteProtocol(target);
+  if (protocol === undefined) {
+    if (/^[a-z][a-z0-9+.-]*:/iu.test(remote)) {
+      throw new Error(`Git remote protocol is unsupported: ${JSON.stringify(remote)}`);
+    }
+    const configured = await tryGit(root, ["config", "--get-all", `remote.${remote}.url`], {
+      timeoutMs,
+    });
+    const targets = configured.stdout
+      .split(/\r?\n/u)
+      .map((value) => value.trim())
+      .filter((value) => value !== "");
+    if (!configured.ok || targets.length !== 1) {
+      throw new Error(`Git remote ${JSON.stringify(remote)} does not resolve to one exact URL`);
+    }
+    target = targets[0] ?? "";
+    protocol = remoteProtocol(target);
+    if (protocol === undefined && !/^[a-z][a-z0-9+.-]*:/iu.test(target)) {
+      // Git permits a relative local repository path. Treat it as file
+      // transport, while retaining the exact configured spelling for Git.
+      protocol = "file";
+    }
+  }
+  if (protocol === undefined) {
+    throw new Error(`Git remote protocol is unsupported: ${JSON.stringify(target)}`);
+  }
+
+  await assertNoGitUrlRewrite(root, target, timeoutMs);
+  const policy = await protocolPolicy(root, protocol, timeoutMs);
+  const ambientAllow = process.env["GIT_ALLOW_PROTOCOL"];
+  const ambientAllows =
+    ambientAllow === undefined || ambientAllow.split(":").includes(protocol);
+  // The child receives GIT_ALLOW_PROTOCOL below, which gives the selected
+  // protocol `always` semantics. Accepting an operator's weaker `user`
+  // setting here would therefore widen it inside the Git process. Runmill is
+  // an orchestrator-owned subprocess boundary, so only `always` is eligible.
+  const policyAllows =
+    policy.operator === "always" &&
+    (policy.repository === undefined || policy.repository === "always");
+  if (!ambientAllows || !policyAllows) {
+    throw new Error(
+      `operator Git protocol policy denies ${protocol} transport for ${JSON.stringify(remote)}`,
+    );
+  }
+  return { target, protocol };
+}
+
+function gitTransportEnvironment(protocol: GitTransportProtocol): NodeJS.ProcessEnv {
+  return {
+    // This is the intersection selected above, never a broader default. It
+    // also prevents url.*.insteadOf from dispatching an unqualified helper.
+    GIT_ALLOW_PROTOCOL: protocol,
+    GIT_PROTOCOL_FROM_USER: "0",
+  };
+}
+
+async function checkedRemoteRef(
+  sourceRepo: string,
+  baseBranch: string,
+): Promise<{ readonly root: string; readonly remoteRef: string }> {
+  const root = await repoRoot(sourceRepo);
+  const remoteRef = `refs/heads/${baseBranch}`;
+  const valid = await tryGit(root, ["check-ref-format", remoteRef]);
+  if (!valid.ok) {
+    throw new Error(`configured base branch ${JSON.stringify(baseBranch)} is not a valid Git ref`);
+  }
+  return { root, remoteRef };
 }
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
@@ -153,12 +354,8 @@ export async function fetchTrustedBase(
   remote = "origin",
   credential?: GitHubGitCredential,
 ): Promise<TrustedBase> {
-  const root = await repoRoot(sourceRepo);
-  const remoteRef = `refs/heads/${baseBranch}`;
-  const valid = await tryGit(root, ["check-ref-format", remoteRef]);
-  if (!valid.ok) {
-    throw new Error(`configured base branch ${JSON.stringify(baseBranch)} is not a valid Git ref`);
-  }
+  const { root, remoteRef } = await checkedRemoteRef(sourceRepo, baseBranch);
+  const qualified = await qualifyGitRemote(root, remote, BASE_FETCH_TIMEOUT_MS);
 
   const key = createHash("sha256")
     .update(remote)
@@ -171,13 +368,19 @@ export async function fetchTrustedBase(
     "--quiet",
     "--no-tags",
     "--no-write-fetch-head",
-    remote,
+    qualified.target,
     `+${remoteRef}:${ref}`,
   ] as const;
   const fetched =
     credential === undefined
-      ? await tryGit(root, fetchArgs)
-      : await credential.tryGit(root, fetchArgs);
+      ? await tryGit(root, fetchArgs, {
+          env: gitTransportEnvironment(qualified.protocol),
+          timeoutMs: BASE_FETCH_TIMEOUT_MS,
+        })
+      : await credential.tryGit(root, fetchArgs, {
+          env: gitTransportEnvironment(qualified.protocol),
+          timeoutMs: BASE_FETCH_TIMEOUT_MS,
+        });
   if (!fetched.ok) {
     throw new Error(
       `could not fetch configured base branch ${JSON.stringify(baseBranch)} from ${remote}: ` +
@@ -185,8 +388,97 @@ export async function fetchTrustedBase(
     );
   }
 
-  const commit = await git(root, "rev-parse", "--verify", `${ref}^{commit}`);
+  const commit = await runGit(root, ["rev-parse", "--verify", `${ref}^{commit}`], {
+    timeoutMs: BASE_OBSERVATION_TIMEOUT_MS,
+  });
   return { ref, commit };
+}
+
+/**
+ * Observe the exact remote base without changing the source repository.
+ *
+ * Observe autonomy promises not to change the repository, so it may not use
+ * `fetchTrustedBase()` merely to read policy. `ls-remote` proves the current
+ * remote identity without writing a ref; the exact object must already exist
+ * locally or the observation fails closed. This never substitutes a stale
+ * tracking branch for missing evidence.
+ */
+export async function observeTrustedBase(
+  sourceRepo: string,
+  baseBranch: string,
+  remote = "origin",
+  credential?: GitHubGitCredential,
+): Promise<TrustedBase> {
+  const { root, remoteRef } = await checkedRemoteRef(sourceRepo, baseBranch);
+  const qualified = await qualifyGitRemote(root, remote, BASE_OBSERVATION_TIMEOUT_MS);
+  const args = [
+    "-c",
+    "credential.helper=",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "protocol.ext.allow=never",
+    "ls-remote",
+    "--exit-code",
+    "--refs",
+    qualified.target,
+    remoteRef,
+  ] as const;
+  const options = {
+    env: {
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_ASKPASS: "",
+      SSH_ASKPASS: "",
+      ...gitTransportEnvironment(qualified.protocol),
+    },
+    timeoutMs: BASE_OBSERVATION_TIMEOUT_MS,
+  } as const;
+  const observed = credential === undefined
+    ? await tryGit(root, args, options)
+    : await credential.tryGit(root, args, options);
+  if (!observed.ok) {
+    throw new Error(
+      `could not observe configured base branch ${JSON.stringify(baseBranch)} without changing ` +
+        "the source repository",
+    );
+  }
+
+  const matches = observed.stdout
+    .split(/\r?\n/u)
+    .map((line) => line.trim().split(/\s+/u))
+    .filter((fields) => fields.length === 2 && fields[1] === remoteRef);
+  if (matches.length !== 1) {
+    throw new Error(
+      `remote base observation for ${JSON.stringify(baseBranch)} was missing or contradictory`,
+    );
+  }
+  const remoteCommit = matches[0]?.[0]?.toLowerCase() ?? "";
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(remoteCommit)) {
+    throw new Error(
+      `remote base observation for ${JSON.stringify(baseBranch)} returned an invalid object id`,
+    );
+  }
+
+  const local = await tryGit(root, ["cat-file", "-e", `${remoteCommit}^{commit}`], {
+    env: IMMUTABLE_OBJECT_READ_ENV,
+    timeoutMs: BASE_OBSERVATION_TIMEOUT_MS,
+  });
+  if (!local.ok) {
+    throw new Error(
+      `remote base ${JSON.stringify(baseBranch)} is not present in the local object database; ` +
+        "observe mode will not fetch it because that would change the repository",
+    );
+  }
+  const commit = await runGit(root, ["rev-parse", "--verify", `${remoteCommit}^{commit}`], {
+    env: IMMUTABLE_OBJECT_READ_ENV,
+    timeoutMs: BASE_OBSERVATION_TIMEOUT_MS,
+  });
+  if (commit.toLowerCase() !== remoteCommit) {
+    throw new Error(
+      `remote base observation for ${JSON.stringify(baseBranch)} did not resolve to the exact commit`,
+    );
+  }
+  return { ref: commit, commit };
 }
 
 const RUNTIME_INPUT_PATHS = [".runmill/run/task.json", ".runmill/run/issue.md"] as const;

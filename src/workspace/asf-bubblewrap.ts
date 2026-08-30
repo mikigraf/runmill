@@ -23,6 +23,7 @@ import type {
   ToolResourceLimits,
 } from "../agent/tool-gateway.js";
 import type { Clock } from "../platform/clock.js";
+import { immutableGitReadArgs } from "../platform/git.js";
 import {
   runControlledProcess,
   type ControlledProcessResult,
@@ -374,7 +375,7 @@ const HOST_GIT_ENV: Readonly<Record<string, string>> = {
 async function gitObservation(gitPath: string, cwd: string, args: readonly string[]): Promise<string> {
   const result = await run(
     gitPath,
-    [
+    immutableGitReadArgs([
       "--no-optional-locks",
       "-c",
       "core.fsmonitor=false",
@@ -383,7 +384,7 @@ async function gitObservation(gitPath: string, cwd: string, args: readonly strin
       "-c",
       "core.hooksPath=/dev/null",
       ...args,
-    ],
+    ]),
     { cwd, env: HOST_GIT_ENV, timeoutMs: 10_000 },
   );
   if (!result.ok) refuse("workspace-refused", "trusted Git workspace observation failed");

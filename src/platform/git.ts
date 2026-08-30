@@ -30,6 +30,21 @@ export interface GitOptions {
 
 export type GitSigningFormat = "openpgp" | "x509" | "ssh";
 
+/**
+ * Build argv for an orchestrator-owned Git operation whose object lookups must
+ * use only already-present, exact Git objects.
+ *
+ * The environment variables remain useful for child commands, but Git clients
+ * predating the global `--no-lazy-fetch` option silently ignore the no-fetch
+ * environment variable. Keeping the controls in argv makes such a client fail
+ * closed instead of hydrating a partial clone behind a supposedly bounded
+ * operation. The central wrappers use this for mutations too because their
+ * prerequisite object reads carry the same exact-evidence requirement.
+ */
+export function immutableGitReadArgs(args: readonly string[]): string[] {
+  return ["--no-lazy-fetch", "--no-replace-objects", ...args];
+}
+
 /** Trusted host-side settings used when Runmill authors a candidate commit. */
 export interface CandidateCommitProvenance {
   readonly name: string;
@@ -51,9 +66,17 @@ export interface CandidateCommitProvenance {
  */
 const STRIPPED = [
   "GIT_DIR",
+  "GIT_COMMON_DIR",
   "GIT_WORK_TREE",
   "GIT_INDEX_FILE",
   "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_QUARANTINE_PATH",
+  "GIT_NAMESPACE",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_GRAFT_FILE",
+  "GIT_SHALLOW_FILE",
+  "GIT_CONFIG_PARAMETERS",
   // Identity and dates are authority-bearing commit inputs. Callers must set
   // them deliberately instead of inheriting a daemon supervisor's ambient
   // environment. The deterministic lease option below adds its own values
@@ -66,7 +89,13 @@ const STRIPPED = [
   "GIT_COMMITTER_DATE",
 ];
 
-function envFor(options: GitOptions): NodeJS.ProcessEnv {
+/**
+ * Build the environment for an authority-bearing Git command.
+ *
+ * Synchronous Git readers use this too so ambient repository selectors and
+ * config injection cannot make them inspect a different object database.
+ */
+export function gitEnvironment(options: GitOptions = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of STRIPPED) delete env[key];
   // `git -c` is encoded through these variables. Inheriting a half-present or
@@ -89,9 +118,9 @@ export async function git(
   args: readonly string[],
   options: GitOptions = {},
 ): Promise<string> {
-  return runOrThrow("git", args, {
+  return runOrThrow("git", immutableGitReadArgs(args), {
     cwd,
-    env: envFor(options),
+    env: gitEnvironment(options),
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
   });
 }
@@ -102,9 +131,9 @@ export async function tryGit(
   args: readonly string[],
   options: GitOptions = {},
 ): Promise<RunResult> {
-  return run("git", args, {
+  return run("git", immutableGitReadArgs(args), {
     cwd,
-    env: envFor(options),
+    env: gitEnvironment(options),
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
   });
 }
@@ -116,9 +145,9 @@ export async function tryGitBytes(
   maxOutputBytes: number,
   options: GitOptions = {},
 ): Promise<RunBytesResult> {
-  return runBytes("git", args, {
+  return runBytes("git", immutableGitReadArgs(args), {
     cwd,
-    env: envFor(options),
+    env: gitEnvironment(options),
     maxOutputBytes,
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
   });

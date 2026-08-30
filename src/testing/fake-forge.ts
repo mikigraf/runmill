@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import type {
   BranchProtection,
   ForgeAdapter,
@@ -7,6 +6,7 @@ import type {
   RemoteCheck,
 } from "../pr/adapter.js";
 import { ForgeError } from "../pr/adapter.js";
+import { git, tryGit } from "../platform/git.js";
 
 export interface FakeForgeOptions {
   readonly requiredChecks?: readonly string[] | undefined;
@@ -55,25 +55,19 @@ export class FakeForgeAdapter implements ForgeAdapter {
   async push(input: { repo: string; branch: string; workspacePath: string }): Promise<void> {
     this.calls.push({ op: "push", args: input });
     const branchKey = `${input.repo}#${input.branch}`;
-    this.#pushed.add(branchKey);
 
     // The production forge reports the actual pushed commit as the PR head.
     // Preserve that identity in the fake too, so tests cannot pass with a
     // synthetic SHA that would fail the production exact-candidate gate.
+    let head: string;
     try {
-      const head = execFileSync("git", ["rev-parse", "HEAD"], {
-        cwd: input.workspacePath,
-        encoding: "utf8",
-      }).trim();
-      this.#pushedHeads.set(branchKey, head);
-      for (const [number, pr] of this.#prs) {
-        if (pr.url.endsWith(input.branch)) {
-          this.#prs.set(number, { ...pr, headSha: head });
-        }
+      head = await git(input.workspacePath, ["rev-parse", "HEAD"], { timeoutMs: 30_000 });
+      if (head === "") {
+        throw new Error("git rev-parse returned an empty commit id");
       }
-    } catch {
-      // Some adapter unit tests use a synthetic workspace. They still assert
-      // the call itself; the fallback PR SHA keeps those tests usable.
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new ForgeError(`fake forge could not resolve the pushed HEAD: ${detail}`, false);
     }
 
     // Actually push. Recording the call and doing nothing made the fake MORE
@@ -81,14 +75,34 @@ export class FakeForgeAdapter implements ForgeAdapter {
     // existing afterwards passed here and failed against a real forge. A
     // stacked layer depends on exactly that, because it clones the branch the
     // layer below pushed.
-    try {
-      execFileSync("git", ["push", "--quiet", "--force", "origin", `HEAD:refs/heads/${input.branch}`], {
-        cwd: input.workspacePath,
-        stdio: "ignore",
-      });
-    } catch {
-      // The workspace may have no reachable origin in unit tests that never
-      // built one. The recorded call is still the assertion surface there.
+    const pushed = await tryGit(
+      input.workspacePath,
+      [
+        "push",
+        "--quiet",
+        "--no-verify",
+        "origin",
+        `HEAD:refs/heads/${input.branch}`,
+      ],
+      { timeoutMs: 30_000 },
+    );
+    if (!pushed.ok) {
+      const detail = pushed.stderr.trim() || `git exited ${String(pushed.code)}`;
+      throw new ForgeError(
+        `fake forge push failed: ${detail}`,
+        /timed out|network|503|502/iu.test(detail),
+      );
+    }
+
+    // Publish success only after Git confirmed the mutation. A failed or
+    // ambiguous subprocess result must not leave evidence that the branch or
+    // its exact head exists remotely.
+    this.#pushed.add(branchKey);
+    this.#pushedHeads.set(branchKey, head);
+    for (const [number, pr] of this.#prs) {
+      if (pr.url.endsWith(input.branch)) {
+        this.#prs.set(number, { ...pr, headSha: head });
+      }
     }
     this.#maybeLoseResponse("push");
   }
@@ -102,6 +116,14 @@ export class FakeForgeAdapter implements ForgeAdapter {
     draft: boolean;
   }): Promise<PullRequest> {
     this.calls.push({ op: "openPullRequest", args: input });
+    const branchKey = `${input.repo}#${input.branch}`;
+    const pushedHead = this.#pushedHeads.get(branchKey);
+    if (!this.#pushed.has(branchKey) || pushedHead === undefined) {
+      throw new ForgeError(
+        `cannot open a pull request before ${input.branch} is confirmed on the remote`,
+        false,
+      );
+    }
 
     // GitHub rejects a duplicate PR for the same head/base with 422. Modelled
     // so the orchestrator's idempotency path is exercised rather than assumed.
@@ -115,7 +137,7 @@ export class FakeForgeAdapter implements ForgeAdapter {
     const pr: PullRequest = {
       number,
       url: `https://fake/${input.repo}/pull/${number}/${input.branch}`,
-      headSha: this.#pushedHeads.get(`${input.repo}#${input.branch}`) ?? `head-${number}`,
+      headSha: pushedHead,
       baseSha: `base-${number}`,
       draft: input.draft,
       state: "open",

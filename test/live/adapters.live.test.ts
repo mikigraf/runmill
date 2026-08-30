@@ -6,8 +6,9 @@
  *
  *   npx vitest run --config vitest.live.config.ts
  *
- * Each suite skips itself when its credential or binary is absent, so this file
- * is safe to run anywhere; it simply reports less.
+ * Credential-backed suites skip when credentials are absent. Provider suites
+ * remain explicitly pending until a production sandbox backend is qualified;
+ * live tests must never downgrade to host execution.
  */
 import { describe, expect, it } from "vitest";
 import { CliProviderAdapter, CODEX_DIALECT, CLAUDE_DIALECT } from "../../src/agent/cli-provider.js";
@@ -21,26 +22,31 @@ const creds = new CredentialStore();
 const githubToken = await creds.get("github");
 const linearKey = await creds.get("linear");
 
-const sandbox = createNativeSandboxBackend("native");
-const codex = new CliProviderAdapter({ dialect: CODEX_DIALECT, sandbox });
-const claude = new CliProviderAdapter({ dialect: CLAUDE_DIALECT, sandbox });
-const codexInstalled = (await codex.detect()).installed;
-const claudeInstalled = (await claude.detect()).installed;
+const codex = (): CliProviderAdapter =>
+  new CliProviderAdapter({
+    dialect: CODEX_DIALECT,
+    sandbox: createNativeSandboxBackend("native"),
+  });
+const claude = (): CliProviderAdapter =>
+  new CliProviderAdapter({
+    dialect: CLAUDE_DIALECT,
+    sandbox: createNativeSandboxBackend("native"),
+  });
 
-describe.runIf(codexInstalled)("live: Codex provider", () => {
+describe.skip("live: Codex provider (pending qualified production sandbox)", () => {
   it("detects the installed binary and reports a version", async () => {
-    const installation = await codex.detect();
+    const installation = await codex().detect();
     expect(installation.installed).toBe(true);
     expect(installation.version).toBeTruthy();
   });
 
   it("reports authentication status", async () => {
-    const auth = await codex.authStatus();
+    const auth = await codex().authStatus();
     expect(typeof auth.authenticated).toBe("boolean");
   });
 
   it("advertises only the capabilities the Codex CLI actually enforces", async () => {
-    const caps = await codex.capabilities();
+    const caps = await codex().capabilities();
     expect(caps.streamingOutput).toBe(true);
     expect(caps.turnLimits).toBe(false);
     expect(caps.toolAllowDeny).toBe(false);
@@ -48,7 +54,7 @@ describe.runIf(codexInstalled)("live: Codex provider", () => {
 
   it("refuses to resume for a reviewer role", async () => {
     await expect(
-      codex.resume({
+      codex().resume({
         runId: "r",
         issueId: "ENG-1",
         role: "local-reviewer",
@@ -67,9 +73,9 @@ describe.runIf(codexInstalled)("live: Codex provider", () => {
   });
 });
 
-describe.runIf(claudeInstalled)("live: Claude Code provider", () => {
+describe.skip("live: Claude Code provider (pending qualified production sandbox)", () => {
   it("detects the installed binary", async () => {
-    expect((await claude.detect()).installed).toBe(true);
+    expect((await claude().detect()).installed).toBe(true);
   });
 });
 

@@ -11,12 +11,18 @@ case "$1" in
   *) exit 1 ;;
 esac
 `;
+const CREDENTIAL_CONFIG_TIMEOUT_MS = 15_000;
+const URL_REWRITE_PATTERN = "^url\\..*\\.insteadof$";
+const GIT_CONFIG_SCOPES = ["system", "global", "local", "worktree"] as const;
 
 function cloneBaseUrl(apiBaseUrl: string | undefined): string {
   if (apiBaseUrl === undefined) return "https://github.com";
 
   const api = new URL(apiBaseUrl);
   if (api.hostname === "api.github.com") return "https://github.com";
+  if (api.protocol !== "https:") {
+    throw new Error("GitHub Enterprise credentials require an HTTPS API base URL");
+  }
 
   // GitHub Enterprise's REST endpoint conventionally ends in /api/v3 while
   // HTTPS clone URLs live at the same host (and optional reverse-proxy prefix).
@@ -40,6 +46,9 @@ export class GitHubGitCredential {
   readonly #cloneBaseUrl: string;
 
   constructor(options: { token: string; baseUrl?: string | undefined }) {
+    if (options.token === "" || /[\0\r\n]/u.test(options.token)) {
+      throw new Error("GitHub credentials must be non-empty and contain no line break or NUL byte");
+    }
     this.#token = options.token;
     this.#cloneBaseUrl = cloneBaseUrl(options.baseUrl);
   }
@@ -64,6 +73,7 @@ export class GitHubGitCredential {
   }
 
   async git(cwd: string, args: readonly string[], options: GitOptions = {}): Promise<string> {
+    await this.#assertExactCredentialTarget(cwd, args, options.timeoutMs);
     return this.#withAskpass(async (authArgs, authEnv) => {
       try {
         const output = await git(cwd, [...authArgs, ...args], {
@@ -82,6 +92,7 @@ export class GitHubGitCredential {
     args: readonly string[],
     options: GitOptions = {},
   ): Promise<RunResult> {
+    await this.#assertExactCredentialTarget(cwd, args, options.timeoutMs);
     return this.#withAskpass(async (authArgs, authEnv) => {
       try {
         const result = await tryGit(cwd, [...authArgs, ...args], {
@@ -97,6 +108,69 @@ export class GitHubGitCredential {
         throw new Error(this.redact(messageOf(error)));
       }
     });
+  }
+
+  #credentialOwnedUrl(value: string): boolean {
+    try {
+      const base = new URL(this.#cloneBaseUrl);
+      const candidate = new URL(value);
+      if (
+        candidate.protocol !== "https:" ||
+        candidate.origin !== base.origin ||
+        candidate.username !== "" ||
+        candidate.password !== "" ||
+        candidate.search !== "" ||
+        candidate.hash !== ""
+      ) {
+        return false;
+      }
+      const prefix = `${base.pathname.replace(/\/+$/u, "")}/`;
+      if (!candidate.pathname.startsWith(prefix)) return false;
+      const repository = candidate.pathname.slice(prefix.length);
+      return /^[^/]+\/[^/]+\.git$/u.test(repository);
+    } catch {
+      return false;
+    }
+  }
+
+  async #assertExactCredentialTarget(
+    cwd: string,
+    args: readonly string[],
+    requestedTimeoutMs: number | undefined,
+  ): Promise<void> {
+    const targets = args.filter((arg) => this.#credentialOwnedUrl(arg));
+    if (targets.length !== 1) {
+      throw new Error(
+        "credentialed Git operation requires one exact HTTPS URL owned by this GitHub credential",
+      );
+    }
+    const target = targets[0] as string;
+    const timeoutMs =
+      requestedTimeoutMs !== undefined && requestedTimeoutMs > 0
+        ? Math.min(requestedTimeoutMs, CREDENTIAL_CONFIG_TIMEOUT_MS)
+        : CREDENTIAL_CONFIG_TIMEOUT_MS;
+    for (const scope of GIT_CONFIG_SCOPES) {
+      const result = await tryGit(
+        cwd,
+        ["config", `--${scope}`, "--get-regexp", URL_REWRITE_PATTERN],
+        { timeoutMs },
+      );
+      if (!result.ok) {
+        if (result.code === 1 && result.stderr.trim() === "") continue;
+        throw new Error(`could not verify ${scope} Git URL rewrite policy`);
+      }
+      for (const line of result.stdout.split(/\r?\n/u).filter((value) => value !== "")) {
+        const match = line.match(/^[^\t ]+[\t ](.*)$/u);
+        if (match?.[1] === undefined) {
+          throw new Error(`could not parse ${scope} Git URL rewrite policy`);
+        }
+        if (target.startsWith(match[1])) {
+          throw new Error(
+            "credentialed Git operation refuses a URL affected by url.*.insteadOf policy",
+          );
+        }
+      }
+    }
   }
 
   async #withAskpass<T>(

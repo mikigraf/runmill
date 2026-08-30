@@ -9,7 +9,7 @@ npm ci
 npm run check
 ```
 
-Node 22 or 24, git, and macOS or Linux. Sandbox tests need Seatbelt (built into macOS) or
+Node 22 or 24, Git 2.45 or newer, and macOS or Linux. Sandbox tests need Seatbelt (built into macOS) or
 bubblewrap (`apt-get install bubblewrap`). The repository pins npm 11.15.0 in `package.json`; use
 that version when regenerating `package-lock.json`.
 
@@ -29,8 +29,9 @@ Run those on purpose:
 npx vitest run --config vitest.live.config.ts
 ```
 
-Each live suite skips itself when its credential is absent, so it is safe to run anywhere. It
-simply reports less.
+Live suites that require credentials skip when their credential is absent. Provider execution
+suites also remain skipped until a qualified production sandbox backend is available; the live
+configuration reports which prerequisite is missing.
 
 ## How the layers fit
 

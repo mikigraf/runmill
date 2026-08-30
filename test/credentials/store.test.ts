@@ -29,7 +29,11 @@ beforeEach(() => {
     delete process.env[key];
   }
   // Default: nothing found anywhere.
-  runMock.mockResolvedValue({ ok: false, stdout: "", stderr: "", code: 1 });
+  runMock.mockImplementation(async (command: string) =>
+    command === "security"
+      ? { ok: false, stdout: "", stderr: "item not found", code: 44 }
+      : { ok: false, stdout: "", stderr: "spawn gh ENOENT", code: null },
+  );
   runWithInputMock.mockResolvedValue({ ok: true, stdout: "", stderr: "", code: 0 });
 });
 
@@ -65,6 +69,7 @@ describe("get", () => {
     expect(await new CredentialStore().get("linear")).toBe("secret-value");
     expect(runMock.mock.calls[0]?.[0]).toBe("security");
     expect(runMock.mock.calls[0]?.[1]).toContain("runmill:linear");
+    expect(runMock.mock.calls[0]?.[2]).toMatchObject({ timeoutMs: 15_000 });
   });
 
   it("falls back to `gh auth token` for github only", async () => {
@@ -74,20 +79,45 @@ describe("get", () => {
       if (cmd === "gh" && args[0] === "auth") {
         return { ok: true, stdout: "gho_token\n", stderr: "", code: 0 };
       }
-      return { ok: false, stdout: "", stderr: "", code: 1 };
+      return { ok: false, stdout: "", stderr: "item not found", code: 44 };
     });
 
     expect(await new CredentialStore().get("github")).toBe("gho_token");
     expect(await new CredentialStore().get("linear")).toBeUndefined();
+    const ghCall = runMock.mock.calls.find((call) => call[0] === "gh");
+    expect(ghCall?.[2]).toMatchObject({ timeoutMs: 15_000 });
   });
 
   it("returns undefined rather than an empty string when nothing resolves", async () => {
     expect(await new CredentialStore().get("linear")).toBeUndefined();
   });
 
-  it("does not treat a successful command with empty output as a credential", async () => {
+  it("fails closed when a successful keychain lookup returns empty output", async () => {
+    if (platform() !== "darwin") return;
     runMock.mockResolvedValue({ ok: true, stdout: "   \n", stderr: "", code: 0 });
-    expect(await new CredentialStore().get("linear")).toBeUndefined();
+    await expect(new CredentialStore().get("linear")).rejects.toThrow(/returned an empty/u);
+  });
+
+  it.each([
+    ["a locked keychain", { ok: false, stdout: "", stderr: "locked", code: 36 }],
+    ["a keychain timeout", { ok: false, stdout: "", stderr: "timed out", code: null }],
+  ])("does not fall through to gh after %s", async (_label, result) => {
+    if (platform() !== "darwin") return;
+    runMock.mockResolvedValue(result);
+
+    await expect(new CredentialStore().get("github")).rejects.toThrow(/macOS keychain/u);
+    expect(runMock).toHaveBeenCalledTimes(1);
+    expect(runMock.mock.calls[0]?.[0]).toBe("security");
+  });
+
+  it("fails closed when gh credential lookup times out", async () => {
+    runMock.mockImplementation(async (command: string) =>
+      command === "security"
+        ? { ok: false, stdout: "", stderr: "item not found", code: 44 }
+        : { ok: false, stdout: "", stderr: "command timed out", code: null },
+    );
+
+    await expect(new CredentialStore().get("github")).rejects.toThrow(/gh auth token.*timed out/u);
   });
 
   it("honours custom environment variable names", async () => {
@@ -197,9 +227,39 @@ describe("set", () => {
 });
 
 describe("remove", () => {
+  it("refuses to claim logout while the environment override remains active", async () => {
+    process.env["LINEAR_API_KEY"] = "still-active";
+
+    await expect(new CredentialStore().remove("linear")).rejects.toThrow(
+      /unset \$LINEAR_API_KEY before logout/,
+    );
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
   it("is idempotent — nothing stored is not an error", async () => {
+    if (platform() !== "darwin") return;
     runMock.mockResolvedValue({ ok: false, stdout: "", stderr: "not found", code: 44 });
     await expect(new CredentialStore().remove("linear")).resolves.toBeUndefined();
+  });
+
+  it("refuses on a platform where keychain removal is not implemented", async () => {
+    if (platform() === "darwin") return;
+    await expect(new CredentialStore().remove("linear")).rejects.toThrow(/LINEAR_API_KEY/);
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "a keychain denial",
+      { ok: false, stdout: "", stderr: "User interaction is not allowed", code: 36 },
+    ],
+    ["a bounded timeout", { ok: false, stdout: "", stderr: "command timed out", code: null }],
+  ])("does not report success after %s", async (_name, result) => {
+    if (platform() !== "darwin") return;
+    runMock.mockResolvedValue(result);
+    await expect(new CredentialStore().remove("linear")).rejects.toThrow(
+      /could not remove linear.*(?:User interaction is not allowed|timed out)/,
+    );
   });
 
   it("targets the same service key that set uses", async () => {
@@ -207,6 +267,7 @@ describe("remove", () => {
     runMock.mockResolvedValue({ ok: true, stdout: "", stderr: "", code: 0 });
     await new CredentialStore().remove("github");
     expect(runMock.mock.calls[0]?.[1]).toContain("runmill:github");
+    expect(runMock.mock.calls[0]?.[2]).toMatchObject({ timeoutMs: 15_000 });
   });
 });
 

@@ -31,8 +31,10 @@ What each platform can enforce differs, and runmill does not pretend otherwise:
 
 The \`proxy\` value currently permits provider network access; the
 hostname-filtering proxy is not implemented yet. \`network_allowlist\` is
-therefore rejected rather than silently ignored, and doctor reports unrestricted
-provider egress as a warning on both platforms.
+therefore rejected rather than silently ignored. Doctor currently reports the
+categorical unqualified-backend failure without emitting any per-control
+isolation claim; a future qualified backend must report unrestricted provider
+egress as a warning.
 
 doctor currently refuses both unqualified harnesses before any planted-resource
 probe. A future qualified backend must deny a planted credential and prove its

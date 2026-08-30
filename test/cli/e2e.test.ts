@@ -44,6 +44,7 @@ async function cli(
     env: {
       ...process.env,
       RUNMILL_DATA_DIR: join(dir, "state"),
+      RUNMILL_DAEMON_REGISTRY: join(dir, "runtime", "daemon.json"),
       PATH: TEST_PATH,
       ...env,
     },
@@ -279,6 +280,18 @@ describe("standalone mode without ASF", () => {
     }
     expect(existsSync(marker)).toBe(false);
     expect(result.stderr).toBe("");
+
+    const startResult = await cli(["--json", "start"]);
+    expect(startResult.code).toBe(0);
+    expect(JSON.parse(startResult.stdout)).toMatchObject({
+      running: false,
+      reason: "autonomy is observe",
+    });
+
+    const detachedDaemon = await cli(["--json", "daemon", "--detach"]);
+    expect(detachedDaemon.code).toBe(0);
+    expect(JSON.parse(detachedDaemon.stdout)).toMatchObject({ ran: false });
+    expect(existsSync(marker)).toBe(false);
   });
 
   it("runs the ordinary one-shot command without ASF keys, ctxlane, or MCP", async () => {
@@ -324,6 +337,90 @@ describe("runmill doctor", () => {
     expect(out.checks.every((c) => c.id.startsWith("sandbox"))).toBe(true);
   });
 
+  it.each(["definitely-unknown", "git:typo"])(
+    "refuses unknown scoped rerun %s instead of reporting a prerequisite pass",
+    async (check) => {
+      const r = await cli(["--json", "doctor", "--check", check]);
+      const out = JSON.parse(r.stdout) as {
+        overall: string;
+        checks: unknown[];
+        reason: string;
+      };
+      expect(r.code).toBe(2);
+      expect(out).toMatchObject({
+        overall: "fail",
+        checks: [],
+        reason: `no check matches "${check}"`,
+      });
+    },
+  );
+
+  it.each(["provider:codex:request", "provider:codex:req"])(
+    "returns a failed provider prerequisite when requested live probe %s cannot start",
+    async (check) => {
+      const r = await cli(["--json", "doctor", "--check", check]);
+      const out = JSON.parse(r.stdout) as {
+        checks: { id: string; status: string }[];
+      };
+      expect(out.checks).toEqual([
+        expect.objectContaining({ id: "provider:codex", status: "fail" }),
+      ]);
+    },
+  );
+
+  it("keeps the configured provider and model when sandbox qualification refuses", async () => {
+    const configPath = join(dir, "runmill.yaml");
+    writeFileSync(
+      configPath,
+      readFileSync(configPath, "utf8").replace(
+        "  implementer:\n    implementation: codex",
+        "  implementer:\n    implementation: claude\n    model: sonnet",
+      ),
+    );
+
+    const r = await cli([
+      "--json",
+      "doctor",
+      "--check",
+      "provider:claude:sonnet:request",
+    ]);
+    const out = JSON.parse(r.stdout) as {
+      checks: { id: string; status: string }[];
+    };
+    expect(out.checks).toEqual([
+      expect.objectContaining({ id: "provider:claude:sonnet", status: "fail" }),
+    ]);
+  });
+
+  it.each([
+    ["start", ["start"]],
+    ["detached daemon", ["daemon", "--detach"]],
+  ])("fails closed when %s finds a registered but unreachable daemon", async (_name, args) => {
+    const configPath = join(dir, "runmill.yaml");
+    writeFileSync(
+      configPath,
+      readFileSync(configPath, "utf8").replace("autonomy: pr-only", "autonomy: observe"),
+    );
+    const registry = join(dir, "unreachable-daemon.json");
+    writeFileSync(
+      registry,
+      `${JSON.stringify({
+        protocolVersion: 1,
+        pid: process.pid,
+        socketPath: join(dir, "unreachable-daemon.sock"),
+        startedAt: "2026-08-29T10:00:00.000Z",
+        repoRoot: dir,
+        configPath,
+      })}\n`,
+    );
+
+    const result = await cli(args, { RUNMILL_DAEMON_REGISTRY: registry });
+
+    expect(result.code).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toMatch(/Cannot connect to Runmill daemon/u);
+    expect(`${result.stdout}\n${result.stderr}`).not.toMatch(/no (?:delivery loop|daemon) was started/iu);
+  });
+
   it("scopes dependency readiness and refuses a fixture with no trusted remote", async () => {
     const r = await cli(["--json", "doctor", "--check", "verification:dependencies"]);
     const out = JSON.parse(r.stdout) as {
@@ -338,12 +435,23 @@ describe("runmill doctor", () => {
     });
   });
 
-  it("proves the sandbox denies a credential read rather than assuming it", async () => {
-    const r = await cli(["--json", "doctor", "--check", "sandbox:deny"]);
-    const out = JSON.parse(r.stdout) as { checks: { id: string; status: string }[] };
-    const probe = out.checks.find((c) => c.id === "sandbox:deny-credential-read");
-    expect(probe?.status).toBe("pass");
-  });
+  it.each(["sandbox:deny", "sandbox:den", "sandbox:d"])(
+    "refuses sandbox subcheck prefix %s before making unqualified isolation claims",
+    async (check) => {
+      const r = await cli(["--json", "doctor", "--check", check]);
+      const out = JSON.parse(r.stdout) as {
+        checks: { id: string; status: string; code?: string }[];
+      };
+      expect(out.checks).toContainEqual(
+        expect.objectContaining({
+          id: "sandbox:mechanism",
+          status: "fail",
+          code: "RM-SANDBOX-001",
+        }),
+      );
+      expect(out.checks.some((result) => result.id === "sandbox:deny-credential-read")).toBe(false);
+    },
+  );
 });
 
 describe("runmill errors", () => {

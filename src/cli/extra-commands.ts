@@ -694,7 +694,7 @@ function registerAuth(program: Command, ctx: CommandContext): void {
           });
         }
         await store.remove(system);
-        ctx.emit(`Removed the ${system} credential.`, {
+        ctx.emit(`Removed the ${system} credential from the Runmill keychain.`, {
           system,
           removed: true,
         });

@@ -1069,23 +1069,22 @@ describe("Sandbox.run", () => {
     async () => {
       const dir = mkdtempSync(join(tmpdir(), "runmill-sbx-descendant-"));
       const pidFile = join(dir, "descendant.pid");
-      let pid: number | undefined;
       try {
         const result = await mechanismSandbox().run({
           command: "/bin/sh",
-          args: ["-c", `sleep 30 </dev/null >/dev/null 2>&1 & echo $! > ${JSON.stringify(pidFile)}`],
+          args: ["-c", `sleep 5 </dev/null >/dev/null 2>&1 & echo $! > ${JSON.stringify(pidFile)}`],
           subprocesses: ["/bin/sleep"],
           cwd: dir,
           policy: { writablePaths: [dir], allowNetwork: false },
           timeoutMs: 10_000,
         });
         expect(result).toMatchObject({ outcome: "exited", exitCode: 0 });
-        pid = Number(readFileSync(pidFile, "utf8"));
-        expect(() => process.kill(pid ?? 0, 0)).toThrow();
+        const rawPid = readFileSync(pidFile, "utf8").trim();
+        expect(rawPid).toMatch(/^[1-9]\d*$/u);
+        const pid = Number(rawPid);
+        expect(Number.isSafeInteger(pid) && pid > 1).toBe(true);
+        expect(() => process.kill(pid, 0)).toThrow();
       } finally {
-        if (pid !== undefined) {
-          try { process.kill(pid, "SIGKILL"); } catch { /* already contained */ }
-        }
         rmSync(dir, { recursive: true, force: true });
       }
     },

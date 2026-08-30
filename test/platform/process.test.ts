@@ -4,6 +4,7 @@ import {
   armKillTimer,
   BoundedCapture,
   run,
+  runBytes,
   runOrThrow,
   runWithInput,
   terminateTree,
@@ -86,6 +87,62 @@ describe("run", () => {
     const result = await run("/bin/pwd", [], { cwd: "/tmp" });
     expect(result.stdout).toContain("tmp");
   });
+
+  it("bounds pipe drain when a detached descendant retains stdout", async () => {
+    if (process.platform === "win32") return;
+    const script = [
+      'import { spawn } from "node:child_process";',
+      "const held = spawn(process.execPath, [",
+      '  "--input-type=module",',
+      '  "-e",',
+      '  "setTimeout(() => {}, 5000)",',
+      "], {",
+      "  detached: true,",
+      '  stdio: ["ignore", process.stdout, process.stderr],',
+      "});",
+      "if (held.pid === undefined) process.exit(2);",
+      "held.unref();",
+      'process.stdout.write("descendant-started\\n");',
+    ].join("\n");
+    const started = Date.now();
+
+    const result = await run(process.execPath, ["--input-type=module", "-e", script], {
+      timeoutMs: 20_000,
+    });
+
+    expect(Date.now() - started).toBeLessThan(4_500);
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("descendant-started");
+    expect(result.stderr).toMatch(/output pipes did not close/iu);
+  }, 15_000);
+
+  it("settles after a hard timeout even when the child does not exit voluntarily", async () => {
+    const started = Date.now();
+    const result = await run(
+      process.execPath,
+      ["--input-type=module", "-e", "setTimeout(() => {}, 60000)"],
+      { timeoutMs: 50 },
+    );
+
+    expect(Date.now() - started).toBeLessThan(3_500);
+    expect(result.ok).toBe(false);
+    expect(result.stderr).toMatch(/timed out after 50 ms/iu);
+  }, 10_000);
+});
+
+describe("runBytes", () => {
+  it("enforces the caller's byte ceiling and fails the producer", async () => {
+    const result = await runBytes(
+      process.execPath,
+      ["--input-type=module", "-e", 'process.stdout.write("x".repeat(4096))'],
+      { maxOutputBytes: 64, timeoutMs: 5_000 },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.stdout.length).toBeLessThanOrEqual(64);
+    expect(result.stderr).toMatch(/output exceeded 64 bytes/iu);
+  });
 });
 
 describe("runOrThrow", () => {
@@ -157,40 +214,29 @@ describe("runWithInput", () => {
       "const held = spawn(process.execPath, [",
       '  "--input-type=module",',
       '  "-e",',
-      '  "setTimeout(() => {}, 10000)",',
+      '  "setTimeout(() => {}, 5000)",',
       "], {",
       "  detached: true,",
       '  stdio: ["ignore", process.stdout, process.stderr],',
       "});",
       "if (held.pid === undefined) process.exit(2);",
-      'writeSync(1, String(held.pid) + "\\n");',
+      'writeSync(1, "descendant-started\\n");',
       "held.unref();",
     ].join("\n");
-    let descendantPid: number | undefined;
-    try {
-      const started = Date.now();
-      const result = await runWithInput(
-        process.execPath,
-        ["--input-type=module", "-e", script],
-        "",
-        { timeoutMs: 20_000 },
-      );
-      const elapsedMs = Date.now() - started;
-      descendantPid = Number.parseInt(result.stdout.trim(), 10);
+    const started = Date.now();
+    const result = await runWithInput(
+      process.execPath,
+      ["--input-type=module", "-e", script],
+      "",
+      { timeoutMs: 20_000 },
+    );
+    const elapsedMs = Date.now() - started;
 
-      expect(elapsedMs).toBeLessThan(7_500);
-      expect(result.ok).toBe(false);
-      expect(result.code).toBe(0);
-      expect(result.stderr).toMatch(/output pipes did not close/i);
-    } finally {
-      if (descendantPid !== undefined && Number.isSafeInteger(descendantPid)) {
-        try {
-          process.kill(descendantPid, "SIGKILL");
-        } catch {
-          // The bounded fixture may already have exited.
-        }
-      }
-    }
+    expect(elapsedMs).toBeLessThan(4_500);
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("descendant-started");
+    expect(result.stderr).toMatch(/output pipes did not close/i);
   }, 15_000);
 
   it("uses one cancellable hard signal and arms no delayed escalation", () => {

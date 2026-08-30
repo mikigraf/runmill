@@ -14,20 +14,89 @@ import {
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { WorkspaceManager, fetchTrustedBase } from "../../src/workspace/manager.js";
+import { join, resolve } from "node:path";
+import {
+  WorkspaceManager,
+  fetchTrustedBase,
+  observeTrustedBase,
+} from "../../src/workspace/manager.js";
 import { ALL_CHANGE_SCOPE } from "../../src/workspace/path-scope.js";
 import { ALWAYS_FORBIDDEN_PATHS } from "../../src/agent/task-packet.js";
 import { loadChecksManifest } from "../../src/verification/manifest.js";
+import {
+  gitEnvironment,
+  immutableGitReadArgs,
+} from "../../src/platform/git.js";
 
 let root: string;
 let source: string;
 let runs: string;
 let mgr: WorkspaceManager;
+let operatorGitConfig: string;
+let previousGlobalGitConfig: string | undefined;
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
+
+function gitWithoutObjectSubstitution(cwd: string, ...args: string[]): string {
+  return execFileSync("git", immutableGitReadArgs(args), {
+    cwd,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_NO_LAZY_FETCH: "1",
+      GIT_NO_REPLACE_OBJECTS: "1",
+    },
+  }).trim();
+}
+
+describe("gitEnvironment", () => {
+  it("removes ambient repository and command-local config selectors", () => {
+    const keys = [
+      "GIT_DIR",
+      "GIT_REPLACE_REF_BASE",
+      "GIT_CONFIG_PARAMETERS",
+    ] as const;
+    const prior = new Map(keys.map((key) => [key, process.env[key]]));
+    const priorGlobalConfig = process.env["GIT_CONFIG_GLOBAL"];
+    const priorSshCommand = process.env["GIT_SSH_COMMAND"];
+    for (const key of keys) process.env[key] = `ambient-${key.toLowerCase()}`;
+    process.env["GIT_CONFIG_GLOBAL"] = "/operator-selected/config";
+    process.env["GIT_SSH_COMMAND"] = "/operator/managed-ssh --proxy managed";
+
+    try {
+      const env = gitEnvironment();
+      for (const key of keys) expect(env[key]).toBeUndefined();
+      // Managed host config is part of the operator's effective provenance;
+      // unlike command-local `-c` injection, it remains deliberate input.
+      expect(env["GIT_CONFIG_GLOBAL"]).toBe("/operator-selected/config");
+      // Observe-mode transport must not replace an operator-managed SSH
+      // wrapper, identity, or ProxyCommand with an ambient PATH executable.
+      expect(env["GIT_SSH_COMMAND"]).toBe("/operator/managed-ssh --proxy managed");
+    } finally {
+      for (const key of keys) {
+        const value = prior.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      if (priorGlobalConfig === undefined) delete process.env["GIT_CONFIG_GLOBAL"];
+      else process.env["GIT_CONFIG_GLOBAL"] = priorGlobalConfig;
+      if (priorSshCommand === undefined) delete process.env["GIT_SSH_COMMAND"];
+      else process.env["GIT_SSH_COMMAND"] = priorSshCommand;
+    }
+  });
+
+  it("puts immutable object-read controls before the Git subcommand", () => {
+    expect(immutableGitReadArgs(["cat-file", "-e", "abc^{commit}"])).toEqual([
+      "--no-lazy-fetch",
+      "--no-replace-objects",
+      "cat-file",
+      "-e",
+      "abc^{commit}",
+    ]);
+  });
+});
 
 function makeRemovable(path: string): void {
   if (!existsSync(path)) return;
@@ -75,6 +144,10 @@ function addInstalledNodeProject(): void {
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "runmill-ws-"));
+  previousGlobalGitConfig = process.env["GIT_CONFIG_GLOBAL"];
+  operatorGitConfig = join(root, "operator.gitconfig");
+  writeFileSync(operatorGitConfig, '[protocol "file"]\n\tallow = always\n');
+  process.env["GIT_CONFIG_GLOBAL"] = operatorGitConfig;
   source = join(root, "source");
   runs = join(root, "runs");
   execFileSync("git", ["init", "-q", "-b", "main", source]);
@@ -88,6 +161,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  if (previousGlobalGitConfig === undefined) delete process.env["GIT_CONFIG_GLOBAL"];
+  else process.env["GIT_CONFIG_GLOBAL"] = previousGlobalGitConfig;
   makeRemovable(root);
   rmSync(root, { recursive: true, force: true });
 });
@@ -163,6 +238,192 @@ describe("WorkspaceManager.create (clone isolation)", () => {
     expect(manifest?.checks.map((check) => check.id)).toEqual(["remote-new"]);
     expect(ws.baseCommit).toBe(remoteMain);
     expect(readFileSync(join(ws.path, "remote-only.txt"), "utf8")).toBe("from origin/main\n");
+  });
+
+  it("observes an exact local remote base without writing any repository ref", async () => {
+    const origin = join(root, "observe-origin.git");
+    execFileSync("git", ["init", "-q", "--bare", "-b", "main", origin]);
+    git(source, "remote", "add", "origin", origin);
+    git(source, "push", "-q", "origin", "main");
+    const expected = git(source, "rev-parse", "HEAD");
+    const before = git(source, "for-each-ref", "--format=%(refname) %(objectname)");
+
+    const observed = await observeTrustedBase(source, "main");
+
+    expect(observed).toEqual({ ref: expected, commit: expected });
+    expect(git(source, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(before);
+  });
+
+  it("refuses a remote base whose exact object is absent rather than fetching it", async () => {
+    const origin = join(root, "observe-stale-origin.git");
+    execFileSync("git", ["init", "-q", "--bare", "-b", "main", origin]);
+    git(source, "remote", "add", "origin", origin);
+    git(source, "push", "-q", "origin", "main");
+
+    const updater = join(root, "observe-updater");
+    execFileSync("git", ["clone", "-q", origin, updater]);
+    git(updater, "config", "user.email", "remote@test");
+    git(updater, "config", "user.name", "Remote");
+    writeFileSync(join(updater, "remote-only.txt"), "not present locally\n");
+    git(updater, "add", "-A");
+    git(updater, "commit", "-q", "-m", "advance unseen remote");
+    git(updater, "push", "-q", "origin", "main");
+    const remoteCommit = git(updater, "rev-parse", "HEAD");
+    const replacementCommit = git(source, "rev-parse", "HEAD");
+    git(source, "update-ref", `refs/replace/${remoteCommit}`, replacementCommit);
+    git(source, "config", "remote.origin.promisor", "true");
+    git(source, "config", "remote.origin.partialclonefilter", "blob:none");
+    const before = git(source, "for-each-ref", "--format=%(refname) %(objectname)");
+    const objectsBefore = gitWithoutObjectSubstitution(source, "count-objects", "-v");
+    expect(() =>
+      gitWithoutObjectSubstitution(source, "cat-file", "-e", `${remoteCommit}^{commit}`),
+    ).toThrow();
+
+    await expect(observeTrustedBase(source, "main")).rejects.toThrow(
+      /not present in the local object database/i,
+    );
+    expect(git(source, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(before);
+    expect(gitWithoutObjectSubstitution(source, "count-objects", "-v")).toBe(objectsBefore);
+    expect(() =>
+      gitWithoutObjectSubstitution(source, "cat-file", "-e", `${remoteCommit}^{commit}`),
+    ).toThrow();
+  });
+
+  it("does not let repository config widen the operator's file transport policy", async () => {
+    const origin = join(root, "denied-origin.git");
+    execFileSync("git", ["init", "-q", "--bare", "-b", "main", origin]);
+    git(source, "remote", "add", "origin", origin);
+    writeFileSync(operatorGitConfig, '[protocol "file"]\n\tallow = user\n');
+    git(source, "config", "protocol.file.allow", "always");
+
+    await expect(observeTrustedBase(source, "main")).rejects.toThrow(
+      /operator Git protocol policy denies file transport/u,
+    );
+    await expect(fetchTrustedBase(source, "main")).rejects.toThrow(
+      /operator Git protocol policy denies file transport/u,
+    );
+  });
+
+  it("lets repository config narrow an operator transport grant", async () => {
+    const origin = join(root, "narrowed-origin.git");
+    execFileSync("git", ["init", "-q", "--bare", "-b", "main", origin]);
+    git(source, "remote", "add", "origin", origin);
+    git(source, "config", "protocol.file.allow", "never");
+
+    await expect(observeTrustedBase(source, "main")).rejects.toThrow(
+      /operator Git protocol policy denies file transport/u,
+    );
+  });
+
+  it("refuses an ssh remote narrowed by operator policy before network access", async () => {
+    git(source, "remote", "add", "origin", "ssh://example.invalid/acme/repo.git");
+    git(source, "config", "protocol.ssh.allow", "never");
+
+    await expect(observeTrustedBase(source, "main")).rejects.toThrow(
+      /operator Git protocol policy denies ssh transport/u,
+    );
+  });
+
+  it("refuses custom remote-helper schemes before an executing fetch", async () => {
+    await expect(
+      fetchTrustedBase(source, "main", "git+https://github.com/acme/repo.git"),
+    ).rejects.toThrow(/Git remote protocol is unsupported/u);
+    await expect(fetchTrustedBase(source, "main", "ext::arbitrary-helper"))
+      .rejects.toThrow(/Git remote protocol is unsupported/u);
+  });
+
+  it("intersects transport access with the operator's ambient protocol allowlist", async () => {
+    const previous = process.env["GIT_ALLOW_PROTOCOL"];
+    git(source, "remote", "add", "origin", "ssh://example.invalid/acme/repo.git");
+    process.env["GIT_ALLOW_PROTOCOL"] = "https";
+    try {
+      await expect(observeTrustedBase(source, "main")).rejects.toThrow(
+        /operator Git protocol policy denies ssh transport/u,
+      );
+    } finally {
+      if (previous === undefined) delete process.env["GIT_ALLOW_PROTOCOL"];
+      else process.env["GIT_ALLOW_PROTOCOL"] = previous;
+    }
+  });
+
+  it("refuses a named remote affected by a same-protocol URL rewrite", async () => {
+    git(source, "remote", "add", "origin", "https://github.com/acme/repo.git");
+    git(
+      source,
+      "config",
+      "url.https://attacker.invalid/.insteadOf",
+      "https://github.com/",
+    );
+
+    await expect(observeTrustedBase(source, "main")).rejects.toThrow(
+      /affected by url\.\*\.insteadOf policy/u,
+    );
+  });
+
+  it("does not lazy-fetch a missing base-policy blob while loading a manifest", () => {
+    mkdirSync(join(source, ".runmill"), { recursive: true });
+    writeFileSync(
+      join(source, ".runmill", "checks.yaml"),
+      "checks:\n  - id: base-policy\n    run: npm test\n",
+    );
+    git(source, "add", ".runmill/checks.yaml");
+    git(source, "commit", "-q", "-m", "add base policy");
+
+    const origin = join(root, "observe-manifest-origin.git");
+    execFileSync("git", ["init", "-q", "--bare", "-b", "main", origin]);
+    git(source, "remote", "add", "origin", origin);
+    git(source, "push", "-q", "origin", "main");
+    git(source, "config", "remote.origin.promisor", "true");
+    git(source, "config", "remote.origin.partialclonefilter", "blob:none");
+
+    const baseCommit = git(source, "rev-parse", "HEAD");
+    const blob = git(source, "rev-parse", "HEAD:.runmill/checks.yaml");
+    const looseObject = resolve(
+      source,
+      git(source, "rev-parse", "--git-path", `objects/${blob.slice(0, 2)}/${blob.slice(2)}`),
+    );
+    expect(existsSync(looseObject)).toBe(true);
+    rmSync(looseObject);
+    expect(() => gitWithoutObjectSubstitution(source, "cat-file", "-e", blob)).toThrow();
+    const objectsBefore = gitWithoutObjectSubstitution(source, "count-objects", "-v");
+
+    expect(() =>
+      loadChecksManifest({
+        repoRoot: source,
+        manifestPath: ".runmill/checks.yaml",
+        baseRef: baseCommit,
+      }),
+    ).toThrow(/could not read .* configured base ref/u);
+    expect(gitWithoutObjectSubstitution(source, "count-objects", "-v")).toBe(objectsBefore);
+    expect(() => gitWithoutObjectSubstitution(source, "cat-file", "-e", blob)).toThrow();
+  });
+
+  it("reads base policy from the named commit rather than a local replacement object", () => {
+    mkdirSync(join(source, ".runmill"), { recursive: true });
+    writeFileSync(
+      join(source, ".runmill", "checks.yaml"),
+      "checks:\n  - id: original-policy\n    run: npm test\n",
+    );
+    git(source, "add", ".runmill/checks.yaml");
+    git(source, "commit", "-q", "-m", "original policy");
+    const baseCommit = git(source, "rev-parse", "HEAD");
+
+    writeFileSync(
+      join(source, ".runmill", "checks.yaml"),
+      "checks:\n  - id: replacement-policy\n    run: npm run check\n",
+    );
+    git(source, "add", ".runmill/checks.yaml");
+    git(source, "commit", "-q", "-m", "replacement policy");
+    const replacementCommit = git(source, "rev-parse", "HEAD");
+    git(source, "replace", baseCommit, replacementCommit);
+
+    const manifest = loadChecksManifest({
+      repoRoot: source,
+      manifestPath: ".runmill/checks.yaml",
+      baseRef: baseCommit,
+    });
+
+    expect(manifest?.checks.map((check) => check.id)).toEqual(["original-policy"]);
   });
 
   it("gives the run a self-contained .git DIRECTORY, not a pointer file", async () => {

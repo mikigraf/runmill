@@ -16,6 +16,16 @@ user-private control socket, so they work from any directory and do not need a c
 `stop` requests shutdown at the next safe orchestration boundary rather than abandoning a lease or
 a partially recorded external operation.
 
+Daemon startup acquires an atomic user-private ownership record before touching the control socket
+or registry. A second starter refuses while that owner is live or cannot be identified; it reclaims
+the paths only after the recorded PID is definitively absent. Invalid registries and ownership
+records are preserved for diagnosis instead of being overwritten.
+
+When autonomy is `observe`, `start` and `daemon` refuse to create a delivery loop because that mode
+may inspect backlog state but may not execute work. `start` and `daemon --detach` still check for
+and report an already running daemon, so changing configuration cannot hide older active
+automation.
+
 The default idle poll interval is 30 seconds. Change it when starting the background process:
 
 ```bash

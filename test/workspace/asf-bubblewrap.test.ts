@@ -1,5 +1,7 @@
 import { execFileSync } from "node:child_process";
 import {
+  accessSync,
+  constants,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -9,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { platform, tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CredentialFreeSandboxExecution } from "../../src/agent/tool-gateway.js";
 import { runControlledProcess } from "../../src/platform/process.js";
@@ -24,10 +26,41 @@ import {
 
 const directories: string[] = [];
 
+function executableOnPath(command: string): string {
+  for (const directory of (process.env["PATH"] ?? "").split(delimiter)) {
+    if (directory === "") continue;
+    const candidate = join(directory, command);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return realpathSync(candidate);
+    } catch {
+      // Continue through the operator's declared executable search path.
+    }
+  }
+  throw new Error(`test prerequisite ${command} was not found on PATH`);
+}
+
+const TEST_GIT_PATH = executableOnPath(platform() === "win32" ? "git.exe" : "git");
+
 function temporaryDirectory(prefix: string): string {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   directories.push(directory);
   return directory;
+}
+
+async function waitForWrittenPid(path: string, timeoutMs = 5_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      const raw = readFileSync(path, "utf8").trim();
+      if (/^[1-9]\d*$/u.test(raw)) {
+        const pid = Number(raw);
+        if (Number.isSafeInteger(pid) && pid > 1) return pid;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for a valid child PID in ${path}`);
 }
 
 afterEach(() => {
@@ -173,7 +206,7 @@ describe("proveAsfWorkspaceCandidate", () => {
       workspaceRoot: repo.workspace,
       candidateSha: repo.candidate,
       requireClean: true,
-      gitPath: "/usr/bin/git",
+      gitPath: TEST_GIT_PATH,
     });
 
     expect(proof).toMatchObject({
@@ -195,7 +228,7 @@ describe("proveAsfWorkspaceCandidate", () => {
         workspaceRoot: repo.workspace,
         candidateSha: repo.candidate,
         requireClean: true,
-        gitPath: "/usr/bin/git",
+        gitPath: TEST_GIT_PATH,
       }),
     ).rejects.toThrow(/exactly clean Git tree/u);
     await expect(
@@ -203,7 +236,7 @@ describe("proveAsfWorkspaceCandidate", () => {
         workspaceRoot: repo.workspace,
         candidateSha: repo.candidate,
         requireClean: false,
-        gitPath: "/usr/bin/git",
+        gitPath: TEST_GIT_PATH,
       }),
     ).resolves.toMatchObject({ clean: false, head_sha: repo.candidate });
   });
@@ -215,7 +248,7 @@ describe("proveAsfWorkspaceCandidate", () => {
         workspaceRoot: repo.workspace,
         candidateSha: "f".repeat(40),
         requireClean: true,
-        gitPath: "/usr/bin/git",
+        gitPath: TEST_GIT_PATH,
       }),
     ).rejects.toThrow(/HEAD does not equal/u);
 
@@ -227,7 +260,7 @@ describe("proveAsfWorkspaceCandidate", () => {
         workspaceRoot: repo.workspace,
         candidateSha: repo.candidate,
         requireClean: true,
-        gitPath: "/usr/bin/git",
+        gitPath: TEST_GIT_PATH,
       }),
     ).rejects.toThrow(/HEAD does not equal/u);
   });
@@ -243,7 +276,7 @@ describe("proveAsfWorkspaceCandidate", () => {
         workspaceRoot: linked,
         candidateSha: source.candidate,
         requireClean: true,
-        gitPath: "/usr/bin/git",
+        gitPath: TEST_GIT_PATH,
       }),
     ).rejects.toThrow(/self-contained directory/u);
   });
@@ -289,35 +322,28 @@ describe("runControlledProcess", () => {
   it.skip("does not resolve after a normal direct-child exit until background descendants are gone", async () => {
     const directory = temporaryDirectory("runmill-process-normal-exit-");
     const pidFile = join(directory, "grandchild.pid");
-    let grandchildPid: number | undefined;
-    try {
-      const result = await runControlledProcess({
-        command: process.execPath,
-        args: [
-          "-e",
-          [
-            "const {spawn}=require('node:child_process')",
-            "const fs=require('node:fs')",
-            "const child=spawn(process.execPath,['-e','setInterval(() => {}, 1000)'],{stdio:'ignore'})",
-            "child.unref()",
-            `fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))`,
-          ].join(";"),
-        ],
-        cwd: directory,
-        env: { PATH: process.env["PATH"] ?? "" },
-        timeoutMs: 10_000,
-        maxOutputBytes: 4_096,
-        signal: new AbortController().signal,
-      });
+    const result = await runControlledProcess({
+      command: process.execPath,
+      args: [
+        "-e",
+        [
+          "const {spawn}=require('node:child_process')",
+          "const fs=require('node:fs')",
+          "const child=spawn(process.execPath,['-e','setTimeout(() => {}, 10000)'],{stdio:'ignore'})",
+          "child.unref()",
+          `fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))`,
+        ].join(";"),
+      ],
+      cwd: directory,
+      env: { PATH: process.env["PATH"] ?? "" },
+      timeoutMs: 10_000,
+      maxOutputBytes: 4_096,
+      signal: new AbortController().signal,
+    });
 
-      expect(result).toMatchObject({ outcome: "exited", exitCode: 0 });
-      grandchildPid = Number(readFileSync(pidFile, "utf8"));
-      expect(() => process.kill(grandchildPid ?? 0, 0)).toThrow();
-    } finally {
-      if (grandchildPid !== undefined) {
-        try { process.kill(grandchildPid, "SIGKILL"); } catch { /* already contained */ }
-      }
-    }
+    expect(result).toMatchObject({ outcome: "exited", exitCode: 0 });
+    const grandchildPid = await waitForWrittenPid(pidFile);
+    expect(() => process.kill(grandchildPid, 0)).toThrow();
   }, 15_000);
 
   it("terminates execution once observed output exceeds the trusted ceiling", async () => {
@@ -347,39 +373,43 @@ describe("runControlledProcess", () => {
         [
           "const {spawn}=require('node:child_process')",
           "const fs=require('node:fs')",
-          "const child=spawn(process.execPath,['-e','setInterval(() => {}, 1000)'],{stdio:'ignore'})",
+          "const child=spawn(process.execPath,['-e','setTimeout(() => {}, 10000)'],{stdio:'ignore'})",
           `fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))`,
-          "setInterval(() => {}, 1000)",
+          // The direct parent self-expires too, so even a simultaneous abort
+          // and timeout regression cannot leave this fixture behind Vitest.
+          "setTimeout(() => {}, 10000)",
         ].join(";"),
       ],
       cwd: directory,
       env: { PATH: process.env["PATH"] ?? "" },
-      timeoutMs: 20_000,
+      // This deadline must remain comfortably inside the test's own timeout:
+      // if abort handling regresses, the fixture still owns and reaps its
+      // planted process before Vitest can abandon the test body.
+      timeoutMs: 6_000,
       maxOutputBytes: 4_096,
       signal: controller.signal,
     });
+    try {
+      const grandchildPid = await waitForWrittenPid(pidFile);
+      process.kill(grandchildPid, 0);
+      controller.abort();
+      await expect(execution).resolves.toMatchObject({ outcome: "aborted", signal: "ABORT" });
 
-    const deadline = Date.now() + 5_000;
-    while (!existsSync(pidFile) && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    expect(existsSync(pidFile)).toBe(true);
-    const grandchildPid = Number(readFileSync(pidFile, "utf8"));
-    process.kill(grandchildPid, 0);
-    controller.abort();
-    await expect(execution).resolves.toMatchObject({ outcome: "aborted", signal: "ABORT" });
-
-    let alive = true;
-    const stoppedDeadline = Date.now() + 5_000;
-    while (alive && Date.now() < stoppedDeadline) {
-      try {
-        process.kill(grandchildPid, 0);
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      } catch {
-        alive = false;
+      let alive = true;
+      const stoppedDeadline = Date.now() + 5_000;
+      while (alive && Date.now() < stoppedDeadline) {
+        try {
+          process.kill(grandchildPid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        } catch {
+          alive = false;
+        }
       }
+      expect(alive).toBe(false);
+    } finally {
+      controller.abort();
+      await execution.catch(() => undefined);
     }
-    expect(alive).toBe(false);
   }, 15_000);
 });
 
@@ -419,7 +449,7 @@ describe("AsfBubblewrapProductionSandbox", () => {
         workspaceParent: parent,
         bwrapPath: "/usr/bin/bwrap",
         prlimitPath: "/usr/bin/prlimit",
-        gitPath: "/usr/bin/git",
+        gitPath: TEST_GIT_PATH,
       });
       const input: CredentialFreeSandboxExecution = {
         sandbox: {

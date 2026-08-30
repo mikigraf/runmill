@@ -37,7 +37,9 @@ remains an explicit test-only policy renderer/qualification harness; execution r
 pending until cleanup is lifecycle-safe. It is not selected by the factory, config composition, or doctor. Runmill also does not yet ship its planned hostname-filtering
 proxy. When an execution backend is qualified, `workspace.network: proxy` will initially permit
 unrestricted provider egress; `none` disables it. A non-empty `network_allowlist` is rejected rather than silently accepted as a
-control that does not exist. `runmill doctor` reports unrestricted egress as a warning.
+control that does not exist. The current doctor reports a categorical unqualified-backend failure
+and emits no per-control isolation claims; once a backend is qualified, its network probe must
+report unrestricted egress as a warning.
 
 ## The Seatbelt profile
 
@@ -134,8 +136,9 @@ Qualification records two separate hashes: a runtime digest over the canonical e
 runtime-path, and launcher identities, and an effective-policy digest over that runtime plus the
 actual immutable executable snapshots, host/guest layout,
 mount access and purpose, protected and prepared paths, network mode, and limits. Executable and
-launcher identities are checked again immediately before each spawn. `doctor` reports the same
-launcher identity used by production execution.
+launcher identities are checked again immediately before each spawn in the pending harness. The
+current doctor cannot report a production launcher identity because no production backend is
+qualified; any future activation must report the exact identity it executes.
 
 The TLS and proxy entries let a provider reach its API on managed hosts. Proxy URLs containing
 userinfo, such as `http://user:password@proxy`, are stripped because every provider tool would

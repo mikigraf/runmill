@@ -22,7 +22,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${1:-all}"
-IMAGE="${RUNMILL_LINUX_IMAGE:-node:22}"
+# Debian trixie supplies Git with fail-closed --no-lazy-fetch support. An
+# override is allowed, but the capability probe inside the container remains
+# mandatory so a mutable image tag cannot silently weaken exact-object reads.
+IMAGE="${RUNMILL_LINUX_IMAGE:-node:22-trixie}"
 
 if ! docker info >/dev/null 2>&1; then
   echo "docker is not running. Start Docker and try again." >&2
@@ -47,7 +50,9 @@ docker run --rm --privileged \
   "$IMAGE" bash -euo pipefail -c '
     apt-get update -qq >/dev/null
     apt-get install -y -qq bubblewrap git rsync >/dev/null
+    git --no-lazy-fetch --no-replace-objects --version >/dev/null
     echo "bwrap:  $(bwrap --version)"
+    echo "git:    $(git --version)"
     echo "node:   $(node --version)"
 
     mkdir -p /build && cd /build
