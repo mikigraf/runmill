@@ -42,7 +42,7 @@
     "prepublishOnly": "npm run check && npm run package:check"
   },
   "dependencies": {
-    "@linear/sdk": "39.2.1",
+    "@linear/sdk": "92.0.0",
     "@octokit/rest": "21.1.1",
     "@opentui/core": "0.5.1",
     "ajv": "8.20.0",
