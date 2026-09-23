@@ -1,6 +1,6 @@
 # Runmill brand assets
 
-The Gated Loop shows one work item reaching the point where evidence either lets it through or stops it. The open track is intentional. Keep the mark square, with no app-tile container, shadow, or gradient.
+The Gated Loop shows one work item arriving at the gate where evidence either lets it through or stops it. The track is open on purpose. Keep the mark square, and don't put it in an app tile or add a shadow or gradient.
 
 ## Files
 
@@ -17,7 +17,7 @@ The Gated Loop shows one work item reaching the point where evidence either lets
 | `icon-512.png` | 512 px application and repository icon |
 | `social-card.png` | 1280 x 640 social preview |
 
-The SVG files are the sources. `icon-512.svg` and `social-card.svg` are included so the PNG exports can be reproduced without a font or design tool.
+The SVG files are the sources. `icon-512.svg` and `social-card.svg` are here so you can regenerate the PNG exports without a font or design tool.
 
 ## Palette
 
@@ -31,6 +31,6 @@ The SVG files are the sources. `icon-512.svg` and `social-card.svg` are included
 | Warning | `#F0B429` | Warning state |
 | Fail | `#D64545` | Failed operational state |
 
-Use orange as an accent on Warm Stock. Keep green, yellow, and red for status so the brand color never changes the meaning of an operational signal.
+Use orange as an accent on Warm Stock. Reserve green, yellow, and red for status, so the brand color never changes what an operational signal means.
 
 At 16 px, use `favicon.svg` or `runmill-monochrome.svg`. Leave clear space around the mark equal to the width of its track.

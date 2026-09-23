@@ -2,19 +2,19 @@
 
 ## Goal
 
-Harden every currently supported Runmill workflow and add only the explicitly requested sandbox portability: Docker plus local sandbox execution on macOS, Linux, and Windows. A platform is supported only when its public containment primitive can meet the same fail-closed contract; an unavailable or insufficient primitive reports `unsupported` rather than silently falling back or claiming best-effort isolation. Preserve public commands, exit codes, JSON fields, forward-only state migrations, and the separate standalone and ASF state machines. Agents and adapters continue to return observations or proposals; only the orchestrator authorizes external side effects.
+Harden every Runmill workflow we currently support, and add the one piece of new scope that was explicitly asked for: sandbox portability, meaning Docker plus local sandbox execution on macOS, Linux, and Windows. A platform counts as supported only when its public containment primitive can meet the same fail-closed contract. If the primitive is missing or not good enough, report `unsupported`. Don't fall back silently and don't claim best-effort isolation. Keep public commands, exit codes, JSON fields, forward-only state migrations, and the separate standalone and ASF state machines as they are. Agents and adapters still return observations or proposals, and only the orchestrator authorizes external side effects.
 
 ## Global constraints
 
-- Use Node 22 or 24 and Git with `--no-lazy-fetch` support (upstream 2.45 or newer). Follow strict red-green-refactor TDD for every behavior change and record the red and green commands in each task report.
+- Use Node 22 or 24 and Git with `--no-lazy-fetch` support (upstream 2.45 or newer). Every behavior change follows strict red-green-refactor TDD, and each task report records the red and green commands.
 - Run `npm run check` before completion. Run `npm run package:check` after changing package metadata, build output, the CLI entrypoint, or bundled fixtures. Run `npm run docs:errors` after changing the error catalog.
 - Missing, unknown, stale, contradictory, or ambiguous evidence fails closed.
 - Verification and review evidence stays bound to the exact candidate commit.
 - Fakes are at least as restrictive as production adapters.
 - Time-dependent code uses injected clocks/schedulers; process execution uses `src/platform/process.ts`.
 - Repository-controlled inputs may narrow operator authority, never widen it.
-- Governance changes include negative/refusal coverage. Sandbox tests exercise real Seatbelt on macOS as a filesystem/process-policy regression harness, bubblewrap on Linux and Windows/WSL2, Docker, and any qualified macOS VM mechanism, and prove a planted resource is accessible outside and denied inside. Seatbelt alone is never accepted as lifecycle containment because a child can create a new session and outlive both its original process group and `launchctl bootout`.
-- Sandbox qualification records exact backend/runtime identity and policy digest, but startup recomputes and revalidates them. A prior doctor pass is diagnostic evidence, never continuing authority.
+- Governance changes include negative/refusal coverage. Sandbox tests exercise real Seatbelt on macOS as a filesystem/process-policy regression harness, bubblewrap on Linux and Windows/WSL2, Docker, and any qualified macOS VM mechanism, and prove a planted resource is accessible outside and denied inside. Seatbelt alone never counts as lifecycle containment: a child can create a new session and outlive both its original process group and `launchctl bootout`.
+- Sandbox qualification records the exact backend/runtime identity and policy digest, but startup recomputes and revalidates them anyway. A previous doctor pass is diagnostic evidence. It never carries authority forward.
 - Do not implement unrelated roadmap items: automatic run resumption, new agent roles, provider credential brokering, network proxies, merge queues, first-party ASF composition, or provider session resumption.
 - Keep patches scoped. Never publish, release, merge, push, or change external repository settings.
 
@@ -29,7 +29,7 @@ Replace host-path review-guidance reads with exact base-commit Git blob reads.
 
 ## Task 2: Establish one fail-closed sandbox boundary
 
-Introduce one internal sandbox-backend contract, wire the selected sandbox instance into provider and verification execution, and remove ambient filesystem exposure from native profiles.
+Introduce a single internal sandbox-backend contract, wire the selected sandbox instance into provider and verification execution, and stop native profiles from exposing the ambient filesystem.
 
 - Replace the shared host-path `wrap()` assumption with lifecycle-owning `start()`/`run()` operations. The contract carries an explicit host-to-guest path layout, bounded streaming output, an awaited idempotent abort, and completion only after the entire backend-owned process tree/resource is gone.
 - Stop granting every ambient `PATH` directory, package roots, `/opt`, and `/Library`.
@@ -38,21 +38,21 @@ Introduce one internal sandbox-backend contract, wire the selected sandbox insta
 - Reject root, home, workspace ancestors, credential ancestors, and other over-broad grants. Make doctor refuse when the closure cannot be proven.
 - Normalize host sources and guest destinations once; reject duplicate, overlapping, conflicting, or over-broad mounts. Make dependency preparation and disposable provider-home creation explicit backend operations keyed to the target runtime OS/architecture/libc/Node ABI rather than the host runtime.
 - Create orchestrator-owned task/issue/runtime inputs with no-follow containment checks; repository symlinks or special files must never redirect a host write. Verification accepts only an exact `exited`/zero result, and real provider/npm tool-child startup must be proven through the production call paths.
-- Keep backend selection explicit and deterministic: `native`, `docker`, or `none`; never fall back between mechanisms. `native` may select bubblewrap on Linux only after the exact descriptor-bound runtime and lifecycle qualification below passes; the current fail-closed checkpoint refuses Linux, macOS, and Windows. Tasks 12a and 13 own the additional macOS and Windows transports. Pure Seatbelt is retained only as an internal regression harness: process groups and launchd jobs do not contain a descendant that calls `setsid()`, so it cannot satisfy backend-owned teardown.
+- Keep backend selection explicit and deterministic: `native`, `docker`, or `none`; never fall back between mechanisms. `native` may select bubblewrap on Linux only after the exact descriptor-bound runtime and lifecycle qualification below passes; the current fail-closed checkpoint refuses Linux, macOS, and Windows. Tasks 12a and 13 own the additional macOS and Windows transports. Pure Seatbelt stays only as an internal regression harness. Process groups and launchd jobs do not contain a descendant that calls `setsid()`, so Seatbelt cannot provide backend-owned teardown.
 - Qualify a rootless, non-setuid bubblewrap with FD-bind support. Hold no-follow descriptors for every runtime and policy mount, pass them through the sole process boundary, and render `--ro-bind-fd`/`--bind-fd`; never reopen a qualified source pathname at launch or fall back to path binds. Preserve original guest aliases for shebangs, ELF `PT_INTERP`, libraries, and runtime data even when their canonical host sources differ.
 - Build a deterministic, bounded immutable runtime manifest from descriptor-anchored traversal. Bind every executed/package/library and required DNS, TLS, NSS, hosts, and timezone input to its exact content evidence; enforce aggregate ELF/file/edge/byte limits and fail closed on unsupported loader, libc, symlink, encoding, or mount semantics.
 - For bubblewrap lifecycle ownership, create a dedicated `--sync-fd` pipe and require direct monitor completion, PID-namespace-init EOF after it has reaped all children, and bounded output drain before returning, deleting runtime state, or releasing credentials/workspaces. Timeout, abort, and output-limit paths use the same proof; missing acknowledgement quarantines resources and never becomes success.
 - Resolve and qualify exactly one configured backend at the composition root and inject it into provider, verification, doctor, evaluation, and orchestrator paths. Remove production constructor defaults that can select an ambient mechanism independently.
-- Add actual macOS Seatbelt and Linux bubblewrap planted-secret tests under prior broad roots and PATH/package siblings while retaining provider/npm startup tests. Keep them explicitly pending while their harness cannot clean up safely. The Seatbelt tests prove its access policy and separately prove why production selection refuses it; they do not qualify it as a lifecycle-owning backend. Linux activation additionally requires real glibc and musl, Node shebang/package/native-dependency, DNS/TLS/hosts/timezone, source-swap, invalid-name/FIFO/symlink, normal-exit descendant, timeout, abort, output-limit, and `--sync-fd` ordering tests.
+- Add actual macOS Seatbelt and Linux bubblewrap planted-secret tests under prior broad roots and PATH/package siblings while retaining provider/npm startup tests. Keep them explicitly pending while their harness cannot clean up safely. The Seatbelt tests prove its access policy and separately prove why production selection refuses it; they do not qualify it as a lifecycle-owning backend. Linux activation also requires real glibc and musl, Node shebang/package/native-dependency, DNS/TLS/hosts/timezone, source-swap, invalid-name/FIFO/symlink, normal-exit descendant, timeout, abort, output-limit, and `--sync-fd` ordering tests.
 
 ## Task 3: Make provider and process completion fail closed
 
-Unify provider/process lifecycle and remove false-success paths.
+Unify the provider and process lifecycle and remove the paths that report false success.
 
-- Reuse `runControlledProcess` for provider, Git, signing, verification, and credential-helper execution where practical. Make termination asynchronous, backend-extensible, and confirmed; killing a transport CLI alone is not completion. Ensure detached process-tree/container/guest termination completes before credentials, leases, or workspaces are released.
+- Reuse `runControlledProcess` for provider, Git, signing, verification, and credential-helper execution where practical. Make termination asynchronous, backend-extensible, and confirmed. Killing a transport CLI by itself is not completion. Detached process-tree/container/guest termination must finish before credentials, leases, or workspaces are released.
 - Defaults: local commands 2 minutes, remote observations 30 seconds per attempt, remote mutations 5 minutes; all are bounded by the remaining run/lease deadline with a 5-second safety margin.
 - A provider result succeeds only with one start event, exactly one successful terminal event, and exit code zero. Pre-abort never spawns. Cancellation, timeout, output-limit, failure terminal, missing terminal, duplicate terminal, or contradictory terminal fails closed in that order.
-- All roles, including local review, require successful process status before accepting output; discard output otherwise.
+- Every role, local review included, needs a successful process status before its output is accepted. Otherwise discard the output.
 - Stream through a bounded async queue. Limits: 16 MiB aggregate output, 1 MiB line, 10,000 retained events, 1 MiB structured review file. Accept only regular no-follow output files.
 - Test failure-terminal/exit-zero, missing/duplicate/conflicting terminal, pre-abort, TERM trapping, delayed grandchildren, stale approval files, and all output limits.
 
@@ -134,7 +134,7 @@ Unify provider/process lifecycle and remove false-success paths.
 - Mount allowlisted authentication read-only at a staging path and use a fixed trusted image helper to copy it into tmpfs home before execution. Bind only normalized workspace, pre-created output, and target-runtime dependency sources at stable guest paths; re-mount `.git`, immutable `.runmill/run` inputs, dependency trees, and every protected subtree read-only after any broader workspace bind.
 - Key dependency preparation and provider/verifier qualification to the container runtime OS/architecture/libc/Node ABI. Rewrite every cwd, home, temp, task-packet, provider `-C`, dependency, and output argument to its declared guest path; refuse an untranslatable path.
 - Persist/emit the backend ID, manifest digest, resolved image/config ID, policy digest, runtime limits, and qualification outcome. Doctor and run startup both revalidate; failure never falls back to native or unsandboxed execution.
-- Add argument/inspection-contract tests plus real Docker planted-secret, protected-path, network-denial, process-tree cancellation, provider-startup, and verification-startup tests using a preloaded checksum-verified, digest-pinned fixture image. The backend and its security tests always use pull-never semantics.
+- Add argument/inspection-contract tests plus real Docker planted-secret, protected-path, network-denial, process-tree cancellation, provider-startup, and verification-startup tests using a preloaded checksum-verified, digest-pinned fixture image. The backend and its security tests always run with pull-never semantics.
 
 ## Task 12a: Add the qualified local macOS sandbox backend
 

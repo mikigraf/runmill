@@ -1,7 +1,7 @@
 # Working on Runmill
 
-This file is the short contract for coding agents and automated contributors. Human contributors
-should also read [CONTRIBUTING.md](./CONTRIBUTING.md).
+These are the rules for coding agents and other automated contributors. If you are a person, read
+[CONTRIBUTING.md](./CONTRIBUTING.md) as well.
 
 ## Setup and checks
 
@@ -10,30 +10,32 @@ npm ci
 npm run check
 ```
 
-Use Node 22 or 24 and Git 2.45 or newer. `npm test` is offline and excludes `test/live/`. Run live
-suites only when the task explicitly requires real credentials and remotes. Run
-`npm run package:check` after changing package metadata, build output, the CLI entrypoint, or
+Use Node 22 or 24 and Git 2.45 or newer. `npm test` runs offline and skips `test/live/`. Only run
+the live suites when the task actually needs real credentials and remotes. Run
+`npm run package:check` after you change package metadata, build output, the CLI entrypoint, or
 bundled fixtures.
 
 ## Architectural invariants
 
-- The orchestrator owns every external side effect and policy decision. Agents and adapters return
-  proposals or observations; they do not acquire authority.
-- Missing, unknown, stale, or contradictory evidence fails closed.
-- Verification and review evidence is bound to the exact candidate commit.
-- Fakes must be at least as restrictive as the production adapter they represent.
-- Time-dependent code uses the injected `Clock`; process execution uses `platform/process.ts`.
-- Repository-controlled inputs may narrow operator authority, never widen it.
+- The orchestrator performs every external side effect and makes every policy decision. Agents and
+  adapters return proposals or observations. They never gain authority.
+- If evidence is missing, unknown, stale, or contradictory, fail closed.
+- Verification and review evidence belongs to one exact candidate commit.
+- A fake must be at least as strict as the production adapter it stands in for.
+- Code that depends on time uses the injected `Clock`. Code that runs processes goes through
+  `platform/process.ts`.
+- Inputs the repository controls can narrow operator authority. They can never widen it.
 - Never commit credentials, support bundles, generated runtime state, or `.runmill/state/`.
 
 ## Tests and documentation
 
-- Governance changes need a negative or refusal test, not only a successful path.
-- Sandbox tests must prove a planted resource is accessible outside and denied inside. Exercise both
-  Seatbelt and bubblewrap mechanisms; do not infer one from the other.
-- Every remediation command printed by Runmill must exist and remain covered by the CLI contracts.
-- Run `npm run docs:errors` after changing the error catalog and include the generated update.
-- Preserve public exit codes, JSON output contracts, and forward-only state migrations.
+- A governance change needs a negative or refusal test. A passing happy path is not enough.
+- A sandbox test has to plant a resource, show it is readable outside the sandbox, and show it is
+  denied inside. Test Seatbelt and bubblewrap separately; passing on one says nothing about the
+  other.
+- Every remediation command Runmill prints must exist and stay covered by the CLI contract tests.
+- After changing the error catalog, run `npm run docs:errors` and include the regenerated file.
+- Keep public exit codes, JSON output contracts, and forward-only state migrations stable.
 
-Keep patches scoped. Do not overwrite unrelated work in a dirty worktree, and do not publish,
-release, merge, or change external repository settings unless the task explicitly authorizes it.
+Keep patches small and on-task. In a dirty worktree, don't overwrite work that isn't yours. Don't
+publish, release, merge, or change external repository settings unless the task says you may.

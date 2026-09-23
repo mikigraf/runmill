@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  Runmill turns eligible Linear issues into verified, independently reviewed GitHub pull requests, then takes the next one.
+  Runmill takes a Linear issue, has an agent implement it, checks and reviews the result, opens a GitHub pull request, and moves on to the next issue.
 </p>
 
 <p align="center">
@@ -48,7 +48,7 @@ Runmill works standalone as a backlog-to-PR product and is also part of
 
 ## Quick start
 
-The demo runs one complete delivery loop with bundled integrations and temporary storage. It needs no credentials and leaves your repository alone.
+The demo runs one full delivery loop using bundled integrations and temporary storage. It needs no credentials and does not touch your repository.
 
 Runmill is not published to npm yet, so install the source preview first:
 
@@ -61,17 +61,17 @@ npm link
 runmill demo
 ```
 
-The demo selects a bundled issue, claims it, runs a simulated coding agent, verifies the candidate in a real Git repository, reviews it with fresh context, and delivers a simulated pull request.
+The demo picks a bundled issue, claims it, runs a simulated coding agent, verifies the result in a real Git repository, reviews it with a fresh agent, and opens a simulated pull request.
 
 ## What happens during a run
 
-1. **Claim.** Runmill selects an eligible Linear issue, maps it to a repository, and acquires a durable lease.
+1. **Claim.** Runmill picks an eligible Linear issue, maps it to a repository, and takes a durable lease on it.
 2. **Implement.** Codex or Claude Code works inside an isolated workspace with an enforced write scope.
 3. **Verify.** Every required check runs against the exact candidate commit in a clean checkout.
-4. **Review locally.** A new agent context reads the task and exact candidate, accounts for each acceptance criterion, and returns line-level findings.
-5. **Deliver.** Runmill pushes the branch, opens the GitHub pull request, and reconciles CI and branch protection for that candidate SHA.
-6. **Review the PR evidence.** Another fresh review receives the exact candidate plus Runmill's PR identity and CI verdicts.
-7. **Repeat.** The daemon takes the next eligible issue, waits when the queue is empty, or escalates with a named reason.
+4. **Review locally.** A fresh agent reads the task and the exact candidate commit, checks each acceptance criterion, and returns line-level findings.
+5. **Deliver.** Runmill pushes the branch, opens the GitHub pull request, and checks CI and branch protection for that exact SHA.
+6. **Review the PR evidence.** A second fresh review gets the same commit plus the PR details and CI results that Runmill recorded.
+7. **Repeat.** The daemon takes the next eligible issue, waits if the queue is empty, or hands the issue to a person with a stated reason.
 
 ```text
 Backlog → Claim → Implement → Verify → Review → Pull request → CI → PR review → Repeat
@@ -79,31 +79,31 @@ Backlog → Claim → Implement → Verify → Review → Pull request → CI �
 
 The agents write and review code. Runmill controls backlog changes, repository effects, pull requests, and merge decisions.
 
-Portable signed delivery evidence can be checked on a separate, state-free host:
+You can check signed delivery evidence on another machine that has no Runmill state:
 
 ```bash
 runmill evidence verify evidence.json --trust trusted-signers.json --expectations candidate-facts.json
 ```
 
-Add `--artifacts-dir` to re-hash the content-addressed artifact bodies as well as the signed statement.
+Add `--artifacts-dir` to also re-hash the artifact files, not just the signed statement.
 
 ## Why Runmill exists
 
 ### One issue has one owner
 
-Git-ref leases prevent two workers from claiming the same issue. A worker that loses its lease is fenced out before another external mutation.
+Leases stored as Git refs stop two workers from claiming the same issue. A worker that loses its lease is blocked before it can make another external change.
 
 ### A green command needs proof
 
-Runmill ties every check result to the candidate commit. Merge modes require machine-readable test evidence and reject missing tests, undeclared skips, dirty worktrees, and zero-test passes. The generated `pr-only` policy may label a passing command `unproven` when setup cannot safely infer a reporter; that evidence can open a PR for a person, but it cannot authorize an automatic merge.
+Runmill ties every check result to the candidate commit. Merge modes need machine-readable test results and reject missing tests, undeclared skips, dirty worktrees, and runs that pass with zero tests. If setup cannot work out a test reporter, the generated `pr-only` policy may mark a passing command `unproven`. That is enough to open a PR for a person to review, but not enough for an automatic merge.
 
 ### Review starts clean
 
-The reviewer receives the issue, acceptance criteria, and exact candidate checkout without the implementer's conversation history. Its workspace is read-only except for one pre-created JSON verdict file. After the push, PR review also receives orchestrator-owned PR identity and CI verdicts tied to the same SHA. Its structured verdict is checked against the full task and the paths that changed.
+The reviewer gets the issue, the acceptance criteria, and a checkout of the exact candidate, but not the implementer's conversation. Its workspace is read-only apart from one JSON file for its verdict. After the push, the PR review also gets the PR details and CI results that the orchestrator recorded for the same SHA. Runmill checks the verdict against the full task and the list of changed paths.
 
 ### Authority stays outside the model
 
-Deterministic code owns pushes, pull requests, issue transitions, and merges. Stale, incomplete, contradictory, or unreadable evidence stops the run for a person.
+Pushes, pull requests, issue transitions, and merges are done by ordinary code, not by the model. If evidence is stale, incomplete, contradictory, or unreadable, the run stops and waits for a person.
 
 ## Support
 
@@ -121,14 +121,14 @@ Deterministic code owns pushes, pull requests, issue transitions, and merges. St
 | TUI                               | Bun, or Node 26.4+ with experimental FFI. The daemon and other commands run on Node 22 or 24.                                                  |
 | Windows                           | Unsupported                                                                                                                                    |
 
-`runmill doctor` checks Git, candidate commit identity and signing, local verification commands and locked dependencies, configured remotes, credentials, and the platform isolation mechanism. The provenance check creates a real candidate commit in a disposable repository, so a missing identity or unusable signer fails before Runmill claims an issue. Provider authentication and one-turn execution probes remain separate checks, but neither runs until a production sandbox is available; this checkpoint fails at that boundary.
+`runmill doctor` checks Git, the commit identity and signing setup, local verification commands and locked dependencies, configured remotes, credentials, and the platform sandbox. The provenance check makes a real commit in a throwaway repository, so a missing identity or broken signer shows up before Runmill claims an issue. Provider sign-in and a one-turn test run are separate checks. Neither runs until a production sandbox exists, so doctor currently stops at that point.
 
 ### Credential boundary
 
 | Credential                           | Status                                                                                                                                                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Codex or Claude subscription session | Experimental. Each run uses a disposable private copy, so tools cannot modify the real provider config. They can still read the copied credential. Use a dedicated subscription and stay in `pr-only`. |
-| Provider API key                     | Unsupported until Runmill has a host-side credential broker. Provider keys are stripped from the agent and its tool subprocesses.                                                                      |
+| Codex or Claude subscription session | Experimental. Each run gets a private throwaway copy, so tools cannot change the real provider config. They can still read the copied credential. Use a dedicated subscription and stay in `pr-only`.           |
+| Provider API key                     | Unsupported until Runmill has a host-side credential broker. Provider keys are removed from the agent and its tool subprocesses.                                                                        |
 | GitHub and Linear credentials        | Supported. They stay in orchestrator-side adapters and never enter the agent process.                                                                                                                  |
 
 ## Install and connect a repository
@@ -141,11 +141,11 @@ runmill next
 runmill start
 ```
 
-`init` discovers existing GitHub and Linear access. It never asks for GitHub or Linear secrets in an echoed terminal question: GitHub sign-in is delegated to `gh`, while Linear uses a preconfigured environment value or the stdin-only macOS keychain command. Init creates missing files and preserves existing ones. It then validates that the configured sandbox is the composition root's exact qualified backend before running doctor. This checkpoint has no production-qualified local backend, so a generated `native` policy is written but readiness fails at that pre-doctor gate; provider CLI/auth/request probes are never reached. Use `runmill init --defaults` for non-interactive setup.
+`init` finds the GitHub and Linear access you already have. It never asks you to type a GitHub or Linear secret at a visible prompt: GitHub sign-in goes through `gh`, and Linear uses an existing environment variable or the stdin-only macOS keychain command. Init creates missing files and leaves existing ones alone. Before running doctor, it checks that the configured sandbox is the exact qualified backend Runmill was built with. No local backend is production-qualified yet, so init writes a `native` policy and then stops at that check; the provider CLI, sign-in, and request probes never run. Use `runmill init --defaults` for non-interactive setup.
 
-For npm projects, run `npm ci` in the source checkout first. Init adds only verification scripts that actually exist in `package.json`; it does not guess `npm test` for another ecosystem. Doctor fetches the configured remote base without moving your local branch, reads the check manifest from that exact commit, and blocks when the local install would not work in the live workspace. It never runs an installer or warms the cache. Live checks reuse a lockfile-matching, read-only dependency cache, so the exact-commit verification checkout never installs packages or opens network access. If no safe check can be inferred, setup stops until you edit `.runmill/checks.yaml`.
+For npm projects, run `npm ci` in the source checkout first. Init only adds verification scripts that exist in `package.json`; it does not guess `npm test` for other ecosystems. Doctor fetches the configured remote base without moving your local branch, reads the check manifest from that commit, and blocks if your local install would not work in the live workspace. It never runs an installer or fills a cache. Live checks reuse a read-only dependency cache that matches the lockfile, so the verification checkout never installs packages or uses the network. If init cannot find a safe check, setup stops until you edit `.runmill/checks.yaml`.
 
-Operator policy lives in your OS user-config directory. The repository keeps only its required checks and review instructions under `.runmill/`. Repository content can make a run stricter, but it cannot grant itself more authority.
+Operator policy lives in your OS user-config directory. The repository only keeps its required checks and review instructions, under `.runmill/`. Repository content can make a run stricter, but it cannot give itself more authority.
 
 Once the daemon is running:
 
@@ -155,7 +155,7 @@ runmill tui
 runmill stop
 ```
 
-The TUI connects through a user-private local socket, so it can be opened from another directory. `runmill daemon` remains available for advanced foreground, one-shot, polling, and breaker options.
+The TUI connects through a local socket that only your user can reach, so you can open it from any directory. `runmill daemon` is still there for foreground, one-shot, polling, and breaker options.
 
 See [configuration](./docs/configuration.md) for single-repository routing, workflow states, checks, budgets, credentials, network policy, and risk paths.
 
@@ -168,7 +168,7 @@ See [configuration](./docs/configuration.md) for single-repository routing, work
 | `guarded-merge` | Experimental                   | Merge eligible low-risk changes after every configured gate passes  |
 | `continuous`    | Experimental                   | Keep applying guarded merge policy across repeated runs             |
 
-`pr-only` is the default. Automatic merge also requires `experimental.automatic_merge: true`, so changing the autonomy mode alone cannot enable it.
+`pr-only` is the default. Automatic merge also needs `experimental.automatic_merge: true`, so changing the autonomy mode alone does not turn it on.
 
 ## Go deeper
 
@@ -183,7 +183,7 @@ See [configuration](./docs/configuration.md) for single-repository routing, work
 | Historical replay and refusal accuracy   | [Evaluation](./docs/evaluation.md)     |
 | Error codes and fixes                    | [Errors](./docs/errors.md)             |
 
-For bugs and accepted feature work, use [GitHub Issues](https://github.com/mikigraf/runmill/issues). Read [SUPPORT.md](./SUPPORT.md) for setup help and diagnostic bundles. Changes are welcome through [CONTRIBUTING.md](./CONTRIBUTING.md).
+Report bugs and accepted feature work in [GitHub Issues](https://github.com/mikigraf/runmill/issues). See [SUPPORT.md](./SUPPORT.md) for setup help and diagnostic bundles, and [CONTRIBUTING.md](./CONTRIBUTING.md) to send changes.
 
 Runmill is available under the [MIT License](./LICENSE).
 
@@ -192,7 +192,7 @@ Runmill is available under the [MIT License](./LICENSE).
 
 | Command                                                          | Purpose                                                                                                         |
 | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `runmill doctor`                                                 | Prove that this host, sandbox, credentials, and provider setup can run                                          |
+| `runmill doctor`                                                 | Check that this host, sandbox, credentials, and provider setup can run                                          |
 | `runmill demo`                                                   | Run the zero-credential delivery loop in temporary storage                                                      |
 | `runmill next`                                                   | Show the next issue and explain every rejection                                                                 |
 | `runmill prepare <issue>`                                        | Score whether an issue is ready                                                                                 |
@@ -204,7 +204,7 @@ Runmill is available under the [MIT License](./LICENSE).
 | `runmill tui`                                                    | Open the terminal interface                                                                                     |
 | `runmill list --needs-attention`                                 | Find runs waiting for a person                                                                                  |
 | `runmill inspect <run-id>`                                       | Show transitions, evidence, and pending effects                                                                 |
-| `runmill resume <run-id>`                                        | Explain why checkpoint continuation is unavailable in the preview; never changes state                          |
+| `runmill resume <run-id>`                                        | Explain why resuming from a checkpoint is not available in the preview; never changes state                     |
 | `runmill effects list`                                           | Show ambiguous GitHub or backlog mutations that block new runs                                                  |
 | `runmill effects resolve <key> --outcome <applied\|not-applied>` | Record an outcome verified in the remote system                                                                 |
 | `runmill leases list`                                            | Show local lease rows left by interrupted runs                                                                  |

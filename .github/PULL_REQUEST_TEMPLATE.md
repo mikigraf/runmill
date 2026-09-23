@@ -5,10 +5,10 @@
 ## Safety review
 
 - [ ] This change does not alter authority or irreversible effects.
-- [ ] If it does, I described the new authority, its owner, and its fail-closed behavior below.
-- [ ] I identified risk-sensitive paths touched (`workspace`, `credentials`, `orchestrator`, `pr`,
+- [ ] If it does, I described the new authority, who owns it, and how it fails closed below.
+- [ ] I listed any risk-sensitive paths this touches (`workspace`, `credentials`, `orchestrator`, `pr`,
       state migrations, configuration policy, or workflows).
-- [ ] I added or updated a negative/refusal test where a safety gate changed.
+- [ ] Where a safety gate changed, I added or updated a negative/refusal test.
 - [ ] I considered both macOS Seatbelt and Linux bubblewrap behavior, or marked one not applicable.
 - [ ] Verification and review still apply to the exact candidate commit.
 
@@ -24,7 +24,7 @@ Exact commands run:
 npm run check
 ```
 
-- [ ] Documentation is updated where behavior or support changed.
+- [ ] Docs are updated wherever behavior or support changed.
 - [ ] Generated error documentation is current (`npm run docs:check`).
 - [ ] Package smoke passes (`npm run package:check`) when packaging or CLI entrypoints changed.
-- [ ] Live credentials or remotes were not used, or the live test scope and cleanup are documented.
+- [ ] No live credentials or remotes were used, or I documented the live test scope and cleanup.

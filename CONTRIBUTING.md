@@ -9,9 +9,9 @@ npm ci
 npm run check
 ```
 
-Node 22 or 24, Git 2.45 or newer, and macOS or Linux. Sandbox tests need Seatbelt (built into macOS) or
-bubblewrap (`apt-get install bubblewrap`). The repository pins npm 11.15.0 in `package.json`; use
-that version when regenerating `package-lock.json`.
+You need Node 22 or 24, Git 2.45 or newer, and macOS or Linux. Sandbox tests need Seatbelt (built
+into macOS) or bubblewrap (`apt-get install bubblewrap`). `package.json` pins npm 11.15.0; use that
+version when you regenerate `package-lock.json`.
 
 ## The loop you will be working in
 
@@ -22,16 +22,16 @@ npm run package:check   # pack, clean-install, and execute the release artifact
 npm run docs:errors     # regenerate docs/errors.md after touching the catalog
 ```
 
-`npm test` deliberately excludes `test/live/`, which talks to real credentials and real remotes.
-Run those on purpose:
+`npm test` leaves out `test/live/` on purpose, because those tests use real credentials and real
+remotes. Run them deliberately:
 
 ```bash
 npx vitest run --config vitest.live.config.ts
 ```
 
-Live suites that require credentials skip when their credential is absent. Provider execution
-suites also remain skipped until a qualified production sandbox backend is available; the live
-configuration reports which prerequisite is missing.
+A live suite that needs a credential skips itself when the credential isn't there. Provider
+execution suites also stay skipped until a qualified production sandbox backend exists. The live
+config tells you which prerequisite is missing.
 
 ## How the layers fit
 
@@ -49,36 +49,36 @@ state/        SQLite, migrations, the side-effect outbox
 testing/      in-memory implementations of every boundary
 ```
 
-Three rules the codebase is built around, and the reasoning behind each:
+The codebase is built around three rules. Here is why each one exists.
 
-**The orchestrator owns side effects.** If you find yourself giving the agent a credential or
+**The orchestrator owns side effects.** If you catch yourself handing the agent a credential or
 letting an adapter make a policy decision, the design has drifted.
 
 **Fakes must never be more permissive than the real thing.** `FakeForgeAdapter` defaults
 `canWriteBranchProtection` to `true` because `GitHubForgeAdapter` fails closed to `true` when it
-cannot determine the answer. A fake that defaulted to `false` would make every merge test exercise
-a branch production cannot reach — which is exactly how a reviewer bug shipped once already.
+can't tell. If the fake defaulted to `false`, every merge test would exercise a branch production
+can never reach. That is exactly how a reviewer bug shipped once already.
 
-**Everything runmill tells a developer to run must exist.** `test/cli/contract.test.ts` asserts
-that every command cited by the error catalog and the README resolves. Add a fix line, add the
-command.
+**Everything runmill tells a developer to run must exist.** `test/cli/contract.test.ts` checks
+that every command cited in the error catalog and the README resolves. If you add a fix line, add
+the command too.
 
 ## Tests
 
 Write the test first. Beyond that:
 
-- If you touch a governance gate, add a case proving it *refuses*. The valuable half of this
-  product is the paths where it declines to merge.
-- Anything time-dependent takes the injected `Clock`. `FakeClock` can advance minutes, simulate a
-  laptop suspend, and produce a skewed view for cross-host lease tests.
-- Anything spawning a process goes through `platform/process.ts`.
+- If you touch a governance gate, add a case proving it *refuses*. The paths where Runmill declines
+  to merge are the valuable half of the product.
+- Anything time-dependent takes the injected `Clock`. `FakeClock` can jump forward by minutes,
+  simulate a laptop going to sleep, and give a skewed clock for cross-host lease tests.
+- Anything that spawns a process goes through `platform/process.ts`.
 
 ## Commits
 
 `<type>: <description>`, types: feat, fix, refactor, docs, test, chore, perf, ci.
 
-Explain *why* in the body when the why is not obvious from the diff. The commit history is the
-only place some of these decisions are recorded.
+If the diff doesn't make the *why* obvious, explain it in the body. For some of these decisions,
+the commit history is the only record we have.
 
 ## Filing a bug
 
@@ -87,34 +87,34 @@ Paste it into the issue.
 
 ## Verifying the Linux sandbox
 
-Half the supported platforms are Linux, where the sandbox is bubblewrap — a
-different mechanism from macOS Seatbelt, with different flags, failure modes,
-and enforcement limits. Developing on a Mac leaves that half unexercised.
+Half the supported platforms are Linux, where the sandbox is bubblewrap. That is
+a different mechanism from macOS Seatbelt, with its own flags, failure modes, and
+enforcement limits. If you only develop on a Mac, that half never gets exercised.
 
 ```bash
 npm run verify:linux            # full suite on Linux, in Docker
 npm run verify:linux sandbox    # just the sandbox enforcement tests
 ```
 
-Requires Docker. It runs `--privileged`, because bubblewrap needs to create user
-namespaces and nested containers do not get that by default — the sandbox needs
-the same kernel feature inside the container that it needs on a real host.
+This needs Docker. It runs `--privileged` because bubblewrap has to create user
+namespaces, and nested containers can't do that by default. The sandbox needs the
+same kernel feature inside the container as it does on a real host.
 
-Do not gate a sandbox test to one platform. Enforcement tests were once written
-`it.runIf(onMac)`, so bubblewrap's containment was verified by nothing,
-anywhere. Gate on whether a mechanism exists (`detectMechanism() !== "none"`)
+Don't gate a sandbox test to one platform. The enforcement tests were once written
+as `it.runIf(onMac)`, which meant nothing, anywhere, verified bubblewrap's
+containment. Gate on whether a mechanism exists (`detectMechanism() !== "none"`)
 instead.
 
-And make a negative test prove something. `DENIES reading a credential path`
-originally read the developer's real `~/.ssh/id_rsa`, so on a machine without
-that file it passed because `cat` found nothing — proving nothing about the
-sandbox. Plant the secret, confirm it is readable outside, then assert the
-denial inside.
+Make sure a negative test actually proves something. `DENIES reading a credential path`
+used to read the developer's real `~/.ssh/id_rsa`. On a machine without that file
+it passed because `cat` found nothing, which told us nothing about the sandbox.
+Plant the secret, confirm it is readable outside, then assert that it is denied
+inside.
 
 ## Releasing
 
-The package is not published yet. Do not publish it from a development machine. Before a release
-PR is approved, run the same gates used by CI:
+The package isn't published yet. Don't publish it from a development machine. Before a release PR
+is approved, run the same gates CI runs:
 
 ```bash
 npm ci
@@ -124,13 +124,13 @@ npm run verify:linux
 ```
 
 `prepublishOnly` repeats `check` and the package smoke test. The smoke test builds the tarball,
-enforces its size budget, installs it in an empty prefix, and executes `runmill --version`. It is
-the release artifact—not the working tree—that must pass.
+enforces its size budget, installs it into an empty prefix, and runs `runmill --version`. The
+release artifact has to pass, and the working tree passing doesn't count.
 
-Release publication uses a reviewed GitHub release and npm trusted publishing with provenance once
-the npm package and repository environments are configured. Maintainers must follow the complete
-[release checklist](./docs/releasing.md); until its one-time external setup is finished, the
-workflow will not be authorized to publish.
+Once the npm package and repository environments are configured, releases go out through a
+reviewed GitHub release and npm trusted publishing with provenance. Maintainers must follow the
+full [release checklist](./docs/releasing.md). Until its one-time external setup is done, the
+workflow has no permission to publish.
 
-`npm link` is not a substitute for `npm run package:check`: it symlinks the working copy, so it can
-pass when `files` omits something the tarball needs.
+`npm link` does not replace `npm run package:check`. It symlinks the working copy, so it can pass
+even when `files` leaves out something the tarball needs.

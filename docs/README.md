@@ -4,7 +4,7 @@
 
 # Runmill documentation
 
-Runmill owns the delivery loop around Codex and Claude Code. It selects eligible Linear issues, claims one, runs the agent in an isolated workspace, verifies the exact candidate, starts an independent review, opens the GitHub pull request, and returns to the queue.
+Runmill runs the delivery loop around Codex and Claude Code. It picks an eligible Linear issue, claims it, runs the agent in an isolated workspace, verifies the exact candidate commit, gets an independent review, opens the GitHub pull request, and goes back to the queue.
 
 ```text
 Backlog → Claim → Implement → Verify → Review → Pull request → CI → PR review → Repeat
@@ -23,18 +23,18 @@ Backlog → Claim → Implement → Verify → Review → Pull request → CI �
 | Leave Runmill working in the background | [Daemon operations](./daemon.md) |
 | Find out why the host is blocked | `runmill doctor`, then [Errors](./errors.md) |
 
-`runmill init` writes the missing setup files and immediately runs doctor before it suggests the
-next command. Provider readiness includes one small, potentially billable request for each
-distinct configured provider/model inside Runmill's real sandbox; authentication status alone is
-not treated as proof that the agent can run.
+`runmill init` writes any missing setup files and runs doctor straight away, before it suggests
+the next command. The provider readiness check sends one small, possibly billable request to each
+distinct configured provider/model inside Runmill's real sandbox. Being signed in is not taken as
+proof that the agent can run.
 
-Setup also requires at least one real verification command. Init infers only scripts that exist in
-a locked npm project and blocks on `checks: []` for an unknown ecosystem. Run `npm ci` in the
-source checkout first. Doctor proves the installed inventory matches the lockfile without installing
-or warming a cache; exact-commit checks then reuse that matching tree read-only and never enable
-network access inside verification.
+Setup also needs at least one real verification command. Init only picks up scripts that exist in
+a locked npm project, and blocks on `checks: []` for an ecosystem it doesn't know. Run `npm ci` in
+the source checkout first. Doctor checks that what is installed matches the lockfile, without
+installing anything or filling a cache. Exact-commit checks then reuse that tree read-only, and
+verification never gets network access.
 
-Operator policy lives outside the repository in the OS user-config directory. The repository keeps its check manifest and review instructions under `.runmill/`. The effective policy only gets stricter when repository content changes.
+Operator policy lives outside the repository, in the OS user-config directory. The repository keeps its check manifest and review instructions under `.runmill/`. Changes to repository content can only make the effective policy stricter.
 
 ## Follow one run
 
@@ -47,28 +47,28 @@ Operator policy lives outside the repository in the OS user-config directory. Th
 | Deliver | Pushes, pull requests, CI reconciliation, and merge policy | [Autonomy](./autonomy.md) |
 | Repeat | Idle polling, crash inspection, explicit recovery, circuit breakers, and operator controls | [Daemon operations](./daemon.md) |
 
-An engineering run covers one issue, one lease, one isolated implementation, one evidence bundle, and one delivery decision. Runmill stores every transition plus the reason for a retry, refusal, quarantine, or escalation.
+One run means one issue, one lease, one isolated implementation, one evidence bundle, and one delivery decision. Runmill stores every transition, along with the reason for any retry, refusal, quarantine, or escalation.
 
 ## The rules behind the loop
 
 ### External effects belong to the orchestrator
 
-Agents propose and inspect changes. Deterministic code handles issue transitions, pushes, pull requests, and merges. An agent can add a required check, but it cannot remove one or widen its own authority.
+Agents propose and inspect changes. Ordinary deterministic code handles issue transitions, pushes, pull requests, and merges. An agent can add a required check. It cannot remove one or widen its own authority.
 
 ### Evidence describes the exact candidate
 
-A passing command is insufficient when a check was missing, skipped without permission, ran against another tree, or discovered no tests. Runmill records coverage and binds the result to the commit that may be delivered.
+A passing command is not enough if a check was missing, skipped without permission, ran against a different tree, or found no tests. Runmill records coverage and ties the result to the commit that may be delivered.
 
 ### Review gets fresh context
 
-The reviewer sees the task, acceptance criteria, and exact candidate checkout without the
-implementer's conversation. After the push, PR review also receives orchestrator-owned PR identity
-and CI verdicts tied to the same SHA. Its verdict is checked against changed paths and the complete
-acceptance-criteria list.
+The reviewer sees the task, the acceptance criteria, and a checkout of the exact candidate, but not
+the implementer's conversation. After the push, the PR review also gets the PR details and CI
+results that the orchestrator recorded for the same SHA. Runmill checks its verdict against the
+changed paths and the full list of acceptance criteria.
 
 ### Uncertainty stops the run
 
-Unreadable branch protection, stale evidence, a failed sandbox probe, lease loss, or malformed review output sends the issue to a person. `pr-only` remains the default. Automatic merge needs both an experimental mode and `experimental.automatic_merge: true`.
+If branch protection can't be read, evidence is stale, a sandbox probe fails, the lease is lost, or review output is malformed, the issue goes to a person. `pr-only` stays the default. Automatic merge needs both an experimental mode and `experimental.automatic_merge: true`.
 
 ## Operate and inspect
 
@@ -95,6 +95,6 @@ The TUI is optional. It needs Bun, or Node 26.4+ with experimental FFI. The daem
 | [Security policy](../SECURITY.md) | Supported versions, private reporting, and threat boundary |
 | [Support](../SUPPORT.md) | Setup help, diagnostic reports, and issue routing |
 | [Releasing](./releasing.md) | Trusted publishing, provenance, signed tags, and the maintainer release gate |
-| [ASF worker](./asf-worker.md) | The explicit, operator-composed Autonomous Software Factory integration surface |
+| [ASF worker](./asf-worker.md) | The explicit Autonomous Software Factory integration, composed by the operator |
 
 Runtime and development dependencies are pinned. Use `npm ci` when working from source.

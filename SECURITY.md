@@ -1,7 +1,7 @@
 # Security policy
 
-Runmill controls repository writes, pull requests, and—when explicitly enabled—merge decisions.
-Security reports are treated as product-safety reports, not ordinary bugs.
+Runmill controls repository writes, pull requests, and (when explicitly enabled) merge decisions.
+We treat security reports as product-safety reports rather than ordinary bugs.
 
 ## Supported versions
 
@@ -13,8 +13,8 @@ Runmill is a developer preview and has not published its first npm release.
 | Unreleased snapshots and older commits | No |
 | npm releases | None published |
 
-Start with `pr-only`. Automatic merge modes are experimental and should be evaluated against your
-repositories, rulesets, classic branch protection, and CI behavior before use.
+Start with `pr-only`. Automatic merge modes are experimental. Before you use one, test it against
+your repositories, rulesets, classic branch protection, and CI behavior.
 
 ## Report a vulnerability
 
@@ -39,23 +39,25 @@ part of the repository's external launch checklist.
 ## Security model
 
 Runmill treats repository content, issue text, agent output, and remote API responses as untrusted.
-The coding agent proposes code. Deterministic orchestration owns side effects and decides whether
-the evidence permits the run to continue. Missing, stale, contradictory, or unreadable evidence
-must fail closed.
+The coding agent proposes code. Deterministic orchestration code performs the side effects and
+decides whether the evidence lets the run continue. Missing, stale, contradictory, or unreadable
+evidence must fail closed.
 
 The main trust boundaries are:
 
-- **Operator policy:** authority is configured outside the repository. Repository-owned check
-  manifests and review instructions describe required evidence; they do not grant authority.
-- **Agent execution:** each issue runs in an isolated workspace under Seatbelt on macOS or
-  bubblewrap on Linux. A missing enforcement mechanism is an error, not a permissive fallback.
-- **Verification:** checks and reviews apply to the exact candidate commit. A rebase or amendment
-  invalidates earlier evidence.
-- **External effects:** branch writes, pull requests, backlog mutations, and merges are performed by
-  the orchestrator behind a lease fence—not by model output. An ambiguous outcome blocks all new
-  work until a person verifies the remote system and records what happened.
-- **Durable state:** leases prevent duplicate claims, and recorded operation intent survives an
-  ambiguous failure or restart. Hard-crash lease cleanup is manual in this preview.
+- **Operator policy.** Authority is configured outside the repository. Check manifests and review
+  instructions in the repository describe what evidence is required. They grant no authority.
+- **Agent execution.** Each issue runs in an isolated workspace under Seatbelt on macOS or
+  bubblewrap on Linux. If the enforcement mechanism is missing, that is an error. Runmill does not
+  fall back to running without it.
+- **Verification.** Checks and reviews apply to the exact candidate commit. A rebase or amend
+  invalidates any earlier evidence.
+- **External effects.** The orchestrator performs branch writes, pull requests, backlog changes,
+  and merges behind a lease fence. Model output never does. If an outcome is ambiguous, all new
+  work is blocked until a person checks the remote system and records what happened.
+- **Durable state.** Leases prevent duplicate claims, and the recorded intent of each operation
+  survives an ambiguous failure or a restart. Cleaning up leases after a hard crash is manual in
+  this preview.
 
 ## Threats we explicitly consider
 
@@ -75,36 +77,36 @@ The main trust boundaries are:
 | Sensitive support-bundle content | Redact credentials, source, and absolute paths; review before sharing |
 | Platform-specific gaps | Test Seatbelt and bubblewrap independently; do not infer one from the other |
 
-Provider API-key authentication is currently unsupported. Runmill strips `OPENAI_API_KEY` and
-`ANTHROPIC_API_KEY` from the agent environment because every tool process spawned by a provider
-would inherit them. Use a dedicated CLI subscription session and require `runmill doctor` to prove
-it works inside the real sandbox; successful authentication in an ordinary terminal is not
-sufficient evidence. Each invocation receives a private disposable copy of subscription config;
-the real provider directory is not mounted and sandbox writes are never copied back. Tool
+Provider API-key authentication is not supported yet. Runmill removes `OPENAI_API_KEY` and
+`ANTHROPIC_API_KEY` from the agent environment, because every tool process the provider spawns
+would otherwise inherit them. Use a dedicated CLI subscription session and have `runmill doctor`
+prove it works inside the real sandbox. Signing in successfully in an ordinary terminal is not
+enough evidence. Each invocation gets its own throwaway copy of the subscription config. The real
+provider directory is not mounted, and nothing the sandbox writes is copied back. Tool
 subprocesses can still read the copied credential, and provider egress is unrestricted in `proxy`
-mode. Doctor reports both as warnings, and Runmill does not claim provider credential isolation. A
-host-side credential and network broker is required before that boundary can be closed. Linear and
-GitHub credentials stay in orchestrator-owned adapters and are never given to the coding agent.
-Commit signing is also host-side: Runmill snapshots the source checkout's selected Git identity and
-signing settings before agent execution, but does not copy them into the agent-visible clone. The
+mode. Doctor reports both as warnings, and Runmill makes no claim to isolate provider credentials.
+Closing that gap needs a host-side credential and network broker. Linear and GitHub credentials
+stay in adapters the orchestrator owns and are never given to the coding agent. Commit signing
+also happens on the host. Before the agent runs, Runmill records the source checkout's Git
+identity and signing settings, but it does not copy them into the clone the agent can see. The
 signing key or signing-agent credential stays outside the coding-agent process.
 
 ## Credential guidance
 
-- Provider API keys are not a supported coding-agent authentication method. Do not work around the
+- Provider API keys are not a supported way to authenticate the coding agent. Don't work around the
   environment denylist.
-- Use a dedicated provider subscription and start in `pr-only`. Disposable homes prevent persistent
-  config changes, but the copied subscription credential and network egress remain developer-preview
-  limitations.
+- Use a dedicated provider subscription and start in `pr-only`. Throwaway home directories stop
+  config changes from persisting. The copied subscription credential and open network egress are
+  still developer-preview limitations.
 - Prefer short-lived or revocable Linear and GitHub credentials dedicated to Runmill.
-- Restrict GitHub access to the repositories Runmill operates on. `pr-only` does not need merge
-  authority. Do not grant administrative permissions merely to make a check pass.
-- Restrict Linear access to the teams Runmill consumes and mutates.
+- Limit GitHub access to the repositories Runmill works on. `pr-only` does not need merge
+  authority. Don't grant admin permissions just to make a check pass.
+- Limit Linear access to the teams Runmill reads from and writes to.
 - Never commit credentials, `.env` files, support bundles, or `.runmill/state/`.
 - Rotate a credential immediately if it appears in logs, Git history, an issue, or agent output.
 
 ## Out of scope for private disclosure
 
-Feature requests, setup problems without a security impact, and expected refusal behavior belong in
-the public issue templates. Vulnerabilities in Codex, Claude Code, GitHub, Linear, npm, Node.js, or
-the operating system should also be reported to the affected upstream project.
+Feature requests, setup problems with no security impact, and refusals that are working as
+intended belong in the public issue templates. If you find a vulnerability in Codex, Claude Code,
+GitHub, Linear, npm, Node.js, or the operating system, report it to that upstream project as well.

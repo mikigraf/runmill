@@ -1,7 +1,7 @@
 # Roadmap
 
-Runmill is a developer preview. This roadmap describes direction, not delivery dates or support
-commitments.
+Runmill is a developer preview. This roadmap shows where we are heading. It does not promise
+delivery dates or support.
 
 ## Available
 
@@ -15,11 +15,11 @@ commitments.
 
 ## Experimental
 
-- `guarded-merge` and `continuous`; automatic merge needs explicit evaluation against repository
-  rules, classic branch protection, CI timing, and failure recovery.
+- `guarded-merge` and `continuous`. Automatic merge still has to be tested deliberately against
+  repository rules, classic branch protection, CI timing, and failure recovery.
 - The TUI on Bun. The Node path needs Node 26.4+ with experimental FFI and is not part of the
   supported Node 22/24 daemon baseline.
-- Evaluation replay as evidence for increasing autonomy.
+- Evaluation replay as the evidence for raising autonomy.
 
 ## Planned
 
@@ -30,7 +30,7 @@ commitments.
 - Additional Git forges and backlog systems.
 - A credential broker that keeps provider secrets outside agent-spawned processes.
 - Stronger automatic-merge evaluation and a documented promotion path out of experimental status.
-- Standalone or prebuilt TUI distribution without a second runtime surprise.
+- A standalone or prebuilt TUI, so nobody discovers they need a second runtime.
 - Windows enforcement after a native sandbox boundary and CI coverage exist.
 - Multi-host coordination after leases and side-effect reconciliation have public compatibility
   tests.

@@ -3,13 +3,13 @@
 > Implemented in [`src/eval/suite.ts`](../src/eval/suite.ts),
 > [`src/eval/score.ts`](../src/eval/score.ts), and [`src/eval/replay.ts`](../src/eval/replay.ts).
 
-Public benchmarks compare broad agent capability. That is not the question you have. Yours is
-whether *this Runmill policy and agent configuration*, on *your* repository, does the right thing
-— including on the work it should refuse to do.
+Public benchmarks compare broad agent capability. That isn't your question. Yours is whether *this
+Runmill policy and agent configuration*, on *your* repository, does the right thing, including on
+the work it should refuse to do.
 
-This is what turns "autonomy is risk-tiered" from a policy into a measurement. You do not move from
-`pr-only` to `guarded-merge` because it feels ready; you move because a suite of your own historical
-work says it is, with an interval attached.
+Evaluation is what turns "autonomy is risk-tiered" from a policy into a measurement. You don't move
+from `pr-only` to `guarded-merge` because it feels ready. You move because a suite built from your
+own historical work says it is, with an interval attached.
 
 ```bash
 runmill eval validate examples/eval/suite.yaml
@@ -19,13 +19,13 @@ runmill eval replay   examples/eval/suite.yaml --split held-out
 
 ## A suite must contain work that should NOT be done
 
-This is the rule everything else rests on, and it is enforced:
-`runmill eval validate` **rejects** a suite whose every task expects success.
+Everything else rests on this rule, and it is enforced: `runmill eval validate` **rejects** a suite
+in which every task expects success.
 
 The reason is mechanical. A suite made only of completable work measures throughput. Optimise
-against it — by hand or automatically — and the winning strategy is to merge more things. The
-system that merges everything scores perfectly. So a suite must contain tasks whose correct
-outcome is *stopped and asked a human*, or it is measuring the opposite of what you want.
+against it, by hand or automatically, and the winning strategy is to merge more things. A system
+that merges everything gets a perfect score. So a suite has to include tasks whose correct outcome
+is *stopped and asked a human*. Without them it measures the opposite of what you want.
 
 | Expected | Correct behavior |
 |---|---|
@@ -34,10 +34,10 @@ outcome is *stopped and asked a human*, or it is measuring the opposite of what 
 | `escalate` | Stopped and asked a human |
 | `refuse` | Refused outright. An escalation also satisfies this |
 
-Matching is deliberately asymmetric: **completion never satisfies an escalation requirement.**
-Runmill has failed a high-risk task if it merges the change, no matter how good the diff is.
+Matching is deliberately asymmetric: **completion never satisfies an escalation requirement.** If
+Runmill merges a high-risk task, it has failed that task, however good the diff is.
 
-Refusal accuracy is reported on its own line, never folded into the aggregate:
+Refusal accuracy gets its own line and is never folded into the aggregate:
 
 ```
   development  ████████████████░░░░  80%  (4/5, 95% CI 38%–96%)
@@ -45,7 +45,7 @@ Refusal accuracy is reported on its own line, never folded into the aggregate:
   correctly refused  1/2   ← a system that merges these is worse, not faster
 ```
 
-An aggregate alone would show a configuration that stopped escalating as *improved*.
+On the aggregate alone, a configuration that stopped escalating would look *improved*.
 
 ## Splits
 
@@ -56,12 +56,13 @@ An aggregate alone would show a configuration that stopped escalating as *improv
 | `held-out` | Nothing |
 
 Held-out task titles, descriptions, and rationales are redacted from every report, human and JSON.
-Not as a courtesy — a held-out set stops being held out the moment its details reach a trace an
-optimizer can read, and that happens through a debug log long before anyone does it deliberately.
+This isn't a courtesy. A held-out set stops being held out the moment its details reach a trace an
+optimizer can read, and that tends to happen through a debug log long before anyone does it on
+purpose.
 
 ## Composing tasks
 
-A task is a replayable unit derived from your own history:
+A task is a replayable unit built from your own history:
 
 ```
 Historical issue + pre-change commit + original failing behavior
@@ -94,13 +95,14 @@ Historical issue + pre-change commit + original failing behavior
       run: npm test
 ```
 
-Cover the range: bug fixes, small features, refactors, test additions, documentation, dependency
-bumps, UI, operational work — **and** intentionally underspecified issues that should escalate,
-plus high-risk changes that should never merge autonomously.
+Cover the range of work you actually do: bug fixes, small features, refactors, test additions,
+documentation, dependency bumps, UI, operational work. **Also** include intentionally
+underspecified issues that should escalate, and high-risk changes that should never merge
+autonomously.
 
 > **Do not put `agent-ready` on an escalation task.** That label is an explicit human override of
-> the readiness heuristic, so applying it asserts the opposite of what the task is testing. This is
-> easy to get wrong: it was got wrong while writing the example suite.
+> the readiness heuristic, so applying it asserts the opposite of what the task is testing. It's an
+> easy mistake. We made it while writing the example suite.
 
 ## Evaluators
 
@@ -113,63 +115,62 @@ plus high-risk changes that should never merge autonomously.
 | Human calibration | Does automated judgment match yours? | Not implemented |
 | Delayed outcome | Reverts, incidents, follow-up defects | Not implemented |
 
-The last two are listed as missing rather than approximated. An evaluator that guesses is worse
-than one that is absent, because its output gets acted on.
+The last two are listed as missing instead of approximated. An evaluator that guesses is worse than
+none at all, because people act on its output.
 
 ## Stochasticity
 
-Agent execution is not deterministic, so a single run is an anecdote:
+Agent execution isn't deterministic, so a single run is an anecdote:
 
 ```bash
 runmill eval replay suite.yaml --repeat 5
 ```
 
-Every rate carries a 95% Wilson interval. Three-for-three looks like 100% and is consistent with a
-true rate near 44% — which is why the bare fraction is never reported alone.
+Every rate carries a 95% Wilson interval. Three for three looks like 100%, and it is consistent with
+a true rate near 44%. That's why the bare fraction is never reported alone.
 
 ## How replay executes
 
-Each task gets its own throwaway git repository (with a local bare `origin`, because the
-[lease](./leases.md) is a ref pushed to a remote) and its own state database, so tasks cannot see
-each other's leases, runs, or workspaces.
+Each task gets its own throwaway git repository and its own state database, so tasks can't see each
+other's leases, runs, or workspaces. The repository has a local bare `origin`, because the
+[lease](./leases.md) is a ref pushed to a remote.
 
-The replay issue defaults to the configured `backlog.team` and first `eligible_states` entry. A
-task may override `issue.team`, `issue.state`, or `issue.project`. Normal ordered repository rules
-then choose the target repository and base branch; replay does not assume the first configured
+The replay issue defaults to the configured `backlog.team` and the first `eligible_states` entry. A
+task may override `issue.team`, `issue.state`, or `issue.project`. The normal ordered repository
+rules then pick the target repository and base branch. Replay doesn't assume the first configured
 repository.
 
 Historical dependencies are exact-base evidence. If the selected base contains
 `package-lock.json`, Runmill validates `package.json`, `package-lock.json`, npm's installed package
 inventory, platform, architecture, and Node ABI before importing `node_modules`. The task's
-`dependency_path` is checked first; otherwise the fixture/current repository is accepted only when
-it proves the same identity. A current checkout with different package inputs is never reused for
-a historical commit. Prepare a separate checkout at `base_commit`, run `npm ci`, and point
+`dependency_path` is checked first. Failing that, the fixture/current repository is accepted only if
+it proves the same identity. A current checkout with different package inputs is never reused for a
+historical commit: prepare a separate checkout at `base_commit`, run `npm ci`, and point
 `dependency_path` at it. Missing or mismatched dependency evidence fails the attempt before the
-provider is started. Repositories without `package-lock.json` need no dependency path.
+provider starts. Repositories without `package-lock.json` need no dependency path.
 
 Replay may dispatch the configured Codex or Claude Code provider, so every agent and review
-invocation can consume provider usage. It never uses the configured production
-backlog or GitHub boundary. The suite issue is loaded into an in-memory backlog, and branch pushes,
-pull requests, checks, comments, transitions, and merges are simulated by an in-memory forge plus
-the task's throwaway local `origin`. This boundary is forced even when the loaded policy uses
-`guarded-merge` or `continuous` and valid Linear/GitHub credentials are available.
+invocation can consume provider usage. It never touches the configured production backlog or GitHub
+boundary. The suite issue is loaded into an in-memory backlog, and branch pushes, pull requests,
+checks, comments, transitions, and merges are simulated by an in-memory forge plus the task's
+throwaway local `origin`. That boundary is forced even when the loaded policy uses `guarded-merge`
+or `continuous` and valid Linear/GitHub credentials are available.
 
-There is no replay flag that enables production mutations. Use `--dry-run` when you also want to
-avoid provider usage.
+No replay flag enables production mutations. Use `--dry-run` if you also want to avoid provider
+usage.
 
 Then, in the order the daemon uses:
 
-1. **Selection** — eligibility, readiness, labels, dependencies, repository mapping.
-2. **The run** — the real [orchestrator](./lifecycle.md), not a simplified copy.
+1. **Selection**: eligibility, readiness, labels, dependencies, repository mapping.
+2. **The run**: the real [orchestrator](./lifecycle.md), not a simplified copy.
 
 Step 1 matters. Eligibility lives in the selector, not in `Orchestrator.run`, which trusts its
-caller. A replay implementation that called `run()` directly would bypass every rule deciding
-whether an issue should be worked on at all — and could never measure the escalations those rules
-exist to produce.
+caller. A replay that called `run()` directly would skip every rule that decides whether an issue
+should be worked on at all, and so could never measure the escalations those rules exist to produce.
 
 `--dry-run` scores a suite without dispatching anything. Every task reports the outcome it declared
-it expects, so it always scores 100%: useful for checking that a suite is wired up, useless as
-evidence. The report says which mode produced it.
+it expects, so it always scores 100%. That's useful for checking that a suite is wired up and useless
+as evidence. The report says which mode produced it.
 
 ## Using it to justify autonomy
 
@@ -179,11 +180,11 @@ runmill eval replay suite.yaml --repeat 5 --split held-out   # once, deliberatel
 ```
 
 Read refusal accuracy first. If Runmill stopped escalating on the tasks that require it, the
-aggregate is irrelevant — that is a regression regardless of how much else improved, and
-`eval replay` exits non-zero on it for exactly that reason.
+aggregate doesn't matter. That is a regression no matter how much else improved, and it's exactly
+why `eval replay` exits non-zero on it.
 
 ## See also
 
-- [Autonomy and merge gates](./autonomy.md) — what the suite is measuring
-- [The coverage contract](./verification.md) — the per-run evaluator
-- [Run lifecycle](./lifecycle.md) — what a replay actually executes
+- [Autonomy and merge gates](./autonomy.md): what the suite is measuring
+- [The coverage contract](./verification.md): the per-run evaluator
+- [Run lifecycle](./lifecycle.md): what a replay actually executes

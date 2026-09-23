@@ -4,22 +4,22 @@
 
 Autonomy modes govern the **Deliver** stage of Runmill's delivery loop.
 
-Autonomy is a dial with four positions, and the interesting question is not "how much can it do"
-but "what has to be *provable* before it does". Every mode below `continuous` differs from the one
-above it by a specific gate, not by a vague sense of caution.
+Autonomy is a dial with four positions. The interesting question about each one is what has to be
+*provable* before Runmill acts. Every mode below `continuous` differs from the one above it by a
+specific gate. None of them is just a vaguer sense of caution.
 
-The agent may operate autonomously inside implementation and review. These modes govern the
+Inside implementation and review, the agent may work on its own. The modes govern the
 deterministic workflow around the task: claims, repository effects, PR delivery, and merge policy.
 
 | Mode | Does | Never does |
 |---|---|---|
 | `observe` | Selects and plans | Takes a lease, clones, or mutates anything |
-| `pr-only` | Implements, verifies, reviews, fixes, opens a PR — **the default** | Merges |
+| `pr-only` | Implements, verifies, reviews, fixes, opens a PR (**the default**) | Merges |
 | `guarded-merge` | Merges low-risk changes after every gate passes | Merges when any gate is unprovable |
 | `continuous` | Applies guarded merge policy to every run in the daemon loop | — |
 
-`pr-only` is the default because opening a pull request cannot bypass anything. It is the mode
-where a mistake costs a review comment.
+`pr-only` is the default because opening a pull request cannot bypass anything. In this mode a
+mistake costs you a review comment.
 
 > [!IMPORTANT]
 > Runmill is a developer preview. `guarded-merge` and `continuous` are experimental. Selecting
@@ -28,7 +28,8 @@ where a mistake costs a review comment.
 
 ## The seven gates
 
-Evaluated in order. Any failure ends the run in a terminal state that names which gate and why.
+The gates run in order. Any failure ends the run in a terminal state that names the gate and the
+reason.
 
 ```
 1. lease held with the current fencing generation
@@ -45,11 +46,11 @@ not replay the run against today's configuration or invent a gate result from a 
 When no policy evidence exists, its answer is `unknown`; use `runmill inspect <run-id>` for the
 underlying candidate-bound inputs and observations.
 
-Issue authority is a cross-cutting prerequisite around these gates. Runmill re-observes the full
-issue immediately before the first push and before PR delivery or merge. It accepts only the exact
-confirmed claim-state and configured claim-assignee delta that Runmill itself made. Any other edit,
-missing observation, ineligibility, cancellation, completion, or repository retargeting withholds
-the next mutation and is persisted as a policy refusal or unknown result.
+Issue authority sits underneath all of these gates. Runmill re-observes the full issue right
+before the first push, and again before PR delivery or merge. The only change it accepts is the
+exact confirmed claim-state and configured claim-assignee delta that Runmill itself made. Any other
+edit, a missing observation, ineligibility, cancellation, completion, or repository retargeting
+withholds the next mutation and is persisted as a policy refusal or unknown result.
 
 ### Gate 1 — the lease
 
@@ -57,19 +58,19 @@ the next mutation and is persisted as a policy refusal or unknown result.
 
 ### Gate 2 — the coverage contract
 
-Discovery, coverage, freshness, outcome. A green command satisfies only the last of those. See
+Discovery, coverage, freshness, outcome. A green command only satisfies the last one. See
 [the coverage contract](./verification.md).
 
 ### Gate 3 — review, cross-checked
 
-Review runs in a **fresh context** with no implementer narrative, and returns structured findings
-tied to file and line. With the default `review.require_all_findings_resolved: true`, every finding
+Review runs in a fresh context with no implementer narrative. It returns structured findings tied
+to file and line. With the default `review.require_all_findings_resolved: true`, every finding
 dispatches a fix. If that flag is deliberately disabled, only findings listed by
 `review.merge_blocking_severities` (default `critical`, `high`) block an approving verdict. An
 explicit `changes_required` verdict always makes every returned finding blocking. The loop is
-bounded by `review.max_fix_iterations`; anything still blocking after that escalates.
+bounded by `review.max_fix_iterations`, and anything still blocking after that escalates.
 
-The verdict itself is not taken on faith. `crossCheckVerdict` rejects contradictory combinations,
+We don't take the verdict on faith either. `crossCheckVerdict` rejects contradictory combinations,
 including a passing verdict whose scope is not `within_scope`, `no_findings` with a non-empty
 finding list, and `changes_required` without an actionable finding. It also rejects a clean verdict
 on a risk-marked diff:
@@ -84,12 +85,12 @@ if (review.verdict !== "changes_required" && review.scope_assessment !== "within
 }
 ```
 
-The first is the signature of a prompt-injected or simply over-agreeable review: a clean bill of
-health on a diff touching `risk.manual_approval.paths`. The second withholds permission whenever
-scope is unknown. A review cannot approve a change while stating it does something it was not asked
-to do. Both cases escalate to a person instead of resolving in the change's favor.
+The first check catches what a prompt-injected or merely over-agreeable review looks like: a clean
+bill of health on a diff that touches `risk.manual_approval.paths`. The second withholds permission
+whenever scope is unknown, because a review cannot approve a change while saying it does something
+nobody asked for. Both cases go to a person. Neither resolves in the change's favor.
 
-Configure the paths that trigger this:
+You configure the paths that trigger this:
 
 ```yaml
 risk:
@@ -102,29 +103,29 @@ risk:
 
 ### Gate 4 — branch protection must be readable
 
-Branch protection is frequently unreadable: the classic endpoint needs admin, and org-level
-rulesets are invisible to repo-scoped calls.
+Branch protection is often unreadable. The classic endpoint needs admin, and org-level rulesets
+are invisible to repo-scoped calls.
 
-**runmill treats unreadable rules as unknown, not as absent, and refuses.** The alternative —
-assuming no rules exist because none could be read — turns a permissions problem into an
-unguarded merge, and does it silently, on the repositories most likely to be governed.
+**runmill treats unreadable rules as unknown and refuses.** It never assumes they are absent. The
+alternative (deciding no rules exist because none could be read) turns a permissions problem into
+an unguarded merge. It would do that silently, and on exactly the repositories most likely to be
+governed.
 
 ### Gate 5 — required contexts satisfied
 
-Every context branch protection requires must have actually reported success. `neutral` and
-`skipped` do not count. A required check that is never *scheduled* fails after 10 minutes rather
-than waiting forever — see [remote checks](./verification.md#remote-checks).
+Every context that branch protection requires must have actually reported success. `neutral` and
+`skipped` don't count. A required check that is never *scheduled* fails after 10 minutes instead of
+waiting forever (see [remote checks](./verification.md#remote-checks)).
 
-Immediately before an automatic merge, Runmill also asks GitHub for its authoritative mergeability
+Right before an automatic merge, Runmill also asks GitHub for its authoritative mergeability
 verdict and requires `clean` plus `mergeable: true`. If branch rules require a merge queue, Runmill
-stops: queue enrollment is not implemented in this preview, so it will not substitute a direct
-merge. A `blocked` verdict also withholds merge, including when required conversations are not
+stops. Queue enrollment isn't implemented in this preview, and Runmill will not quietly substitute
+a direct merge. A `blocked` verdict also withholds merge, including when required conversations are not
 resolved.
 
 ### Gate 6 — the negative capability test
 
-This is the gate that distinguishes `guarded-merge` from `pr-only`, and it is a proof of
-*inability*:
+This gate is what separates `guarded-merge` from `pr-only`. It is a proof of *inability*:
 
 ```ts
 const canWriteProtection = await this.#d.forge.canWriteBranchProtection({ repo: target.repo });
@@ -137,16 +138,16 @@ if (canWriteProtection) {
 }
 ```
 
-The reasoning: if the credential that merges can also rewrite the rules constraining the merge,
-then "no merge bypassed protection" is not a verifiable claim. Not because runmill would rewrite
-them — because nothing *proves* it could not, and an audit trail that depends on good intentions
-is not an audit trail.
+Here's the reasoning. If the credential that merges can also rewrite the rules constraining the
+merge, then "no merge bypassed protection" is a claim nobody can verify. runmill has no intention of
+rewriting them. The problem is that nothing *proves* it could not, and an audit trail that depends
+on good intentions isn't an audit trail.
 
 So before any merge mode unlocks, runmill checks whether its own credential is too powerful, and
-locks merging if it is. A governance system that cannot demonstrate its own constraints is
-decorative.
+locks merging if it is. A governance system that can't demonstrate its own constraints is
+decoration.
 
-**What this means in practice:**
+In practice:
 
 | Mode | Credential |
 |---|---|
@@ -154,15 +155,15 @@ decorative.
 | `guarded-merge`, `continuous` | A GitHub App installation token scoped to `contents: write` + `pull_requests: write`, and explicitly **not** `administration` |
 
 A classic personal access token with `repo` scope will not unlock merging. `repo` includes
-administration on repositories you own, so it fails the negative test — correctly.
+administration on repositories you own, so it fails the negative test, as it should.
 
 `runmill doctor --explain github` covers this interactively.
 
 ### Gate 7 — risk tier vs mode
 
 If branch protection requires an approving human review, the run finishes in `AWAITING_APPROVAL`
-rather than attempting a merge it cannot complete. Runmill then evaluates the final diff and the
-claimed issue against operator-owned risk policy immediately before `MERGE_READY`:
+instead of attempting a merge it cannot complete. Runmill then checks the final diff and the claimed
+issue against operator-owned risk policy right before `MERGE_READY`:
 
 - only `risk.default: low` is eligible for automatic merge;
 - a final changed path matching `risk.manual_approval.paths` requires approval;
@@ -171,18 +172,18 @@ claimed issue against operator-owned risk policy immediately before `MERGE_READY
   the task packet and final changed paths.
 
 A known match finishes in `AWAITING_APPROVAL` and names every matching rule. A configured condition
-that Runmill cannot prove from available evidence finishes in `NEEDS_HUMAN`. Today that applies to
-`public_api_change`, `permissions_change`, and `secret_related_change`: treating an unimplemented
+that Runmill cannot prove from available evidence finishes in `NEEDS_HUMAN`. Today that covers
+`public_api_change`, `permissions_change`, and `secret_related_change`. Treating an unimplemented
 classifier as "false" would be a fail-open merge.
 
-This gate governs automatic merge only. `pr-only` still delivers the verified, reviewed pull
-request so a person can make the final decision.
+This gate only governs automatic merge. `pr-only` still delivers the verified, reviewed pull
+request, and a person makes the final call.
 
 ## What happens after the gates
 
 **`pr-only`** transitions the issue to `backlog.delivered_state`, comments with the PR URL,
-releases the lease, and finishes at `PR_DELIVERED`. This is a success, not a partial one.
-The delivered state is required and cannot be eligible, so the daemon's next poll cannot select
+releases the lease, and finishes at `PR_DELIVERED`. That is a full success.
+The delivered state is required and cannot be eligible, so the daemon's next poll can't pick up
 the same issue and open a second pull request.
 
 **`guarded-merge` / `continuous`** re-assert the lease, require GitHub's clean mergeability verdict,
@@ -190,8 +191,8 @@ merge with `github.merge.method`, transition the issue to `backlog.completed_sta
 up, and finish at `COMPLETED`. Repositories requiring a merge queue stop for a person in this
 preview.
 
-Note the ordering: `assertHeld` immediately precedes the merge. The gap between "we decided to
-merge" and "we merged" is where a stale worker would do damage, so the fence is checked inside it.
+Look at the ordering: `assertHeld` runs immediately before the merge. The gap between "we decided
+to merge" and "we merged" is where a stale worker would do damage, so we check the fence inside it.
 
 ## Terminal states
 
@@ -203,9 +204,9 @@ merge" and "we merged" is where a stale worker would do damage, so the fence is 
 | `NEEDS_HUMAN` | A gate could not be satisfied deterministically, so it escalated |
 | `QUARANTINED` | Something happened that policy could not classify |
 
-`NEEDS_HUMAN` and `QUARANTINED` are different on purpose. The first is a gate doing its job — a
-known condition with a named reason. The second means runmill encountered something it could not
-categorize, which is the case where continuing would mean guessing.
+`NEEDS_HUMAN` and `QUARANTINED` are different on purpose. The first is a gate doing its job: a
+known condition with a named reason. The second means runmill hit something it could not
+categorize. That's the case where continuing would mean guessing.
 
 ```bash
 runmill list --needs-attention
@@ -214,8 +215,8 @@ runmill inspect <run-id>
 runmill effects list
 ```
 
-Checkpoint continuation is not available in the developer preview. `runmill resume <run-id>` is an
-honest diagnostic refusal and does not record an answer or advance state. Resolve any ambiguous
+The developer preview has no checkpoint continuation. `runmill resume <run-id>` is an honest
+diagnostic refusal. It doesn't record an answer or advance state. Resolve any ambiguous
 external effect, restore the issue to an eligible state, and start a fresh attempt.
 
 ## Choosing a mode
@@ -223,18 +224,18 @@ external effect, restore the issue to an eligible state, and start a fresh attem
 Start at `pr-only`. It is the default, it needs no special credential, and every PR it opens is
 evidence about whether you would have wanted it merged.
 
-Move to `guarded-merge` once you have a body of runs you would have approved, and once you can
-issue a scoped App token and explicitly opt in with `experimental.automatic_merge: true`. Use
+Move to `guarded-merge` once you have a body of runs you would have approved, you can issue a
+scoped App token, and you have explicitly opted in with `experimental.automatic_merge: true`. Use
 `continuous` when every repeated daemon run should apply that experimental merge policy. The
-daemon loop itself works with `pr-only` too; autonomy controls each run, while `runmill daemon`
-controls repetition, polling, circuit breakers, and session budgets.
+daemon loop works with `pr-only` too. Autonomy controls each run; `runmill daemon` controls
+repetition, polling, circuit breakers, and session budgets.
 
-Autonomy should be earned with evidence you actually collected, and the PRs from `pr-only` are
-that evidence.
+Autonomy should be earned with evidence you actually collected. The PRs from `pr-only` are that
+evidence.
 
 ## See also
 
-- [The coverage contract](./verification.md) — gate 2 in full
-- [The lease model](./leases.md) — gate 1 in full
-- [Run lifecycle](./lifecycle.md) — states, the outbox, and recovery
-- [Configuration](./configuration.md) — every key referenced above
+- [The coverage contract](./verification.md): gate 2 in full
+- [The lease model](./leases.md): gate 1 in full
+- [Run lifecycle](./lifecycle.md): states, the outbox, and recovery
+- [Configuration](./configuration.md): every key referenced above

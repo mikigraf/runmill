@@ -1,8 +1,8 @@
 # Daemon operation
 
-The background process supplies the **Repeat** step in Runmill's backlog-to-PR loop. It watches the
-configured backlog, executes one engineering run at a time, and waits when there is nothing
-eligible. Adding a new eligible issue is enough to start another run on the next poll.
+The background process is the **Repeat** step in Runmill's backlog-to-PR loop. It watches the
+configured backlog, does one engineering run at a time, and waits when nothing is eligible. Add a
+new eligible issue and the next poll picks it up.
 
 ```bash
 runmill start
@@ -11,29 +11,30 @@ runmill tui
 runmill stop
 ```
 
-`start`, `status`, and `stop` are the normal operational interface. `status` and `stop` use the
-user-private control socket, so they work from any directory and do not need a configuration path.
-`stop` requests shutdown at the next safe orchestration boundary rather than abandoning a lease or
-a partially recorded external operation.
+`start`, `status`, and `stop` are what you use day to day. `status` and `stop` talk to the
+user-private control socket, so they work from any directory and don't need a configuration path.
+`stop` asks for shutdown at the next safe orchestration boundary. It won't abandon a lease or a
+partially recorded external operation.
 
-Daemon startup acquires an atomic user-private ownership record before touching the control socket
-or registry. A second starter refuses while that owner is live or cannot be identified; it reclaims
-the paths only after the recorded PID is definitively absent. Invalid registries and ownership
-records are preserved for diagnosis instead of being overwritten.
+On startup the daemon acquires an atomic user-private ownership record before it touches the
+control socket or registry. A second starter refuses while that owner is live or can't be
+identified, and reclaims the paths only once the recorded PID is definitely gone. Invalid registries
+and ownership records are kept for diagnosis instead of being overwritten.
 
-When autonomy is `observe`, `start` and `daemon` refuse to create a delivery loop because that mode
-may inspect backlog state but may not execute work. `start` and `daemon --detach` still check for
-and report an already running daemon, so changing configuration cannot hide older active
-automation.
+When autonomy is `observe`, `start` and `daemon` refuse to create a delivery loop. That mode may
+inspect backlog state but may not execute work. `start` and `daemon --detach` still check for and
+report a daemon that's already running, so changing configuration can't hide older automation that
+is still active.
 
-The default idle poll interval is 30 seconds. Change it when starting the background process:
+The default idle poll interval is 30 seconds. You can change it when you start the background
+process:
 
 ```bash
 runmill start --poll-seconds 60
 ```
 
-`runmill daemon` remains the advanced foreground interface for service supervisors, bounded runs,
-and queue draining:
+`runmill daemon` is still there as the advanced foreground interface, for service supervisors,
+bounded runs, and draining the queue:
 
 ```bash
 runmill daemon
@@ -44,13 +45,13 @@ runmill daemon --detach     # lower-level equivalent of runmill start
 ```
 
 `--once` does not mean one issue. It processes everything currently eligible, then exits. Use
-`--max-runs 1` when exactly one run is wanted.
+`--max-runs 1` when you want exactly one run.
 
 ## Idle and stop behavior
 
-An empty queue is an idle state, not an error. Runmill prints the next poll time once, then stays
-quiet until work appears or it is stopped. Selection is performed again after every poll, so state,
-labels, priorities, leases, and repository routing are never cached across the idle period.
+An empty queue is just idle. It isn't an error. Runmill prints the next poll time once, then stays
+quiet until work shows up or you stop it. Selection runs again after every poll, so state, labels,
+priorities, leases, and repository routing are never cached across the idle period.
 
 The daemon stops when:
 
@@ -60,7 +61,7 @@ The daemon stops when:
 - the queue drains in `--once` mode.
 
 A signal takes effect between runs. Runmill lets the active orchestration boundary finish so it
-does not abandon a lease or a half-recorded side effect.
+doesn't abandon a lease or a half-recorded side effect.
 
 ## Keeping the host awake
 
@@ -72,25 +73,25 @@ Runmill holds a native sleep inhibitor for the complete daemon session and for i
 - Linux: a `systemd-inhibit` block for idle, sleep, suspend/hibernate, and lid-switch handling,
   backed by a shell-free watcher for the exact Runmill process
 
-This prevents display idle, system idle sleep, and suspend while work may be running. On a normal
-shutdown Runmill terminates the complete inhibitor process group. If Runmill is killed abruptly,
-`caffeinate` or the Linux parent watcher exits when its Runmill process disappears, so the
-inhibitor cannot remain orphaned. No giant timeout, infinite sleep, or persistent power setting is
-used.
+That keeps the display from idling and the system from idle-sleeping or suspending while work may
+be running. On a normal shutdown Runmill terminates the whole inhibitor process group. If Runmill is
+killed abruptly, `caffeinate` or the Linux parent watcher exits when its Runmill process disappears,
+so the inhibitor can't be left orphaned. There's no giant timeout, infinite sleep, or persistent
+power setting involved.
 
-If the native command is missing, Runmill prints a warning and continues. This is useful on
-headless hosts where suspend is already disabled, while making the weaker guarantee visible on a
-laptop.
+If the native command is missing, Runmill prints a warning and carries on. That's what you want on
+a headless host where suspend is already disabled, and on a laptop the warning makes the weaker
+guarantee visible.
 
 ## Reviews start clean
 
-The reviewer is a separate agent invocation with a new context. It receives the issue, acceptance
-criteria, diff, and verification evidence. It does not receive the implementer's conversation or
-reasoning. Configure a different CLI or model under `providers.reviewer` when you also want an
-independent model.
+The reviewer is a separate agent invocation with a new context. It gets the issue, acceptance
+criteria, diff, and verification evidence. It doesn't get the implementer's conversation or
+reasoning. If you also want an independent model, configure a different CLI or model under
+`providers.reviewer`.
 
 Review can send the change back through a bounded fix loop. New code from a fixer is verified and
-reviewed again; it is never accepted on the strength of the fixer's claim.
+reviewed again. We never accept it because the fixer says it's fine.
 
 ## Operations and DevEx
 
@@ -116,16 +117,16 @@ runmill stop
 
 ### OpenTUI dashboard
 
-`runmill tui` connects to the active daemon over a user-private Unix socket. It can be launched
-from any directory: configuration discovery, repository paths, and SQLite access remain inside the
-daemon.
+`runmill tui` connects to the active daemon over a user-private Unix socket. You can launch it
+from any directory, because configuration discovery, repository paths, and SQLite access all stay
+inside the daemon.
 
 ![Runmill OpenTUI with recent runs, transition history, agent events, and live daemon logs](https://raw.githubusercontent.com/mikigraf/runmill/main/assets/runmill-tui.png)
 
-The CLI automatically delegates the TUI process to Bun. The
+The CLI hands the TUI process to Bun automatically. The
 [OpenTUI native renderer](https://opentui.com/docs/getting-started/) currently needs Bun, or Node
 26.4+ with experimental FFI; Runmill supports Node 22 and 24 for the daemon and all non-TUI
-commands. If Bun is missing, `runmill tui` exits with an installation hint rather than opening a
+commands. If Bun is missing, `runmill tui` exits with an installation hint instead of opening a
 broken screen.
 
 The dashboard includes:
@@ -149,9 +150,9 @@ Keyboard controls:
 The registry is stored in `$XDG_RUNTIME_DIR/runmill/daemon.json` when available and otherwise in
 `~/.runmill/daemon.json`. Both the registry and socket are mode `0600`. Only one active Runmill
 daemon is registered per user session. A policy may use several routing rules, but every rule must
-target the same local GitHub repository in this release. One active daemon manages one checkout;
-stop it before switching the session to another repository. Cross-repo checkout and delivery are
-not implemented.
+target the same local GitHub repository in this release. One active daemon manages one checkout,
+so stop it before switching the session to another repository. Cross-repo checkout and delivery
+aren't implemented.
 
 Run state and evidence live outside the repository under
 `$XDG_STATE_HOME/runmill/projects/<project-id>/` on Linux, falling back to
@@ -159,16 +160,17 @@ Run state and evidence live outside the repository under
 `~/Library/Application Support/runmill/projects/<project-id>/`. `RUNMILL_DATA_DIR` overrides the
 location. Completed deliveries are also appended to `log.md` in that same project-state directory,
 with local `DD/MM/YYYY HH:mm` timestamps, issue and PR links, result, cost, and run ID. The Markdown
-file is an activity journal; SQLite remains the recovery source of truth.
+file is an activity journal. SQLite is still the source of truth for recovery.
 
 Use `--json` for supervisors and scripts. Runmill uses stable exit codes and writes non-essential
 human output only when `--quiet` is not set.
 
 ## Backlog support
 
-The daemon is backlog-agnostic internally, but Linear is the current live issue adapter. GitHub is
-used for repositories, pull requests, CI, branch protection, and merges. Unsupported backlog
-providers are rejected during configuration validation rather than failing after the daemon starts.
+Internally the daemon doesn't care which backlog it talks to, but Linear is the only live issue
+adapter today. GitHub handles repositories, pull requests, CI, branch protection, and merges.
+Unsupported backlog providers are rejected during configuration validation, so they fail before the
+daemon starts instead of after.
 
 ## Running in the background or as a service
 
@@ -177,11 +179,11 @@ to `daemon.log` in the project state directory described above. The control regi
 discoverable by `runmill status`, `runmill stop`, and `runmill tui` regardless of the client's
 working directory.
 
-Foreground mode still works well under launchd, systemd, or a container supervisor. Native service
-unit generation is not built in yet.
+Foreground mode works fine under launchd, systemd, or a container supervisor. Runmill doesn't
+generate native service units yet.
 
 Whichever supervisor you use, give `SIGTERM` enough time for an in-flight issue to reach a safe
-boundary. Do not configure the supervisor to restart a circuit-breaker exit immediately; that
-would defeat the breaker. Daily spend is reconstructed from the durable budget ledger. Quarantine,
+boundary. Don't configure the supervisor to restart a circuit-breaker exit immediately. That
+defeats the breaker. Daily spend is reconstructed from the durable budget ledger. Quarantine,
 consecutive-failure, and escalation-rate counters and trips are also durable in SQLite, so a daemon
 restart cannot reset an opened breaker.
